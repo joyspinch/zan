@@ -39,6 +39,7 @@ partial class Ngen {
     int dataLen;
     int fmtiIdx;
     int fmtsIdx;
+    int fmtnIdx;
 
     Cls FindClass(string n) {
         int i = 0;
@@ -129,6 +130,8 @@ partial class Ngen {
         fmtiIdx = strs.Count - 1;
         strs.Add("%s\n");
         fmtsIdx = strs.Count - 1;
+        strs.Add("%lld");
+        fmtnIdx = strs.Count - 1;
         dglbs.Add(new DGlob("zan_eh", 8, dataLen));
         dataLen = dataLen + 8;
         RtEmitAlloc();
@@ -136,7 +139,31 @@ partial class Ngen {
         RtEmitStrCat2();
         RtEmitPrintInt();
         RtEmitPrintln();
+        RtEmitInt2Str();
         RtEmitEhState();
+    }
+
+    // ptr zan_rt_int2str(i64 v) -- malloc a 32-byte scratch buffer and
+    // sprintf("%lld", v) into it; 32 bytes hold any 64-bit decimal + NUL.
+    // Darwin arm64 passes variadic arguments on the stack (at [sp] at the
+    // call), not in x2..x7, so v gets a dedicated stack slot.
+    void RtEmitInt2Str() {
+        syms.Add(new Sym("_zan_rt_int2str", txt.Count));
+        RtPrologue();
+        E4(0xF81F0FE0);                        // str x0, [sp, #-16]! (save v)
+        LoadImm(0, 32);
+        BLExtern("_malloc");                  // x0 = buf
+        E4(0xF81F0FE0);                        // str x0, [sp, #-16]! (save buf)
+        LdrU(2, 31, 16);                       // x2 = v (reload)
+        AddSPImm(16, false);                   // variadic argument slot
+        StrU(2, 31, 0);                        // [sp] = v
+        LdrU(0, 31, 16);                       // x0 = buf
+        LoadSymRef("l_.str." + fmtnIdx, 1);    // x1 = "%lld"
+        BLExtern("_sprintf");
+        AddSPImm(16, true);                    // drop the vararg slot
+        LdrU(0, 31, 0);                        // x0 = buf
+        AddSPImm(32, true);                    // pop buf + v
+        RtEpilogue();
     }
 
     // ptr _zan_rt_eh_state(): the exception-state block, allocated on first
