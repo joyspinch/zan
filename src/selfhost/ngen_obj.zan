@@ -88,7 +88,7 @@ partial class Ngen {
     }
 
     // ---- register-op helpers (encodings verified against clang -arch arm64) ----
-    void MovRR(int rd, int rm) { E4(0xAA000000 | (rm << 16) | rd); }
+    void MovRR(int rd, int rm) { E4(0xAA000000 | (rm << 16) | (31 << 5) | rd); } // mov rd, rm (orr with xzr)
     void AddRR(int rd, int rn, int rm) { E4(0x8B000000 | (rm << 16) | (rn << 5) | rd); }
     void SubImm(int rd, int rn, int imm) { E4(0xD1000000 | (imm << 10) | (rn << 5) | rd); }
     void CbzReg(int rt, int lbl) { fixups.Add(new Fixup(txt.Count, 1, lbl, 0, null)); E4(0xB4000000 | rt); }
@@ -249,5 +249,69 @@ partial class Ngen {
         BLExtern("_printf");
         E4(0xF84107E0);
         RtEpilogue();
+    }
+
+    // ---- List<T>, ABI-identical to gen0's %List = {i64 count, i64 cap, ptr data} ----
+
+    // new List<T>(): alloc 24+16 (calloc-zeroed count), cap = 8,
+    // data = calloc(8, 8) -- mirrors gen0's collection initializer
+    void GenListNew() {
+        LoadImm(0, 24 + 16);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");
+        E4(0xF81F0FE0);                              // str x0, [sp, #-16]! (obj)
+        LoadImm(1, 8);
+        StrU(1, 0, 8);                               // obj->cap = 8
+        LoadImm(0, 8);
+        LoadImm(1, 8);
+        BLExtern("_calloc");                         // data = calloc(8, 8)
+        E4(0xF84107E1);                              // ldr x1, [sp], #16 (obj)
+        StrU(0, 1, 16);                              // obj->data = x0
+        MovRR(0, 1);                                 // result = obj
+    }
+
+    // list.Count: load field 0
+    void GenListCount(Node recv) {
+        GenExpr(recv);
+        LdrU(0, 0, 0);
+    }
+
+    // list.Add(v) inlined: grow when count == cap (cap*2, realloc data),
+    // then data[count++] = v -- mirrors gen0's inline Add sequence
+    void GenListAdd(Node recv, Node arg) {
+        GenExpr(recv);
+        E4(0xF81F0FE0);                              // push list
+        GenExpr(arg);
+        E4(0xF81F0FE0);                              // push value
+        E4(0xF84107E1);                              // ldr x1, [sp], #16 (value)
+        E4(0xF84107E0);                              // ldr x0, [sp], #16 (list)
+        E4(0xF81F0FE1);                              // push value (kept across grow)
+        E4(0xF81F0FE0);                              // push list
+        LdrU(2, 0, 0);                               // count
+        LdrU(3, 0, 8);                               // cap
+        E4(0xEB03005F);                              // cmp x2, x3
+        int skip = NL();
+        EmitBcond(1, skip);                          // b.ne skip (cond 1 = NE)
+        AddRR(3, 3, 3);                              // ncap = cap * 2
+        StrU(3, 0, 8);                               // cap = ncap
+        LdrU(4, 0, 16);                              // old data
+        MovRR(9, 3);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);                              // x9 = ncap * 8 bytes
+        MovRR(0, 4);
+        MovRR(1, 9);
+        BLExtern("_realloc");
+        LdrU(5, 31, 0);                              // x5 = list
+        StrU(0, 5, 16);                              // list->data = new data
+        Mark(skip);
+        LdrU(0, 31, 0);                              // list
+        LdrU(2, 0, 0);                               // count
+        LdrU(3, 0, 16);                              // data
+        LdrU(1, 31, 8);                              // value
+        E4(0xF8207800 | (2 << 16) | (3 << 5) | 1);   // str x1, [x3, x2, lsl #3]
+        AddImm(2, 2, 1);                             // count + 1
+        StrU(2, 0, 0);                               // list->count
+        AddSPImm(32, true);                          // pop value + list
     }
 }
