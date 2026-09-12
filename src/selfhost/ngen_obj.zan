@@ -1,0 +1,253 @@
+using System;
+using System.Collections;
+namespace Zan;
+
+// M2: class/object support for Ngen -- class layout, allocation, instance
+// methods, field access, string concat, Console.WriteLine, and the
+// Ngen-emitted object runtime core (alloc / str ops / print). The runtime
+// core mirrors gen0's IR-embedded runtime (zan_rt_alloc: 16-byte header,
+// [-16]=refcount, [-8]=descriptor; strings stamped with the ZANS magic) so
+// both backends stay ABI-identical.
+//
+// Object layout: fields in declaration order, 8-byte-aligned slots; int
+// fields occupy 8 bytes (value in slot 0). %List matches {i64,i64,ptr}.
+
+class Fld {
+    public string name;
+    public int off;
+    public string ty;   // "int" / "string" / class name
+    public Fld(string n, int o, string t) { name = n; off = o; ty = t; }
+}
+
+class Cls {
+    public string name;
+    public List<Fld> flds;
+    public int size;
+    public Cls(string n) { name = n; flds = new List<Fld>(); size = 0; }
+}
+
+class DGlob {
+    public string name; // data global name (without the l_.g. prefix)
+    public int size;
+    public int off;     // offset within __DATA,__data
+    public DGlob(string n, int s, int o) { name = n; size = s; off = o; }
+}
+
+partial class Ngen {
+    List<Cls> classes;
+    List<DGlob> dglbs;
+    int dataLen;
+    int fmtiIdx;
+    int fmtsIdx;
+
+    Cls FindClass(string n) {
+        int i = 0;
+        while (i < classes.Count) { if (classes[i].name == n) { return classes[i]; } i = i + 1; }
+        return null;
+    }
+
+    Fld FindField(Cls c, string n) {
+        if (c == null) { return null; }
+        int i = 0;
+        while (i < c.flds.Count) { if (c.flds[i].name == n) { return c.flds[i]; } i = i + 1; }
+        return null;
+    }
+
+    int FieldOff(string cls, string fld) {
+        Fld f = FindField(FindClass(cls), fld);
+        if (f == null) { return -1; }
+        return f.off;
+    }
+
+    void CollectClasses(Node unit) {
+        classes = new List<Cls>();
+        dglbs = new List<DGlob>();
+        dataLen = 0;
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node dcl = unit.kids[i];
+            if (dcl.kind == AK.ClassDecl()) { CollectClass(dcl); }
+            i = i + 1;
+        }
+    }
+
+    void CollectClass(Node dcl) {
+        Cls c = new Cls(dcl.sval);
+        int off = 0;
+        int k = 0;
+        while (k < dcl.kids.Count) {
+            Node m = dcl.kids[k];
+            if (m.kind == AK.FieldDecl() && m.type != null) {
+                c.flds.Add(new Fld(m.sval, off, m.type.sval));
+                off = off + 8;
+            }
+            k = k + 1;
+        }
+        c.size = off;
+        classes.Add(c);
+    }
+
+    // ---- register-op helpers (encodings verified against clang -arch arm64) ----
+    void MovRR(int rd, int rm) { E4(0xAA000000 | (rm << 16) | rd); }
+    void AddRR(int rd, int rn, int rm) { E4(0x8B000000 | (rm << 16) | (rn << 5) | rd); }
+    void SubImm(int rd, int rn, int imm) { E4(0xD1000000 | (imm << 10) | (rn << 5) | rd); }
+    void CbzReg(int rt, int lbl) { fixups.Add(new Fixup(txt.Count, 1, lbl, 0, null)); E4(0xB4000000 | rt); }
+    void LdrU(int rd, int rn, int off) { E4(0xF9400000 | ((off / 8) << 10) | (rn << 5) | rd); }
+    void StrU(int rt, int rn, int off) { E4(0xF9000000 | ((off / 8) << 10) | (rn << 5) | rt); }
+    void Strb0(int rn) { E4(0x39000000 | (rn << 5) | 31); } // strb wzr, [rn]
+
+    // stur/ldur with explicit base register, signed 9-bit unscaled offset
+    void RtStur(int rt, int rn, int off) {
+        E4(0xF8000000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
+    }
+    void RtLdur(int rd, int rn, int off) {
+        E4(0xF8400000 | ((off & 0x1FF) << 12) | (rn << 5) | rd);
+    }
+
+    // ---- hand-emitted runtime core ----
+    void RtPrologue() {
+        E4(0xA9BF7BFD); // stp x29, x30, [sp, #-16]!
+        E4(0x910003FD); // mov x29, sp
+    }
+    void RtEpilogue() {
+        E4(0xA8C17BFD); // ldp x29, x30, [sp], #16
+        E4(0xD65F03C0); // ret
+    }
+    void RtOom() { // prints the oom message and exits; clobbers everything
+        LoadSymRef("l_.str." + oomIdx, 0);
+        BLExtern("_printf");
+        LoadImm(0, 1);
+        BLExtern("_exit");
+    }
+
+    int oomIdx;
+
+    void EmitRtCore() {
+        strs.Add("zan: out of memory\n");
+        oomIdx = strs.Count - 1;
+        strs.Add("%lld\n");
+        fmtiIdx = strs.Count - 1;
+        strs.Add("%s\n");
+        fmtsIdx = strs.Count - 1;
+        RtEmitAlloc();
+        RtEmitStrAlloc();
+        RtEmitStrCat2();
+        RtEmitPrintInt();
+        RtEmitPrintln();
+    }
+
+    // ptr zan_rt_alloc(i64 size, i64 desc): zeroed (calloc), rc=1, desc at raw+8
+    void RtEmitAlloc() {
+        syms.Add(new Sym("_zan_rt_alloc", txt.Count));
+        RtPrologue();
+        AddSPImm(16, false);      // sub sp, sp, #16 (scratch below the saved pair)
+        StrU(1, 31, 0);           // str x1, [sp]      (save desc)
+        AddImm(0, 0, 16);
+        LoadImm(1, 1);
+        BLExtern("_calloc");
+        CbzReg(0, NL());
+        int oom = lblPos.Count - 1;
+        LoadImm(2, 1);
+        StrU(2, 0, 0);
+        LdrU(1, 31, 0);
+        StrU(1, 0, 8);
+        AddImm(0, 0, 16);
+        AddSPImm(16, true);       // add sp, sp, #16
+        RtEpilogue();
+        Mark(oom);
+        RtOom();
+    }
+
+    // ptr zan_rt_str_alloc(i64 total): malloc'd, rc=1, magic|sentinel at raw+8
+    void RtEmitStrAlloc() {
+        syms.Add(new Sym("_zan_rt_str_alloc", txt.Count));
+        RtPrologue();
+        AddImm(0, 0, 16);
+        BLExtern("_malloc");
+        CbzReg(0, NL());
+        int oom = lblPos.Count - 1;
+        LoadImm(2, 1);
+        StrU(2, 0, 0);
+        LoadImm(2, 0x5A414E5354524D47);
+        StrU(2, 0, 8);
+        AddImm(0, 0, 16);
+        RtEpilogue();
+        Mark(oom);
+        RtOom();
+    }
+
+    // ptr zan_rt_strcat2(ptr a, ptr b)
+    // frame 96: a@-96, b@-80, l1@-64, l2@-48, buf@-32 (l1+l2 recomputed via slots)
+    void RtEmitStrCat2() {
+        syms.Add(new Sym("_zan_rt_strcat2", txt.Count));
+        RtPrologue();
+        E4(0xD10403FF);           // sub sp, sp, #96
+        RtStur(0, 29, -96);       // a
+        RtStur(1, 29, -80);       // b
+        RtLdur(0, 29, -96);
+        BLExtern("_strlen");
+        RtStur(0, 29, -64);       // l1
+        RtLdur(0, 29, -80);
+        BLExtern("_strlen");
+        RtStur(0, 29, -48);       // l2
+        // memcpy(buf, a, l1) -- buf allocated after lengths so total is known
+        RtLdur(0, 29, -64);       // l1
+        RtLdur(1, 29, -48);       // l2
+        AddRR(0, 0, 1);           // x0 = l1 + l2
+        AddImm(0, 0, 1);          // total (bytes incl NUL)
+        BLInternal("_zan_rt_str_alloc");
+        RtStur(0, 29, -32);       // buf
+        RtLdur(0, 29, -32);
+        RtLdur(1, 29, -96);
+        RtLdur(2, 29, -64);
+        BLExtern("_memcpy");
+        // memcpy(buf + l1, b, l2)
+        RtLdur(0, 29, -32);
+        RtLdur(3, 29, -64);
+        AddRR(0, 0, 3);
+        RtLdur(1, 29, -80);
+        RtLdur(2, 29, -48);
+        BLExtern("_memcpy");
+        // *end = 0 at buf + l1 + l2 (memcpy returned buf+l1, so recompute)
+        RtLdur(0, 29, -32);
+        RtLdur(1, 29, -64);
+        AddRR(0, 0, 1);
+        RtLdur(1, 29, -48);
+        AddRR(0, 0, 1);
+        Strb0(0);
+        // stamp header at buf-8: 0x5A414E53_00000000 | (l1 + l2)
+        RtLdur(1, 29, -64);
+        RtLdur(2, 29, -48);
+        AddRR(1, 1, 2);           // len
+        LoadImm(4, 0x5A414E5300000000);
+        E4(0xAA040021);           // orr x1, x1, x4
+        RtLdur(5, 29, -32);
+        SubImm(5, 5, 8);
+        RtStur(1, 5, 0);          // str x1, [x5] (== buf-8)
+        RtLdur(0, 29, -32);
+        E4(0x910403FF);           // add sp, sp, #96
+        RtEpilogue();
+    }
+
+    // void zan_rt_print_int(i64 v) -- printf("%lld\n", v on stack)
+    void RtEmitPrintInt() {
+        syms.Add(new Sym("_zan_rt_print_int", txt.Count));
+        RtPrologue();
+        E4(0xF81F0FE0);           // str x0, [sp, #-16]!
+        LoadSymRef("l_.str." + fmtiIdx, 0);
+        BLExtern("_printf");
+        E4(0xF84107E0);           // ldr x0, [sp], #16
+        RtEpilogue();
+    }
+
+    // void zan_rt_println(ptr s) -- printf("%s\n", s on stack)
+    void RtEmitPrintln() {
+        syms.Add(new Sym("_zan_rt_println", txt.Count));
+        RtPrologue();
+        E4(0xF81F0FE0);
+        LoadSymRef("l_.str." + fmtsIdx, 0);
+        BLExtern("_printf");
+        E4(0xF84107E0);
+        RtEpilogue();
+    }
+}

@@ -41,6 +41,7 @@ SRCS=(
   "$ROOT/src/selfhost/lexer.zan"
   "$ROOT/src/selfhost/ngen.zan"
   "$ROOT/src/selfhost/ngen_macho.zan"
+  "$ROOT/src/selfhost/ngen_obj.zan"
   "$ROOT/src/selfhost/nio.zan"
   "$ROOT/src/selfhost/ast.zan"
   "$ROOT/src/selfhost/token.zan"

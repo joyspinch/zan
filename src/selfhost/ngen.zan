@@ -27,8 +27,8 @@ class Fixup {
 class StrRef {
     public int adrpPos;  // text offset of the adrp instruction
     public int addPos;   // text offset of the add instruction
-    public int strIdx;   // index into Ngen.strs
-    public StrRef(int a, int b, int s) { adrpPos = a; addPos = b; strIdx = s; }
+    public string sym;   // target symbol name (l_.str.N / l_.g.NAME)
+    public StrRef(int a, int b, string s) { adrpPos = a; addPos = b; sym = s; }
 }
 
 class Sym {
@@ -49,6 +49,7 @@ partial class Ngen {
 
     string curCls;
     List<string> locName;   // locals of the method being emitted
+    List<string> locTy;     // declared type name per local ("" for this/params of unknown)
     List<int> locOff;       // frame offset (bytes from sp)
     int nloc;
     int frame;
@@ -56,6 +57,7 @@ partial class Ngen {
 
     List<Node> methNodes;
     List<string> methCls;
+    List<int> methStat;     // 0 = instance, 1 = static, 2 = ctor
     string mainCls;
 
     public Ngen(Binder b, Diags d) {
@@ -68,6 +70,7 @@ partial class Ngen {
         lblPos = new List<int>();
         methNodes = new List<Node>();
         methCls = new List<string>();
+        methStat = new List<int>();
         nlabel = 0;
     }
 
@@ -79,6 +82,8 @@ partial class Ngen {
             if (dcl.kind == AK.ClassDecl()) { CollectMethods(dcl); }
             i = i + 1;
         }
+        CollectClasses(unit);
+        EmitRtCore();
         if (FindStatic("Main") == null) {
             diags.Error("ngen: no static Main() found", 0, 0);
             return txt;
@@ -86,11 +91,10 @@ partial class Ngen {
         EmitMainShim();
         int mi = 0;
         while (mi < methNodes.Count) {
-            EmitMethod(methCls[mi], methNodes[mi]);
+            EmitMethod(methCls[mi], methNodes[mi], mi);
             mi = mi + 1;
         }
         Patch();
-        PatchStrRefs(txt.Count);
         return BuildMachO();
     }
 
@@ -98,11 +102,16 @@ partial class Ngen {
         int i = 0;
         while (i < cls.kids.Count) {
             Node m = cls.kids[i];
-            if (m.kind == AK.MethodDecl() && HasMod(m, MOD.Static())
-                    && !HasMod(m, MOD.Extern()) && !IsAsync(m)) {
-                if (m.sval == "Main") { mainCls = cls.sval; }
+            if (m.kind == AK.MethodDecl() && !HasMod(m, MOD.Extern()) && !IsAsync(m)) {
+                if (m.sval == "Main" && HasMod(m, MOD.Static())) { mainCls = cls.sval; }
                 methNodes.Add(m);
                 methCls.Add(cls.sval);
+                methStat.Add(HasMod(m, MOD.Static()) ? 1 : 0);
+            }
+            if (m.kind == AK.CtorDecl()) {
+                methNodes.Add(m);
+                methCls.Add(cls.sval);
+                methStat.Add(2);
             }
             i = i + 1;
         }
@@ -114,10 +123,20 @@ partial class Ngen {
     Node FindStatic(string name) {
         int i = 0;
         while (i < methNodes.Count) {
-            if (methNodes[i].sval == name) { return methNodes[i]; }
+            if (methNodes[i].sval == name && methStat[i] == 1) { return methNodes[i]; }
             i = i + 1;
         }
         return null;
+    }
+
+    // find an instance method by name (first match across classes)
+    int FindInstanceIdx(string name) {
+        int i = 0;
+        while (i < methNodes.Count) {
+            if (methNodes[i].sval == name && methStat[i] == 0) { return i; }
+            i = i + 1;
+        }
+        return -1;
     }
 
     // ---- method emission ----
@@ -130,18 +149,32 @@ partial class Ngen {
         E4(0xD65F03C0);                                  // ret
     }
 
-    void EmitMethod(string cls, Node m) {
+    void EmitMethod(string cls, Node m, int mi) {
         curCls = cls;
-        syms.Add(new Sym("_" + cls + "_" + m.sval, txt.Count));
+        bool inst = methStat[mi] != 1;
+        if (methStat[mi] == 2) {
+            syms.Add(new Sym("_" + cls + "_ctor", txt.Count));
+        } else {
+            syms.Add(new Sym("_" + cls + "_" + m.sval, txt.Count));
+        }
         locName = new List<string>();
+        locTy = new List<string>();
         locOff = new List<int>();
         nloc = 0;
+        // instance methods and ctors take `this` as their first argument
+        if (inst) {
+            locName.Add("this");
+            locTy.Add("");
+            locOff.Add(16 * nloc);
+            nloc = nloc + 1;
+        }
         // params get frame slots; the prologue stores x0.. into them in order
         int pi = 0;
         while (pi < m.kids.Count) {
             Node p = m.kids[pi];
             if (p.kind == AK.Param()) {
                 locName.Add(p.sval);
+                locTy.Add(p.type != null ? p.type.sval : "");
                 locOff.Add(16 * nloc);
                 nloc = nloc + 1;
             }
@@ -154,6 +187,10 @@ partial class Ngen {
         if (frame > 0) { AddSPImm(frame, false); }       // sub sp, sp, #frame
         pi = 0;
         int argReg = 0;
+        if (inst) {
+            StoreLocal(0, 0);        // this
+            argReg = 1;
+        }
         while (pi < m.kids.Count) {
             Node p = m.kids[pi];
             if (p.kind == AK.Param()) {
@@ -174,6 +211,7 @@ partial class Ngen {
             Node s = blk.kids[i];
             if (s.kind == AK.VarDecl()) {
                 locName.Add(s.sval);
+                locTy.Add(s.type != null ? s.type.sval : "");
                 locOff.Add(16 * nloc);
                 nloc = nloc + 1;
             }
@@ -237,44 +275,91 @@ partial class Ngen {
         int k = e.kind;
         if (k == AK.IntLit()) {
             LoadImm(0, e.ival);
+        } else if (k == AK.StringLit()) {
+            LoadStr(InternStr(e.sval), 0);
+        } else if (k == AK.ThisExpr()) {
+            LoadLocal(LocalIdx("this"), 0);
         } else if (k == AK.Ident()) {
             int li = LocalIdx(e.sval);
             if (li < 0) {
+                // implicit field reference inside instance methods
+                Fld fld = CurField(e.sval);
+                if (fld != null) {
+                    LoadLocal(LocalIdx("this"), 0);
+                    LdrU(0, 0, fld.off);
+                    return;
+                }
                 diags.Error("ngen: unknown identifier '" + e.sval + "'", e.line, e.col);
                 LoadImm(0, 0);
                 return;
             }
             LoadLocal(li, 0);
+        } else if (k == AK.MemberAccess()) {
+            GenFieldLoad(e);
         } else if (k == AK.Binary()) {
-            GenExpr(e.a);
-            E4(0xF81F0FE0);                              // str x0, [sp, #-16]!
-            GenExpr(e.b);
-            E4(0xF84107E1);                              // ldr x1, [sp], #16
-            int op = e.op;
-            if (op == TK.Plus()) {
-                E4(0x8B000020);                          // add x0, x1, x0
-            } else if (op == TK.Minus()) {
-                E4(0xCB000020);                          // sub x0, x1, x0
-            } else if (op == TK.Star()) {
-                E4(0x9B027C20);                          // mul x0, x1, x0
-            } else if (op == TK.Less()) {
-                E4(0xEB00003F);                          // cmp x1, x0
-                E4(0x9A9FA7E0);                          // cset x0, lt
+            if (e.op == TK.Plus() && IsStrExpr(e.a)) {
+                // string concatenation: lhs -> x0, rhs -> x1, then
+                // zan_rt_strcat2(lhs, rhs)
+                GenExpr(e.a);
+                E4(0xF81F0FE0);                          // str x0, [sp, #-16]!
+                GenExpr(e.b);
+                E4(0xF84107E1);                          // ldr x1, [sp], #16 (lhs)
+                E4(0xAA0003E9);                          // mov x9, x0
+                E4(0xAA0103E0);                          // mov x0, x1
+                E4(0xAA0903E1);                          // mov x1, x9
+                BLInternal("_zan_rt_strcat2");
             } else {
-                diags.Error("ngen: unsupported operator " + op, e.line, e.col);
+                GenExpr(e.a);
+                E4(0xF81F0FE0);                          // str x0, [sp, #-16]!
+                GenExpr(e.b);
+                E4(0xF84107E1);                          // ldr x1, [sp], #16
+                int op = e.op;
+                if (op == TK.Plus()) {
+                    E4(0x8B000020);                      // add x0, x1, x0
+                } else if (op == TK.Minus()) {
+                    E4(0xCB000020);                      // sub x0, x1, x0
+                } else if (op == TK.Star()) {
+                    E4(0x9B007C20);                      // mul x0, x1, x0
+                } else if (op == TK.Less()) {
+                    E4(0xEB00003F);                      // cmp x1, x0
+                    E4(0x9A9FA7E0);                      // cset x0, lt
+                } else {
+                    diags.Error("ngen: unsupported operator " + op, e.line, e.col);
+                }
             }
         } else if (k == AK.Assignment()) {
             GenExpr(e.b);
             if (e.a != null && e.a.kind == AK.Ident()) {
                 int li = LocalIdx(e.a.sval);
                 if (li < 0) {
+                    // implicit field store inside instance methods
+                    Fld fld = CurField(e.a.sval);
+                    if (fld != null) {
+                        E4(0xF81F0FE0);                  // str x0, [sp, #-16]! (value)
+                        LoadLocal(LocalIdx("this"), 0);  // receiver -> x0
+                        E4(0xF84107E1);                  // ldr x1, [sp], #16 (value)
+                        StrU(1, 0, fld.off);             // str x1, [x0, #off]
+                        return;
+                    }
                     diags.Error("ngen: unknown identifier '" + e.a.sval + "'", e.line, e.col);
                     return;
                 }
                 StoreLocal(li, 0);
+            } else if (e.a != null && e.a.kind == AK.MemberAccess()) {
+                Fld f = FieldOf(e.a);
+                if (f == null) {
+                    diags.Error("ngen: unknown field '" + e.a.sval + "'", e.line, e.col);
+                    return;
+                }
+                E4(0xF81F0FE0);                          // str x0, [sp, #-16]! (value)
+                GenExpr(e.a.a);                          // receiver -> x0
+                E4(0xF84107E1);                          // ldr x1, [sp], #16 (value)
+                StrU(1, 0, f.off);                       // str x1, [x0, #off]
             } else {
                 diags.Error("ngen: unsupported assignment target", e.line, e.col);
             }
+        } else if (k == AK.NewExpr()) {
+            GenNew(e);
         } else if (k == AK.Call()) {
             GenCall(e);
         } else {
@@ -282,55 +367,177 @@ partial class Ngen {
         }
     }
 
+    void GenNew(Node e) {
+        string cls = e.type != null ? e.type.sval : null;
+        Cls c = cls != null ? FindClass(cls) : null;
+        if (c == null) {
+            diags.Error("ngen: unknown class in 'new' expression", e.line, e.col);
+            LoadImm(0, 0);
+            return;
+        }
+        // allocate: x0 = size + 16 (header), x1 = descriptor (0: no dtor)
+        LoadImm(0, c.size + 16);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");
+        E4(0xF81F0FE0);                                  // str x0, [sp, #-16]! (obj)
+        int i = 0;
+        while (i < e.kids.Count) {
+            GenExpr(e.kids[i]);
+            E4(0xF81F0FE0);                              // str x0, [sp, #-16]! (arg)
+            i = i + 1;
+        }
+        int r = e.kids.Count;
+        while (r >= 1) { E4(0xF84107E0 | r); r = r - 1; } // ldr xr, [sp], #16 (args reversed)
+        E4(0xF84107E0);                                  // ldr x0, [sp], #16 (obj)
+        E4(0xF81F0FE0);                                  // str x0, [sp, #-16]! (keep obj across the void ctor)
+        BLInternal("_" + cls + "_ctor");
+        E4(0xF84107E0);                                  // ldr x0, [sp], #16 (obj)
+    }
+
+    void GenFieldLoad(Node mem) {
+        Fld f = FieldOf(mem);
+        if (f == null) {
+            diags.Error("ngen: unknown field '" + mem.sval + "'", mem.line, mem.col);
+            LoadImm(0, 0);
+            return;
+        }
+        GenExpr(mem.a);                                  // receiver -> x0
+        LdrU(0, 0, f.off);                               // ldr x0, [x0, #off]
+    }
+
+    // static type name of an expression when it denotes a user class, else null
+    string ExprCls(Node e) {
+        if (e == null) { return null; }
+        if (e.kind == AK.ThisExpr()) { return curCls; }
+        if (e.kind == AK.NewExpr()) { return e.type != null ? e.type.sval : null; }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0 && locTy[li] != null && locTy[li] != "") {
+                string t = locTy[li];
+                if (t != "int" && t != "string" && t != "bool" && t != "void") { return t; }
+            }
+        }
+        return null;
+    }
+
+    Fld FieldOf(Node mem) {
+        string cls = ExprCls(mem.a);
+        if (cls == null) { return null; }
+        Cls c = FindClass(cls);
+        if (c == null) { return null; }
+        return FindField(c, mem.sval);
+    }
+
+    // field of the class being emitted (implicit `this` references)
+    Fld CurField(string name) {
+        return FindField(FindClass(curCls), name);
+    }
+
+    // does this expression evaluate to a string? (local type / field type /
+    // string literal / concatenation / method with a string return type)
+    bool IsStrExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.StringLit()) { return true; }
+        if (e.kind == AK.Binary()) { return e.op == TK.Plus() && (IsStrExpr(e.a) || IsStrExpr(e.b)); }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            return f != null && f.ty == "string";
+        }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            return li >= 0 && locTy[li] == "string";
+        }
+        if (e.kind == AK.Call() && e.a != null) {
+            return MethRetTy(e.a.sval) == "string";
+        }
+        return false;
+    }
+
+    string MethRetTy(string name) {
+        int i = 0;
+        while (i < methNodes.Count) {
+            if (methNodes[i].sval == name && methNodes[i].type != null) { return methNodes[i].type.sval; }
+            i = i + 1;
+        }
+        return "";
+    }
+
     void GenCall(Node e) {
         Node callee = e.a;
-        if (callee != null && callee.kind == AK.MemberAccess()
-                && callee.a != null && callee.a.kind == AK.Ident()
-                && callee.a.sval == "Console" && callee.sval == "WriteLine"
-                && e.kids.Count == 1) {
-            // printf("%lld\n", v). Darwin arm64 passes variadic arguments on
-            // the stack (not in x1..x7), so the value is pushed below sp and
-            // popped after the call; pushing 16 bytes keeps sp 16-aligned.
-            GenExpr(e.kids[0]);
-            E4(0xAA0003E1);                              // mov x1, x0
-            E4(0xF81F0FE1);                              // str x1, [sp, #-16]!
-            LoadStr(InternStr("%lld\n"), 0);
-            BLExtern("_printf");
-            E4(0xF84107E1);                              // ldr x1, [sp], #16
+        if (callee != null && callee.kind == AK.MemberAccess()) {
+            Node recv = callee.a;
+            if (recv != null && recv.kind == AK.Ident() && recv.sval == "Console"
+                    && callee.sval == "WriteLine" && e.kids.Count == 1) {
+                // own runtime core: print_int(i64) / println(str)
+                if (IsStrExpr(e.kids[0])) {
+                    GenExpr(e.kids[0]);
+                    BLInternal("_zan_rt_println");
+                } else {
+                    GenExpr(e.kids[0]);
+                    BLInternal("_zan_rt_print_int");
+                }
+                return;
+            }
+            // instance method call: x0 = receiver, x1.. = args
+            int mi = FindInstanceIdx(callee.sval);
+            if (mi < 0) {
+                diags.Error("ngen: unknown method '" + callee.sval + "'", e.line, e.col);
+                return;
+            }
+            if (e.kids.Count != ParamCount(methNodes[mi])) {
+                diags.Error("ngen: arity mismatch calling '" + callee.sval + "'", e.line, e.col);
+                return;
+            }
+            GenExpr(recv);
+            E4(0xF81F0FE0);                              // str x0, [sp, #-16]! (receiver)
+            int i = 0;
+            while (i < e.kids.Count) {
+                GenExpr(e.kids[i]);
+                E4(0xF81F0FE0);                          // str x0, [sp, #-16]! (arg)
+                i = i + 1;
+            }
+            int r = e.kids.Count;
+            while (r >= 1) { E4(0xF84107E0 | r); r = r - 1; } // ldr xr, [sp], #16 (args reversed)
+            E4(0xF84107E0);                              // ldr x0, [sp], #16 (receiver)
+            BLInternal("_" + methCls[mi] + "_" + callee.sval);
             return;
         }
         if (callee == null || callee.kind != AK.Ident()) {
             diags.Error("ngen: unsupported call target", e.line, e.col);
             return;
         }
-        Node m = FindStatic(callee.sval);
-        if (m == null) {
+        int si = FindStaticIdx(callee.sval);
+        if (si < 0) {
             diags.Error("ngen: unknown static method '" + callee.sval + "'", e.line, e.col);
             return;
         }
+        Node m = methNodes[si];
         if (e.kids.Count != ParamCount(m)) {
             diags.Error("ngen: arity mismatch calling '" + callee.sval + "'", e.line, e.col);
             return;
         }
         // evaluate args left to right, spilling each; reload into x0.. reversed
-        int i = 0;
-        while (i < e.kids.Count) {
-            GenExpr(e.kids[i]);
+        int j = 0;
+        while (j < e.kids.Count) {
+            GenExpr(e.kids[j]);
             E4(0xF81F0FE0);                              // str x0, [sp, #-16]!
-            i = i + 1;
+            j = j + 1;
         }
-        int r = e.kids.Count - 1;
-        while (r >= 0) {
-            E4(0xF84107E0 | r);                          // ldr xr, [sp], #16
-            r = r - 1;
+        int q = e.kids.Count - 1;
+        while (q >= 0) {
+            E4(0xF84107E0 | q);                          // ldr xq, [sp], #16
+            q = q - 1;
         }
-        BLInternal("_" + methCls[IndexOfMeth(callee.sval)] + "_" + callee.sval);
+        BLInternal("_" + methCls[si] + "_" + callee.sval);
     }
 
-    int IndexOfMeth(string name) {
+    int FindStaticIdx(string name) {
         int i = 0;
-        while (i < methNodes.Count) { if (methNodes[i].sval == name) { return i; } i = i + 1; }
-        return 0;
+        while (i < methNodes.Count) {
+            if (methNodes[i].sval == name && methStat[i] == 1) { return i; }
+            i = i + 1;
+        }
+        return -1;
     }
 
     int ParamCount(Node m) {
@@ -401,6 +608,11 @@ partial class Ngen {
         else { E4(0xD1000000 | (imm << 10) | (31 << 5) | 31); }
     }
 
+    // add immediate between registers (imm < 4096)
+    void AddImm(int rd, int rn, int imm) {
+        E4(0x91000000 | (imm << 10) | (rn << 5) | rd);
+    }
+
     // ---- branches and calls ----
     void EmitB(int label) { E4(0x14000000); fixups.Add(new Fixup(txt.Count - 4, 0, label, 0, null)); }
     void EmitCBZ(int reg, int label) {
@@ -415,11 +627,14 @@ partial class Ngen {
         strs.Add(s);
         return strs.Count - 1;
     }
-    void LoadStr(int si, int reg) {
-        E4(0x90000000 | reg);                            // adrp reg, @PAGE
+    void LoadSymRef(string sym, int reg) {
+        E4(0x90000000 | reg);                            // adrp reg, sym@PAGE
         int a = txt.Count - 4;
-        E4(0x91000000 | (reg << 5) | reg);               // add reg, reg, @PAGEOFF
-        strRefs.Add(new StrRef(a, txt.Count - 4, si));
+        E4(0x91000000 | (reg << 5) | reg);               // add reg, reg, sym@PAGEOFF
+        strRefs.Add(new StrRef(a, txt.Count - 4, sym));
+    }
+    void LoadStr(int si, int reg) {
+        LoadSymRef("l_.str." + si, reg);
     }
 
     // ---- fixup resolution (text offsets are final here) ----

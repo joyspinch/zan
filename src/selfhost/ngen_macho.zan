@@ -4,43 +4,28 @@ namespace Zan;
 
 // Mach-O 64-bit object file writer for Ngen (arm64). Layout:
 //
-//   header (32) + LC_SEGMENT_64 (104, 2 sections) + LC_SYMTAB (24)
-//   __text          at 160
-//   __cstring       after text
-//   text relocations after cstring (8 bytes each, sorted by r_address)
+//   header (32) + LC_SEGMENT_64 (312, 3 sections) + LC_SYMTAB (24)
+//   __TEXT,__text    at 368
+//   __TEXT,__cstring after text
+//   __DATA,__data    after cstring, 8-aligned (module globals)
+//   text relocations (8 bytes each, sorted by r_address)
 //   symbol table (16 bytes per nlist_64), then string table
+//
+// Symbols: one defined symbol per method/runtime function (n_sect 1), one
+// local symbol per string literal "l_.str.N" (n_sect 2) and per data global
+// "l_.g.NAME" (n_sect 3), then the undefined externs. ADRP/ADD references
+// stay imm=0 in the object; the linker fills them via the relocations
+// (embedded addends in ADD are rejected by ld64).
 //
 // Relocations emitted:
 //   BL extern   -> ARM64_RELOC_BRANCH26 (pcrel, extern)
-//   adrp str    -> ARM64_RELOC_PAGE21    (pcrel, section-ordinal 2 = __cstring)
-//   add  str    -> ARM64_RELOC_PAGEOFF12 (absolute, section-ordinal 2)
+//   adrp ref    -> ARM64_RELOC_PAGE21    (pcrel, extern, target symbol)
+//   add  ref    -> ARM64_RELOC_PAGEOFF12 (absolute, extern, target symbol)
 partial class Ngen {
-    int TextFileOff = 288; // 32 header + 232 LC_SEGMENT_64 + 24 LC_SYMTAB
+    int TextFileOff = 368; // 32 header + 312 LC_SEGMENT_64 (3 sections) + 24 LC_SYMTAB
 
-    // patch adrp/add pairs now that the cstring offset is known
-    void PatchStrRefs(int cstrOff) {
-        int i = 0;
-        while (i < strRefs.Count) {
-            StrRef r = strRefs[i];
-            int strPos = StrOffset(r.strIdx);
-            int pc = TextFileOff + r.adrpPos;
-            int target = TextFileOff + cstrOff + strPos;
-            int delta = (target - (target / 4096) * 4096) - (pc - (pc / 4096) * 4096);
-            // ADRP: immimm = delta / 4096, split immlo (bits 30..29) + immhi (23..5)
-            int imm = delta / 4096;
-            int immlo = imm - (imm / 4) * 4;
-            int immhi = (imm - immlo) / 4;
-            int rd = ByteAt(WordAt(r.adrpPos), 0) - (ByteAt(WordAt(r.adrpPos), 0) / 32) * 32;
-            SetWordAt(r.adrpPos, 0x90000000 | (immlo << 29) | (immhi << 5) | rd);
-            // ADD: imm12 must be 0 in the object file; the linker fills the
-            // lo12 offset via the PAGEOFF12 relocation (embedded addends in
-            // ADD/LDR/STR are rejected by ld64).
-            int old = WordAt(r.addPos);
-            int rnrd = old - (old / 4096) * 4096; // Rn,Rd bits 9..0 kept
-            SetWordAt(r.addPos, 0x91000000 | rnrd);
-            i = i + 1;
-        }
-    }
+    string StrSym(int i) { return "l_.str." + i; }
+    string DGlobalSym(string n) { return "l_.g." + n; }
 
     int StrOffset(int si) {
         int off = 0;
@@ -73,6 +58,18 @@ partial class Ngen {
         return -1;
     }
 
+    // symbol-table index of a referenced symbol: defined syms first, then
+    // string literals, then data globals, then undefined externs
+    int RefSymNum(string name, List<string> exts, int extBase) {
+        int i = 0;
+        while (i < syms.Count) { if (syms[i].name == name) { return i; } i = i + 1; }
+        i = 0;
+        while (i < strs.Count) { if (StrSym(i) == name) { return syms.Count + i; } i = i + 1; }
+        i = 0;
+        while (i < dglbs.Count) { if (DGlobalSym(dglbs[i].name) == name) { return syms.Count + strs.Count + i; } i = i + 1; }
+        return extBase + IndexOf(exts, name);
+    }
+
     // build the whole object image; returns bytes
     List<int> BuildMachO() {
         int textLen = txt.Count;
@@ -81,17 +78,22 @@ partial class Ngen {
         int i = 0;
         while (i < strs.Count) { cstrLen = cstrLen + strs[i].Length + 1; i = i + 1; }
         if (cstrLen == 0) { cstrLen = 1; } // keep the section non-empty
-        // relocations for the text section, collected in address order
+        int dataOff = cstrOff + cstrLen;
+        int pad = dataOff - (dataOff / 8) * 8;
+        if (pad != 0) { pad = 8 - pad; dataOff = dataOff + pad; }
+
+        // relocation symbol numbers: defined methods, then string literals,
+        // then data globals, then undefined externs
+        List<string> exts = ExternSyms();
+        int extBase = syms.Count + strs.Count + dglbs.Count;
+
         List<int> rAddr = new List<int>();
         List<int> rWord = new List<int>();
-        // extern BLs first (they are spread through the text); then string
-        // refs; then sort by insertion (counts are tiny for the kernel slice)
-        List<string> exts = ExternSyms();
         i = 0;
         while (i < fixups.Count) {
             Fixup f = fixups[i];
             if (f.kind == 4) {
-                int symnum = syms.Count + 1 + IndexOf(exts, f.sym); // +1 for the __cstring section symbol
+                int symnum = extBase + IndexOf(exts, f.sym);
                 // word: symbolnum:24 | pcrel:1 | length:2 | extern:1 | type:4
                 int rw = symnum + (1 << 24) + (2 << 25) + (1 << 27) + (2 << 28);
                 InsertReloc(rAddr, rWord, f.pos, rw);
@@ -101,15 +103,17 @@ partial class Ngen {
         i = 0;
         while (i < strRefs.Count) {
             StrRef r = strRefs[i];
-            InsertReloc(rAddr, rWord, r.adrpPos, syms.Count + (1 << 24) + (2 << 25) + (1 << 27) + (3 << 28));
-            InsertReloc(rAddr, rWord, r.addPos, syms.Count + (2 << 25) + (1 << 27) + (4 << 28)); // PAGEOFF12: pcrel=0
+            int symnum = RefSymNum(r.sym, exts, extBase);
+            InsertReloc(rAddr, rWord, r.adrpPos, symnum + (1 << 24) + (2 << 25) + (1 << 27) + (3 << 28));
+            InsertReloc(rAddr, rWord, r.addPos, symnum + (2 << 25) + (1 << 27) + (4 << 28)); // PAGEOFF12: pcrel=0
             i = i + 1;
         }
-        int relocOff = cstrOff + cstrLen;
+        int relocOff = dataOff + dataLen;
         int nrel = rAddr.Count;
+        int nsyms = extBase + exts.Count;
         int symOff = relocOff + nrel * 8;
-        int nsyms = syms.Count + 1 + exts.Count; // +1 = __cstring section symbol
         int strOff = symOff + nsyms * 16;
+        int fileEnd = strOff + strTotal(exts);
 
         List<int> img = new List<int>();
         // ---- header ----
@@ -118,20 +122,20 @@ partial class Ngen {
         Put32(img, 0);                   // cpusubtype
         Put32(img, 1);                   // MH_OBJECT
         Put32(img, 2);                   // ncmds
-        Put32(img, 232 + 24);            // sizeofcmds (72 + 2*80 sections + symtab)
+        Put32(img, 312 + 24);            // sizeofcmds (72 + 3*80 sections + symtab)
         Put32(img, 0);                   // flags
         Put32(img, 0);                   // reserved
         // ---- LC_SEGMENT_64 ----
         Put32(img, 0x19);
-        Put32(img, 232);
+        Put32(img, 312);
         PutName(img, "", 16);            // segname
         Put64(img, 0);                   // vmaddr
         Put64(img, 0);                   // vmsize
         Put64(img, 0);                   // fileoff
-        Put64(img, strOff + strTotal(exts)); // filesize
+        Put64(img, fileEnd);             // filesize
         Put32(img, 7);                   // maxprot
         Put32(img, 7);                   // initprot
-        Put32(img, 2);                   // nsects
+        Put32(img, 3);                   // nsects
         Put32(img, 0);                   // flags
         // section __TEXT,__text
         PutName(img, "__text", 16);
@@ -159,6 +163,19 @@ partial class Ngen {
         Put32(img, 0);                   // reserved1
         Put32(img, 0);                   // reserved2
         Put32(img, 0);                   // reserved3
+        // section __DATA,__data
+        PutName(img, "__data", 16);
+        PutName(img, "__DATA", 16);
+        Put64(img, dataOff);
+        Put64(img, dataLen);
+        Put32(img, dataOff);
+        Put32(img, 3);                   // align = 2^3
+        Put32(img, 0);                   // reloff
+        Put32(img, 0);                   // nreloc
+        Put32(img, 0);                   // flags
+        Put32(img, 0);                   // reserved1
+        Put32(img, 0);                   // reserved2
+        Put32(img, 0);                   // reserved3
         // ---- LC_SYMTAB ----
         Put32(img, 0x2);
         Put32(img, 24);
@@ -175,30 +192,51 @@ partial class Ngen {
         }
         if (strs.Count == 0) { Put8(img, 0); }
         i = 0;
+        while (i < pad) { Put8(img, 0); i = i + 1; }
+        i = 0;
+        while (i < dataLen) { Put8(img, 0); i = i + 1; }
+        i = 0;
         while (i < nrel) {
             Put32(img, rAddr[i]);
             Put32(img, rWord[i]);
             i = i + 1;
         }
-        // symbol table: defined externs first, then undefined externs
-        i = 0;
+        // ---- symbol table ----
         int stro = 1; // strtab[0] is the NUL byte
+        // defined method/runtime symbols (n_sect = __text)
+        i = 0;
         while (i < syms.Count) {
             Put32(img, stro);
             Put8(img, 0x0F);             // N_SECT | N_EXT
-            Put8(img, 1);                // n_sect = __text
+            Put8(img, 1);
             Put16(img, 0);               // n_desc
             Put64(img, TextFileOff + syms[i].pos);
             stro = stro + syms[i].name.Length + 1;
             i = i + 1;
         }
-        // local section symbol for __cstring (string ADRP/ADD relocs target it)
-        Put32(img, stro);
-        Put8(img, 0x0E);                 // N_SECT (local)
-        Put8(img, 2);                    // n_sect = __cstring
-        Put16(img, 0);
-        Put64(img, cstrOff);
-        stro = stro + 11;                // "___cstring" + NUL
+        // string literal symbols (n_sect = __cstring, local)
+        i = 0;
+        while (i < strs.Count) {
+            Put32(img, stro);
+            Put8(img, 0x0E);             // N_SECT (local)
+            Put8(img, 2);
+            Put16(img, 0);
+            Put64(img, cstrOff + StrOffset(i));
+            stro = stro + StrSym(i).Length + 1;
+            i = i + 1;
+        }
+        // data global symbols (n_sect = __data, local)
+        i = 0;
+        while (i < dglbs.Count) {
+            Put32(img, stro);
+            Put8(img, 0x0E);             // N_SECT (local)
+            Put8(img, 3);
+            Put16(img, 0);
+            Put64(img, dataOff + dglbs[i].off);
+            stro = stro + DGlobalSym(dglbs[i].name).Length + 1;
+            i = i + 1;
+        }
+        // undefined externs
         i = 0;
         while (i < exts.Count) {
             Put32(img, stro);
@@ -209,11 +247,14 @@ partial class Ngen {
             stro = stro + exts[i].Length + 1;
             i = i + 1;
         }
-        // string table
+        // ---- string table ----
         Put8(img, 0);
         i = 0;
         while (i < syms.Count) { PutName(img, syms[i].name, syms[i].name.Length + 1); i = i + 1; }
-        PutName(img, "___cstring", 11);
+        i = 0;
+        while (i < strs.Count) { PutName(img, StrSym(i), StrSym(i).Length + 1); i = i + 1; }
+        i = 0;
+        while (i < dglbs.Count) { PutName(img, DGlobalSym(dglbs[i].name), DGlobalSym(dglbs[i].name).Length + 1); i = i + 1; }
         i = 0;
         while (i < exts.Count) { PutName(img, exts[i], exts[i].Length + 1); i = i + 1; }
         return img;
@@ -223,7 +264,10 @@ partial class Ngen {
         int n = 1;
         int i = 0;
         while (i < syms.Count) { n = n + syms[i].name.Length + 1; i = i + 1; }
-        n = n + 11;                      // "___cstring" + NUL
+        i = 0;
+        while (i < strs.Count) { n = n + StrSym(i).Length + 1; i = i + 1; }
+        i = 0;
+        while (i < dglbs.Count) { n = n + DGlobalSym(dglbs[i].name).Length + 1; i = i + 1; }
         i = 0;
         while (i < exts.Count) { n = n + exts[i].Length + 1; i = i + 1; }
         return n;
