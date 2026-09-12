@@ -362,12 +362,14 @@ partial class Ngen {
                 GenExpr(e.a);
                 if (!IsStrExpr(e.a)) {
                     if (IsDblExpr(e.a)) { BLInternal("_zan_rt_dbl2str"); }
+                    else if (IsUlongExpr(e.a)) { BLInternal("_zan_rt_uint2str"); }
                     else { BLInternal("_zan_rt_int2str"); }
                 }
                 E4(0xF81F0FE0);                          // str x0, [sp, #-16]!
                 GenExpr(e.b);
                 if (!IsStrExpr(e.b)) {
                     if (IsDblExpr(e.b)) { BLInternal("_zan_rt_dbl2str"); }
+                    else if (IsUlongExpr(e.b)) { BLInternal("_zan_rt_uint2str"); }
                     else { BLInternal("_zan_rt_int2str"); }
                 }
                 E4(0xF84107E1);                          // ldr x1, [sp], #16 (lhs)
@@ -442,7 +444,64 @@ partial class Ngen {
                 GenExpr(e.b);
                 E4(0xF84107E1);                          // ldr x1, [sp], #16
                 int op = e.op;
-                if (op == TK.Plus()) {
+                if (IsUlongExpr(e.a) || IsUlongExpr(e.b)) {
+                    // unsigned 64-bit: add/sub/mul wrap identically, but
+                    // division drops the MIN/-1 fold, comparisons go
+                    // unsigned, and >> is logical (mirrors gen0's IR)
+                    if (op == TK.Plus()) {
+                        E4(0x8B000020);                  // add x0, x1, x0
+                    } else if (op == TK.Minus()) {
+                        E4(0xCB000020);                  // sub x0, x1, x0
+                    } else if (op == TK.Star()) {
+                        E4(0x9B007C20);                  // mul x0, x1, x0
+                    } else if (op == TK.Slash() || op == TK.Percent()) {
+                        int bad = NL();
+                        int cont = NL();
+                        CbzReg(0, bad);
+                        EmitB(cont);
+                        Mark(bad);
+                        E4(0xF81F0FE1);                  // str x1, [sp, #-16]! (keep dividend)
+                        LoadSymRef("l_.str." + guardFileIdx, 0);
+                        LoadImm(1, curLine);
+                        LoadImm(2, curCol);
+                        if (op == TK.Slash()) { LoadSymRef("l_.str." + guardDivIdx, 3); }
+                        else { LoadSymRef("l_.str." + guardModIdx, 3); }
+                        BLExtern("_zan_rt_guard_fail3");
+                        E4(0xF84107E1);                  // ldr x1, [sp], #16
+                        LoadImm(0, 1);                   // safe divisor
+                        Mark(cont);
+                        if (op == TK.Slash()) {
+                            E4(0x9AC00820);              // udiv x0, x1, x0
+                        } else {
+                            E4(0x9AC00824);              // udiv x4, x1, x0
+                            E4(0x9B008480);              // msub x0, x4, x0, x1
+                        }
+                    } else if (op == TK.Less()) {
+                        E4(0xEB00003F);                  // cmp x1, x0
+                        E4(0x9A9F27E0);                  // cset x0, lo
+                    } else if (op == TK.Greater()) {
+                        E4(0xEB00003F);
+                        E4(0x9A9F97E0);                  // cset x0, hi
+                    } else if (op == TK.LessEq()) {
+                        E4(0xEB00003F);
+                        E4(0x9A9F87E0);                  // cset x0, ls
+                    } else if (op == TK.GreaterEq()) {
+                        E4(0xEB00003F);
+                        E4(0x9A9F37E0);                  // cset x0, hs
+                    } else if (op == TK.EqEq()) {
+                        E4(0xEB00003F);
+                        E4(0x9A9F17E0);                  // cset x0, eq
+                    } else if (op == TK.BangEq()) {
+                        E4(0xEB00003F);
+                        E4(0x9A9F07E0);                  // cset x0, ne
+                    } else if (op == TK.LessLess()) {
+                        E4(0x9AC02020);                  // lslv x0, x1, x0
+                    } else if (op == TK.GreaterGreater()) {
+                        E4(0x9AC02420);                  // lsrv x0, x1, x0
+                    } else {
+                        diags.Error("ngen: unsupported ulong operator " + op, e.line, e.col);
+                    }
+                } else if (op == TK.Plus()) {
                     E4(0x8B000020);                      // add x0, x1, x0
                 } else if (op == TK.Minus()) {
                     E4(0xCB000020);                      // sub x0, x1, x0
@@ -502,9 +561,41 @@ partial class Ngen {
                 } else if (op == TK.BangEq()) {
                     E4(0xEB00003F);                      // cmp x1, x0
                     E4(0x9A9F07E0);                      // cset x0, ne
+                } else if (op == TK.LessLess()) {
+                    E4(0x9AC02020);                      // lslv x0, x1, x0
+                } else if (op == TK.GreaterGreater()) {
+                    E4(0x9AC02820);                      // asrv x0, x1, x0
                 } else {
                     diags.Error("ngen: unsupported operator " + op, e.line, e.col);
                 }
+            }
+        } else if (k == AK.Unary()) {
+            GenExpr(e.a);
+            if (e.op == TK.Minus()) {
+                E4(0xCB0003E0);                      // neg x0, x0 (sub x0, xzr, x0)
+            } else if (e.op == TK.Bang()) {
+                // cset needs fresh flags: cmp against 1 so any nonzero-ish
+                // bool (0/1 in practice) negates correctly
+                E4(0xF100041F);                      // cmp x0, #1
+                E4(0x9A9F07E0);                      // cset x0, ne
+            }
+            // unary plus is a no-op on the bit pattern
+        } else if (k == AK.CastExpr() && e.type != null) {
+            // numeric casts: int<->ulong share the slot bits; to/from
+            // double converts via scvtf/fcvtzs (like gen0's fptosi/sitofp)
+            string ty = e.type.sval;
+            bool toDbl = ty == "double";
+            bool fromDbl = IsDblExpr(e.b);
+            if (toDbl && !fromDbl) {
+                GenExpr(e.b);
+                E4(0x9E620000);                      // scvtf d0, x0
+                E4(0x9E660000);                      // fmov x0, d0
+            } else if (!toDbl && fromDbl) {
+                GenExpr(e.b);
+                E4(0x9E670000);                      // fmov d0, x0
+                E4(0x9E780000);                      // fcvtzs x0, d0
+            } else {
+                GenExpr(e.b);                        // int<->ulong (and dbl->dbl): bits unchanged
             }
         } else if (k == AK.Assignment()) {
             GenExpr(e.b);
@@ -647,6 +738,7 @@ partial class Ngen {
             }
             return false;
         }
+        if (e.kind == AK.CastExpr() && e.type != null) { return e.type.sval == "double"; }
         if (e.kind == AK.MemberAccess()) {
             Fld f = FieldOf(e);
             return f != null && f.ty == "double";
@@ -663,6 +755,39 @@ partial class Ngen {
         return false;
     }
 
+    // does this expression evaluate to a ulong? (ulong typed locals,
+    // fields and method results; arithmetic carrying a ulong operand --
+    // ulong is the only integer type whose slot can set the high bit)
+    bool IsUlongExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.Binary()) {
+            int op = e.op;
+            if (op == TK.Plus() || op == TK.Minus() || op == TK.Star()
+                    || op == TK.Slash() || op == TK.Percent()
+                    || op == TK.LessLess() || op == TK.GreaterGreater()) {
+                return IsUlongExpr(e.a) || IsUlongExpr(e.b);
+            }
+            return false;
+        }
+        if (e.kind == AK.CastExpr() && e.type != null) {
+            return e.type.sval == "ulong" && !IsDblExpr(e.b);
+        }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            return f != null && f.ty == "ulong";
+        }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return locTy[li] == "ulong"; }
+            Fld f = CurField(e.sval);
+            return f != null && f.ty == "ulong";
+        }
+        if (e.kind == AK.Call() && e.a != null) {
+            return MethRetTy(e.a.sval) == "ulong";
+        }
+        return false;
+    }
+
     // does this expression evaluate to a bool? (comparisons / bool locals,
     // fields and method results -- WriteLine renders those true/false)
     bool IsBoolExpr(Node e) {
@@ -673,6 +798,7 @@ partial class Ngen {
             return op == TK.Less() || op == TK.Greater() || op == TK.LessEq()
                 || op == TK.GreaterEq() || op == TK.EqEq() || op == TK.BangEq();
         }
+        if (e.kind == AK.Unary()) { return e.op == TK.Bang(); }
         if (e.kind == AK.MemberAccess()) {
             Fld f = FieldOf(e);
             return f != null && f.ty == "bool";
@@ -724,6 +850,9 @@ partial class Ngen {
                     GenExpr(e.kids[0]);
                     E4(0x9E670000);                      // fmov d0, x0
                     BLExtern("_zan_rt_print_double");
+                } else if (IsUlongExpr(e.kids[0])) {
+                    GenExpr(e.kids[0]);
+                    BLInternal("_zan_rt_print_uint");
                 } else {
                     GenExpr(e.kids[0]);
                     BLInternal("_zan_rt_print_int");
