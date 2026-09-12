@@ -35,6 +35,9 @@ set(_srcs
   ${SELFHOST_DIR}/jsongen.zan
   ${SELFHOST_DIR}/dbgen.zan
   ${SELFHOST_DIR}/lexer.zan
+  ${SELFHOST_DIR}/ngen.zan
+  ${SELFHOST_DIR}/ngen_macho.zan
+  ${SELFHOST_DIR}/nio.zan
   ${SELFHOST_DIR}/ast.zan
   ${SELFHOST_DIR}/token.zan)
 
