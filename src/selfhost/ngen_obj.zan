@@ -42,6 +42,8 @@ partial class Ngen {
     int fmtnIdx;
     int fmtuIdx;
     int fmtuNIdx;
+    int fmtwIdx;
+    int fmtcIdx;
     int emptyIdx;
 
     Cls FindClass(string n) {
@@ -139,6 +141,10 @@ partial class Ngen {
         fmtuIdx = strs.Count - 1;
         strs.Add("%llu\n");
         fmtuNIdx = strs.Count - 1;
+        strs.Add("%s");
+        fmtwIdx = strs.Count - 1;
+        strs.Add("%lc");
+        fmtcIdx = strs.Count - 1;
         strs.Add("");
         emptyIdx = strs.Count - 1;
         dglbs.Add(new DGlob("zan_eh", 8, dataLen));
@@ -153,6 +159,8 @@ partial class Ngen {
         RtEmitPrintDouble();
         RtEmitUint2Str();
         RtEmitPrintUint();
+        RtEmitChrstr();
+        RtEmitSubstr2();
         RtEmitEhState();
     }
 
@@ -247,6 +255,113 @@ partial class Ngen {
         MovRR(1, 9);                           // x1 = buf
         BLInternal("_zan_rt_strcat2");
         AddSPImm(48, true);
+        RtEpilogue();
+    }
+
+    // ptr zan_rt_chrstr(i64 cp) -- render one codepoint as a heap string
+    // via snprintf("%lc") (libc does the UTF-8 multibyte encoding), then a
+    // strcat2 copy so the result carries a stamped header like gen0's
+    void RtEmitChrstr() {
+        syms.Add(new Sym("_zan_rt_chrstr", txt.Count));
+        RtPrologue();
+        AddSPImm(32, false);                   // buf[16] | variadic slot
+        StrU(0, 31, 0);                        // [sp] = cp (first stack variadic)
+        E4(0x910043E0);                        // x0 = buf (sp+16)
+        LoadImm(1, 16);
+        LoadSymRef("l_.str." + fmtcIdx, 2);    // x2 = "%lc"
+        BLExtern("_snprintf");
+        E4(0x910043E0);                        // x0 = buf (sp+16)
+        MovRR(9, 0);
+        LoadSymRef("l_.str." + emptyIdx, 0);   // x0 = ""
+        MovRR(1, 9);
+        BLInternal("_zan_rt_strcat2");
+        AddSPImm(32, true);
+        RtEpilogue();
+    }
+
+    // ptr zan_rt_substr2(ptr s, i64 start) -- caller checked start <= len
+    // (gen0 folds an out-of-range start to 0 at the call site). Builds the
+    // substring with str_alloc/memcpy and stamps the real length header.
+    void RtEmitSubstr2() {
+        syms.Add(new Sym("_zan_rt_substr2", txt.Count));
+        RtPrologue();
+        E4(0xF81F0FE0);                        // push s
+        E4(0xF81F0FE1);                        // push start
+        LdrU(1, 31, 16);                       // x1 = s
+        E4(0xD1002022);                        // sub x2, x1, #8
+        E4(0xF9400042);                        // ldr x2, [x2]
+        E4(0xD3407C42);                        // ubfm x2, x2, #0, #31 (len)
+        LdrU(3, 31, 0);                        // x3 = start
+        E4(0xCB030044);                        // sub x4, x2, x3 (subl)
+        E4(0xEB1F009F);                        // cmp x4, xzr
+        EmitBcond(10, NL());
+        int ok = lblPos.Count - 1;
+        LoadImm(4, 0);
+        Mark(ok);
+        E4(0x91000480);                        // add x0, x4, #1 (size)
+        E4(0xF81F0FE4);                        // push subl
+        BLInternal("_zan_rt_str_alloc");       // x0 = dst
+        E4(0xF81F0FE0);                        // push dst
+        LdrU(0, 31, 0);                        // dst
+        LdrU(1, 31, 48);                       // s
+        LdrU(2, 31, 32);                       // start
+        E4(0x8B020021);                        // add x1, x1, x2 (s + start)
+        LdrU(2, 31, 16);                       // subl
+        BLExtern("_memcpy");
+        LdrU(0, 31, 0);                        // dst
+        LdrU(1, 31, 16);                       // subl
+        E4(0x8B010000);                        // add x0, x0, x1
+        Strb0(0);                              // *end = 0
+        LdrU(0, 31, 0);                        // dst
+        E4(0xD1002009);                        // sub x9, x0, #8
+        LoadImm(1, 0x5A414E5300000000);
+        LdrU(2, 31, 16);                       // subl
+        E4(0xAA020020);                        // orr x0, x1, x2 (hdr | len)
+        StrU(0, 9, 0);
+        LdrU(0, 31, 0);                        // return dst
+        AddSPImm(64, true);                    // pop dst/subl/start/s
+        RtEpilogue();
+    }
+
+    // initialise the string-literal pool: every interned literal becomes a
+    // stamped heap string (rc=1, SNAZ header with the real length) stored
+    // in a l_.g.strp.N slot; LoadStr loads the pointer from that slot. This
+    // mirrors gen0's stamped literal constants and lets Length/index probe
+    // the header. Runs once from _main before user code.
+    void RtEmitStrpool() {
+        syms.Add(new Sym("_zan_rt_strpool_init", txt.Count));
+        RtPrologue();
+        int i = 0;
+        while (i < strs.Count) {
+            dglbs.Add(new DGlob("strp." + i, 8, dataLen));
+            dataLen = dataLen + 8;
+            LoadSymRef("l_.str." + i, 0);      // x0 = literal text
+            E4(0xF81F0FE0);                    // push text
+            BLExtern("_strlen");               // x0 = len
+            E4(0xF81F0FE0);                    // push len
+            AddImm(0, 0, 1);                   // size = len + 1
+            BLInternal("_zan_rt_str_alloc");   // x0 = dst (stamped unknown)
+            E4(0xF81F0FE0);                    // push dst
+            LdrU(0, 31, 0);
+            LdrU(1, 31, 32);                   // text
+            LdrU(2, 31, 16);                   // len
+            BLExtern("_memcpy");
+            LdrU(0, 31, 0);
+            LdrU(1, 31, 16);
+            AddRR(0, 0, 1);
+            Strb0(0);                          // dst[len] = 0
+            LdrU(0, 31, 0);
+            E4(0xD1002009);                    // sub x9, x0, #8
+            LoadImm(1, 0x5A414E5300000000);
+            LdrU(2, 31, 16);                   // len
+            E4(0xAA020020);                    // orr x0, x1, x2
+            StrU(0, 9, 0);                     // stamp real length
+            LoadSymRef("l_.g.strp." + i, 9);
+            LdrU(0, 31, 0);
+            StrU(0, 9, 0);                     // strp.slot = dst
+            AddSPImm(48, true);                // pop dst/len/text
+            i = i + 1;
+        }
         RtEpilogue();
     }
 
@@ -420,8 +535,9 @@ partial class Ngen {
         E4(0xF81F0FE0);                              // push value
         E4(0xF84107E1);                              // ldr x1, [sp], #16 (value)
         E4(0xF84107E0);                              // ldr x0, [sp], #16 (list)
-        E4(0xF81F0FE1);                              // push value (kept across grow)
-        E4(0xF81F0FE0);                              // push list
+        // re-push list+value as one pair: the str-only push leaves the
+        // upper half of the slot stale (callee-saved LR from earlier calls)
+        E4(0xA9BF07E0);                              // stp x0, x1, [sp, #-16]!
         LdrU(2, 0, 0);                               // count
         LdrU(3, 0, 8);                               // cap
         E4(0xEB03005F);                              // cmp x2, x3
@@ -447,6 +563,6 @@ partial class Ngen {
         E4(0xF8207800 | (2 << 16) | (3 << 5) | 1);   // str x1, [x3, x2, lsl #3]
         AddImm(2, 2, 1);                             // count + 1
         StrU(2, 0, 0);                               // list->count
-        AddSPImm(32, true);                          // pop value + list
+        AddSPImm(16, true);                          // pop the stp'd pair
     }
 }

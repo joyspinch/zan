@@ -59,6 +59,9 @@ partial class Ngen {
     int guardDivIdx;
     int guardModIdx;
     int guardFileIdx;
+    int guardStrIdx;
+    int guardSubIdx;
+    int guardListIdx;
     string srcFile;
 
     List<Node> methNodes;
@@ -94,6 +97,9 @@ partial class Ngen {
         guardDivIdx = InternStr("division by zero\n");
         guardModIdx = InternStr("division by zero (modulo)\n");
         guardFileIdx = InternStr(srcFile);
+        guardStrIdx = InternStr("string index out of bounds\n");
+        guardSubIdx = InternStr("substring index out of bounds\n");
+        guardListIdx = InternStr("list index out of bounds\n");
         if (FindStatic("Main") == null) {
             diags.Error("ngen: no static Main() found", 0, 0);
             return txt;
@@ -104,6 +110,7 @@ partial class Ngen {
             EmitMethod(methCls[mi], methNodes[mi], mi);
             mi = mi + 1;
         }
+        RtEmitStrpool();
         Patch();
         return BuildMachO();
     }
@@ -153,6 +160,7 @@ partial class Ngen {
     void EmitMainShim() {
         syms.Add(new Sym("_main", txt.Count));
         E4(0xA9BF7BFD);                                  // stp x29, x30, [sp, #-16]! (save lr: bl below clobbers it)
+        BLInternal("_zan_rt_strpool_init");              // stamp literals first
         BLInternal("_" + mainCls + "_Main");
         E4(0xD2800000);                                  // movz x0, #0
         E4(0xA8C17BFD);                                  // ldp x29, x30, [sp], #16
@@ -184,7 +192,7 @@ partial class Ngen {
             Node p = m.kids[pi];
             if (p.kind == AK.Param()) {
                 locName.Add(p.sval);
-                locTy.Add(p.type != null ? p.type.sval : "");
+                locTy.Add(TypeFullName(p.type));
                 locOff.Add(16 * nloc);
                 nloc = nloc + 1;
             }
@@ -221,7 +229,7 @@ partial class Ngen {
             Node s = blk.kids[i];
             if (s.kind == AK.VarDecl()) {
                 locName.Add(s.sval);
-                locTy.Add(s.type != null ? s.type.sval : "");
+                locTy.Add(TypeFullName(s.type));
                 locOff.Add(16 * nloc);
                 nloc = nloc + 1;
             } else if (s.kind == AK.Block()) {
@@ -353,6 +361,14 @@ partial class Ngen {
             LoadLocal(li, 0);
         } else if (k == AK.MemberAccess()) {
             if (e.sval == "Count" && ExprCls(e.a) == "List") { GenListCount(e.a); }
+            else if (e.sval == "Length" && IsStrExpr(e.a)) {
+                // gen0 probes the SNAZ header: length lives in the low 32
+                // bits of the i64 at s-8
+                GenExpr(e.a);
+                E4(0xD1002009);                      // sub x9, x0, #8
+                E4(0xF9400120);                      // ldr x0, [x9]
+                E4(0xD3407C00);                      // ubfm x0, x0, #0, #31
+            }
             else { GenFieldLoad(e); }
         } else if (k == AK.Binary()) {
             if (e.op == TK.Plus() && (IsStrExpr(e.a) || IsStrExpr(e.b))) {
@@ -362,6 +378,7 @@ partial class Ngen {
                 GenExpr(e.a);
                 if (!IsStrExpr(e.a)) {
                     if (IsDblExpr(e.a)) { BLInternal("_zan_rt_dbl2str"); }
+                    else if (IsCharExpr(e.a)) { BLInternal("_zan_rt_chrstr"); }
                     else if (IsUlongExpr(e.a)) { BLInternal("_zan_rt_uint2str"); }
                     else { BLInternal("_zan_rt_int2str"); }
                 }
@@ -369,6 +386,7 @@ partial class Ngen {
                 GenExpr(e.b);
                 if (!IsStrExpr(e.b)) {
                     if (IsDblExpr(e.b)) { BLInternal("_zan_rt_dbl2str"); }
+                    else if (IsCharExpr(e.b)) { BLInternal("_zan_rt_chrstr"); }
                     else if (IsUlongExpr(e.b)) { BLInternal("_zan_rt_uint2str"); }
                     else { BLInternal("_zan_rt_int2str"); }
                 }
@@ -377,6 +395,17 @@ partial class Ngen {
                 E4(0xAA0103E0);                          // mov x0, x1
                 E4(0xAA0903E1);                          // mov x1, x9
                 BLInternal("_zan_rt_strcat2");
+            } else if (IsStrExpr(e.a) && IsStrExpr(e.b)
+                    && (e.op == TK.EqEq() || e.op == TK.BangEq())) {
+                // lexicographic equality via strcmp (gen0 parity)
+                GenExpr(e.a);
+                E4(0xF81F0FE0);                      // push a
+                GenExpr(e.b);
+                E4(0xF84107E1);                      // pop a -> x1 (x0 = b)
+                BLExtern("_strcmp");                 // w0 = 0 iff equal
+                E4(0x7100001F);                      // cmp w0, #0
+                if (e.op == TK.EqEq()) { E4(0x9A9F17E0); }   // cset x0, eq
+                else { E4(0x9A9F07E0); }                     // cset x0, ne
             } else if (IsDblExpr(e.a) || IsDblExpr(e.b)) {
                 // double arithmetic/comparison: values travel as i64 bit
                 // patterns in x0; the op materialises d-regs, coercing int
@@ -597,6 +626,64 @@ partial class Ngen {
             } else {
                 GenExpr(e.b);                        // int<->ulong (and dbl->dbl): bits unchanged
             }
+        } else if (k == AK.Index()) {
+            if (IsStrExpr(e.a)) {
+                // char access: bounds-checked byte load (gen0 reports the
+                // same guard message and continues with index 0)
+                GenExpr(e.a);
+                E4(0xF81F0FE0);                      // push s
+                GenExpr(e.b);
+                E4(0xF84107E1);                      // pop s -> x1 (x0 = idx)
+                E4(0xD1002022);                      // sub x2, x1, #8
+                E4(0xF9400042);                      // ldr x2, [x2]
+                E4(0xD3407C42);                      // ubfm x2, x2, #0, #31 (len)
+                int bad = NL();
+                int cont = NL();
+                E4(0xEB02001F);                      // cmp x0, x2
+                EmitBcond(10, bad);                  // b.ge bad
+                E4(0xEB1F001F);                      // cmp x0, xzr
+                EmitBcond(11, bad);                  // b.lt bad
+                EmitB(cont);
+                Mark(bad);
+                E4(0xF81F0FE1);                      // keep s across the call
+                LoadSymRef("l_.str." + guardFileIdx, 0);
+                LoadImm(1, curLine);
+                LoadImm(2, curCol);
+                LoadSymRef("l_.str." + guardStrIdx, 3);
+                BLExtern("_zan_rt_guard_fail3");
+                E4(0xF84107E1);                      // pop s
+                LoadImm(0, 0);                       // safe index
+                Mark(cont);
+                E4(0x38606820);                      // ldrb w0, [x1, x0]
+            } else if (ExprCls(e.a) == "List") {
+                // element get: data = obj+16, count = obj+0, 8-byte slots
+                GenExpr(e.a);
+                E4(0xF81F0FE0);                      // push obj
+                GenExpr(e.b);
+                E4(0xF84107E1);                      // pop obj -> x1 (x0 = idx)
+                LdrU(2, 1, 0);                       // count
+                LdrU(3, 1, 16);                      // data
+                int bad = NL();
+                int cont = NL();
+                E4(0xEB02001F);                      // cmp x0, x2
+                EmitBcond(10, bad);                  // b.ge bad
+                E4(0xEB1F001F);                      // cmp x0, xzr
+                EmitBcond(11, bad);                  // b.lt bad
+                EmitB(cont);
+                Mark(bad);
+                E4(0xF81F0FE0);                      // keep idx
+                LoadSymRef("l_.str." + guardFileIdx, 0);
+                LoadImm(1, curLine);
+                LoadImm(2, curCol);
+                LoadSymRef("l_.str." + guardListIdx, 3);
+                BLExtern("_zan_rt_guard_fail3");
+                E4(0xF84107E0);                      // pop idx
+                LoadImm(0, 0);
+                Mark(cont);
+                E4(0xF8607860);                      // ldr x0, [x3, x0, lsl #3]
+            } else {
+                diags.Error("ngen: unsupported index target", e.line, e.col);
+            }
         } else if (k == AK.Assignment()) {
             GenExpr(e.b);
             if (e.a != null && e.a.kind == AK.Ident()) {
@@ -615,6 +702,37 @@ partial class Ngen {
                     return;
                 }
                 StoreLocal(li, 0);
+            } else if (e.a != null && e.a.kind == AK.Index() && ExprCls(e.a.a) == "List") {
+                // element set: bounds check like the get, then store into
+                // the 8-byte slot (value preserved across the guard call)
+                E4(0xF81F0FE0);                      // push value
+                GenExpr(e.a.a);
+                E4(0xF81F0FE0);                      // push obj
+                GenExpr(e.a.b);                      // x0 = idx
+                E4(0xF84107E1);                      // pop obj -> x1
+                E4(0xF84107E2);                      // pop value -> x2
+                LdrU(3, 1, 0);                       // count
+                LdrU(4, 1, 16);                      // data
+                int bad = NL();
+                int cont = NL();
+                E4(0xEB03001F);                      // cmp x0, x3
+                EmitBcond(10, bad);                  // b.ge bad
+                E4(0xEB1F001F);                      // cmp x0, xzr
+                EmitBcond(11, bad);                  // b.lt bad
+                EmitB(cont);
+                Mark(bad);
+                E4(0xF81F0FE0);                      // keep idx
+                E4(0xF81F0FE2);                      // keep value
+                LoadSymRef("l_.str." + guardFileIdx, 0);
+                LoadImm(1, curLine);
+                LoadImm(2, curCol);
+                LoadSymRef("l_.str." + guardListIdx, 3);
+                BLExtern("_zan_rt_guard_fail3");
+                E4(0xF84107E2);                      // pop value
+                E4(0xF84107E0);                      // pop idx
+                LoadImm(0, 0);
+                Mark(cont);
+                E4(0xF8207882);                      // str x2, [x4, x0, lsl #3]
             } else if (e.a != null && e.a.kind == AK.MemberAccess()) {
                 Fld f = FieldOf(e.a);
                 if (f == null) {
@@ -685,10 +803,24 @@ partial class Ngen {
             int li = LocalIdx(e.sval);
             if (li >= 0 && locTy[li] != null && locTy[li] != "") {
                 string t = locTy[li];
-                if (t != "int" && t != "string" && t != "bool" && t != "void") { return t; }
+                if (t != "int" && t != "string" && t != "bool" && t != "void") {
+                    // generic instantiations behave as their open type here
+                    if (t.Length > 5 && t.Substring(0, 5) == "List<") { return "List"; }
+                    return t;
+                }
             }
         }
         return null;
+    }
+
+    // full type name including one generic argument ("List<string>")
+    string TypeFullName(Node t) {
+        if (t == null) { return ""; }
+        if (t.kids != null && t.kids.Count > 0 && t.kids[0] != null
+                && t.kids[0].sval != null && t.kids[0].sval != "") {
+            return t.sval + "<" + t.kids[0].sval + ">";
+        }
+        return t.sval;
     }
 
     Fld FieldOf(Node mem) {
@@ -721,7 +853,26 @@ partial class Ngen {
             return f != null && f.ty == "string";
         }
         if (e.kind == AK.Call() && e.a != null) {
+            if (e.a.kind == AK.MemberAccess() && e.a.sval == "Substring") { return true; }
             return MethRetTy(e.a.sval) == "string";
+        }
+        // List<string> element reads yield heap strings (string indexing
+        // yields a char codepoint -- see IsCharExpr, not a string)
+        if (e.kind == AK.Index()) { return IsStrListOf(e.a); }
+        return false;
+    }
+
+    // does this expression denote a List<string> (element reads are strings)?
+    bool IsStrListOf(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return locTy[li] == "List<string>"; }
+            Fld f = CurField(e.sval);
+            return f != null && f.ty == "List<string>";
+        }
+        if (e.kind == AK.NewExpr()) {
+            return e.type != null && TypeFullName(e.type) == "List<string>";
         }
         return false;
     }
@@ -753,6 +904,13 @@ partial class Ngen {
             return MethRetTy(e.a.sval) == "double";
         }
         return false;
+    }
+
+    // does this expression evaluate to a char? (string indexing yields a
+    // codepoint; rendering goes through zan_rt_chrstr)
+    bool IsCharExpr(Node e) {
+        if (e == null) { return false; }
+        return e.kind == AK.Index() && IsStrExpr(e.a);
     }
 
     // does this expression evaluate to a ulong? (ulong typed locals,
@@ -834,6 +992,10 @@ partial class Ngen {
                 if (IsStrExpr(e.kids[0])) {
                     GenExpr(e.kids[0]);
                     BLInternal("_zan_rt_println");
+                } else if (IsCharExpr(e.kids[0])) {
+                    GenExpr(e.kids[0]);
+                    BLInternal("_zan_rt_chrstr");
+                    BLInternal("_zan_rt_println");
                 } else if (IsBoolExpr(e.kids[0])) {
                     // gen0 prints bools as true/false (select of literals)
                     GenExpr(e.kids[0]);
@@ -859,6 +1021,44 @@ partial class Ngen {
                 }
                 return;
             }
+            // Console.WriteLine() with no arguments prints just the newline
+            if (recv != null && recv.kind == AK.Ident() && recv.sval == "Console"
+                    && callee.sval == "WriteLine" && e.kids.Count == 0) {
+                LoadStr(InternStr(""), 0);
+                BLInternal("_zan_rt_println");
+                return;
+            }
+            // Console.Write: no newline; gen0 routes every argument type
+            // through its string form and printf("%s", s)
+            if (recv != null && recv.kind == AK.Ident() && recv.sval == "Console"
+                    && callee.sval == "Write" && e.kids.Count == 1) {
+                Node arg = e.kids[0];
+                if (IsStrExpr(arg)) { GenExpr(arg); }
+                else if (IsCharExpr(arg)) {
+                    GenExpr(arg); BLInternal("_zan_rt_chrstr");
+                } else if (IsBoolExpr(arg)) {
+                    GenExpr(arg);
+                    int fls = NL();
+                    int doneb = NL();
+                    CbzReg(0, fls);
+                    LoadStr(InternStr("true"), 0);
+                    EmitB(doneb);
+                    Mark(fls);
+                    LoadStr(InternStr("false"), 0);
+                    Mark(doneb);
+                } else if (IsDblExpr(arg)) {
+                    GenExpr(arg); BLInternal("_zan_rt_dbl2str");
+                } else if (IsUlongExpr(arg)) {
+                    GenExpr(arg); BLInternal("_zan_rt_uint2str");
+                } else {
+                    GenExpr(arg); BLInternal("_zan_rt_int2str");
+                }
+                E4(0xF81F0FE0);                      // push s (stack variadic)
+                LoadSymRef("l_.str." + fmtwIdx, 0);  // x0 = "%s"
+                BLExtern("_printf");
+                AddSPImm(16, true);
+                return;
+            }
             // List<T> built-ins (gen0-compatible inline sequences)
             if (ExprCls(recv) == "List") {
                 if (callee.sval == "Add" && e.kids.Count == 1) {
@@ -867,6 +1067,59 @@ partial class Ngen {
                 }
                 diags.Error("ngen: unsupported List operation '" + callee.sval + "'", e.line, e.col);
                 return;
+            }
+            // string instance methods (gen0: Substring checks start <= len
+            // and folds to 0; IndexOf is strstr with a -1 miss)
+            if (e.kids.Count == 1 && IsStrExpr(recv)) {
+                if (callee.sval == "Substring") {
+                    GenExpr(recv);
+                    E4(0xF81F0FE0);                  // push s
+                    GenExpr(e.kids[0]);
+                    E4(0xF84107E1);                  // pop s -> x1 (x0 = start)
+                    E4(0xD1002022);                  // sub x2, x1, #8
+                    E4(0xF9400042);                  // ldr x2, [x2]
+                    E4(0xD3407C42);                  // ubfm x2, x2, #0, #31 (len)
+                    int bad = NL();
+                    int cont = NL();
+                    E4(0xEB02001F);                  // cmp x0, x2
+                    EmitBcond(12, bad);              // b.gt bad
+                    EmitB(cont);
+                    Mark(bad);
+                    E4(0xF81F0FE0);                  // keep start
+                    LoadSymRef("l_.str." + guardFileIdx, 0);
+                    LoadImm(1, curLine);
+                    LoadImm(2, curCol);
+                    LoadSymRef("l_.str." + guardSubIdx, 3);
+                    BLExtern("_zan_rt_guard_fail3");
+                    E4(0xF84107E0);                  // pop start
+                    LoadImm(0, 0);
+                    Mark(cont);
+                    // substr2 takes (s, start); the probe left them swapped
+                    E4(0xAA0003E9);                  // mov x9, x0
+                    E4(0xAA0103E0);                  // mov x0, x1
+                    E4(0xAA0903E1);                  // mov x1, x9
+                    BLInternal("_zan_rt_substr2");
+                    return;
+                }
+                if (callee.sval == "IndexOf") {
+                    GenExpr(recv);
+                    E4(0xF81F0FE0);                  // push s
+                    GenExpr(e.kids[0]);
+                    E4(0xF84107E1);                  // pop s -> x1 (x0 = needle)
+                    E4(0xAA0103E9);                  // mov x9, x1
+                    E4(0xAA0003E1);                  // mov x1, x0
+                    E4(0xAA0903E0);                  // mov x0, x9
+                    BLExtern("_strstr");
+                    int miss = NL();
+                    int done = NL();
+                    CbzReg(0, miss);
+                    E4(0xCB090000);                  // sub x0, x0, x9
+                    EmitB(done);
+                    Mark(miss);
+                    LoadImm(0, -1);
+                    Mark(done);
+                    return;
+                }
             }
             // instance method call: x0 = receiver, x1.. = args
             int mi = FindInstanceIdx(callee.sval);
@@ -1116,7 +1369,10 @@ partial class Ngen {
         strRefs.Add(new StrRef(a, txt.Count - 4, sym));
     }
     void LoadStr(int si, int reg) {
-        LoadSymRef("l_.str." + si, reg);
+        // literals live in the startup pool as stamped heap strings; the
+        // l_.g.strp.N slot holds the pointer (see RtEmitStrpool)
+        LoadSymRef("l_.g.strp." + si, reg);
+        LdrU(reg, reg, 0);
     }
 
     // ---- fixup resolution (text offsets are final here) ----
