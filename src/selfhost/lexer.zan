@@ -1,0 +1,603 @@
+using System;
+using System.Collections;
+namespace Zan;
+
+// Faithful port of src/compiler/lexer.c (bootstrap subset). Produces a
+// List<Token> covering identifiers/keywords, int/float/string/char literals,
+// comments and the operator/punctuation set the compiler itself uses.
+class Lexer {
+    public string src;
+    public int pos;
+    public int n;
+    public int line;
+    public int col;
+
+    // Preprocessor state (mirrors src/compiler/lexer.c): a define table and a
+    // nested #if/#else conditional stack. Only the target-platform macros the
+    // stdlib tests are predefined.
+    public List<string> ppName;
+    public List<int> ppActive;   // this frame emits tokens (accounts for ancestors)
+    public List<int> ppParent;   // enclosing region was active when frame pushed
+    public List<int> ppTaken;    // some branch of this frame has been taken
+    public int ppTop;            // logical conditional-stack depth (no List.RemoveAt)
+    string peSrc; int pePos; int peN;   // scratch for #if expression evaluation
+
+    public Lexer(string s) {
+        src = s; pos = 0; n = s.Length; line = 1; col = 1;
+        ppName = new List<string>();
+        ppActive = new List<int>();
+        ppParent = new List<int>();
+        ppTaken = new List<int>();
+        ppTop = 0;
+        peSrc = ""; pePos = 0; peN = 0;
+        ppName.Add("WINDOWS"); ppName.Add("WIN32"); ppName.Add("X86_64"); ppName.Add("ZAN");
+    }
+
+    bool PpIsDef(string name) {
+        int i = 0;
+        while (i < ppName.Count) { if (ppName[i] == name) { return true; } i = i + 1; }
+        return false;
+    }
+    void PpDefine(string name) { if (!PpIsDef(name)) { ppName.Add(name); } }
+    void PpUndef(string name) {
+        int i = 0;
+        while (i < ppName.Count) {
+            if (ppName[i] == name) { ppName[i] = ""; return; }  // tombstone (no RemoveAt)
+            i = i + 1;
+        }
+    }
+    void PpPush(int pa, int c, int t) {
+        if (ppTop < ppActive.Count) { ppActive[ppTop] = c; ppParent[ppTop] = pa; ppTaken[ppTop] = t; }
+        else { ppActive.Add(c); ppParent.Add(pa); ppTaken.Add(t); }
+        ppTop = ppTop + 1;
+    }
+    void PpPop() { if (ppTop > 0) { ppTop = ppTop - 1; } }
+    bool PpActiveNow() {
+        if (ppTop == 0) { return true; }
+        return ppActive[ppTop - 1] == 1;
+    }
+
+    // ---- #if expression evaluation (bare ident = defined?1:0, ints, defined(),
+    // !, &&, ||, ==, != and parentheses) ----
+    int PeEval(string s) { peSrc = s; pePos = 0; peN = s.Length; return PeOr(); }
+    void PeWs() { while (pePos < peN && (peSrc[pePos] == ' ' || peSrc[pePos] == '\t')) { pePos = pePos + 1; } }
+    int PeCh() { if (pePos < peN) { return (int)peSrc[pePos]; } return 0; }
+    int PeCh1() { if (pePos + 1 < peN) { return (int)peSrc[pePos + 1]; } return 0; }
+    bool PeEat2(int a, int b) {
+        PeWs();
+        if (PeCh() == a && PeCh1() == b) { pePos = pePos + 2; return true; }
+        return false;
+    }
+    int PeOr() {
+        int v = PeAnd();
+        while (PeEat2(124, 124)) { int r = PeAnd(); if (v != 0 || r != 0) { v = 1; } else { v = 0; } }
+        return v;
+    }
+    int PeAnd() {
+        int v = PeEq();
+        while (PeEat2(38, 38)) { int r = PeEq(); if (v != 0 && r != 0) { v = 1; } else { v = 0; } }
+        return v;
+    }
+    int PeEq() {
+        int v = PeUnary();
+        while (true) {
+            if (PeEat2(61, 61)) { int r = PeUnary(); if (v == r) { v = 1; } else { v = 0; } }
+            else if (PeEat2(33, 61)) { int r = PeUnary(); if (v != r) { v = 1; } else { v = 0; } }
+            else { return v; }
+        }
+    }
+    int PeUnary() {
+        PeWs();
+        if (PeCh() == 33 && PeCh1() != 61) { pePos = pePos + 1; int v = PeUnary(); if (v == 0) { return 1; } return 0; }
+        return PePrimary();
+    }
+    int PePrimary() {
+        PeWs();
+        int c = PeCh();
+        if (c == 40) { pePos = pePos + 1; int v = PeOr(); PeWs(); if (PeCh() == 41) { pePos = pePos + 1; } return v; }
+        if (c >= 48 && c <= 57) {
+            int v = 0;
+            while (pePos < peN && PeCh() >= 48 && PeCh() <= 57) { v = v * 10 + (PeCh() - 48); pePos = pePos + 1; }
+            return v;
+        }
+        // identifier
+        int start = pePos;
+        while (pePos < peN && (IsAlnum(PeCh()))) { pePos = pePos + 1; }
+        if (pePos == start) { return 0; }
+        string id = peSrc.Substring(start, pePos - start);
+        if (id == "defined") {
+            PeWs();
+            bool paren = false;
+            if (PeCh() == 40) { paren = true; pePos = pePos + 1; PeWs(); }
+            int s2 = pePos;
+            while (pePos < peN && IsAlnum(PeCh())) { pePos = pePos + 1; }
+            string nm = peSrc.Substring(s2, pePos - s2);
+            if (paren) { PeWs(); if (PeCh() == 41) { pePos = pePos + 1; } }
+            if (PpIsDef(nm)) { return 1; }
+            return 0;
+        }
+        if (PpIsDef(id)) { return 1; }
+        return 0;
+    }
+
+    // Consume a `#...` directive line (the leading '#' is already consumed) and
+    // update the define table / conditional stack.
+    void Directive() {
+        // directive keyword
+        while (pos < n && (Peek() == 32 || Peek() == 9)) { Adv(); }
+        int ds = pos;
+        while (pos < n && IsAlpha(Peek())) { Adv(); }
+        string dir = src.Substring(ds, pos - ds);
+        // rest of line (argument text)
+        while (pos < n && (Peek() == 32 || Peek() == 9)) { Adv(); }
+        int rs = pos;
+        while (pos < n && Peek() != 10) { Adv(); }
+        string rest = src.Substring(rs, pos - rs);
+        if (dir == "if") {
+            int pa = 0; if (PpActiveNow()) { pa = 1; }
+            int c = 0; if (pa == 1 && PeEval(rest) != 0) { c = 1; }
+            PpPush(pa, c, c);
+        } else if (dir == "ifdef" || dir == "ifndef") {
+            int pa = 0; if (PpActiveNow()) { pa = 1; }
+            string nm = PpTrim(rest);
+            bool def = PpIsDef(nm);
+            if (dir == "ifndef") { def = !def; }
+            int c = 0; if (pa == 1 && def) { c = 1; }
+            PpPush(pa, c, c);
+        } else if (dir == "elif") {
+            int top = ppTop - 1;
+            if (top >= 0) {
+                if (ppTaken[top] == 0 && ppParent[top] == 1 && PeEval(rest) != 0) { ppActive[top] = 1; ppTaken[top] = 1; }
+                else { ppActive[top] = 0; }
+            }
+        } else if (dir == "else") {
+            int top = ppTop - 1;
+            if (top >= 0) {
+                if (ppParent[top] == 1 && ppTaken[top] == 0) { ppActive[top] = 1; ppTaken[top] = 1; }
+                else { ppActive[top] = 0; }
+            }
+        } else if (dir == "endif") {
+            PpPop();
+        } else if (dir == "define") {
+            if (PpActiveNow()) {
+                string nm = PpFirstWord(rest);
+                if (nm != "") { PpDefine(nm); }
+            }
+        } else if (dir == "undef") {
+            if (PpActiveNow()) { string nm = PpFirstWord(rest); if (nm != "") { PpUndef(nm); } }
+        }
+    }
+
+    string PpTrim(string s) {
+        int a = 0; int b = s.Length;
+        while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == 13)) { a = a + 1; }
+        while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == 13)) { b = b - 1; }
+        return s.Substring(a, b - a);
+    }
+    string PpFirstWord(string s) {
+        int a = 0; int m = s.Length;
+        while (a < m && (s[a] == ' ' || s[a] == '\t')) { a = a + 1; }
+        int b = a;
+        while (b < m && IsAlnum((int)s[b])) { b = b + 1; }
+        return s.Substring(a, b - a);
+    }
+
+    int Peek() { if (pos < n) { return (int)src[pos]; } return 0; }
+    int Peek2() { if (pos + 1 < n) { return (int)src[pos + 1]; } return 0; }
+
+    int Adv() {
+        int c = 0;
+        if (pos < n) { c = (int)src[pos]; }
+        pos = pos + 1;
+        if (c == 10) { line = line + 1; col = 1; } else { col = col + 1; }
+        return c;
+    }
+
+    bool IsDigit(int c) { return c >= 48 && c <= 57; }
+    bool IsHex(int c) {
+        if (c >= 48 && c <= 57) { return true; }
+        if (c >= 97 && c <= 102) { return true; }
+        if (c >= 65 && c <= 70) { return true; }
+        return false;
+    }
+    bool IsAlpha(int c) {
+        if (c >= 97 && c <= 122) { return true; }
+        if (c >= 65 && c <= 90) { return true; }
+        if (c == 95) { return true; }
+        return false;
+    }
+    bool IsAlnum(int c) { if (IsAlpha(c)) { return true; } return IsDigit(c); }
+
+    int KeywordKind(string s) {
+        if (s == "abstract") { return TK.Abstract(); }
+        if (s == "as") { return TK.As(); }
+        if (s == "async") { return TK.Async(); }
+        if (s == "await") { return TK.Await(); }
+        if (s == "base") { return TK.Base(); }
+        if (s == "bool") { return TK.Bool(); }
+        if (s == "break") { return TK.Break(); }
+        if (s == "byte") { return TK.Byte(); }
+        if (s == "case") { return TK.Case(); }
+        if (s == "char") { return TK.Char(); }
+        if (s == "class") { return TK.Class(); }
+        if (s == "const") { return TK.Const(); }
+        if (s == "continue") { return TK.Continue(); }
+        if (s == "default") { return TK.Default(); }
+        if (s == "do") { return TK.Do(); }
+        if (s == "double") { return TK.Double(); }
+        if (s == "else") { return TK.Else(); }
+        if (s == "enum") { return TK.Enum(); }
+        if (s == "false") { return TK.False(); }
+        if (s == "float") { return TK.Float(); }
+        if (s == "for") { return TK.For(); }
+        if (s == "foreach") { return TK.Foreach(); }
+        if (s == "get") { return TK.Get(); }
+        if (s == "if") { return TK.If(); }
+        if (s == "in") { return TK.In(); }
+        if (s == "int") { return TK.Int(); }
+        if (s == "interface") { return TK.Interface(); }
+        if (s == "is") { return TK.Is(); }
+        if (s == "long") { return TK.Long(); }
+        if (s == "namespace") { return TK.Namespace(); }
+        if (s == "new") { return TK.New(); }
+        if (s == "null") { return TK.Null(); }
+        if (s == "object") { return TK.Object(); }
+        if (s == "override") { return TK.Override(); }
+        if (s == "private") { return TK.Private(); }
+        if (s == "protected") { return TK.Protected(); }
+        if (s == "public") { return TK.Public(); }
+        if (s == "readonly") { return TK.Readonly(); }
+        if (s == "ref") { return TK.Ref(); }
+        if (s == "return") { return TK.Return(); }
+        if (s == "sealed") { return TK.Sealed(); }
+        if (s == "try") { return TK.Try(); }
+        if (s == "catch") { return TK.Catch(); }
+        if (s == "throw") { return TK.Throw(); }
+        if (s == "finally") { return TK.Finally(); }
+        if (s == "set") { return TK.Set(); }
+        if (s == "short") { return TK.Short(); }
+        if (s == "static") { return TK.Static(); }
+        if (s == "string") { return TK.String(); }
+        if (s == "struct") { return TK.Struct(); }
+        if (s == "switch") { return TK.Switch(); }
+        if (s == "this") { return TK.This(); }
+        if (s == "true") { return TK.True(); }
+        if (s == "using") { return TK.Using(); }
+        // `value` is contextual (like C#): only special inside a setter body.
+        // Not reserved here, so members named `value` (field.value) work.
+        if (s == "var") { return TK.Var(); }
+        if (s == "virtual") { return TK.Virtual(); }
+        if (s == "void") { return TK.Void(); }
+        if (s == "while") { return TK.While(); }
+        if (s == "uint") { return TK.Uint(); }
+        if (s == "ulong") { return TK.Ulong(); }
+        if (s == "ushort") { return TK.Ushort(); }
+        if (s == "sbyte") { return TK.Sbyte(); }
+        if (s == "decimal") { return TK.Decimal(); }
+        return TK.Ident();
+    }
+
+    void SkipTrivia() {
+        while (pos < n) {
+            int c = Peek();
+            if (c == 32 || c == 9 || c == 13 || c == 10) {
+                Adv();
+            } else if (c == 47 && Peek2() == 47) {
+                // line comment
+                while (pos < n && Peek() != 10) { Adv(); }
+            } else if (c == 47 && Peek2() == 42) {
+                // block comment
+                Adv(); Adv();
+                while (pos < n) {
+                    if (Peek() == 42 && Peek2() == 47) { Adv(); Adv(); break; }
+                    Adv();
+                }
+            } else {
+                return;
+            }
+        }
+    }
+
+    Token Ident(int startLine, int startCol) {
+        int start = pos;
+        while (pos < n && IsAlnum(Peek())) { Adv(); }
+        string t = src.Substring(start, pos - start);
+        int k = KeywordKind(t);
+        return new Token(k, t, 0, startLine, startCol);
+    }
+
+    Token Number(int startLine, int startCol) {
+        int start = pos;
+        long val = 0;
+        bool isFloat = false;
+        if (Peek() == 48 && (Peek2() == 120 || Peek2() == 88)) {
+            // hex
+            Adv(); Adv();
+            while (pos < n && (IsHex(Peek()) || Peek() == 95)) {
+                int c = Peek();
+                if (c != 95) {
+                    int d = 0;
+                    if (c >= 48 && c <= 57) { d = c - 48; }
+                    else if (c >= 97 && c <= 102) { d = c - 97 + 10; }
+                    else { d = c - 65 + 10; }
+                    val = val * 16 + d;
+                }
+                Adv();
+            }
+            string ht = src.Substring(start, pos - start);
+            return new Token(TK.IntLit(), ht, val, startLine, startCol);
+        }
+        while (pos < n && (IsDigit(Peek()) || Peek() == 95)) {
+            int c = Peek();
+            if (c != 95) { val = val * 10 + (c - 48); }
+            Adv();
+        }
+        if (Peek() == 46 && IsDigit(Peek2())) {
+            isFloat = true;
+            Adv();
+            while (pos < n && (IsDigit(Peek()) || Peek() == 95)) { Adv(); }
+        }
+        // numeric text excludes any trailing type suffix
+        string t = src.Substring(start, pos - start);
+        // suffix: f/F (float), m/M (decimal, mapped to double)
+        if (pos < n && (Peek() == 102 || Peek() == 70 || Peek() == 109 || Peek() == 77)) {
+            isFloat = true;
+            Adv();
+        }
+        if (isFloat) { return new Token(TK.FloatLit(), t, 0, startLine, startCol); }
+        return new Token(TK.IntLit(), t, val, startLine, startCol);
+    }
+
+    int EscapeChar(int c) {
+        if (c == 110) { return 10; }  // n
+        if (c == 116) { return 9; }   // t
+        if (c == 114) { return 13; }  // r
+        if (c == 48) { return 0; }    // 0
+        return c;                     // \ " ' and others
+    }
+
+    Token Str(int startLine, int startCol) {
+        Adv(); // opening quote
+        int start = pos;
+        while (pos < n && Peek() != 34) {
+            if (Peek() == 92) { Adv(); Adv(); } else { Adv(); }
+        }
+        string t = src.Substring(start, pos - start);
+        Adv(); // closing quote
+        return new Token(TK.StringLit(), t, 0, startLine, startCol);
+    }
+
+    // Verbatim string @"...". No escape processing: backslashes are literal and
+    // a doubled quote ("") is a single literal quote; the string may span lines.
+    // Stored as an ordinary StringLit whose value round-trips through
+    // Irgen.DecodeStr, so each literal backslash is emitted here doubled.
+    Token Verbatim(int startLine, int startCol) {
+        Adv(); // @
+        Adv(); // opening quote
+        string t = "";
+        while (pos < n) {
+            int c = Peek();
+            if (c == 34) {
+                if (Peek2() == 34) { t = t + "\""; Adv(); Adv(); }
+                else { Adv(); break; }
+            } else if (c == 92) {
+                t = t + "\\\\";
+                Adv();
+            } else {
+                t = t + src.Substring(pos, 1);
+                Adv();
+            }
+        }
+        return new Token(TK.StringLit(), t, 0, startLine, startCol);
+    }
+
+    // Verbatim interpolated string $@"...{expr}...". Verbatim text rules (no
+    // escape processing, "" is a literal quote, may span lines) combined with
+    // {expr} interpolation. Spliced into the same concatenation token stream
+    // as InterpStr so the parser sees ordinary "+".
+    void InterpVerbatim(List<Token> toks, int sl, int sc) {
+        Adv(); // $ or @
+        Adv(); // @ or $
+        Adv(); // opening quote
+        toks.Add(new Token(TK.LParen(), "", 0, sl, sc));
+        toks.Add(new Token(TK.StringLit(), "", 0, sl, sc));
+        string seg = "";
+        while (pos < n) {
+            int c = Peek();
+            if (c == 34) {
+                if (Peek2() == 34) { seg = seg + "\""; Adv(); Adv(); continue; }
+                Adv(); // closing quote
+                break;
+            }
+            if (c == 123) {
+                toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
+                toks.Add(new Token(TK.StringLit(), seg, 0, sl, sc));
+                seg = "";
+                Adv(); // '{'
+                toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
+                toks.Add(new Token(TK.LParen(), "", 0, sl, sc));
+                int depth = 1;
+                while (pos < n && depth > 0) {
+                    SkipTrivia();
+                    if (pos >= n) { break; }
+                    int ic = Peek();
+                    if (ic == 125) { depth = depth - 1; Adv(); if (depth == 0) { break; } continue; }
+                    if (ic == 123) { depth = depth + 1; Adv(); continue; }
+                    if (IsAlpha(ic)) { toks.Add(Ident(line, col)); }
+                    else if (IsDigit(ic)) { toks.Add(Number(line, col)); }
+                    else if (ic == 34) { toks.Add(Str(line, col)); }
+                    else if (ic == 39) { toks.Add(CharLit(line, col)); }
+                    else { toks.Add(Punct(line, col)); }
+                }
+                toks.Add(new Token(TK.RParen(), "", 0, sl, sc));
+                continue;
+            }
+            if (c == 92) { seg = seg + "\\\\"; Adv(); continue; }
+            seg = seg + src.Substring(pos, 1);
+            Adv();
+        }
+        toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
+        toks.Add(new Token(TK.StringLit(), seg, 0, sl, sc));
+        toks.Add(new Token(TK.RParen(), "", 0, sl, sc));
+    }
+
+    // Interpolated string $"...{expr}...". Spliced into an ordinary
+    // concatenation token stream: ( "" + "seg" + ( expr ) + "seg" + ... ).
+    // The leading "" guarantees a string-typed result even for $"{x}".
+    void InterpStr(List<Token> toks, int sl, int sc) {
+        Adv(); // $
+        Adv(); // opening quote
+        toks.Add(new Token(TK.LParen(), "", 0, sl, sc));
+        toks.Add(new Token(TK.StringLit(), "", 0, sl, sc));
+        int start = pos;
+        while (pos < n && Peek() != 34) {
+            int c = Peek();
+            if (c == 92) { Adv(); Adv(); }
+            else if (c == 123) {
+                string seg = src.Substring(start, pos - start);
+                toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
+                toks.Add(new Token(TK.StringLit(), seg, 0, sl, sc));
+                Adv(); // '{'
+                toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
+                toks.Add(new Token(TK.LParen(), "", 0, sl, sc));
+                int depth = 1;
+                while (pos < n && depth > 0) {
+                    SkipTrivia();
+                    if (pos >= n) { break; }
+                    int ic = Peek();
+                    if (ic == 125) { depth = depth - 1; Adv(); if (depth == 0) { break; } continue; }
+                    if (ic == 123) { depth = depth + 1; Adv(); continue; }
+                    if (IsAlpha(ic)) { toks.Add(Ident(line, col)); }
+                    else if (IsDigit(ic)) { toks.Add(Number(line, col)); }
+                    else if (ic == 34) { toks.Add(Str(line, col)); }
+                    else if (ic == 39) { toks.Add(CharLit(line, col)); }
+                    else { toks.Add(Punct(line, col)); }
+                }
+                toks.Add(new Token(TK.RParen(), "", 0, sl, sc));
+                start = pos;
+            }
+            else { Adv(); }
+        }
+        string tail = src.Substring(start, pos - start);
+        toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
+        toks.Add(new Token(TK.StringLit(), tail, 0, sl, sc));
+        Adv(); // closing quote
+        toks.Add(new Token(TK.RParen(), "", 0, sl, sc));
+    }
+
+    Token CharLit(int startLine, int startCol) {
+        Adv(); // opening '
+        int v = 0;
+        if (Peek() == 92) { Adv(); v = EscapeChar(Peek()); Adv(); }
+        else { v = Peek(); Adv(); }
+        if (Peek() == 39) { Adv(); } // closing '
+        return new Token(TK.CharLit(), "", v, startLine, startCol);
+    }
+
+    public List<Token> Run() {
+        List<Token> toks = new List<Token>();
+        while (true) {
+            SkipTrivia();
+            int sl = line;
+            int sc = col;
+            if (pos >= n) {
+                toks.Add(new Token(TK.Eof(), "", 0, sl, sc));
+                return toks;
+            }
+            int c = Peek();
+            if (c == 35) { Adv(); Directive(); }               // '#' preprocessor line
+            else if (!PpActiveNow()) { while (pos < n && Peek() != 10) { Adv(); } }
+            else if (c == 36 && Peek2() == 64) { InterpVerbatim(toks, sl, sc); }
+            else if (c == 64 && Peek2() == 36) { InterpVerbatim(toks, sl, sc); }
+            else if (c == 64 && Peek2() == 34) { toks.Add(Verbatim(sl, sc)); }
+            else if (c == 36 && Peek2() == 34) { InterpStr(toks, sl, sc); }
+            else if (IsAlpha(c)) { toks.Add(Ident(sl, sc)); }
+            else if (IsDigit(c)) { toks.Add(Number(sl, sc)); }
+            else if (c == 34) { toks.Add(Str(sl, sc)); }
+            else if (c == 39) { toks.Add(CharLit(sl, sc)); }
+            else { toks.Add(Punct(sl, sc)); }
+        }
+    }
+
+    Token Mk(int k, int sl, int sc) { return new Token(k, "", 0, sl, sc); }
+
+    Token Punct(int sl, int sc) {
+        int c = Adv();
+        int d = Peek();
+        if (c == 40) { return Mk(TK.LParen(), sl, sc); }
+        if (c == 41) { return Mk(TK.RParen(), sl, sc); }
+        if (c == 123) { return Mk(TK.LBrace(), sl, sc); }
+        if (c == 125) { return Mk(TK.RBrace(), sl, sc); }
+        if (c == 91) { return Mk(TK.LBracket(), sl, sc); }
+        if (c == 93) { return Mk(TK.RBracket(), sl, sc); }
+        if (c == 59) { return Mk(TK.Semicolon(), sl, sc); }
+        if (c == 58) { return Mk(TK.Colon(), sl, sc); }
+        if (c == 44) { return Mk(TK.Comma(), sl, sc); }
+        if (c == 46) { return Mk(TK.Dot(), sl, sc); }
+        if (c == 63) {
+            if (d == 63) { Adv(); return Mk(TK.QQ(), sl, sc); }
+            if (d == 46) { Adv(); return Mk(TK.QDot(), sl, sc); } // ?.
+            return Mk(TK.Question(), sl, sc);
+        }
+        if (c == 126) { return Mk(TK.Bang(), sl, sc); } // ~ (reuse bang slot rarely used)
+        if (c == 43) {
+            if (d == 43) { Adv(); return Mk(TK.PlusPlus(), sl, sc); }
+            if (d == 61) { Adv(); return Mk(TK.PlusEq(), sl, sc); }
+            return Mk(TK.Plus(), sl, sc);
+        }
+        if (c == 45) {
+            if (d == 45) { Adv(); return Mk(TK.MinusMinus(), sl, sc); }
+            if (d == 61) { Adv(); return Mk(TK.MinusEq(), sl, sc); }
+            return Mk(TK.Minus(), sl, sc);
+        }
+        if (c == 42) {
+            if (d == 61) { Adv(); return Mk(TK.StarEq(), sl, sc); }
+            return Mk(TK.Star(), sl, sc);
+        }
+        if (c == 47) {
+            if (d == 61) { Adv(); return Mk(TK.SlashEq(), sl, sc); }
+            return Mk(TK.Slash(), sl, sc);
+        }
+        if (c == 37) {
+            if (d == 61) { Adv(); return Mk(TK.PercentEq(), sl, sc); }
+            return Mk(TK.Percent(), sl, sc);
+        }
+        if (c == 60) {
+            if (d == 61) { Adv(); return Mk(TK.LessEq(), sl, sc); }
+            if (d == 60) {
+                Adv();
+                if (Peek() == 61) { Adv(); return Mk(TK.LessLessEq(), sl, sc); }
+                return Mk(TK.LessLess(), sl, sc);
+            }
+            return Mk(TK.Less(), sl, sc);
+        }
+        if (c == 62) {
+            if (d == 61) { Adv(); return Mk(TK.GreaterEq(), sl, sc); }
+            return Mk(TK.Greater(), sl, sc);
+        }
+        if (c == 61) {
+            if (d == 61) { Adv(); return Mk(TK.EqEq(), sl, sc); }
+            if (d == 62) { Adv(); return Mk(TK.Arrow(), sl, sc); }
+            return Mk(TK.Eq(), sl, sc);
+        }
+        if (c == 33) {
+            if (d == 61) { Adv(); return Mk(TK.BangEq(), sl, sc); }
+            return Mk(TK.Bang(), sl, sc);
+        }
+        if (c == 38) {
+            if (d == 38) { Adv(); return Mk(TK.AmpAmp(), sl, sc); }
+            if (d == 61) { Adv(); return Mk(TK.AmpEq(), sl, sc); }
+            return Mk(TK.Amp(), sl, sc);
+        }
+        if (c == 124) {
+            if (d == 124) { Adv(); return Mk(TK.PipePipe(), sl, sc); }
+            if (d == 61) { Adv(); return Mk(TK.PipeEq(), sl, sc); }
+            return Mk(TK.Pipe(), sl, sc);
+        }
+        if (c == 94) {
+            if (d == 61) { Adv(); return Mk(TK.CaretEq(), sl, sc); }
+            return Mk(TK.Caret(), sl, sc);
+        }
+        return Mk(TK.Invalid(), sl, sc);
+    }
+}
