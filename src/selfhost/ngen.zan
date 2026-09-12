@@ -310,6 +310,30 @@ partial class Ngen {
             LoadImm(0, e.ival);
         } else if (k == AK.StringLit()) {
             LoadStr(InternStr(e.sval), 0);
+        } else if (k == AK.BoolLit()) {
+            LoadImm(0, e.ival);
+        } else if (k == AK.FloatLit()) {
+            // materialise the IEEE bits through libc strtod -- lazily, into
+            // a zero-initialised __DATA slot (0.0 simply reconverts, so the
+            // conversion path stays idempotent)
+            int di = InternStr(e.sval);
+            dglbs.Add(new DGlob("dbl." + di, 8, dataLen));
+            dataLen = dataLen + 8;
+            LoadSymRef(DGlobalSym("dbl." + di), 9);
+            LdrU(0, 9, 0);
+            int need = NL();
+            int done = NL();
+            CbzReg(0, need);
+            EmitB(done);
+            Mark(need);
+            LoadStr(di, 0);                          // x0 = literal text
+            LoadImm(1, 0);
+            BLExtern("_strtod");
+            E4(0x9E660000);                          // fmov x0, d0
+            LoadSymRef(DGlobalSym("dbl." + di), 9);  // x9 is caller-saved: reload the slot
+            StrU(0, 9, 0);
+            LdrU(0, 9, 0);
+            Mark(done);
         } else if (k == AK.ThisExpr()) {
             LoadLocal(LocalIdx("this"), 0);
         } else if (k == AK.Ident()) {
@@ -336,15 +360,82 @@ partial class Ngen {
                 // zan_rt_int2str (gen0 prints them with "%lld"), then
                 // lhs -> x0, rhs -> x1, zan_rt_strcat2(lhs, rhs)
                 GenExpr(e.a);
-                if (!IsStrExpr(e.a)) { BLInternal("_zan_rt_int2str"); }
+                if (!IsStrExpr(e.a)) {
+                    if (IsDblExpr(e.a)) { BLInternal("_zan_rt_dbl2str"); }
+                    else { BLInternal("_zan_rt_int2str"); }
+                }
                 E4(0xF81F0FE0);                          // str x0, [sp, #-16]!
                 GenExpr(e.b);
-                if (!IsStrExpr(e.b)) { BLInternal("_zan_rt_int2str"); }
+                if (!IsStrExpr(e.b)) {
+                    if (IsDblExpr(e.b)) { BLInternal("_zan_rt_dbl2str"); }
+                    else { BLInternal("_zan_rt_int2str"); }
+                }
                 E4(0xF84107E1);                          // ldr x1, [sp], #16 (lhs)
                 E4(0xAA0003E9);                          // mov x9, x0
                 E4(0xAA0103E0);                          // mov x0, x1
                 E4(0xAA0903E1);                          // mov x1, x9
                 BLInternal("_zan_rt_strcat2");
+            } else if (IsDblExpr(e.a) || IsDblExpr(e.b)) {
+                // double arithmetic/comparison: values travel as i64 bit
+                // patterns in x0; the op materialises d-regs, coercing int
+                // operands with scvtf. Comparisons are the ordered ones (a
+                // NaN input always answers false, true only for !=).
+                GenExpr(e.a);
+                E4(0xF81F0FE0);                      // str x0, [sp, #-16]!
+                GenExpr(e.b);
+                E4(0xF84107E1);                      // ldr x1, [sp], #16
+                int op = e.op;
+                if (IsDblExpr(e.a)) { E4(0x9E670020); }  // fmov d0, x1
+                else { E4(0x9E620020); }                 // scvtf d0, x1
+                if (IsDblExpr(e.b)) { E4(0x9E670001); }  // fmov d1, x0
+                else { E4(0x9E620001); }                 // scvtf d1, x0
+                if (op == TK.Plus()) {
+                    E4(0x1E602820);                  // fadd d0, d1, d0
+                    E4(0x9E660000);                  // fmov x0, d0
+                } else if (op == TK.Minus()) {
+                    E4(0x1E613800);                  // fsub d0, d0, d1
+                    E4(0x9E660000);
+                } else if (op == TK.Star()) {
+                    E4(0x1E600820);                  // fmul d0, d1, d0
+                    E4(0x9E660000);
+                } else if (op == TK.Slash()) {
+                    E4(0x1E611800);                  // fdiv d0, d0, d1 (IEEE: no guard, like gen0)
+                    E4(0x9E660000);
+                } else if (op == TK.Less()) {
+                    E4(0x1E612000);                  // fcmp d0, d1
+                    E4(0x9A9F57E0);                  // cset x0, mi
+                } else if (op == TK.Greater()) {
+                    E4(0x1E612000);                  // fcmp d0, d1
+                    E4(0x9A9FD7E0);                  // cset x0, gt
+                } else if (op == TK.LessEq()) {
+                    E4(0x1E602020);                  // fcmp d1, d0 (swapped: a<=b <=> b>=a)
+                    E4(0x9A9FB7E0);                  // cset x0, ge
+                } else if (op == TK.GreaterEq()) {
+                    E4(0x1E612000);                  // fcmp d0, d1
+                    E4(0x9A9FB7E0);                  // cset x0, ge
+                } else if (op == TK.EqEq()) {
+                    int set0 = NL();
+                    int done2 = NL();
+                    E4(0x1E602020);                  // fcmp d1, d0
+                    EmitBcond(6, set0);              // b.vs -> unordered: false
+                    E4(0x9A9F17E0);                  // cset x0, eq
+                    EmitB(done2);
+                    Mark(set0);
+                    LoadImm(0, 0);
+                    Mark(done2);
+                } else if (op == TK.BangEq()) {
+                    int set1 = NL();
+                    int done3 = NL();
+                    E4(0x1E602020);                  // fcmp d1, d0
+                    EmitBcond(6, set1);              // b.vs -> unordered: true
+                    E4(0x9A9F07E0);                  // cset x0, ne
+                    EmitB(done3);
+                    Mark(set1);
+                    LoadImm(0, 1);
+                    Mark(done3);
+                } else {
+                    diags.Error("ngen: unsupported double operator " + op, e.line, e.col);
+                }
             } else {
                 GenExpr(e.a);
                 E4(0xF81F0FE0);                          // str x0, [sp, #-16]!
@@ -408,6 +499,9 @@ partial class Ngen {
                 } else if (op == TK.EqEq()) {
                     E4(0xEB00003F);                      // cmp x1, x0
                     E4(0x9A9F17E0);                      // cset x0, eq
+                } else if (op == TK.BangEq()) {
+                    E4(0xEB00003F);                      // cmp x1, x0
+                    E4(0x9A9F07E0);                      // cset x0, ne
                 } else {
                     diags.Error("ngen: unsupported operator " + op, e.line, e.col);
                 }
@@ -541,6 +635,60 @@ partial class Ngen {
         return false;
     }
 
+    // does this expression evaluate to a double? (float literal / double
+    // typed local or field / double-returning method / double arithmetic)
+    bool IsDblExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.FloatLit()) { return true; }
+        if (e.kind == AK.Binary()) {
+            int op = e.op;
+            if (op == TK.Plus() || op == TK.Minus() || op == TK.Star() || op == TK.Slash()) {
+                return IsDblExpr(e.a) || IsDblExpr(e.b);
+            }
+            return false;
+        }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            return f != null && f.ty == "double";
+        }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return locTy[li] == "double"; }
+            Fld f = CurField(e.sval);
+            return f != null && f.ty == "double";
+        }
+        if (e.kind == AK.Call() && e.a != null) {
+            return MethRetTy(e.a.sval) == "double";
+        }
+        return false;
+    }
+
+    // does this expression evaluate to a bool? (comparisons / bool locals,
+    // fields and method results -- WriteLine renders those true/false)
+    bool IsBoolExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.BoolLit()) { return true; }
+        if (e.kind == AK.Binary()) {
+            int op = e.op;
+            return op == TK.Less() || op == TK.Greater() || op == TK.LessEq()
+                || op == TK.GreaterEq() || op == TK.EqEq() || op == TK.BangEq();
+        }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            return f != null && f.ty == "bool";
+        }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return locTy[li] == "bool"; }
+            Fld f = CurField(e.sval);
+            return f != null && f.ty == "bool";
+        }
+        if (e.kind == AK.Call() && e.a != null) {
+            return MethRetTy(e.a.sval) == "bool";
+        }
+        return false;
+    }
+
     string MethRetTy(string name) {
         int i = 0;
         while (i < methNodes.Count) {
@@ -560,6 +708,22 @@ partial class Ngen {
                 if (IsStrExpr(e.kids[0])) {
                     GenExpr(e.kids[0]);
                     BLInternal("_zan_rt_println");
+                } else if (IsBoolExpr(e.kids[0])) {
+                    // gen0 prints bools as true/false (select of literals)
+                    GenExpr(e.kids[0]);
+                    int fls = NL();
+                    int doneb = NL();
+                    CbzReg(0, fls);
+                    LoadStr(InternStr("true"), 0);
+                    EmitB(doneb);
+                    Mark(fls);
+                    LoadStr(InternStr("false"), 0);
+                    Mark(doneb);
+                    BLInternal("_zan_rt_println");
+                } else if (IsDblExpr(e.kids[0])) {
+                    GenExpr(e.kids[0]);
+                    E4(0x9E670000);                      // fmov d0, x0
+                    BLExtern("_zan_rt_print_double");
                 } else {
                     GenExpr(e.kids[0]);
                     BLInternal("_zan_rt_print_int");

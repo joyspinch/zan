@@ -40,6 +40,7 @@ partial class Ngen {
     int fmtiIdx;
     int fmtsIdx;
     int fmtnIdx;
+    int emptyIdx;
 
     Cls FindClass(string n) {
         int i = 0;
@@ -132,6 +133,8 @@ partial class Ngen {
         fmtsIdx = strs.Count - 1;
         strs.Add("%lld");
         fmtnIdx = strs.Count - 1;
+        strs.Add("");
+        emptyIdx = strs.Count - 1;
         dglbs.Add(new DGlob("zan_eh", 8, dataLen));
         dataLen = dataLen + 8;
         RtEmitAlloc();
@@ -140,6 +143,8 @@ partial class Ngen {
         RtEmitPrintInt();
         RtEmitPrintln();
         RtEmitInt2Str();
+        RtEmitDbl2Str();
+        RtEmitPrintDouble();
         RtEmitEhState();
     }
 
@@ -163,6 +168,43 @@ partial class Ngen {
         AddSPImm(16, true);                    // drop the vararg slot
         LdrU(0, 31, 0);                        // x0 = buf
         AddSPImm(32, true);                    // pop buf + v
+        RtEpilogue();
+    }
+
+    // zan_rt_print_double(double v) -- gen0 embeds this shim in its IR (the
+    // C objects only carry the underlying zan_rt_dbl_str writer), so the
+    // native backend mirrors it: 40-byte stack buffer, %g render, println.
+    void RtEmitPrintDouble() {
+        syms.Add(new Sym("_zan_rt_print_double", txt.Count));
+        RtPrologue();
+        AddSPImm(48, false);                   // 40-byte buffer, 16-aligned
+        E4(0x910003E0);                        // mov x0, sp
+        LoadImm(1, 40);
+        BLExtern("_zan_rt_dbl_str");           // v flows through in d0
+        E4(0x910003E0);                        // x0 = buf
+        BLInternal("_zan_rt_println");         // printf("%s\n", buf)
+        AddSPImm(48, true);
+        RtEpilogue();
+    }
+
+    // ptr zan_rt_dbl2str(i64 bits) -- the value arrives as the i64 bit
+    // pattern our expression model carries; renders with the C runtime's
+    // %g writer into a 40-byte stack buffer and returns a heap string
+    // (a copy through strcat2's allocator, so it outlives the buffer)
+    void RtEmitDbl2Str() {
+        syms.Add(new Sym("_zan_rt_dbl2str", txt.Count));
+        RtPrologue();
+        E4(0x9E670000);                        // fmov d0, x0
+        AddSPImm(48, false);                   // 40-byte buffer, 16-aligned
+        E4(0x910003E0);                        // mov x0, sp
+        LoadImm(1, 40);
+        BLExtern("_zan_rt_dbl_str");
+        E4(0x910003E0);                        // x0 = buf
+        MovRR(9, 0);                           // x9 = buf
+        LoadSymRef("l_.str." + emptyIdx, 0);   // x0 = ""
+        MovRR(1, 9);                           // x1 = buf
+        BLInternal("_zan_rt_strcat2");
+        AddSPImm(48, true);
         RtEpilogue();
     }
 
