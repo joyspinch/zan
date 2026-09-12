@@ -54,14 +54,21 @@ partial class Ngen {
     int nloc;
     int frame;
     int nlabel;
+    int curLine;
+    int curCol;
+    int guardDivIdx;
+    int guardModIdx;
+    int guardFileIdx;
+    string srcFile;
 
     List<Node> methNodes;
     List<string> methCls;
     List<int> methStat;     // 0 = instance, 1 = static, 2 = ctor
     string mainCls;
 
-    public Ngen(Binder b, Diags d) {
+    public Ngen(Binder b, Diags d, string file) {
         diags = d;
+        srcFile = file;
         txt = new List<int>();
         syms = new List<Sym>();
         fixups = new List<Fixup>();
@@ -84,6 +91,9 @@ partial class Ngen {
         }
         CollectClasses(unit);
         EmitRtCore();
+        guardDivIdx = InternStr("division by zero\n");
+        guardModIdx = InternStr("division by zero (modulo)\n");
+        guardFileIdx = InternStr(srcFile);
         if (FindStatic("Main") == null) {
             diags.Error("ngen: no static Main() found", 0, 0);
             return txt;
@@ -252,6 +262,7 @@ partial class Ngen {
     // ---- statements ----
     void GenStmt(Node s) {
         if (s == null) { return; }
+        if (s.line > 0) { curLine = s.line; curCol = s.col; }
         int k = s.kind;
         if (k == AK.Block()) {
             int i = 0;
@@ -346,6 +357,42 @@ partial class Ngen {
                     E4(0xCB000020);                      // sub x0, x1, x0
                 } else if (op == TK.Star()) {
                     E4(0x9B007C20);                      // mul x0, x1, x0
+                } else if (op == TK.Slash() || op == TK.Percent()) {
+                    // divide/modulo: x1 = dividend, x0 = divisor. A zero
+                    // divisor reports through zan_rt_guard_fail3 -- the same
+                    // C-runtime guard the IR backend links -- and continues
+                    // with divisor 1; INT_MIN / -1 also divides by 1 to
+                    // avoid the SIGFPE trap, mirroring gen0's select guard.
+                    int bad = NL();
+                    int cont = NL();
+                    int safe = NL();
+                    CbzReg(0, bad);
+                    EmitB(cont);
+                    Mark(bad);
+                    E4(0xF81F0FE1);                      // str x1, [sp, #-16]! (keep dividend across the call)
+                    LoadSymRef("l_.str." + guardFileIdx, 0);
+                    LoadImm(1, curLine);
+                    LoadImm(2, curCol);
+                    if (op == TK.Slash()) { LoadSymRef("l_.str." + guardDivIdx, 3); }
+                    else { LoadSymRef("l_.str." + guardModIdx, 3); }
+                    BLExtern("_zan_rt_guard_fail3");
+                    E4(0xF84107E1);                      // ldr x1, [sp], #16 (own push; cont must not pop)
+                    LoadImm(0, 1);                       // safe divisor
+                    Mark(cont);
+                    LoadImm(2, 0x8000000000000000);      // i64 min
+                    LoadImm(3, -1);
+                    E4(0xEB03001F);                      // cmp x0, x3
+                    EmitBcond(1, safe);                  // b.ne safe
+                    E4(0xEB02003F);                      // cmp x1, x2
+                    EmitBcond(1, safe);
+                    LoadImm(0, 1);
+                    Mark(safe);
+                    if (op == TK.Slash()) {
+                        E4(0x9AC00C20);                  // sdiv x0, x1, x0
+                    } else {
+                        E4(0x9AC00C24);                  // sdiv x4, x1, x0
+                        E4(0x9B008480);                  // msub x0, x4, x0, x1
+                    }
                 } else if (op == TK.Less()) {
                     E4(0xEB00003F);                      // cmp x1, x0
                     E4(0x9A9FA7E0);                      // cset x0, lt
@@ -713,12 +760,17 @@ partial class Ngen {
             E4((int)(0x92800000 | (((-v) - 1) << 5) | reg)); // movn x, #~v
             return;
         }
+        // 16-bit chunks: plain truncating division mis-extracts negative
+        // values (e.g. i64min's top chunk comes out as -32768), so fold the
+        // chunk back into [0, 65536).
         long chunk0 = v - (v / 65536) * 65536;
+        if (chunk0 < 0) { chunk0 = chunk0 + 65536; }
         E4((int)(0xD2800000 | (chunk0 << 5) | reg));     // movz x, #c0
         int h = 1;
         while (h < 4) {
             long sh = ShiftRight(v, h * 16);
             long chunk = sh - (sh / 65536) * 65536;
+            if (chunk < 0) { chunk = chunk + 65536; }
             E4((int)(0xF2800000 | (((long)h) << 21) | (chunk << 5) | reg)); // movk
             h = h + 1;
         }
