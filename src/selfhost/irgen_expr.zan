@@ -1285,6 +1285,7 @@ partial class Irgen {
         // are `Field = value` pairs, not ctor args, so only a parameterless ctor
         // is invoked and the field stores follow.
         Node ctor = binder.FindCtor(cls);
+        if (ctor != null && e.ival != 2) { ctor = binder.FindCtorArity(cls, e.kids.Count); }
         if (ctor != null && e.ival != 2) {
             string args = "%" + cn + "* " + obj;
             int i = 0;
@@ -1294,9 +1295,9 @@ partial class Irgen {
                 args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
                 i = i + 1;
             }
-            L("  call void @" + cn + "_ctor(" + args + ")");
+            L("  call void @" + CtorSym(cn, ctor) + "(" + args + ")");
         } else if (ctor != null && e.ival == 2 && CtorParamCount(ctor) == 0) {
-            L("  call void @" + cn + "_ctor(%" + cn + "* " + obj + ")");
+            L("  call void @" + CtorSym(cn, ctor) + "(%" + cn + "* " + obj + ")");
         }
         // object initializer: store each `Field = value` into the instance
         if (e.ival == 2) {
@@ -2330,6 +2331,38 @@ partial class Irgen {
         return MkType("int");
     }
 
+    // Does parameter `idx` of method m carry a `ref`/`out` modifier?
+    bool IsRefParam(Node m, int idx) {
+        int seen = 0; int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) {
+                if (seen == idx) { return m.kids[i].ival == 1; }
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // Address of a by-ref argument place. Bootstrap subset: only a plain
+    // local variable is supported (`ref x`); managed types are rejected
+    // because by-ref write-back needs the caller's byref_slot ARC discipline.
+    string RefPlacePtr(Node place) {
+        if (place != null && place.kind == AK.Ident()) {
+            int li = LocalIdx(place.sval);
+            if (li >= 0) {
+                if (ArcManaged(locType[li])) {
+                    diags.Error("ref/out argument '" + place.sval
+                        + "' must be a value type (bootstrap subset)", place.line, place.col);
+                    return "null";
+                }
+                return locReg[li];
+            }
+        }
+        diags.Error("ref/out argument must be a local variable (bootstrap subset)", place.line, place.col);
+        return "null";
+    }
+
     // evaluate a call argument, first pushing a delegate parameter's
     // signature onto a bare lambda argument
     ExprVal GenArgExpr(Node a, Node pty) {
@@ -2470,6 +2503,13 @@ partial class Irgen {
         while (i < aargs.Count) {
             Node pty = MkType("int"); if (m != null) { pty = ParamTypeNode(m, i); }
             if (spec) { pty = SubstTP(pty, stns, strs); }
+            if (m != null && IsRefParam(m, i) && aargs[i] != null
+                && aargs[i].kind == AK.OutArg() && aargs[i].ival == 1) {
+                if (i > 0) { args = args + ", "; }
+                args = args + MapType(pty) + "* " + RefPlacePtr(aargs[i].a);
+                i = i + 1;
+                continue;
+            }
             ExprVal av = GenArgExpr(aargs[i], pty);
             if (i == 0 && IsStr(av.ty)) { freeArgIsStr = true; }
             if (i > 0) { args = args + ", "; }
@@ -2823,6 +2863,13 @@ partial class Irgen {
         int i = 0;
         while (i < aargs.Count) {
             Node pty = MkType("int"); if (m != null) { pty = ParamTypeNode(m, i); }
+            if (m != null && IsRefParam(m, i) && aargs[i] != null
+                && aargs[i].kind == AK.OutArg() && aargs[i].ival == 1) {
+                if (i > 0) { args = args + ", "; }
+                args = args + MapType(pty) + "* " + RefPlacePtr(aargs[i].a);
+                i = i + 1;
+                continue;
+            }
             ExprVal av = GenArgExpr(aargs[i], pty);
             args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
             i = i + 1;

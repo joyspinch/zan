@@ -1157,16 +1157,18 @@ partial class Irgen {
         }
         List<string> pn = new List<string>();
         List<Node> pt = new List<Node>();
+        List<int> pr = new List<int>();
         int i = 0;
         while (i < m.kids.Count) {
             Node p = m.kids[i];
-            if (p.kind == AK.Param()) { pn.Add(p.sval); pt.Add(p.type); }
+            if (p.kind == AK.Param()) { pn.Add(p.sval); pt.Add(p.type); pr.Add(p.ival); }
             i = i + 1;
         }
         int j = 0;
         while (j < pn.Count) {
             if (np > 0) { sig = sig + ", "; }
-            sig = sig + MapType(pt[j]) + " %p" + j;
+            if (pr[j] == 1) { sig = sig + MapType(pt[j]) + "* %p" + j; }
+            else { sig = sig + MapType(pt[j]) + " %p" + j; }
             np = np + 1;
             j = j + 1;
         }
@@ -1178,6 +1180,15 @@ partial class Irgen {
         j = 0;
         while (j < pn.Count) {
             string lt = MapType(pt[j]);
+            if (pr[j] == 1) {
+                // `ref`/`out` value-type parameter: the incoming pointer IS the
+                // storage slot, so reads/writes go through to the caller's
+                // variable (mirrors irgen_emit.c). Managed types are rejected
+                // at the call site (no byref ARC here).
+                locName.Add(pn[j]); locType.Add(pt[j]); locReg.Add("%p" + j);
+                j = j + 1;
+                continue;
+            }
             string preg = AddLocal(pn[j], pt[j]);
             L("  " + preg + " = alloca " + lt);
             L("  store " + lt + " %p" + j + ", " + lt + "* " + preg);
@@ -1202,7 +1213,7 @@ partial class Irgen {
         curClass = cls.sval;
         curRet = "void";
         curHasThis = true;
-        string sig = "define void @" + cls.sval + "_ctor(%" + cls.sval + "* %this";
+        string sig = "define void @" + CtorSym(cls.sval, m) + "(%" + cls.sval + "* %this";
         List<string> pn = new List<string>();
         List<Node> pt = new List<Node>();
         int i = 0;
@@ -1235,6 +1246,7 @@ partial class Irgen {
         Node bcls = BaseClassOf(cls);
         if (bcls != null) {
             Node bctor = binder.FindCtor(bcls);
+            if (bctor != null && m.b != null) { bctor = binder.FindCtorArity(bcls, m.b.kids.Count); }
             if (bctor != null && (m.b != null || CtorParamCount(bctor) == 0)) {
                 string bthis = NT();
                 L("  " + bthis + " = bitcast %" + cls.sval + "* %this to %" + bcls.sval + "*");
@@ -1248,7 +1260,7 @@ partial class Irgen {
                         k = k + 1;
                     }
                 }
-                L("  call void @" + bcls.sval + "_ctor(" + bargs + ")");
+                L("  call void @" + CtorSym(bcls.sval, bctor) + "(" + bargs + ")");
             }
         }
         if (m.d != null) { GenStmt(m.d); }

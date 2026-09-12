@@ -14,6 +14,23 @@ LLVM 依赖**。本仓库从 zan-lang monorepo 独立出来，以避开主仓库
 
 当前 pin：`BOOTSTRAP_ZANC_VERSION = zan-lang main @ 2b847bbd（待首次构建后填入版本号）`
 
+## 状态（2026-09-13）
+
+- **M0 已达成**：自举闭合恢复。`gen0 → gen1 → g2.ll → gen2（clang 链接）→
+  g3.ll`，`g2.ll == g3.ll`（5,073,570 字节，首次在 macOS 上闭合）。
+  顺带完成 `tests/selfhost/prog1.zan` 端到端语义验证（stdout 与 golden 一致）。
+- 为达成 M0 修复的编译器 bug（均在 `src/selfhost/`）：
+  1. `ref`/`out` 形参声明与调用点 `ref` 实参（B6-SH1 主因；值类型 + 局部变量
+     子集，ARC 类型明确报错）—— parser/binder/checker/irgen 四处；
+  2. stdlib 路径拼接用 Windows 反斜杠，POSIX 上 stdlib 自动拉入从未生效
+     （`Exception` unknown type 的真因）—— 改为 `/`；
+  3. 重载构造函数 LLVM 符号撞名（如 `StreamWriter` 的两个 ctor 都发
+     `@X_ctor`）—— 新增 `CtorSym` 按参数类型 mangling，`new` 与基类链
+     按实参个数选重载（`FindCtorArity`）。
+- `stdlib/` 是裁剪后的快照（仅 `System/Exception.zan`）：bootstrap 只消费
+  这一个 stdlib 类型，其余均为 `using` 目录级拉入带进来的死代码，且部分
+  引用 macOS 缺失的运行时符号。扩展 stdlib 快照 = 显式任务，逐文件验证可链接。
+
 ## 资产分类（决定哪些代码值得投入）
 
 | 分类 | 文件 | 待遇 |

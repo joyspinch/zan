@@ -10,14 +10,20 @@
 #
 # Success criterion (fixed point): g2.ll and g3.ll are byte-identical.
 #
-# The source list mirrors tests/run_selfhost.cmake: main.zan first (entry
-# point), then the pipeline modules.
+# Runtime objects for linking gen2: gen1 links the runtime automatically (zanc
+# self-contained linking), but gen2 is linked by clang and needs the platform
+# runtime objects. Set RT_OBJS (space-separated) and LDFLAGS if the defaults
+# don't match your platform; on macOS the toolchain's libSystem.tbd stub is
+# used. Run from the repo root so the `stdlib/` snapshot is discovered.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
 BUILD="${BUILD:-$ROOT/build}"
 ZANC="${ZANC:?Set ZANC=/path/to/zanc (the pinned bootstrap compiler)}"
 CLANG="${CLANG:-clang}"
+RT_OBJS="${RT_OBJS:-}"
+LDFLAGS="${LDFLAGS:--L$ROOT/stdlib-link -lSystem}"
 mkdir -p "$BUILD"
 
 SRCS=(
@@ -44,7 +50,7 @@ echo "[2/5] gen1 -> g2.ll (self-compile)"
 "$BUILD/zanc1" "$BUILD/g2.ll" "${SRCS[@]}"
 
 echo "[3/5] clang g2.ll -> gen2"
-"$CLANG" "$BUILD/g2.ll" -o "$BUILD/zanc2"
+"$CLANG" "$BUILD/g2.ll" $RT_OBJS -o "$BUILD/zanc2" $LDFLAGS
 
 echo "[4/5] gen2 -> g3.ll (self-compile)"
 "$BUILD/zanc2" "$BUILD/g3.ll" "${SRCS[@]}"
