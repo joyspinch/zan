@@ -91,7 +91,7 @@ partial class Ngen {
     void MovRR(int rd, int rm) { E4(0xAA000000 | (rm << 16) | (31 << 5) | rd); } // mov rd, rm (orr with xzr)
     void AddRR(int rd, int rn, int rm) { E4(0x8B000000 | (rm << 16) | (rn << 5) | rd); }
     void SubImm(int rd, int rn, int imm) { E4(0xD1000000 | (imm << 10) | (rn << 5) | rd); }
-    void CbzReg(int rt, int lbl) { fixups.Add(new Fixup(txt.Count, 1, lbl, 0, null)); E4(0xB4000000 | rt); }
+    void CbzReg(int rt, int lbl) { E4(0xB4000000 | rt); fixups.Add(new Fixup(txt.Count - 4, 1, lbl, 0, null)); }
     void LdrU(int rd, int rn, int off) { E4(0xF9400000 | ((off / 8) << 10) | (rn << 5) | rd); }
     void StrU(int rt, int rn, int off) { E4(0xF9000000 | ((off / 8) << 10) | (rn << 5) | rt); }
     void Strb0(int rn) { E4(0x39000000 | (rn << 5) | 31); } // strb wzr, [rn]
@@ -129,11 +129,35 @@ partial class Ngen {
         fmtiIdx = strs.Count - 1;
         strs.Add("%s\n");
         fmtsIdx = strs.Count - 1;
+        dglbs.Add(new DGlob("zan_eh", 8, dataLen));
+        dataLen = dataLen + 8;
         RtEmitAlloc();
         RtEmitStrAlloc();
         RtEmitStrCat2();
         RtEmitPrintInt();
         RtEmitPrintln();
+        RtEmitEhState();
+    }
+
+    // ptr _zan_rt_eh_state(): the exception-state block, allocated on first
+    // use: { i32 top, ptr exc, 64 x 1024-byte setjmp slots }
+    void RtEmitEhState() {
+        syms.Add(new Sym("_zan_rt_eh_state", txt.Count));
+        RtPrologue();
+        LoadSymRef("l_.g.zan_eh", 0);
+        LdrU(0, 0, 0);
+        CbzReg(0, NL());
+        int alloc = lblPos.Count - 1;
+        RtEpilogue();
+        Mark(alloc);
+        LoadImm(0, 16 + 64 * 1024);
+        LoadImm(1, 0);
+        BLExtern("_calloc");
+        E4(0xF81F0FE0);                              // push state
+        LoadSymRef("l_.g.zan_eh", 1);
+        StrU(0, 1, 0);                               // global = state
+        E4(0xF84107E0);                              // pop x0 (state)
+        RtEpilogue();
     }
 
     // ptr zan_rt_alloc(i64 size, i64 desc): zeroed (calloc), rc=1, desc at raw+8

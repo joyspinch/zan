@@ -214,6 +214,24 @@ partial class Ngen {
                 locTy.Add(s.type != null ? s.type.sval : "");
                 locOff.Add(16 * nloc);
                 nloc = nloc + 1;
+            } else if (s.kind == AK.Block()) {
+                ReserveLocals(s);
+            } else if (s.kind == AK.IfStmt()) {
+                ReserveLocals(s.b);
+                ReserveLocals(s.c);
+            } else if (s.kind == AK.WhileStmt()) {
+                ReserveLocals(s.b);
+            } else if (s.kind == AK.TryStmt()) {
+                ReserveLocals(s.a);
+                if (s.b != null) {
+                    if (s.b.sval != null && s.b.sval != "") {
+                        locName.Add(s.b.sval);
+                        locTy.Add("string");
+                        locOff.Add(16 * nloc);
+                        nloc = nloc + 1;
+                    }
+                    ReserveLocals(s.b.a);
+                }
             }
             i = i + 1;
         }
@@ -265,6 +283,10 @@ partial class Ngen {
             GenStmt(s.b);
             EmitB(top);
             Mark(outL);
+        } else if (k == AK.TryStmt()) {
+            GenTry(s);
+        } else if (k == AK.ThrowStmt()) {
+            GenThrow(s);
         } else {
             diags.Error("ngen: unsupported statement kind " + k, s.line, s.col);
         }
@@ -324,6 +346,18 @@ partial class Ngen {
                 } else if (op == TK.Less()) {
                     E4(0xEB00003F);                      // cmp x1, x0
                     E4(0x9A9FA7E0);                      // cset x0, lt
+                } else if (op == TK.Greater()) {
+                    E4(0xEB00003F);                      // cmp x1, x0
+                    E4(0x9A9FD7E0);                      // cset x0, gt
+                } else if (op == TK.LessEq()) {
+                    E4(0xEB00003F);                      // cmp x1, x0
+                    E4(0x9A9FC7E0);                      // cset x0, le
+                } else if (op == TK.GreaterEq()) {
+                    E4(0xEB00003F);                      // cmp x1, x0
+                    E4(0x9A9FB7E0);                      // cset x0, ge
+                } else if (op == TK.EqEq()) {
+                    E4(0xEB00003F);                      // cmp x1, x0
+                    E4(0x9A9F17E0);                      // cset x0, eq
                 } else {
                     diags.Error("ngen: unsupported operator " + op, e.line, e.col);
                 }
@@ -560,6 +594,85 @@ partial class Ngen {
         return n;
     }
 
+    // ---- exceptions: try / catch / throw ----
+    // EH state (single-thread approximation): one global pointer in
+    // __DATA,__data (l_.g.zan_eh) to a lazily calloc'd { i32 top, ptr exc,
+    // buf[64] of 1024-byte setjmp slots } = 16 + 64*1024 bytes. Mirrors the
+    // observable semantics of gen0's TLS-backed %zan.eh.state.
+    void GenTry(Node s) {
+        BLInternal("_zan_rt_eh_state");              // x0 = state (lazy alloc)
+        E4(0xF81F0FE0);                              // push state
+        LdrU(1, 0, 0);                               // top
+        E4(0xF81F0FE1);                              // push saved top
+        LoadImm(3, 1024);
+        E4(0x9B037C22);                              // mul x2, x1, x3
+        AddRR(2, 0, 2);                              // state + top*1024
+        AddImm(2, 2, 16);                            // &bufs[top]
+        AddImm(1, 1, 1);                             // top + 1
+        StrU(1, 0, 0);                               // state->top = top + 1
+        MovRR(0, 2);
+        BLExtern("_setjmp");                         // returns 0 (direct) / 1 (thrown)
+        EmitCbnz(0, NL());
+        int catchL = lblPos.Count - 1;
+        int endL = NL();
+        // ---- normal path: run the try body, then pop the frame ----
+        GenStmt(s.a);
+        EhRestoreTop();
+        EmitB(endL);
+        Mark(catchL);
+        // ---- thrown path: pop the frame FIRST (a throw inside the handler
+        // must unwind to the enclosing try, not re-enter this one), then bind
+        // exc to the catch variable and run the body ----
+        EhRestoreTop();
+        LdrU(0, 1, 8);                               // exc (x1 = state, kept for bare rethrow)
+        Node cc = s.b;
+        if (cc != null && cc.sval != null && cc.sval != "") {
+            int ci = LocalIdx(cc.sval);
+            if (ci >= 0) { StoreLocal(ci, 0); }
+        }
+        if (cc != null) { GenStmt(cc.a); }
+        Mark(endL);
+        AddSPImm(32, true);                          // pop saved top + state
+    }
+
+    void EhRestoreTop() {
+        LdrU(1, 31, 16);                             // state (pushed first: [sp+16])
+        LdrU(3, 31, 0);                              // saved top
+        StrU(3, 1, 0);                               // state->top = saved
+    }
+
+    void GenThrow(Node s) {
+        if (s.a != null) {
+            GenExpr(s.a);
+            E4(0xF81F0FE0);                          // push exc string
+            BLInternal("_zan_rt_eh_state");          // x0 = state
+            MovRR(1, 0);
+            LdrU(2, 31, 0);                          // exc string
+            StrU(2, 1, 8);                           // state->exc = str
+        } else {
+            // bare rethrow: exc is already set by the original throw
+            BLInternal("_zan_rt_eh_state");
+            MovRR(1, 0);
+        }
+        LdrU(2, 1, 0);                               // top
+        CbzReg(2, NL());
+        int uncaught = lblPos.Count - 1;
+        SubImm(2, 2, 1);                             // top - 1
+        LoadImm(3, 1024);
+        E4(0x9B037C42);                              // mul x2, x2, x3
+        AddRR(2, 1, 2);
+        AddImm(2, 2, 16);                            // &bufs[top-1]
+        MovRR(0, 2);
+        LoadImm(1, 1);
+        BLExtern("_longjmp");
+        Mark(uncaught);
+        // no active try: print the exception and exit(1)
+        LdrU(0, 1, 8);
+        BLInternal("_zan_rt_println");
+        LoadImm(0, 1);
+        BLExtern("_exit");
+    }
+
     // ---- labels ----
     int NL() { lblPos.Add(-1); nlabel = nlabel + 1; return nlabel - 1; }
     void Mark(int l) { lblPos[l] = txt.Count; }
@@ -634,6 +747,10 @@ partial class Ngen {
         E4(0xB4000000 | reg);
         fixups.Add(new Fixup(txt.Count - 4, 1, label, 0, null));
     }
+    void EmitCbnz(int reg, int label) {
+        E4(0xB5000000 | reg);
+        fixups.Add(new Fixup(txt.Count - 4, 1, label, 0, null));
+    }
     void BLInternal(string sym) { E4(0x94000000); fixups.Add(new Fixup(txt.Count - 4, 3, 0, 0, sym)); }
     void BLExtern(string sym) { E4(0x94000000); fixups.Add(new Fixup(txt.Count - 4, 4, 0, 0, sym)); }
 
@@ -675,17 +792,22 @@ partial class Ngen {
             if (f.kind == 0) {
                 // B: opcode occupies the top 6 bits, imm26 the rest
                 int imm = (lblPos[f.lbl] - f.pos) / 4;
-                word = (word / 67108864) * 67108864 + ModLow(imm, 26);
+                word = (ByteAt(word, 3) / 4) * 67108864 + ModLow(imm, 26);
             } else if (f.kind == 1 || f.kind == 2) {
-                // CBZ / B.cond: imm19 at bits 23..5; low byte (Rt / cond) kept
+                // CBZ / B.cond: imm19 at bits 23..5; low byte (Rt / cond) kept.
+                // The word is negative (top byte >= 0x80), so the low 5 bits
+                // must come from ByteAt -- (word - (word/32)*32) breaks on
+                // truncating division for negatives.
                 int imm = (lblPos[f.lbl] - f.pos) / 4;
+                int lo = ByteAt(word, 0);
+                lo = lo - (lo / 32) * 32;
                 word = (ByteAt(word, 3) << 24) | (ByteAt(word, 2) << 16)
                      | (ModLow(imm, 19) << 5)
-                     | (word - (word / 32) * 32);
+                     | lo;
             } else if (f.kind == 3) {
                 // internal BL: same layout as B
                 int imm = (SymPos(f.sym) - f.pos) / 4;
-                word = (word / 67108864) * 67108864 + ModLow(imm, 26);
+                word = (ByteAt(word, 3) / 4) * 67108864 + ModLow(imm, 26);
             } else {
                 // extern BL: imm26 stays zero, resolved by relocation
             }
