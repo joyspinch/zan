@@ -1100,6 +1100,16 @@ partial class Ngen {
                 Mark(cont);
                 E4(0xF8207882);                      // str x2, [x4, x0, lsl #3]
             } else if (e.a != null && e.a.kind == AK.MemberAccess()) {
+                // class-qualified static write: Program.starting = v
+                if (e.a.a != null && e.a.a.kind == AK.Ident()) {
+                    string ssym = FindStaticSym(e.a.a.sval, e.a.sval);
+                    if (ssym != null) {
+                        GenExpr(e.b);                        // value -> x0
+                        LoadSymRef(ssym, 1);                 // x1 = &slot
+                        StrU(0, 1, 0);
+                        return;
+                    }
+                }
                 Fld f = FieldOf(e.a);
                 if (f == null) {
                     diags.Error("ngen: unknown field '" + e.a.sval + "'", e.line, e.col);
@@ -1114,6 +1124,8 @@ partial class Ngen {
             }
         } else if (k == AK.NewExpr()) {
             GenNew(e);
+        } else if (k == AK.IsExpr()) {
+            GenIs(e);
         } else if (k == AK.Call()) {
             GenCall(e);
         } else if (k == AK.Conditional()) {
@@ -1178,6 +1190,13 @@ partial class Ngen {
         LoadImm(0, c.size + 16);
         LoadImm(1, 0);
         BLInternal("_zan_rt_alloc");
+        // stamp the runtime class site into the upper half of obj-8 (the
+        // descriptor slot, 0 for plain news) so `x is T` can identify the
+        // object's class later
+        RtLdur(1, 0, -8);                                // ldur x1, [x0, #-8]
+        E4((int)(0xD2C00000 | (((long)c.site) << 5) | 2)); // movz x2, #site, lsl #32
+        E4(0xAA020021);                                  // orr x1, x1, x2
+        RtStur(1, 0, -8);                                // stur x1, [x0, #-8]
         E4(0xF81F0FE0);                                  // str x0, [sp, #-16]! (obj)
         int i = 0;
         while (i < e.kids.Count) {
@@ -1218,22 +1237,145 @@ partial class Ngen {
         if (e == null) { return null; }
         if (e.kind == AK.ThisExpr()) { return curCls; }
         if (e.kind == AK.NewExpr()) { return e.type != null ? e.type.sval : null; }
+        if (e.kind == AK.Call() && e.a != null) {
+            // method results carry a class identity when the method's
+            // declared return type names one (ChartOption.Create().x)
+            return ClassTyOf(MethRetTy(e.a.sval));
+        }
         if (e.kind == AK.Ident()) {
-            int li = LocalIdx(e.sval);
-            if (li >= 0 && locTy[li] != null && locTy[li] != "") {
-                string t = locTy[li];
-                if (t != "int" && t != "string" && t != "bool" && t != "void") {
-                    // generic instantiations behave as their open type here
-                    if (t.Length > 5 && t.Substring(0, 5) == "List<") { return "List"; }
-                    // primitive arrays carry no class identity
-                    if (IsArrTy(t) && (t == "int[]" || t == "long[]" || t == "ulong[]"
-                            || t == "double[]" || t == "string[]" || t == "bool[]"
-                            || t == "char[]")) { return null; }
-                    return t;
-                }
-            }
+            return ClassTyOf(NamedSlotTy(e.sval));
         }
         return null;
+    }
+
+    // normalize a declared type name to its class identity ("List<string>"
+    // behaves as its open type; primitive arrays carry none), else null
+    string ClassTyOf(string t) {
+        if (t == null || t == "" || t == "int" || t == "string" || t == "bool"
+                || t == "void" || t == "char" || t == "double" || t == "long"
+                || t == "ulong") { return null; }
+        if (t.Length > 5 && t.Substring(0, 5) == "List<") { return "List"; }
+        if (IsArrTy(t) && (t == "int[]" || t == "long[]" || t == "ulong[]"
+                || t == "double[]" || t == "string[]" || t == "bool[]"
+                || t == "char[]")) { return null; }
+        return t;
+    }
+
+    // x is T / x is null. With single inheritance the receiver's static type
+    // decides statically whenever the target is equal to or a base of it
+    // (any instance of the receiver is then also a T, so only null fails).
+    // When the receiver's type is a strict base of T the object's runtime
+    // class has to be consulted via the site stamped by 'new'; unrelated
+    // static types answer false, like gen0.
+    void GenIs(Node e) {
+        if (e.type == null) {                            // `x is null`
+            GenExpr(e.a);
+            E4(0xEB1F001F);                              // cmp x0, xzr
+            E4(0x9A9F17E0);                              // cset x0, eq
+            return;
+        }
+        string tt = e.type.sval;
+        string st = StaticTyOf(e.a);
+        Cls tc = FindClass(tt);
+        if (tc == null) {
+            // non-class target: strings and value types are decided by the
+            // static types alone
+            if (tt == "string" && st == "string") {
+                GenExpr(e.a);
+                E4(0xEB1F001F);                          // cmp x0, xzr
+                E4(0x9A9F07E0);                          // cset x0, ne
+            } else if (st != null && st == tt) {
+                LoadImm(0, 1);                           // same value type: always
+            } else {
+                LoadImm(0, 0);
+            }
+            return;
+        }
+        string sc = ClassTyOf(st);
+        if (sc == null) {
+            // a string can never hold a class instance; anything else with
+            // no class identity cannot either
+            LoadImm(0, 0);
+            return;
+        }
+        GenExpr(e.a);                                    // x0 = receiver
+        if (sc == tt || DerivesFrom(sc, tt)) {
+            E4(0xEB1F001F);                              // cmp x0, xzr
+            E4(0x9A9F07E0);                              // cset x0, ne
+            return;
+        }
+        if (DerivesFrom(tt, sc)) {
+            GenIsSite(tc);
+            return;
+        }
+        LoadImm(0, 0);
+    }
+
+    // runtime site check for `x is T` with the object in x0: extract the
+    // site from obj-8's upper half and compare against T's site set (T and
+    // every class deriving from it)
+    void GenIsSite(Cls c) {
+        int zeroL = NL();
+        int foundL = NL();
+        int endL = NL();
+        CbzReg(0, zeroL);                                // null -> false
+        RtLdur(1, 0, -8);                                // ldur x1, [x0, #-8]
+        E4(0xD360FC21);                                  // lsr x1, x1, #32 (site)
+        int i = 0;
+        while (i < classes.Count) {
+            Cls cc = classes[i];
+            if (cc.site > 0 && DerivesFrom(cc.name, c.name)) {
+                LoadImm(2, cc.site);
+                E4(0xEB02003F);                          // cmp x1, x2
+                EmitBcond(0, foundL);                    // b.eq
+            }
+            i = i + 1;
+        }
+        Mark(zeroL);
+        LoadImm(0, 0);
+        EmitB(endL);
+        Mark(foundL);
+        LoadImm(0, 1);
+        Mark(endL);
+    }
+
+    // declared static type name of an expression (before class identity
+    // normalization), or null when nothing is known
+    string StaticTyOf(Node e) {
+        if (e == null) { return null; }
+        if (e.kind == AK.ThisExpr()) { return curCls; }
+        if (e.kind == AK.NewExpr()) { return e.type != null ? e.type.sval : null; }
+        if (e.kind == AK.CastExpr() && e.type != null) { return e.type.sval; }
+        if (e.kind == AK.Ident()) { return NamedSlotTy(e.sval); }
+        if (e.kind == AK.Call()) { return MethRetTy(e.a != null ? e.a.sval : null); }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            return f != null ? f.ty : null;
+        }
+        return null;
+    }
+
+    // true when sub's base chain reaches anc (equal counts)
+    bool DerivesFrom(string sub, string anc) {
+        if (sub == null || anc == null) { return false; }
+        string cur = sub;
+        while (cur != null) {
+            if (cur == anc) { return true; }
+            Cls cc = FindClass(cur);
+            if (cc == null) { return false; }
+            cur = cc.baseName;
+        }
+        return false;
+    }
+
+    // declared type of a local, field or static of that name (locals shadow
+    // fields shadow statics, matching the binder's lookup order)
+    string NamedSlotTy(string name) {
+        int li = LocalIdx(name);
+        if (li >= 0) { return locTy[li]; }
+        Fld f = CurField(name);
+        if (f != null) { return f.ty; }
+        return FindStaticTy(curCls, name);
     }
 
     // full type name including one generic argument ("List<string>")
