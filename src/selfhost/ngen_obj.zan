@@ -82,8 +82,11 @@ partial class Ngen {
 
     Fld FindField(Cls c, string n) {
         if (c == null) { return null; }
-        int i = 0;
-        while (i < c.flds.Count) { if (c.flds[i].name == n) { return c.flds[i]; } i = i + 1; }
+        // most-derived declaration wins: a derived field may hide a base
+        // field of the same name (field_hiding), and the layout appends the
+        // derived declarations after the base prefix
+        int i = c.flds.Count - 1;
+        while (i >= 0) { if (c.flds[i].name == n) { return c.flds[i]; } i = i - 1; }
         return null;
     }
 
@@ -372,6 +375,8 @@ partial class Ngen {
         RtEmitAlloc();
         RtEmitStrAlloc();
         RtEmitStrCat2();
+        RtEmitStrlen0();
+        RtEmitStrcmp0();
         RtEmitPrintInt();
         RtEmitPrintln();
         RtEmitInt2Str();
@@ -896,10 +901,10 @@ partial class Ngen {
         RtStur(0, 29, -96);       // a
         RtStur(1, 29, -80);       // b
         RtLdur(0, 29, -96);
-        BLExtern("_strlen");
+        BLInternal("_zan_rt_strlen0");
         RtStur(0, 29, -64);       // l1
         RtLdur(0, 29, -80);
-        BLExtern("_strlen");
+        BLInternal("_zan_rt_strlen0");
         RtStur(0, 29, -48);       // l2
         // memcpy(buf, a, l1) -- buf allocated after lengths so total is known
         RtLdur(0, 29, -64);       // l1
@@ -940,6 +945,51 @@ partial class Ngen {
         RtEpilogue();
     }
 
+    // i64 _zan_rt_strlen0(ptr s): null-safe strlen -- a null string acts as
+    // the empty string, like gen0's probes ("abc" + null, concat of nulls)
+    void RtEmitStrlen0() {
+        syms.Add(new Sym("_zan_rt_strlen0", txt.Count));
+        RtPrologue();
+        CbzReg(0, NL());
+        int nul = lblPos.Count - 1;
+        BLExtern("_strlen");
+        RtEpilogue();
+        Mark(nul);
+        LoadImm(0, 0);
+        RtEpilogue();
+    }
+
+    // i64 _zan_rt_strcmp0(ptr a, ptr b): null-safe strcmp -- null equals
+    // null and sorts before every string (gen0 parity for ==, <, ...)
+    void RtEmitStrcmp0() {
+        syms.Add(new Sym("_zan_rt_strcmp0", txt.Count));
+        RtPrologue();
+        RtStur(0, 29, -16);                  // a
+        RtStur(1, 29, -24);                  // b
+        RtLdur(0, 29, -16);
+        CbzReg(0, NL());
+        int aNull = lblPos.Count - 1;
+        RtLdur(0, 29, -24);
+        CbzReg(0, NL());
+        int bNull = lblPos.Count - 1;
+        RtLdur(0, 29, -16);
+        RtLdur(1, 29, -24);
+        BLExtern("_strcmp");
+        RtEpilogue();
+        Mark(aNull);
+        RtLdur(0, 29, -24);
+        CbzReg(0, NL());
+        int bothNull = lblPos.Count - 1;
+        LoadImm(0, -1);                      // a null, b non-null: a < b
+        RtEpilogue();
+        Mark(bothNull);
+        LoadImm(0, 0);                       // both null: equal
+        RtEpilogue();
+        Mark(bNull);
+        LoadImm(0, 1);                       // b null, a non-null: a > b
+        RtEpilogue();
+    }
+
     // void zan_rt_print_int(i64 v) -- printf("%lld\n", v on stack)
     void RtEmitPrintInt() {
         syms.Add(new Sym("_zan_rt_print_int", txt.Count));
@@ -967,6 +1017,40 @@ partial class Ngen {
     // new List<T>(): alloc 24+16 (calloc-zeroed count), cap = 8,
     // data = calloc(8, 8) -- mirrors gen0's collection initializer
     void GenListNew(Node e) {
+        // copy constructor: `new List<T>(src)` clones count/cap and copies
+        // the slot array (shallow: class elements share instances, gen0
+        // parity; the copy is independent of later Add on either side)
+        if (e != null && e.ival != 2 && e.kids.Count == 1
+                && ExprCls(e.kids[0]) == "List") {
+            GenExpr(e.kids[0]);                          // x0 = src
+            E4(0xF81F0FE0);                              // push src
+            LoadImm(0, 24 + 16);
+            LoadImm(1, 0);
+            BLInternal("_zan_rt_alloc");                 // x0 = obj
+            E4(0xF81F0FE0);                              // push obj
+            LdrU(1, 31, 16);                             // x1 = src
+            LdrU(2, 1, 0);                               // src->count
+            StrU(2, 0, 0);                               // obj->count
+            LdrU(2, 1, 8);                               // src->cap
+            StrU(2, 0, 8);                               // obj->cap
+            MovRR(0, 2);                                 // x0 = cap
+            LoadImm(1, 8);
+            BLExtern("_calloc");                         // x0 = data
+            MovRR(9, 0);                                 // x9 = data
+            LdrU(0, 31, 0);                              // x0 = obj
+            StrU(9, 0, 16);                              // obj->data = data
+            MovRR(0, 9);                                 // dst
+            LdrU(1, 31, 16);                             // x1 = src
+            LdrU(1, 1, 16);                              // src->data
+            LdrU(2, 31, 0);                              // x2 = obj
+            LdrU(2, 2, 0);                               // count
+            LoadImm(3, 8);
+            E4(0x9B037C42);                              // mul x2, x2, x3
+            BLExtern("_memcpy");                         // copy the slots
+            LdrU(0, 31, 0);                              // x0 = obj (result)
+            AddSPImm(32, true);                          // pop obj + src
+            return;
+        }
         LoadImm(0, 24 + 16);
         LoadImm(1, 0);
         BLInternal("_zan_rt_alloc");

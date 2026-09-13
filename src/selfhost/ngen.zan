@@ -73,6 +73,7 @@ partial class Ngen {
     int guardArrOvf;
     int guardArrFail;
     int guardArrNull;
+    int guardStrNull;
     string srcFile;
 
     List<Node> methNodes;
@@ -147,6 +148,7 @@ partial class Ngen {
         guardArrOvf = InternStr("array allocation overflow\n");
         guardArrFail = InternStr("array allocation failed\n");
         guardArrNull = InternStr("null reference where an array is required (.Length)\n");
+        guardStrNull = InternStr("null reference where a string is required\n");
         if (FindStatic("Main") == null) {
             diags.Error("ngen: no static Main() found", 0, 0);
             return txt;
@@ -179,10 +181,14 @@ partial class Ngen {
                 methStat.Add(HasMod(m, MOD.Static()) ? 1 : 0);
             }
             if (m.kind == AK.CtorDecl()) {
-                hasCtor = true;
+                // `static T()` is a type initializer (methStat 3), not a
+                // constructor: it takes no `this`, is never selected by
+                // `new T(...)`, and runs once at program entry in
+                // declaration order (gen0 parity)
+                if (!HasMod(m, MOD.Static())) { hasCtor = true; }
                 methNodes.Add(m);
                 methCls.Add(cls.sval);
-                methStat.Add(2);
+                methStat.Add(HasMod(m, MOD.Static()) ? 3 : 2);
             }
             i = i + 1;
         }
@@ -481,7 +487,10 @@ partial class Ngen {
         syms.Add(new Sym("_main", txt.Count));
         E4(0xA9BF7BFD);                                  // stp x29, x30, [sp, #-16]! (save lr: bl below clobbers it)
         BLInternal("_zan_rt_strpool_init");              // stamp literals first
-        // static field initializers run before Main, in declaration order
+        // static field initializers run before Main, in declaration order,
+        // then each `static T()` type initializer in declaration order (gen0
+        // parity: entry-time runs give the same observable order for a
+        // single-file program and avoid a per-type guard on static access)
         int si2 = 0;
         while (si2 < sfInitCls.Count) {
             curCls = sfInitCls[si2];
@@ -489,6 +498,11 @@ partial class Ngen {
             LoadSymRef(sfInitSym[si2], 9);
             StrU(0, 9, 0);
             si2 = si2 + 1;
+        }
+        int ci3 = 0;
+        while (ci3 < methStat.Count) {
+            if (methStat[ci3] == 3) { BLInternal("_" + methCls[ci3] + "_cctor"); }
+            ci3 = ci3 + 1;
         }
         curCls = mainCls;
         BLInternal("_" + mainCls + "_Main");
@@ -499,9 +513,11 @@ partial class Ngen {
 
     void EmitMethod(string cls, Node m, int mi) {
         curCls = cls;
-        bool inst = methStat[mi] != 1;
+        bool inst = methStat[mi] == 0 || methStat[mi] == 2;
         if (methStat[mi] == 2) {
             syms.Add(new Sym(CtorSymNg(cls, m), txt.Count));
+        } else if (methStat[mi] == 3) {
+            syms.Add(new Sym("_" + cls + "_cctor", txt.Count));
         } else {
             syms.Add(new Sym(MethSymNg(cls, m), txt.Count));
         }
@@ -778,6 +794,8 @@ partial class Ngen {
     void GenForeach(Node s) {
         Node coll = s.b;
         bool isArr = IsArrExpr(coll);
+        // strings iterate as chars: the length header and byte loads
+        bool isStr = !isArr && IsStrExpr(coll);
         int esz = isArr ? ArrElemSize(ArrTyOf(coll)) : 8;
         int elemVar = LocalIdx(s.sval);
         int idxVar = LocalIdx("#fei");
@@ -790,6 +808,10 @@ partial class Ngen {
         E4(0xF81F0FE0);                              // push coll
         if (isArr) {
             E4(0xF85F0002);                          // ldur x2, [x0, #-16] (len)
+        } else if (isStr) {
+            E4(0xD1002002);                          // sub x2, x0, #8
+            E4(0xF9400042);                          // ldr x2, [x2]
+            E4(0xD3407C42);                          // ubfm x2, x2, #0, #31
         } else {
             LdrU(2, 0, 0);                           // x2 = count
         }
@@ -803,6 +825,9 @@ partial class Ngen {
         } else if (isArr) {
             E4(0xF84107E2);                          // pop coll -> x2
             E4(0xF8607840);                          // ldr x0, [x2, x0, lsl #3]
+        } else if (isStr) {
+            E4(0xF84107E2);                          // pop coll -> x2
+            E4(0x38606840);                          // ldrb w0, [x2, x0]
         } else {
             LdrU(3, 31, 0);                          // x3 = coll (stack slot)
             LdrU(3, 3, 16);                          // x3 = data
@@ -977,11 +1002,26 @@ partial class Ngen {
             }
             else if (e.sval == "Length" && IsStrExpr(e.a)) {
                 // gen0 probes the SNAZ header: length lives in the low 32
-                // bits of the i64 at s-8
+                // bits of the i64 at s-8; a null string reports and answers 0
                 GenExpr(e.a);
+                int bads = NL();
+                int conts = NL();
+                int dones = NL();
+                CbzReg(0, bads);
+                EmitB(conts);
+                Mark(bads);
+                LoadSymRef("l_.str." + guardFileIdx, 0);
+                LoadImm(1, curLine);
+                LoadImm(2, curCol);
+                LoadSymRef("l_.str." + guardStrNull, 3);
+                BLExtern("_zan_rt_guard_fail3");
+                LoadImm(0, 0);
+                EmitB(dones);
+                Mark(conts);
                 E4(0xD1002009);                      // sub x9, x0, #8
                 E4(0xF9400120);                      // ldr x0, [x9]
                 E4(0xD3407C00);                      // ubfm x0, x0, #0, #31
+                Mark(dones);
             }
             else if (e.a != null && e.a.kind == AK.Ident()
                     && FindEnumMemIdx(e.a.sval, e.sval) >= 0) {
@@ -1043,10 +1083,28 @@ partial class Ngen {
                 E4(0xF81F0FE0);                      // push a
                 GenExpr(e.b);
                 E4(0xF84107E1);                      // pop a -> x1 (x0 = b)
-                BLExtern("_strcmp");                 // w0 = 0 iff equal
+                BLInternal("_zan_rt_strcmp0");       // w0 = 0 iff equal
                 E4(0x7100001F);                      // cmp w0, #0
                 if (e.op == TK.EqEq()) { E4(0x9A9F17E0); }   // cset x0, eq
                 else { E4(0x9A9F07E0); }                     // cset x0, ne
+            } else if (IsStrExpr(e.a) && IsStrExpr(e.b)
+                    && (e.op == TK.Less() || e.op == TK.LessEq()
+                     || e.op == TK.Greater() || e.op == TK.GreaterEq())) {
+                // relational string comparison: strcmp order, not pool
+                // addresses (gen0 parity); null sorts before every string
+                GenExpr(e.a);
+                E4(0xF81F0FE0);                      // push a
+                GenExpr(e.b);
+                E4(0xF84107E1);                      // pop a -> x1 (x0 = b)
+                E4(0xAA0003E9);                      // mov x9, x0
+                E4(0xAA0103E0);                      // mov x0, x1
+                E4(0xAA0903E1);                      // mov x1, x9
+                BLInternal("_zan_rt_strcmp0");       // w0 = strcmp(a, b)
+                E4(0x7100001F);                      // cmp w0, #0
+                if (e.op == TK.Less()) { E4(0x9A9FA7E0); }          // cset x0, lt
+                else if (e.op == TK.LessEq()) { E4(0x9A9FC7E0); }   // cset x0, le
+                else if (e.op == TK.Greater()) { E4(0x9A9FD7E0); }  // cset x0, gt
+                else { E4(0x9A9FB7E0); }                            // cset x0, ge
             } else if (IsDblExpr(e.a) || IsDblExpr(e.b)) {
                 // double arithmetic/comparison: values travel as i64 bit
                 // patterns in x0; the op materialises d-regs, coercing int
@@ -1313,21 +1371,36 @@ partial class Ngen {
         } else if (k == AK.Index()) {
             if (IsStrExpr(e.a)) {
                 // char access: bounds-checked byte load (gen0 reports the
-                // same guard message and continues with index 0)
+                // same guard message and continues with index 0); a null
+                // base reports too and answers 0 like the zeroed scratch
                 GenExpr(e.a);
                 E4(0xF81F0FE0);                      // push s
                 GenExpr(e.b);
                 E4(0xF84107E1);                      // pop s -> x1 (x0 = idx)
+                int bad = NL();
+                int ldok = NL();
+                int done = NL();
+                int nulls = NL();
+                CbzReg(1, nulls);                    // null base
+                EmitB(ldok);
+                Mark(nulls);
+                LoadSymRef("l_.str." + guardFileIdx, 0);
+                LoadImm(1, e.line);
+                LoadImm(2, e.col);
+                LoadSymRef("l_.str." + guardStrNull, 3);
+                BLExtern("_zan_rt_guard_fail3");
+                LoadImm(0, 0);
+                EmitB(done);
+                Mark(ldok);
                 E4(0xD1002022);                      // sub x2, x1, #8
                 E4(0xF9400042);                      // ldr x2, [x2]
                 E4(0xD3407C42);                      // ubfm x2, x2, #0, #31 (len)
-                int bad = NL();
-                int cont = NL();
                 E4(0xEB02001F);                      // cmp x0, x2
                 EmitBcond(10, bad);                  // b.ge bad
                 E4(0xEB1F001F);                      // cmp x0, xzr
                 EmitBcond(11, bad);                  // b.lt bad
-                EmitB(cont);
+                E4(0x38606820);                      // ldrb w0, [x1, x0]
+                EmitB(done);
                 Mark(bad);
                 E4(0xF81F0FE1);                      // keep s across the call
                 LoadSymRef("l_.str." + guardFileIdx, 0);
@@ -1337,8 +1410,7 @@ partial class Ngen {
                 BLExtern("_zan_rt_guard_fail3");
                 E4(0xF84107E1);                      // pop s
                 LoadImm(0, 0);                       // safe index
-                Mark(cont);
-                E4(0x38606820);                      // ldrb w0, [x1, x0]
+                Mark(done);
             } else if (ArrContainerTy(e.a) != null) {
                 // array element get: len = i64 at arr-16; a bad index reports
                 // and continues with index 0 (gen0 parity). int[] stores i32.
@@ -2206,7 +2278,12 @@ partial class Ngen {
         if (e.kind == AK.Conditional()) { return IsStrExpr(e.b) && IsStrExpr(e.c); }
         if (e.kind == AK.MemberAccess()) {
             Fld f = FieldOf(e);
-            return f != null && f.ty == "string";
+            if (f != null && f.ty == "string") { return true; }
+            // class-qualified static field (`Registry.tag`)
+            if (e.a != null && e.a.kind == AK.Ident()) {
+                return FindStaticTy(e.a.sval, e.sval) == "string";
+            }
+            return false;
         }
         if (e.kind == AK.Ident()) {
             int li = LocalIdx(e.sval);
