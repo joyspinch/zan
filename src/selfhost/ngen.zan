@@ -48,6 +48,9 @@ partial class Ngen {
     List<string> strs;      // __cstring entries
     List<int> lblPos;       // label id -> text pos (-1 while open)
     List<int> brkL;         // innermost-enclosing-loop break targets
+    List<Node> finBodies;   // enclosing try/finally bodies, innermost last
+    List<int> finInHandler; // 1 once that try's frame is conceptually disarmed
+    int finCur = -1;        // index of the finally body being emitted right now
     List<int> cntL;         // innermost-enclosing-loop continue targets
 
     string curCls;
@@ -93,6 +96,8 @@ partial class Ngen {
         strs = new List<string>();
         lblPos = new List<int>();
         brkL = new List<int>();
+        finBodies = new List<Node>();
+        finInHandler = new List<int>();
         cntL = new List<int>();
         methNodes = new List<Node>();
         methCls = new List<string>();
@@ -644,18 +649,21 @@ partial class Ngen {
                 ReserveLocals(s.c);
             } else if (s.kind == AK.TryStmt()) {
                 ReserveLocals(s.a);
-                if (s.b != null) {
-                    if (s.b.sval != null && s.b.sval != "") {
-                        locName.Add(s.b.sval);
+                Node cc2 = s.b;
+                while (cc2 != null) {
+                    if (cc2.sval != null && cc2.sval != "") {
                         // catch variable type: the declared type (string for
                         // bare throws, Exception for typed throws)
-                        if (s.b.type != null) { locTy.Add(TypeFullName(s.b.type)); }
+                        locName.Add(cc2.sval);
+                        if (cc2.type != null) { locTy.Add(TypeFullName(cc2.type)); }
                         else { locTy.Add("string"); }
                         locOff.Add(16 * nloc);
                         nloc = nloc + 1;
                     }
-                    ReserveLocals(s.b.a);
+                    ReserveLocals(cc2.a);
+                    cc2 = cc2.b;
                 }
+                ReserveLocals(s.c);
             }
             i = i + 1;
         }
@@ -694,6 +702,9 @@ partial class Ngen {
             GenExpr(s.a);
         } else if (k == AK.ReturnStmt()) {
             if (s.a != null) { GenExpr(s.a); }
+            E4(0xF81F0FE0);                          // hold the result value
+            EmitPendingFins(false);                  // C# runs every finally
+            E4(0xF84107E0);
             Epilogue();
         } else if (k == AK.IfStmt()) {
             int els = NL(); int end = NL();
@@ -742,12 +753,14 @@ partial class Ngen {
             if (brkL.Count == 0) {
                 diags.Error("ngen: break outside loop", s.line, s.col);
             } else {
+                EmitPendingFins(false);
                 EmitB(brkL[brkL.Count - 1]);
             }
         } else if (k == AK.ContinueStmt()) {
             if (cntL.Count == 0) {
                 diags.Error("ngen: continue outside loop", s.line, s.col);
             } else {
+                EmitPendingFins(false);
                 EmitB(cntL[cntL.Count - 1]);
             }
         } else if (k == AK.TryStmt()) {
@@ -3496,24 +3509,183 @@ partial class Ngen {
         EmitCbnz(0, NL());
         int catchL = lblPos.Count - 1;
         int endL = NL();
-        // ---- normal path: run the try body, then pop the frame ----
+        int finIdx = -1;
+        if (s.c != null) {
+            finBodies.Add(s.c);
+            finInHandler.Add(0);
+            finIdx = finBodies.Count - 1;
+        }
+        // ---- normal path: run the try body, disarm, then the finally ----
         GenStmt(s.a);
         EhRestoreTop();
+        if (s.c != null) {
+            finCur = finIdx;                         // a throw in the finally propagates
+            GenStmt(s.c);
+            finCur = -1;
+        }
         EmitB(endL);
         Mark(catchL);
-        // ---- thrown path: pop the frame FIRST (a throw inside the handler
-        // must unwind to the enclosing try, not re-enter this one), then bind
-        // exc to the catch variable and run the body ----
+        // ---- thrown path: disarm first (a throw from a handler or the
+        // finally must unwind to the enclosing try, not re-enter this one),
+        // then dispatch the clauses. x0 holds the in-flight exception and
+        // x2 its class site: 0 when null; a thrown string keeps its magic
+        // site, which sorts above every declared class, so a typed walk
+        // never matches it and it lands in the first clause (gen0's rule).
         EhRestoreTop();
-        LdrU(0, 1, 8);                               // exc (x1 = state, kept for bare rethrow)
-        Node cc = s.b;
-        if (cc != null && cc.sval != null && cc.sval != "") {
-            int ci = LocalIdx(cc.sval);
-            if (ci >= 0) { StoreLocal(ci, 0); }
+        if (finIdx >= 0) { finInHandler[finIdx] = 1; }
+        LdrU(0, 1, 8);                               // exc (x1 = state)
+        LoadImm(2, 0);
+        int hasObj = NL();
+        CbzReg(0, hasObj);
+        E4(0xF85F8002);                              // ldur x2, [x0, #-8] (desc)
+        E4(0xD360FC42);                              // lsr x2, x2, #32 (site)
+        Mark(hasObj);
+        int doneL = NL();
+        int noMatch = NL();
+        if (s.b == null) {
+            // no clauses at all: the exception is nobody's to handle here;
+            // the finally (if any) runs on the noMatch path, then unwinding
+            // continues
+            EmitB(noMatch);
         }
-        if (cc != null) { GenStmt(cc.a); }
+        Node cc = s.b;
+        bool first = true;
+        while (cc != null) {
+            string ctname = cc.type != null ? cc.type.sval : null;
+            Cls ctcls = ctname != null ? FindClass(ctname) : null;
+            int hitL = NL();
+            int missL = cc.b != null ? NL() : noMatch;
+            if (ctcls != null) {
+                if (first) {
+                    LoadImm(3, classes.Count);
+                    E4(0xEB03005F);                  // cmp x2, x3
+                    EmitBcond(8, hitL);              // b.hi (string/legacy site)
+                    CbzReg(0, hitL);                 // null exception object
+                }
+                List<int> msn = MatchSites(ctname);
+                int k = 0;
+                while (k < msn.Count) {
+                    LoadImm(3, msn[k]);
+                    E4(0xEB03005F);                  // cmp x2, x3
+                    EmitBcond(0, hitL);              // b.eq
+                    k = k + 1;
+                }
+                EmitB(missL);
+            }
+            // an untyped clause (or one of unknown type) catches everything
+            Mark(hitL);
+            if (cc.sval != null && cc.sval != "") {
+                int ci = LocalIdx(cc.sval);
+                if (ci >= 0) { StoreLocal(ci, 0); }
+            }
+            GenStmt(cc.a);
+            EmitB(doneL);
+            first = false;
+            if (cc.b != null) { Mark(missL); }
+            cc = cc.b;
+        }
+        Mark(doneL);
+        if (s.c != null) {
+            finCur = finIdx;                         // finally after a handled catch
+            GenStmt(s.c);
+            finCur = -1;
+        }
+        EmitB(endL);
+        Mark(noMatch);
+        if (s.c != null) {
+            // the exception leaves this try unmatched (or there was never a
+            // clause): the finally runs while it keeps unwinding
+            finCur = finIdx;
+            GenStmt(s.c);
+            finCur = -1;
+        }
+        EhRethrowNg();
         Mark(endL);
+        if (finIdx >= 0) {
+            finBodies.RemoveAt(finBodies.Count - 1);
+            finInHandler.RemoveAt(finInHandler.Count - 1);
+        }
         AddSPImm(32, true);                          // pop saved top + state
+    }
+
+    // every class site a thrown descriptor may carry for this clause to hit:
+    // the clause class itself plus every subclass, transitively
+    List<int> MatchSites(string name) {
+        List<int> r = new List<int>();
+        Cls c = FindClass(name);
+        if (c != null) { r.Add(c.site); }
+        int i = 0;
+        while (i < classes.Count) {
+            Cls t = classes[i];
+            bool hit2 = false;
+            while (t != null && t.baseName != null) {
+                if (t.baseName == name) { hit2 = true; break; }
+                t = FindClass(t.baseName);
+            }
+            if (hit2) { r.Add(classes[i].site); }
+            i = i + 1;
+        }
+        return r;
+    }
+
+    // does this subtree reference the builtin Exception class? (ctor, catch
+    // clause, cast, or any type mention -- drives the builtin synthesis)
+    bool TreeNeedsException(Node n) {
+        if (n == null) { return false; }
+        if (n.kind == AK.TypeRef() && n.sval == "Exception") { return true; }
+        if (n.kind == AK.TryStmt()) {
+            Node cc = n.b;
+            while (cc != null) {
+                if (TreeNeedsException(cc.type)) { return true; }
+                cc = cc.b;
+            }
+        }
+        if (TreeNeedsException(n.a) || TreeNeedsException(n.b)
+                || TreeNeedsException(n.c) || TreeNeedsException(n.d)
+                || TreeNeedsException(n.type)) { return true; }
+        int k = 0;
+        while (k < n.kids.Count) {
+            if (TreeNeedsException(n.kids[k])) { return true; }
+            k = k + 1;
+        }
+        return false;
+    }
+
+    // run the finally bodies this exit path leaves, innermost first. With
+    // stopAtBody, the walk stops at the first try whose body we are still
+    // inside -- its clause dispatch owns the finally. A finally never
+    // re-runs itself: while body i executes, entries at i and above are
+    // frozen (gen0's finally_count truncation).
+    void EmitPendingFins(bool stopAtBody) {
+        int i = finBodies.Count - 1;
+        while (i >= 0) {
+            if (i <= finCur) { break; }
+            if (stopAtBody && finInHandler[i] == 0) { break; }
+            if (finBodies[i] != null) {
+                int saved = finCur;
+                finCur = i;
+                ExcSave();
+                GenStmt(finBodies[i]);
+                ExcRestore();
+                finCur = saved;
+            }
+            i = i - 1;
+        }
+    }
+
+    // keep the in-flight exception across a finally body: the body may run
+    // try/catch of its own, which overwrites the stored exception
+    void ExcSave() {
+        BLInternal("_zan_rt_eh_state");
+        E4(0xF81F0FE0);                              // push state
+        LdrU(1, 31, 8);                              // exc
+        E4(0xF81F0FE1);                              // push exc
+    }
+
+    void ExcRestore() {
+        E4(0xF84107E1);                              // pop exc -> x1
+        E4(0xF84107E0);                              // pop state -> x0
+        StrU(1, 0, 8);                               // state->exc = saved
     }
 
     void EhRestoreTop() {
@@ -3525,16 +3697,32 @@ partial class Ngen {
     void GenThrow(Node s) {
         if (s.a != null) {
             GenExpr(s.a);
-            E4(0xF81F0FE0);                          // push exc string
-            BLInternal("_zan_rt_eh_state");          // x0 = state
-            MovRR(1, 0);
-            LdrU(2, 31, 0);                          // exc string
-            StrU(2, 1, 8);                           // state->exc = str
         } else {
-            // bare rethrow: exc is already set by the original throw
+            // bare rethrow: the in-flight exception stays in the state block
             BLInternal("_zan_rt_eh_state");
-            MovRR(1, 0);
+            LdrU(0, 0, 8);
         }
+        E4(0xF81F0FE0);                              // push exception value
+        // a throw leaves every try whose handler is already disarmed (we
+        // are in its catch or finally body): their finallys run here, at
+        // the throw site, before the exception goes on. The first try whose
+        // body we are still inside keeps its own -- its landing dispatch
+        // runs the finally after its clause (or before re-raising).
+        EmitPendingFins(true);
+        BLInternal("_zan_rt_eh_state");              // x0 = state
+        MovRR(1, 0);
+        LdrU(2, 31, 0);                              // exception value
+        StrU(2, 1, 8);                               // state->exc = value
+        EhRethrowNg();
+    }
+
+    // unwind one frame: longjmp into the handler below the current top; with
+    // no handler left, report and exit(1). A string exception prints its
+    // text like gen0; a class object exits without printing (gen0's uncaught
+    // note goes to stderr, which the stdout goldens never see).
+    void EhRethrowNg() {
+        BLInternal("_zan_rt_eh_state");
+        MovRR(1, 0);
         LdrU(2, 1, 0);                               // top
         CbzReg(2, NL());
         int uncaught = lblPos.Count - 1;
@@ -3547,9 +3735,20 @@ partial class Ngen {
         LoadImm(1, 1);
         BLExtern("_longjmp");
         Mark(uncaught);
-        // no active try: print the exception and exit(1)
+        LdrU(0, 1, 8);                               // exc
+        LoadImm(2, 0);
+        int isObj = NL();
+        CbzReg(0, isObj);
+        E4(0xF85F8002);                              // ldur x2, [x0, #-8] (desc)
+        E4(0xD360FC42);                              // lsr x2, x2, #32 (site)
+        Mark(isObj);
+        LoadImm(3, classes.Count);
+        E4(0xEB03005F);                              // cmp x2, x3
+        int skipPr = NL();
+        EmitBcond(9, skipPr);                        // b.ls (class object: silent)
         LdrU(0, 1, 8);
         BLInternal("_zan_rt_println");
+        Mark(skipPr);
         LoadImm(0, 1);
         BLExtern("_exit");
     }
