@@ -2663,6 +2663,17 @@ partial class Ngen {
     // (gen0 instantiates generics; ngen substitutes textually). Falls
     // back to the raw declared type whenever either side is unknown.
     string CallRetTy(Node e) {
+        // builtin ToString renders a string although no user method
+        // declares it: enum receivers do a member-name lookup and scalar
+        // receivers go through the shared renderers (GenCall's builtin
+        // branches run before user dispatch, so the type model must agree
+        // -- otherwise consumers like WriteLine see "no type" and print
+        // the returned pointer as an integer)
+        if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.sval == "ToString"
+                && e.kids != null && e.kids.Count == 0 && e.a.a != null
+                && (EnumTyOf(e.a.a) != null || ScalarToStringTy(e.a.a) != null)) {
+            return "string";
+        }
         string rty = MethRetTy(e.a != null ? e.a.sval : null);
         if (rty == null || rty == "") { return rty; }
         if (e.a == null || e.a.kind != AK.MemberAccess() || e.a.a == null) { return rty; }
@@ -3375,6 +3386,26 @@ partial class Ngen {
             }
         }
         if (scands.Count == 0) {
+            // no static candidate: an unqualified call inside an instance
+            // method may still name an instance method -- the implicit
+            // `this` receiver (gen0's rule). Rewrite the callee to
+            // this.Method and re-dispatch through the instance path.
+            List<int> tc = new List<int>();
+            if (curCls != null) { InstanceCands(curCls, callee.sval, tc); }
+            if (tc.Count > 0) {
+                Node th = new Node(AK.Ident());
+                th.sval = "this";
+                th.line = e.line;
+                th.col = e.col;
+                Node ma = new Node(AK.MemberAccess());
+                ma.a = th;
+                ma.sval = callee.sval;
+                ma.line = e.line;
+                ma.col = e.col;
+                e.a = ma;
+                GenCall(e);
+                return;
+            }
             diags.Error("ngen: unknown static method '" + callee.sval + "'", e.line, e.col);
             return;
         }
@@ -3491,13 +3522,79 @@ partial class Ngen {
             diags.Error("ngen: arity mismatch calling '" + calleeName + "'", e.line, e.col);
             return pc;
         }
+        // named arguments bind by parameter name (mirrors gen0's
+        // reorder_named_args): a named arg claims the slot of the parameter
+        // it names, then positionals fill the leftmost free slots. The
+        // rewrite only applies when the bound slots are exactly 0..prov-1
+        // -- any other shape (unknown or duplicate name, a defaulted
+        // parameter ahead of a bound one) keeps the written order and the
+        // diagnostics stand.
+        List<Node> ak = e.kids;
+        bool hasNamed = false;
+        int k = 0;
+        while (k < prov) {
+            if (e.kids[k].sval2 != null && e.kids[k].sval2 != "") { hasNamed = true; }
+            k = k + 1;
+        }
+        if (hasNamed) {
+            int slots = pc > prov ? pc : prov;
+            int[] slot = new int[slots];
+            bool[] usedName = new bool[prov];
+            k = 0;
+            while (k < slots) { slot[k] = -1; k = k + 1; }
+            k = 0;
+            while (k < prov) {
+                string an = e.kids[k].sval2;
+                if (an == null || an == "") { k = k + 1; continue; }
+                int found = -1;
+                int j = 0;
+                while (j < pc) {
+                    Node pp = ParamAt(m, j);
+                    if (pp != null && pp.sval == an) { found = j; break; }
+                    j = j + 1;
+                }
+                if (found < 0) {
+                    diags.Error("ngen: no parameter named '" + an + "' calling '" + calleeName + "'", e.line, e.col);
+                } else if (slot[found] >= 0) {
+                    diags.Error("ngen: parameter '" + an + "' is already assigned calling '" + calleeName + "'", e.line, e.col);
+                } else {
+                    slot[found] = k;
+                    usedName[k] = true;
+                }
+                k = k + 1;
+            }
+            int j2 = 0;
+            k = 0;
+            while (k < prov) {
+                if (usedName[k]) { k = k + 1; continue; }
+                while (j2 < pc && slot[j2] >= 0) { j2 = j2 + 1; }
+                if (j2 >= pc) { break; }
+                slot[j2] = k;
+                j2 = j2 + 1;
+                k = k + 1;
+            }
+            bool dense = true;
+            k = 0;
+            while (k < prov) {
+                if (slot[k] < 0 || slot[k] >= prov) { dense = false; break; }
+                k = k + 1;
+            }
+            if (dense) {
+                ak = new List<Node>();
+                k = 0;
+                while (k < prov) {
+                    ak.Add(e.kids[slot[k]]);
+                    k = k + 1;
+                }
+            }
+        }
         // whole-bundle passthrough: the single tail argument is already an
         // array value, so it is handed over as-is
-        if (variadic && prov == pc && IsArrValExpr(e.kids[prov - 1])) {
+        if (variadic && prov == pc && IsArrValExpr(ak[prov - 1])) {
             int k = 0;
             while (k < prov) {
-                GenExpr(e.kids[k]);
-                ConvArg(m, k, e.kids[k]);
+                GenExpr(ak[k]);
+                ConvArg(m, k, ak[k]);
                 E4(0xF81F0FE0);                          // str x0, [sp, #-16]!
                 k = k + 1;
             }
@@ -3505,8 +3602,8 @@ partial class Ngen {
         }
         int i = 0;
         while (i < prov && i < fixedc) {
-            GenExpr(e.kids[i]);
-            ConvArg(m, i, e.kids[i]);
+            GenExpr(ak[i]);
+            ConvArg(m, i, ak[i]);
             E4(0xF81F0FE0);                              // str x0, [sp, #-16]!
             i = i + 1;
         }
@@ -3530,8 +3627,8 @@ partial class Ngen {
             // bundle array and store them at their slots
             int j2 = fixedc;
             while (j2 < prov) {
-                GenExpr(e.kids[j2]);
-                if (elTy == "double" && !IsDblExpr(e.kids[j2])) { ConvI2D(); }
+                GenExpr(ak[j2]);
+                if (elTy == "double" && !IsDblExpr(ak[j2])) { ConvI2D(); }
                 E4(0xF81F0FE0);
                 j2 = j2 + 1;
             }
