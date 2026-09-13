@@ -23,7 +23,9 @@ class Cls {
     public string name;
     public List<Fld> flds;
     public int size;
-    public Cls(string n) { name = n; flds = new List<Fld>(); size = 0; }
+    public string baseName;  // ": Base" clause, null when none
+    public int based;        // base fields already merged into flds
+    public Cls(string n) { name = n; flds = new List<Fld>(); size = 0; baseName = null; based = 0; }
 }
 
 class DGlob {
@@ -37,6 +39,10 @@ partial class Ngen {
     List<Cls> classes;
     List<DGlob> dglbs;
     int dataLen;
+    List<string> sfNames;   // static field names
+    List<string> sfCls;     // static field declaring class
+    List<string> sfSyms;    // static field data-global symbol
+    List<string> sfTy;      // static field declared type
     int fmtiIdx;
     int fmtsIdx;
     int fmtnIdx;
@@ -68,24 +74,100 @@ partial class Ngen {
     void CollectClasses(Node unit) {
         classes = new List<Cls>();
         dglbs = new List<DGlob>();
+        sfNames = new List<string>();
+        sfCls = new List<string>();
+        sfSyms = new List<string>();
+        sfTy = new List<string>();
         dataLen = 0;
         int i = 0;
         while (i < unit.kids.Count) {
             Node dcl = unit.kids[i];
-            if (dcl.kind == AK.ClassDecl()) { CollectClass(dcl); }
+            if (dcl.kind == AK.ClassDecl() || dcl.kind == AK.StructDecl()) { CollectClass(dcl); }
             i = i + 1;
         }
+        // fold inherited instance fields into each subclass (base fields
+        // first, own fields shifted after); recursion handles chains
+        i = 0;
+        while (i < classes.Count) { MergeBaseFields(classes[i]); i = i + 1; }
+    }
+
+    void MergeBaseFields(Cls c) {
+        if (c.based != 0) { return; }
+        c.based = 1;
+        if (c.baseName == null) { return; }
+        Cls b = FindClass(c.baseName);
+        if (b == null || b == c) { return; }
+        MergeBaseFields(b);
+        int shift = b.size;
+        if (shift <= 0) { return; }
+        List<Fld> merged = new List<Fld>();
+        int k = 0;
+        while (k < b.flds.Count) { merged.Add(b.flds[k]); k = k + 1; }
+        k = 0;
+        while (k < c.flds.Count) {
+            Fld f = c.flds[k];
+            merged.Add(new Fld(f.name, f.off + shift, f.ty));
+            k = k + 1;
+        }
+        c.flds = merged;
+        c.size = c.size + shift;
+    }
+
+    // static field storage: one 8-byte data-global slot per field; lookup
+    // prefers the given class, then falls back to any (ngen dispatches by
+    // name everywhere else too)
+    string FindStaticSym(string cls, string name) {
+        if (cls != null) {
+            int i = 0;
+            while (i < sfNames.Count) {
+                if (sfNames[i] == name && sfCls[i] == cls) { return sfSyms[i]; }
+                i = i + 1;
+            }
+        }
+        int j = 0;
+        while (j < sfNames.Count) {
+            if (sfNames[j] == name) { return sfSyms[j]; }
+            j = j + 1;
+        }
+        return null;
+    }
+
+    string FindStaticTy(string cls, string name) {
+        if (cls != null) {
+            int i = 0;
+            while (i < sfNames.Count) {
+                if (sfNames[i] == name && sfCls[i] == cls) { return sfTy[i]; }
+                i = i + 1;
+            }
+        }
+        int j = 0;
+        while (j < sfNames.Count) {
+            if (sfNames[j] == name) { return sfTy[j]; }
+            j = j + 1;
+        }
+        return null;
     }
 
     void CollectClass(Node dcl) {
         Cls c = new Cls(dcl.sval);
+        c.baseName = dcl.sval2;
         int off = 0;
         int k = 0;
         while (k < dcl.kids.Count) {
             Node m = dcl.kids[k];
             if (m.kind == AK.FieldDecl() && m.type != null) {
-                c.flds.Add(new Fld(m.sval, off, m.type.sval));
-                off = off + 8;
+                if (HasMod(m, MOD.Static())) {
+                    string dn = "fld." + c.name + "." + m.sval;
+                    dglbs.Add(new DGlob(dn, 8, dataLen));
+                    dataLen = dataLen + 8;
+                    sfNames.Add(m.sval);
+                    sfCls.Add(c.name);
+                    sfSyms.Add(DGlobalSym(dn));
+                    sfTy.Add(TypeFullName(m.type));
+                } else {
+                    c.flds.Add(new Fld(m.sval, off, m.type.sval));
+                    off = off + 8;
+                }
             }
             k = k + 1;
         }
