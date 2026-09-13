@@ -34,7 +34,14 @@ class Cls {
                              // them, but containers must not adopt pointer
                              // semantics for struct elements: gen0 stores
                              // structs inline with value semantics)
-    public Cls(string n) { name = n; flds = new List<Fld>(); size = 0; baseName = null; based = 0; site = 0; isStruct = 0; }
+    public int poly;         // layout tri-state: 0 unknown, 1 polymorphic
+                             // (carries a vtable pointer at obj+0, own fields
+                             // shifted by 8), 2 known not polymorphic
+    public List<string> tps; // type-parameter names in declaration order
+                             // (Box<T> keeps ["T"]); call sites substitute
+                             // the receiver's type arguments into member
+                             // declared types
+    public Cls(string n) { name = n; flds = new List<Fld>(); size = 0; baseName = null; based = 0; site = 0; isStruct = 0; poly = 0; tps = new List<string>(); }
 }
 
 class DGlob {
@@ -96,10 +103,49 @@ partial class Ngen {
         }
         i = 0;
         while (i < classes.Count) { classes[i].site = i + 1; i = i + 1; }
+        // polymorphism layout: any virtual/override instance method in the
+        // class or an ancestor makes the whole chain polymorphic -- every
+        // instance carries a vtable pointer at obj+0 and its fields shift
+        // by 8. Decided before MergeBaseFields so a poly base's grown size
+        // is what derived fields are shifted by.
+        i = 0;
+        while (i < classes.Count) { PolyOf(classes[i]); i = i + 1; }
+        i = 0;
+        while (i < classes.Count) {
+            if (classes[i].poly == 1) { ShiftForVptr(classes[i]); }
+            i = i + 1;
+        }
         // fold inherited instance fields into each subclass (base fields
         // first, own fields shifted after); recursion handles chains
         i = 0;
         while (i < classes.Count) { MergeBaseFields(classes[i]); i = i + 1; }
+    }
+
+    int PolyOf(Cls c) {
+        if (c.poly != 0) { return c.poly; }
+        int p = ClassDeclaresVirtual(c.name) ? 1 : 0;
+        if (p == 0 && c.baseName != null) {
+            Cls b = FindClass(c.baseName);
+            if (b != null && PolyOf(b) == 1) { p = 1; }
+        }
+        c.poly = p == 1 ? 1 : 2;
+        return c.poly;
+    }
+
+    bool ClassDeclaresVirtual(string cls) {
+        int i = 0;
+        while (i < methNodes.Count) {
+            if (methStat[i] == 0 && methCls[i] == cls
+                    && (HasMod(methNodes[i], MOD.Virtual()) || HasMod(methNodes[i], MOD.Override()))) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    void ShiftForVptr(Cls c) {
+        int k = 0;
+        while (k < c.flds.Count) { c.flds[k].off = c.flds[k].off + 8; k = k + 1; }
+        c.size = c.size + 8;
     }
 
     void MergeBaseFields(Cls c) {
@@ -163,6 +209,11 @@ partial class Ngen {
         Cls c = new Cls(dcl.sval);
         c.baseName = dcl.sval2;
         if (dcl.kind == AK.StructDecl()) { c.isStruct = 1; }
+        int tk = 0;
+        while (tk < dcl.kids.Count) {
+            if (dcl.kids[tk].kind == AK.TypeParam()) { c.tps.Add(dcl.kids[tk].sval); }
+            tk = tk + 1;
+        }
         int off = 0;
         int k = 0;
         while (k < dcl.kids.Count) {
@@ -716,9 +767,37 @@ partial class Ngen {
         RtOom();
     }
 
+    // _vtinit_<Cls>: build the class's vtable once -- calloc the slot array,
+    // store each slot's effective implementation address (adrp+add materializes
+    // the text symbol at runtime, so no data relocations are needed), and
+    // publish it in the class's lazy data slot. Returns the table in x0.
+    void EmitVtInit(Cls c) {
+        syms.Add(new Sym("_vtinit_" + c.name, txt.Count));
+        RtPrologue();
+        List<string> slots = new List<string>();
+        CollectVSlotsNg(c.name, slots);
+        LoadImm(0, slots.Count * 8);
+        LoadImm(1, 1);
+        BLExtern("_calloc");
+        int okL = NL();
+        CbnzReg(0, okL);
+        RtOom();
+        Mark(okL);
+        int s = 0;
+        while (s < slots.Count) {
+            string implCls = VSlotImplCls(c.name, slots[s]);
+            Node impl = FindInstanceInCls(implCls, slots[s]);
+            LoadSymRef(MethSymNg(implCls, impl), 1);
+            StrU(1, 0, s * 8);
+            s = s + 1;
+        }
+        LoadSymRef(DGlobalSym("vt." + c.name), 9);
+        StrU(0, 9, 0);                                   // publish the table
+        RtEpilogue();
+    }
+
     // ptr zan_rt_str_alloc(i64 total): malloc'd, rc=1, magic|sentinel at raw+8
-    void RtEmitStrAlloc() {
-        syms.Add(new Sym("_zan_rt_str_alloc", txt.Count));
+    void RtEmitStrAlloc() {        syms.Add(new Sym("_zan_rt_str_alloc", txt.Count));
         RtPrologue();
         AddImm(0, 0, 16);
         BLExtern("_malloc");

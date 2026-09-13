@@ -110,6 +110,16 @@ partial class Ngen {
         }
         CollectClasses(unit);
         CollectEnums(unit);
+        // one lazy vtable slot per polymorphic class (the table itself is
+        // built by _vtinit_<Cls> at first `new`)
+        int ci = 0;
+        while (ci < classes.Count) {
+            if (classes[ci].poly == 1) {
+                dglbs.Add(new DGlob("vt." + classes[ci].name, 8, dataLen));
+                dataLen = dataLen + 8;
+            }
+            ci = ci + 1;
+        }
         EmitRtCore();
         guardDivIdx = InternStr("division by zero\n");
         guardModIdx = InternStr("division by zero (modulo)\n");
@@ -141,6 +151,11 @@ partial class Ngen {
         while (mi < methNodes.Count) {
             EmitMethod(methCls[mi], methNodes[mi], mi);
             mi = mi + 1;
+        }
+        ci = 0;
+        while (ci < classes.Count) {
+            if (classes[ci].poly == 1) { EmitVtInit(classes[ci]); }
+            ci = ci + 1;
         }
         RtEmitStrpool();
         Patch();
@@ -186,6 +201,178 @@ partial class Ngen {
             i = i + 1;
         }
         return -1;
+    }
+
+    bool IsVirtualMod(Node m) { return HasMod(m, MOD.Virtual()) || HasMod(m, MOD.Override()); }
+
+    int IndexOfStrNg(List<string> xs, string s) {
+        int i = 0;
+        while (i < xs.Count) { if (xs[i] == s) { return i; } i = i + 1; }
+        return -1;
+    }
+
+    int MethodCountNg(string cls, string name) {
+        int n = 0; int i = 0;
+        while (i < methNodes.Count) {
+            if (methStat[i] != 2 && methCls[i] == cls && methNodes[i].sval == name) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // symbol for a method (static or instance). With a single declaration
+    // the historical `_Cls_name` stands; with overloads the parameter tags
+    // are appended so two methods cannot collide (mirrors CtorSymNg)
+    string MethSymNg(string cls, Node m) {
+        if (MethodCountNg(cls, m.sval) <= 1) { return "_" + cls + "_" + m.sval; }
+        string s = "_" + cls + "_" + m.sval + "__";
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { s = s + "_" + TypeTagNg(p.type); }
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // virtual-slot names of cls, base classes first; a derived
+    // re-declaration of an inherited virtual keeps the base slot
+    void CollectVSlotsNg(string cls, List<string> slots) {
+        Cls c = FindClass(cls);
+        if (c != null && c.baseName != null) { CollectVSlotsNg(c.baseName, slots); }
+        int i = 0;
+        while (i < methNodes.Count) {
+            if (methStat[i] == 0 && methCls[i] == cls && IsVirtualMod(methNodes[i])
+                    && IndexOfStrNg(slots, methNodes[i].sval) < 0) { slots.Add(methNodes[i].sval); }
+            i = i + 1;
+        }
+    }
+
+    // slot index of `name` in the receiver's static class's vtable, or -1
+    // when the call is not virtual
+    int VSlotOf(string rc, string name) {
+        List<string> slots = new List<string>();
+        CollectVSlotsNg(rc, slots);
+        return IndexOfStrNg(slots, name);
+    }
+
+    // instance-method candidates for a call on receiver class rc, derived
+    // class first (shadowing picks the most-derived declaration)
+    void InstanceCands(string rc, string name, List<int> outIdx) {
+        string cur = rc;
+        while (cur != null) {
+            int i = 0;
+            while (i < methNodes.Count) {
+                if (methStat[i] == 0 && methCls[i] == cur && methNodes[i].sval == name) { outIdx.Add(i); }
+                i = i + 1;
+            }
+            Cls cc = FindClass(cur);
+            cur = cc != null ? cc.baseName : null;
+        }
+    }
+
+    string VSlotImplCls(string cls, string name) {
+        string cur = cls;
+        while (cur != null) {
+            int i = 0;
+            while (i < methNodes.Count) {
+                if (methStat[i] == 0 && methCls[i] == cur && methNodes[i].sval == name) { return cur; }
+                i = i + 1;
+            }
+            Cls cc = FindClass(cur);
+            cur = cc != null ? cc.baseName : null;
+        }
+        return null;
+    }
+
+    Node FindInstanceInCls(string cls, string name) {
+        int i = 0;
+        while (i < methNodes.Count) {
+            if (methStat[i] == 0 && methCls[i] == cls && methNodes[i].sval == name) { return methNodes[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // does method m admit a call with argc arguments: the exact arity, a
+    // `params` tail covering the rest, or trailing default parameters
+    // filling the gap (gen0's method_accepts_arity)
+    bool MethodAcceptsArity(Node m, int argc) {
+        int pc = ParamCount(m);
+        Node lastP = pc > 0 ? ParamAt(m, pc - 1) : null;
+        bool variadic = lastP != null && lastP.op == 1;
+        if (variadic) { return argc >= pc - 1; }
+        if (argc == pc) { return true; }
+        if (argc > pc) { return false; }
+        int j = argc;
+        while (j < pc) {
+            Node p = ParamAt(m, j);
+            if (p == null || p.b == null) { return false; }
+            j = j + 1;
+        }
+        return true;
+    }
+
+    // overload resolution among candidate method indices: exact-arity
+    // candidates outrank default-filled ones, each scored by
+    // argument/parameter type agreement (same shape as FitCtorIdx)
+    int FitPickIdx(List<int> cands, Node callNode) {
+        int argc = callNode.kids.Count;
+        int exact = -1; int exactScore = -2000000000;
+        int filled = -1; int filledScore = -2000000000;
+        int i = 0;
+        while (i < cands.Count) {
+            Node m = methNodes[cands[i]];
+            if (MethodAcceptsArity(m, argc)) {
+                int pc = ParamCount(m);
+                int score = 0;
+                bool compatible = true;
+                int j = 0;
+                while (j < argc && compatible) {
+                    if (j < pc) {
+                        Node p = ParamAt(m, j);
+                        string pt = p != null && p.type != null ? TypeFullName(p.type) : null;
+                        if (p != null && p.op == 1 && IsArrTy(pt)) {
+                            // the params tail takes every remaining argument
+                            // as an element, so it is ranked against the
+                            // element type -- comparing an element with the
+                            // array type would disqualify the only candidate
+                            // that can take the call (Calc.Sum(1, 2, 3),
+                            // gen0's method_args_score). The bundle handed
+                            // over whole stays exact.
+                            string et = pt.Substring(0, pt.Length - 2);
+                            while (j < argc) {
+                                Node ta = callNode.kids[j];
+                                string tat = StaticTyOf(ta);
+                                if (tat != null && tat == pt) {
+                                    score = score + 8;
+                                } else {
+                                    int es = ArgParamScore(ta, et);
+                                    if (es <= -100) { compatible = false; }
+                                    score = score + es;
+                                }
+                                j = j + 1;
+                            }
+                        } else {
+                            int s = ArgParamScore(callNode.kids[j], pt);
+                            if (s <= -100) { compatible = false; }
+                            score = score + s;
+                        }
+                    }
+                    j = j + 1;
+                }
+                if (compatible) {
+                    if (pc == argc) {
+                        if (score > exactScore) { exactScore = score; exact = cands[i]; }
+                    } else {
+                        if (score > filledScore) { filledScore = score; filled = cands[i]; }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        if (exact >= 0) { return exact; }
+        return filled;
     }
 
     // find a static method declared by exactly this class (Class.Method()
@@ -255,7 +442,7 @@ partial class Ngen {
             return null;
         }
         if (e.kind == AK.Call() && e.a != null) {
-            string rt = MethRetTy(e.a.sval);
+            string rt = CallRetTy(e);
             if (rt == "int" || rt == "long" || rt == "short" || rt == "byte") { return "int"; }
         }
         if (e.kind == AK.MemberAccess()) {
@@ -283,7 +470,7 @@ partial class Ngen {
         if (methStat[mi] == 2) {
             syms.Add(new Sym(CtorSymNg(cls, m), txt.Count));
         } else {
-            syms.Add(new Sym("_" + cls + "_" + m.sval, txt.Count));
+            syms.Add(new Sym(MethSymNg(cls, m), txt.Count));
         }
         locName = new List<string>();
         locTy = new List<string>();
@@ -456,6 +643,7 @@ partial class Ngen {
         } else if (k == AK.VarDecl()) {
             if (s.b != null) {
                 GenExpr(s.b);
+                if (s.type != null && TypeFullName(s.type) == "double" && !IsDblExpr(s.b)) { ConvI2D(); }
                 StoreLocal(LocalIdx(s.sval), 0);
             }
         } else if (k == AK.ExprStmt()) {
@@ -1122,7 +1310,9 @@ partial class Ngen {
                 diags.Error("ngen: unsupported index target", e.line, e.col);
             }
         } else if (k == AK.Assignment()) {
+            string tgtTy = AssignTargetTy(e.a);
             GenExpr(e.b);
+            if (tgtTy == "double" && !IsDblExpr(e.b)) { ConvI2D(); }
             if (e.a != null && e.a.kind == AK.Ident()) {
                 int li = LocalIdx(e.a.sval);
                 if (li < 0) {
@@ -1324,6 +1514,19 @@ partial class Ngen {
         E4((int)(0xD2C00000 | (((long)c.site) << 5) | 2)); // movz x2, #site, lsl #32
         E4(0xAA020021);                                  // orr x1, x1, x2
         RtStur(1, 0, -8);                                // stur x1, [x0, #-8]
+        if (c.poly == 1) {
+            // polymorphic: stamp the class's (lazily built) vtable at obj+0
+            E4(0xF81F0FE0);                              // push obj
+            LoadSymRef(DGlobalSym("vt." + cls), 9);      // x9 = &slot
+            LdrU(1, 9, 0);                               // x1 = table (0 before init)
+            int vtDone = NL();
+            CbnzReg(1, vtDone);
+            BLInternal("_vtinit_" + cls);                // x0 = table
+            MovRR(1, 0);                                 // x1 = table
+            Mark(vtDone);
+            E4(0xF84107E0);                              // pop obj -> x0
+            StrU(1, 0, 0);                               // obj->vptr = table
+        }
         E4(0xF81F0FE0);                                  // str x0, [sp, #-16]! (obj)
         // ctor arguments: provided args first, trailing defaults filled in;
         // a class without any ctor allocates bare (no call)
@@ -1404,7 +1607,7 @@ partial class Ngen {
         if (e.kind == AK.Call() && e.a != null) {
             // method results carry a class identity when the method's
             // declared return type names one (ChartOption.Create().x)
-            return ClassTyOf(MethRetTy(e.a.sval));
+            return ClassTyOf(CallRetTy(e));
         }
         if (e.kind == AK.Ident()) {
             return ClassTyOf(NamedSlotTy(e.sval));
@@ -1571,7 +1774,7 @@ partial class Ngen {
         if (e.kind == AK.CastExpr() && e.type != null) { return e.type.sval; }
         if (e.kind == AK.AsExpr() && e.type != null) { return e.type.sval; }
         if (e.kind == AK.Ident()) { return NamedSlotTy(e.sval); }
-        if (e.kind == AK.Call()) { return MethRetTy(e.a != null ? e.a.sval : null); }
+        if (e.kind == AK.Call()) { return CallRetTy(e); }
         if (e.kind == AK.MemberAccess()) {
             // EnumType.Member constants carry their enum identity
             if (e.a != null && e.a.kind == AK.Ident() && FindEnum(e.a.sval) >= 0) { return e.a.sval; }
@@ -1794,7 +1997,7 @@ partial class Ngen {
                 if (rj != null && rj.kind == AK.Ident() && rj.sval == "Convert"
                         && e.a.sval == "ToString" && e.kids.Count == 1) { return true; }
             }
-            return MethRetTy(e.a.sval) == "string";
+            return CallRetTy(e) == "string";
         }
         // List<string> element reads yield heap strings (string indexing
         // yields a char codepoint -- see IsCharExpr, not a string)
@@ -1869,7 +2072,7 @@ partial class Ngen {
                     }
                 }
             }
-            return MethRetTy(e.a.sval) == "double";
+            return CallRetTy(e) == "double";
         }
         return false;
     }
@@ -1929,7 +2132,7 @@ partial class Ngen {
             return FindStaticTy(curCls, e.sval) == "ulong";
         }
         if (e.kind == AK.Call() && e.a != null) {
-            return MethRetTy(e.a.sval) == "ulong";
+            return CallRetTy(e) == "ulong";
         }
         return false;
     }
@@ -1958,7 +2161,7 @@ partial class Ngen {
             return FindStaticTy(curCls, e.sval) == "bool";
         }
         if (e.kind == AK.Call() && e.a != null) {
-            return MethRetTy(e.a.sval) == "bool";
+            return CallRetTy(e) == "bool";
         }
         return false;
     }
@@ -1970,6 +2173,66 @@ partial class Ngen {
             i = i + 1;
         }
         return "";
+    }
+
+    // declared return type of a call with the receiver's type arguments
+    // substituted for the declaring class's type parameters: with
+    // `Box<string> b`, `b.At(i)` reads as `string`, not the bare `T`
+    // (gen0 instantiates generics; ngen substitutes textually). Falls
+    // back to the raw declared type whenever either side is unknown.
+    string CallRetTy(Node e) {
+        string rty = MethRetTy(e.a != null ? e.a.sval : null);
+        if (rty == null || rty == "") { return rty; }
+        if (e.a == null || e.a.kind != AK.MemberAccess() || e.a.a == null) { return rty; }
+        string recv = StaticTyOf(e.a.a);
+        if (recv == null) { return rty; }
+        int lt = recv.IndexOf("<");
+        if (lt <= 0 || recv.Substring(recv.Length - 1, 1) != ">") { return rty; }
+        Cls rc = FindClass(recv.Substring(0, lt));
+        if (rc == null || rc.tps.Count == 0) { return rty; }
+        List<string> targs = SplitTyArgs(recv.Substring(lt + 1, recv.Length - lt - 2));
+        return SubstTy(rty, rc.tps, targs);
+    }
+
+    // top-level comma split of a generic argument list ("Node, Box<Node>")
+    List<string> SplitTyArgs(string s) {
+        List<string> parts = new List<string>();
+        string cur = "";
+        int depth = 0;
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "<") { depth = depth + 1; }
+            else if (ch == ">") { depth = depth - 1; }
+            if (ch == "," && depth == 0) { parts.Add(cur); cur = ""; }
+            else { cur = cur + ch; }
+            i = i + 1;
+        }
+        if (cur != "") { parts.Add(cur); }
+        return parts;
+    }
+
+    // rewrite type-parameter names inside a declared type string: bare
+    // `T`, `T[]` and `Head<A, T>` forms all substitute
+    string SubstTy(string t, List<string> ps, List<string> as2) {
+        if (t == null || t == "") { return t; }
+        if (IsArrTy(t)) { return SubstTy(t.Substring(0, t.Length - 2), ps, as2) + "[]"; }
+        int lt = t.IndexOf("<");
+        if (lt > 0 && t.Substring(t.Length - 1, 1) == ">") {
+            string head = t.Substring(0, lt);
+            List<string> kids = SplitTyArgs(t.Substring(lt + 1, t.Length - lt - 2));
+            string res = SubstTy(head, ps, as2) + "<";
+            int i = 0;
+            while (i < kids.Count) {
+                if (i > 0) { res = res + ","; }
+                res = res + SubstTy(kids[i], ps, as2);
+                i = i + 1;
+            }
+            return res + ">";
+        }
+        int pi = IndexOfStrNg(ps, t);
+        if (pi >= 0) { return as2[pi]; }
+        return t;
     }
 
     void GenCall(Node e) {
@@ -2475,44 +2738,101 @@ partial class Ngen {
             }
             // static call through the class name: Cls.Method(args) -- the
             // receiver names a user class and the member is one of its
-            // static methods (e.g. Point.Of(9))
+            // static methods (e.g. Point.Of(9)); overloads resolve by fit,
+            // walking the base chain for inherited statics
             if (recv != null && recv.kind == AK.Ident() && FindClass(recv.sval) != null) {
-                int si = FindStaticInCls(recv.sval, callee.sval);
-                if (si >= 0) {
+                List<int> scands2 = new List<int>();
+                string curc2 = recv.sval;
+                while (curc2 != null) {
+                    int i5 = 0;
+                    while (i5 < methNodes.Count) {
+                        if (methStat[i5] == 1 && methCls[i5] == curc2 && methNodes[i5].sval == callee.sval) { scands2.Add(i5); }
+                        i5 = i5 + 1;
+                    }
+                    Cls cc5 = FindClass(curc2);
+                    curc2 = cc5 != null ? cc5.baseName : null;
+                }
+                if (scands2.Count == 1) {
+                    int si = scands2[0];
                     int pushed = PushCallArgs(methNodes[si], e);
                     int r = pushed - 1;
                     while (r >= 0) {
                         E4(0xF84107E0 | r);                  // ldr xr, [sp], #16
                         r = r - 1;
                     }
-                    BLInternal("_" + methCls[si] + "_" + callee.sval);
+                    BLInternal(MethSymNg(methCls[si], methNodes[si]));
+                    return;
+                }
+                if (scands2.Count > 1) {
+                    int si = FitPickIdx(scands2, e);
+                    int pushed = PushCallArgs(methNodes[si], e);
+                    int r = pushed - 1;
+                    while (r >= 0) {
+                        E4(0xF84107E0 | r);                  // ldr xr, [sp], #16
+                        r = r - 1;
+                    }
+                    BLInternal(MethSymNg(methCls[si], methNodes[si]));
                     return;
                 }
             }
-            // instance method call: x0 = receiver, x1.. = args
-            int mi = FindInstanceIdx(callee.sval);
+            // instance method call: x0 = receiver, x1.. = args. Candidates
+            // come from the receiver's static class chain (derived first) and
+            // resolve by overload fit; a virtual slot dispatches through the
+            // receiver's runtime vtable
+            string rc = ExprCls(recv);
+            List<int> icands = new List<int>();
+            if (rc != null) { InstanceCands(rc, callee.sval, icands); }
+            int mi = icands.Count > 0 ? FitPickIdx(icands, e) : FindInstanceIdx(callee.sval);
             if (mi < 0) {
                 diags.Error("ngen: unknown method '" + callee.sval + "'", e.line, e.col);
                 return;
             }
+            int vslot = rc != null ? VSlotOf(rc, callee.sval) : -1;
             GenExpr(recv);
             E4(0xF81F0FE0);                              // str x0, [sp, #-16]! (receiver)
             int pushed = PushCallArgs(methNodes[mi], e);
             int r = pushed;
             while (r >= 1) { E4(0xF84107E0 | r); r = r - 1; } // ldr xr, [sp], #16 (args reversed)
             E4(0xF84107E0);                              // ldr x0, [sp], #16 (receiver)
-            BLInternal("_" + methCls[mi] + "_" + callee.sval);
+            if (vslot >= 0) {
+                LdrU(9, 0, 0);                           // x9 = vptr
+                LdrU(9, 9, vslot * 8);                   // x9 = target fn
+                E4(0xD63F0120);                          // blr x9
+            } else {
+                BLInternal(MethSymNg(methCls[mi], methNodes[mi]));
+            }
             return;
         }
         if (callee == null || callee.kind != AK.Ident()) {
             diags.Error("ngen: unsupported call target", e.line, e.col);
             return;
         }
-        int si = FindStaticIdx(callee.sval);
-        if (si < 0) {
+        // static call: candidates from the current class chain first, then
+        // (legacy) any class declaring the bare name; overloads resolve by fit
+        List<int> scands = new List<int>();
+        string curc = curCls;
+        while (curc != null) {
+            int i2 = 0;
+            while (i2 < methNodes.Count) {
+                if (methStat[i2] == 1 && methCls[i2] == curc && methNodes[i2].sval == callee.sval) { scands.Add(i2); }
+                i2 = i2 + 1;
+            }
+            Cls cc2 = FindClass(curc);
+            curc = cc2 != null ? cc2.baseName : null;
+        }
+        if (scands.Count == 0) {
+            int i3 = 0;
+            while (i3 < methNodes.Count) {
+                if (methStat[i3] == 1 && methNodes[i3].sval == callee.sval) { scands.Add(i3); }
+                i3 = i3 + 1;
+            }
+        }
+        if (scands.Count == 0) {
             diags.Error("ngen: unknown static method '" + callee.sval + "'", e.line, e.col);
             return;
         }
+        int si = scands.Count == 1 ? scands[0] : FitPickIdx(scands, e);
+        if (si < 0) { si = scands[0]; }
         Node m = methNodes[si];
         // evaluate args left to right (defaults fill omitted trailing
         // arguments, a params tail bundles the extras), spilling each;
@@ -2523,7 +2843,7 @@ partial class Ngen {
             E4(0xF84107E0 | q);                          // ldr xq, [sp], #16
             q = q - 1;
         }
-        BLInternal("_" + methCls[si] + "_" + callee.sval);
+        BLInternal(MethSymNg(methCls[si], methNodes[si]));
     }
 
     int FindStaticIdx(string name) {
@@ -2567,6 +2887,42 @@ partial class Ngen {
         return t != null && IsArrTy(t);
     }
 
+    // int (x0) -> double (x0), in place: the value is an integer bit pattern
+    // but the destination slot carries a double
+    void ConvI2D() {
+        E4(0x9E620000);                                  // scvtf d0, x0
+        E4(0x9E660000);                                  // fmov x0, d0
+    }
+
+    // implicit int->double conversion for argument `idx` of method m when
+    // the declared parameter is double but the argument expression is not
+    void ConvArg(Node m, int idx, Node arg) {
+        Node p = ParamAt(m, idx);
+        if (p == null || p.type == null) { return; }
+        if (TypeFullName(p.type) == "double" && !IsDblExpr(arg)) { ConvI2D(); }
+    }
+
+    // declared type of an assignment target ("double", ...), or null
+    string AssignTargetTy(Node a) {
+        if (a == null) { return null; }
+        if (a.kind == AK.Ident()) {
+            int li = LocalIdx(a.sval);
+            if (li >= 0) { return locTy[li]; }
+            Fld fld = CurField(a.sval);
+            if (fld != null) { return fld.ty; }
+            return FindStaticTy(curCls, a.sval);
+        }
+        if (a.kind == AK.MemberAccess() && a.sval != null) {
+            Fld f2 = FieldOf(a);
+            if (f2 != null) { return f2.ty; }
+        }
+        if (a.kind == AK.Index() && IsArrExpr(a.a)) {
+            string at = ArrTyOf(a.a);
+            if (at != null && at.Length > 2) { return at.Substring(0, at.Length - 2); }
+        }
+        return null;
+    }
+
     // evaluate call arguments left to right, spilling each onto the stack;
     // omitted trailing arguments fall back to the callee's default parameter
     // values, and a `params T[]` tail bundles every extra argument into a
@@ -2594,6 +2950,7 @@ partial class Ngen {
             int k = 0;
             while (k < prov) {
                 GenExpr(e.kids[k]);
+                ConvArg(m, k, e.kids[k]);
                 E4(0xF81F0FE0);                          // str x0, [sp, #-16]!
                 k = k + 1;
             }
@@ -2602,6 +2959,7 @@ partial class Ngen {
         int i = 0;
         while (i < prov && i < fixedc) {
             GenExpr(e.kids[i]);
+            ConvArg(m, i, e.kids[i]);
             E4(0xF81F0FE0);                              // str x0, [sp, #-16]!
             i = i + 1;
         }
@@ -2612,17 +2970,21 @@ partial class Ngen {
                 return i;
             }
             GenExpr(p.b);
+            ConvArg(m, i, p.b);
             E4(0xF81F0FE0);
             i = i + 1;
         }
         if (variadic) {
             int esz = ArrElemSize(TypeFullName(lastP.type));
+            string elTy = TypeFullName(lastP.type);
+            elTy = elTy.Length > 2 ? elTy.Substring(0, elTy.Length - 2) : elTy;
             int n = prov > fixedc ? prov - fixedc : 0;
             // spill the tail elements left to right, then allocate the
             // bundle array and store them at their slots
             int j2 = fixedc;
             while (j2 < prov) {
                 GenExpr(e.kids[j2]);
+                if (elTy == "double" && !IsDblExpr(e.kids[j2])) { ConvI2D(); }
                 E4(0xF81F0FE0);
                 j2 = j2 + 1;
             }
@@ -2693,12 +3055,27 @@ partial class Ngen {
         return s;
     }
 
+    // is pt a concrete type ngen can score by: a primitive, List<...>, a
+    // declared class/struct, or an array of one of those. Anything else --
+    // an open generic's type parameter like Box<T>'s `T` -- has no family
+    // to rank by and must stay neutral, never disqualify (gen0 scores
+    // FAM_UNKNOWN as 0; a bare T matches anything).
+    bool KnownParamTy(string pt) {
+        if (pt == "int" || pt == "long" || pt == "ulong" || pt == "double"
+                || pt == "bool" || pt == "char" || pt == "string"
+                || pt == "object" || pt == "void") { return true; }
+        if (pt == "List" || (pt.Length > 5 && pt.Substring(0, 5) == "List<")) { return true; }
+        if (IsArrTy(pt)) { return KnownParamTy(pt.Substring(0, pt.Length - 2)); }
+        return FindClass(pt) != null;
+    }
+
     // how well one argument fits one parameter type: exact static/literal
     // agreement scores high, a known literal/type mismatch disqualifies the
     // candidate, anything unknown is neutral. gen0 resolves ctor overloads
     // with full type scoring; ngen sees the declared types and literals.
     int ArgParamScore(Node arg, string pt) {
         if (pt == null || pt == "") { return 0; }
+        if (!KnownParamTy(pt)) { return 0; }
         string at = StaticTyOf(arg);
         if (at != null) { return at == pt ? 8 : 0; }
         int k = arg.kind;
