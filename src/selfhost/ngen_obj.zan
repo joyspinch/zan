@@ -98,6 +98,7 @@ partial class Ngen {
     void AddRR(int rd, int rn, int rm) { E4(0x8B000000 | (rm << 16) | (rn << 5) | rd); }
     void SubImm(int rd, int rn, int imm) { E4(0xD1000000 | (imm << 10) | (rn << 5) | rd); }
     void CbzReg(int rt, int lbl) { E4(0xB4000000 | rt); fixups.Add(new Fixup(txt.Count - 4, 1, lbl, 0, null)); }
+    void CbnzReg(int rt, int lbl) { E4(0xB5000000 | rt); fixups.Add(new Fixup(txt.Count - 4, 1, lbl, 0, null)); }
     void LdrU(int rd, int rn, int off) { E4(0xF9400000 | ((off / 8) << 10) | (rn << 5) | rd); }
     void StrU(int rt, int rn, int off) { E4(0xF9000000 | ((off / 8) << 10) | (rn << 5) | rt); }
     void Strb0(int rn) { E4(0x39000000 | (rn << 5) | 31); } // strb wzr, [rn]
@@ -518,6 +519,77 @@ partial class Ngen {
         E4(0xF84107E1);                              // ldr x1, [sp], #16 (obj)
         StrU(0, 1, 16);                              // obj->data = x0
         MovRR(0, 1);                                 // result = obj
+    }
+
+    // new T[count]: gen0's inline array allocation. Layout from the user
+    // pointer arr: count = i64 at arr-16, magic2 at arr-24, data at arr+0.
+    // raw = calloc(count*esz + 32): [raw]=rc 1, [raw+8]=25404552263127619,
+    // [raw+16]=count, [raw+24]=6503565379360670041. A negative count reports
+    // "negative array length" and then fails the overflow guard (which
+    // zeroes count, like gen0's select pair); a failed calloc reports and
+    // stores into null exactly like gen0's continue-after-guard flow.
+    void GenArrNew(Node countExpr, int esz) {
+        if (countExpr == null) {
+            LoadImm(0, 0);
+        } else {
+            GenExpr(countExpr);                          // x0 = count
+        }
+        // negative guard: report, keep the value (gen0's rt.cont keeps %0)
+        E4(0xEB1F001F);                              // cmp x0, xzr
+        int okneg = NL();
+        EmitBcond(10, okneg);                        // b.ge okneg
+        E4(0xF81F0FE0);                              // keep count
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardArrNeg, 3);
+        BLExtern("_zan_rt_guard_fail3");
+        E4(0xF84107E0);                              // pop count
+        Mark(okneg);
+        // total = count * esz; overflow = total > 2^64-33 (unsigned)
+        MovRR(1, 0);                                 // x1 = count
+        if (esz == 4) {
+            E4(0xD37EF400);                          // lsl x0, x0, #2
+        } else {
+            E4(0xD37DF000);                          // lsl x0, x0, #3
+        }
+        LoadImm(9, -33);                             // x9 = 0xFFFF...FFDF
+        E4(0xEB09001F);                              // cmp x0, x9
+        int okovf = NL();
+        EmitBcond(9, okovf);                         // b.ls okovf (unsigned <=)
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardArrOvf, 3);
+        BLExtern("_zan_rt_guard_fail3");
+        LoadImm(0, 0);                               // safe total = 0
+        LoadImm(1, 0);                               // safe count = 0
+        Mark(okovf);
+        // bytes = total + 32; raw = calloc(bytes, 1)
+        E4(0x91008000);                              // add x0, x0, #32
+        E4(0xF81F0FE1);                              // push count
+        LoadImm(1, 1);
+        BLExtern("_calloc");                         // x0 = raw
+        E4(0xF84107E1);                              // pop count -> x1
+        // null guard: gen0 reports and continues into the stores
+        int okalloc = NL();
+        CbnzReg(0, okalloc);
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardArrFail, 3);
+        BLExtern("_zan_rt_guard_fail3");
+        Mark(okalloc);
+        E4(0xF81F0FE0);                              // push raw
+        LoadImm(2, 1);
+        StrU(2, 0, 0);                               // raw->rc = 1
+        LoadImm(2, 25404552263127619);
+        StrU(2, 0, 8);                               // raw->rcmagic
+        StrU(1, 0, 16);                              // raw->count
+        LoadImm(2, 6503565379360670041);
+        StrU(2, 0, 24);                              // raw->magic2
+        E4(0xF84107E0);                              // pop raw -> x0
+        E4(0x91008000);                              // add x0, x0, #32 (arr)
     }
 
     // list.Count: load field 0
