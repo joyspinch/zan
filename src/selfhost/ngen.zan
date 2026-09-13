@@ -1829,6 +1829,45 @@ partial class Ngen {
                 diags.Error("ngen: unsupported ++/-- target", e.line, e.col);
                 LoadImm(0, 0);
             }
+        } else if (k == AK.WithExpr()) {
+            // `recv with { f = v, ... }`: a memberwise copy of recv with the
+            // named fields overwritten (record copy); the copy is a fresh
+            // object even for classes
+            string wtn = StaticTyOf(e.a);
+            Cls wc = wtn != null ? FindClass(wtn) : null;
+            if (wc == null) {
+                diags.Error("ngen: 'with' receiver has no record type", e.line, e.col);
+                LoadImm(0, 0);
+            } else {
+                GenExpr(e.a);
+                E4(0xF81F0FE0);                      // push src
+                LoadImm(0, wc.size + 16);
+                LoadImm(1, 0);
+                BLInternal("_zan_rt_alloc");
+                E4(0xF84107E1);                      // pop src -> x1
+                LoadImm(2, wc.size + 16);
+                SubImm(0, 0, 8);
+                SubImm(1, 1, 8);
+                BLExtern("_memcpy");
+                AddImm(0, 0, 8);                     // x0 = the copy
+                E4(0xF81F0FE0);                      // hold the copy
+                int wi = 0;
+                while (wi < e.kids.Count) {
+                    Node wasg = e.kids[wi];
+                    Fld wf = wasg.a != null ? FindField(wc, wasg.a.sval) : null;
+                    if (wf == null) {
+                        diags.Error("ngen: unknown field '" + wasg.a.sval + "' in with expression", wasg.line, wasg.col);
+                    } else {
+                        GenExpr(wasg.b);
+                        GenCloneIfStruct(wasg.b);
+                        if (wf.ty == "double" && !IsDblExpr(wasg.b)) { ConvI2D(); }
+                        E4(0xF84003E1);              // ldur x1, [sp] (peek copy)
+                        StrU(0, 1, wf.off);
+                    }
+                    wi = wi + 1;
+                }
+                E4(0xF84107E0);                      // pop copy -> x0
+            }
         } else if (k == AK.OutArg()) {
             // an out/ref argument evaluated in expression position yields
             // its storage ADDRESS (gen0's emit_expr of a ref arg)
@@ -2639,11 +2678,28 @@ partial class Ngen {
     }
 
     Fld FieldOf(Node mem) {
-        string cls = ExprCls(mem.a);
+        // keep the receiver's instantiation args (Box<double>) -- ClassTyOf
+        // would strip them before the type-parameter substitution runs
+        string cls = StaticTyOf(mem.a);
         if (cls == null) { return null; }
-        Cls c = FindClass(cls);
+        return FieldOfInst(cls, mem.sval);
+    }
+
+    // field of the instantiated class: the declared field type comes back
+    // with the receiver's concrete generic arguments substituted
+    // ("List<T>" on Box<double> reads as "List<double>")
+    Fld FieldOfInst(string cls, string name) {
+        int lt = cls.IndexOf("<");
+        string open = lt > 0 ? cls.Substring(0, lt) : cls;
+        List<string> args = lt > 0
+            ? SplitTyArgs(cls.Substring(lt + 1, cls.Length - lt - 2))
+            : new List<string>();
+        Cls c = FindClass(open);
         if (c == null) { return null; }
-        return FindField(c, mem.sval);
+        Fld f = FindField(c, name);
+        if (f == null || c.tps.Count == 0 || args.Count == 0) { return f; }
+        Fld nf = new Fld(f.name, f.off, SubstTy(f.ty, c.tps, args));
+        return nf;
     }
 
     // field of the class being emitted (implicit `this` references)
@@ -2674,6 +2730,11 @@ partial class Ngen {
             Fld f = CurField(e.sval);
             if (f != null && f.ty == "string") { return true; }
             return FindStaticTy(curCls, e.sval) == "string";
+        }
+        if (e.kind == AK.Index()) {
+            // instantiated generic containers carry string elements
+            // (List<string> read through Box<string>.values)
+            return ElemTyOf(e) == "string";
         }
         if (e.kind == AK.Call() && e.a != null) {
             if (e.a.kind == AK.MemberAccess()) {
