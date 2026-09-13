@@ -181,6 +181,17 @@ partial class Ngen {
         return -1;
     }
 
+    // find a static method declared by exactly this class (Class.Method()
+    // form -- FindStaticIdx only matches by bare name)
+    int FindStaticInCls(string cls, string name) {
+        int i = 0;
+        while (i < methNodes.Count) {
+            if (methStat[i] == 1 && methCls[i] == cls && methNodes[i].sval == name) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
     // does the named class declare a constructor?
     bool ClassHasCtor(string cls) {
         int i = 0;
@@ -189,6 +200,63 @@ partial class Ngen {
             i = i + 1;
         }
         return false;
+    }
+
+    // does the program itself declare a member of class "Convert" with this
+    // name? (gen0 steps its built-ins aside per member, so defining one
+    // Convert method does not disable the others)
+    bool UserDefinesConvert(string name) {
+        int i = 0;
+        while (i < methNodes.Count) {
+            if (methCls[i] == "Convert" && methNodes[i].sval == name) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // which scalar flavour does this expression carry, for x.ToString()
+    // rendering (null = not a scalar: leave the call to method dispatch)?
+    string ScalarToStringTy(Node e) {
+        if (e == null) { return null; }
+        if (IsBoolExpr(e)) { return "bool"; }
+        if (IsStrExpr(e)) { return "string"; }
+        if (IsCharExpr(e)) { return "char"; }
+        if (IsDblExpr(e)) { return "double"; }
+        if (IsUlongExpr(e)) { return "ulong"; }
+        if (e.kind == AK.CastExpr() && e.type != null) {
+            // gen0 renders uint/ushort signed too (only ulong goes unsigned)
+            string t = e.type.sval;
+            if (t == "double" || t == "float") { return "double"; }
+            if (t == "ulong") { return "ulong"; }
+            if (t == "int" || t == "long" || t == "short" || t == "byte"
+                    || t == "sbyte" || t == "uint" || t == "ushort") { return "int"; }
+            return null;
+        }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) {
+                string t = locTy[li];
+                if (t == "int" || t == "long" || t == "short" || t == "byte"
+                        || t == "sbyte" || t == "uint" || t == "ushort") { return "int"; }
+                return null;
+            }
+            Fld f = CurField(e.sval);
+            if (f != null && (f.ty == "int" || f.ty == "long"
+                    || f.ty == "short" || f.ty == "byte")) { return "int"; }
+            string st = FindStaticTy(curCls, e.sval);
+            if (st == "int" || st == "long") { return "int"; }
+            return null;
+        }
+        if (e.kind == AK.Call() && e.a != null) {
+            string rt = MethRetTy(e.a.sval);
+            if (rt == "int" || rt == "long" || rt == "short" || rt == "byte") { return "int"; }
+        }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            if (f != null && (f.ty == "int" || f.ty == "long"
+                    || f.ty == "short" || f.ty == "byte")) { return "int"; }
+        }
+        return null;
     }
 
     // ---- method emission ----
@@ -308,7 +376,10 @@ partial class Ngen {
                 if (s.b != null) {
                     if (s.b.sval != null && s.b.sval != "") {
                         locName.Add(s.b.sval);
-                        locTy.Add("string");
+                        // catch variable type: the declared type (string for
+                        // bare throws, Exception for typed throws)
+                        if (s.b.type != null) { locTy.Add(TypeFullName(s.b.type)); }
+                        else { locTy.Add("string"); }
                         locOff.Add(16 * nloc);
                         nloc = nloc + 1;
                     }
@@ -474,6 +545,10 @@ partial class Ngen {
             LoadStr(InternStr(e.sval), 0);
         } else if (k == AK.BoolLit()) {
             LoadImm(0, e.ival);
+        } else if (k == AK.CharLit()) {
+            // a char is its codepoint in the value slot (rendering decides
+            // string vs decimal per context, like gen0)
+            LoadImm(0, e.ival);
         } else if (k == AK.FloatLit()) {
             // materialise the IEEE bits through libc strtod -- lazily, into
             // a zero-initialised __DATA slot (0.0 simply reconverts, so the
@@ -552,6 +627,28 @@ partial class Ngen {
                 E4(0xD3407C00);                      // ubfm x0, x0, #0, #31
             }
             else { GenFieldLoad(e); }
+        } else if (k == AK.Binary() && e.op == TK.AmpAmp()) {
+            // short-circuit AND: the right operand runs only when the left
+            // is truthy; result normalises to 0/1
+            int falsL = NL();
+            int endL = NL();
+            GenExpr(e.a);
+            CbzReg(0, falsL);
+            GenExpr(e.b);
+            EmitB(endL);
+            Mark(falsL);
+            LoadImm(0, 0);
+            Mark(endL);
+        } else if (k == AK.Binary() && e.op == TK.PipePipe()) {
+            int trueL = NL();
+            int endL = NL();
+            GenExpr(e.a);
+            EmitCbnz(0, trueL);
+            GenExpr(e.b);
+            EmitB(endL);
+            Mark(trueL);
+            LoadImm(0, 1);
+            Mark(endL);
         } else if (k == AK.Binary()) {
             if (e.op == TK.Plus() && (IsStrExpr(e.a) || IsStrExpr(e.b))) {
                 // string concatenation: non-string operands convert through
@@ -1226,6 +1323,9 @@ partial class Ngen {
                 if (e.a.sval == "Substring") { return true; }
                 Node rj = e.a.a;
                 if (rj != null && rj.kind == AK.Ident() && rj.sval == "string" && e.a.sval == "Join") { return true; }
+                // Convert.ToString(x) yields a heap string
+                if (rj != null && rj.kind == AK.Ident() && rj.sval == "Convert"
+                        && e.a.sval == "ToString" && e.kids.Count == 1) { return true; }
             }
             return MethRetTy(e.a.sval) == "string";
         }
@@ -1279,12 +1379,23 @@ partial class Ngen {
         }
         if (e.kind == AK.Call() && e.a != null) {
             if (e.a.kind == AK.MemberAccess()) {
-                // Math library calls: Sqrt/Floor/Ceiling/Pow are always
-                // double; Abs/Max/Min are double when any argument is
                 Node rm = e.a.a;
+                // Convert.ToDouble(x) is always double (gen0 lowerings)
+                if (rm != null && rm.kind == AK.Ident() && rm.sval == "Convert"
+                        && e.a.sval == "ToDouble" && e.kids.Count == 1) { return true; }
+                // double.Parse(s) is always double
+                if (rm != null && rm.kind == AK.Ident() && e.a.sval == "Parse"
+                        && e.kids.Count == 1
+                        && (rm.sval == "double" || rm.sval == "float"
+                            || rm.sval == "Double" || rm.sval == "Single")) { return true; }
+                // Math library calls: Sqrt/Floor/Ceiling/Pow/Sin/Cos/Tan/
+                // Log/Exp/Round are always double; Abs/Max/Min are double
+                // when any argument is
                 if (rm != null && rm.kind == AK.Ident() && rm.sval == "Math") {
                     string mn = e.a.sval;
-                    if (mn == "Sqrt" || mn == "Floor" || mn == "Ceiling" || mn == "Pow") { return true; }
+                    if (mn == "Sqrt" || mn == "Floor" || mn == "Ceiling" || mn == "Pow"
+                            || mn == "Sin" || mn == "Cos" || mn == "Tan"
+                            || mn == "Log" || mn == "Exp" || mn == "Round") { return true; }
                     if (mn == "Abs" && e.kids.Count == 1) { return IsDblExpr(e.kids[0]); }
                     if ((mn == "Max" || mn == "Min") && e.kids.Count == 2) {
                         return IsDblExpr(e.kids[0]) || IsDblExpr(e.kids[1]);
@@ -1296,11 +1407,26 @@ partial class Ngen {
         return false;
     }
 
-    // does this expression evaluate to a char? (string indexing yields a
-    // codepoint; rendering goes through zan_rt_chrstr)
+    // does this expression evaluate to a char? (char literals, string
+    // indexing, char-typed locals/fields/statics -- rendering goes through
+    // zan_rt_chrstr)
     bool IsCharExpr(Node e) {
         if (e == null) { return false; }
-        return e.kind == AK.Index() && IsStrExpr(e.a);
+        if (e.kind == AK.CharLit()) { return true; }
+        if (e.kind == AK.Index()) { return IsStrExpr(e.a); }
+        if (e.kind == AK.CastExpr() && e.type != null) { return e.type.sval == "char"; }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            return f != null && f.ty == "char";
+        }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return locTy[li] == "char"; }
+            Fld f = CurField(e.sval);
+            if (f != null && f.ty == "char") { return true; }
+            return FindStaticTy(curCls, e.sval) == "char";
+        }
+        return false;
     }
 
     // does this expression evaluate to a ulong? (ulong typed locals,
@@ -1345,7 +1471,8 @@ partial class Ngen {
         if (e.kind == AK.Binary()) {
             int op = e.op;
             return op == TK.Less() || op == TK.Greater() || op == TK.LessEq()
-                || op == TK.GreaterEq() || op == TK.EqEq() || op == TK.BangEq();
+                || op == TK.GreaterEq() || op == TK.EqEq() || op == TK.BangEq()
+                || op == TK.AmpAmp() || op == TK.PipePipe();
         }
         if (e.kind == AK.Unary()) { return e.op == TK.Bang(); }
         if (e.kind == AK.MemberAccess()) {
@@ -1508,6 +1635,64 @@ partial class Ngen {
                     DblLibm1("_ceil");
                     return;
                 }
+                // gen0 routes Sin/Cos/Tan/Log/Exp to libm (double -> double),
+                // coercing integer arguments with sitofp
+                if ((mn == "Sin" || mn == "Cos" || mn == "Tan" || mn == "Log" || mn == "Exp")
+                        && e.kids.Count == 1) {
+                    GenExpr(e.kids[0]);
+                    if (!IsDblExpr(e.kids[0])) {
+                        E4(0x9E620000);                  // scvtf d0, x0
+                        E4(0x9E660000);                  // fmov x0, d0
+                    }
+                    string lf = "_sin";
+                    if (mn == "Cos") { lf = "_cos"; } else if (mn == "Tan") { lf = "_tan"; }
+                    else if (mn == "Log") { lf = "_log"; } else if (mn == "Exp") { lf = "_exp"; }
+                    DblLibm1(lf);
+                    return;
+                }
+                // Math.Round(x[, digits]): round(x * 10^d) / 10^d via libm
+                // round/pow (integer arguments coerce with sitofp, like gen0).
+                // No value may sit in a d-reg across a GenExpr call (lazy
+                // double literals return theirs in d0), so both operands are
+                // spilled first; the scale lives in callee-saved x19 across
+                // the round call since the divide needs it again (x is the
+                // deepest stack slot, so a second spill copy would bury it).
+                if (mn == "Round" && (e.kids.Count == 1 || e.kids.Count == 2)) {
+                    GenExpr(e.kids[0]);
+                    if (!IsDblExpr(e.kids[0])) {
+                        E4(0x9E620000);                  // scvtf d0, x0
+                        E4(0x9E660000);                  // fmov x0, d0
+                    }
+                    if (e.kids.Count == 1) {
+                        DblLibm1("_round");
+                        return;
+                    }
+                    E4(0xF81F0FE0);                      // push x (bits)
+                    GenExpr(e.kids[1]);
+                    if (!IsDblExpr(e.kids[1])) {
+                        E4(0x9E620000);                  // scvtf d0, x0
+                        E4(0x9E660000);                  // fmov x0, d0
+                    }
+                    E4(0xF81F0FE0);                      // push digits (bits)
+                    LoadImm(0, 4621819117588971520);     // 10.0 IEEE bits
+                    E4(0xF84107E1);                      // pop digits -> x1 (x0 = 10.0)
+                    E4(0x9E670000);                      // fmov d0, x0
+                    E4(0x9E670021);                      // fmov d1, x1
+                    BLExtern("_pow");
+                    E4(0x9E660000);                      // fmov x0, d0 (scale)
+                    MovRR(19, 0);                        // x19 = scale (call-preserved)
+                    E4(0xF84107E0);                      // pop x -> x0
+                    E4(0x9E670000);                      // fmov d0, x0 (d0 = x)
+                    E4(0x9E670261);                      // fmov d1, x19 (d1 = scale)
+                    E4(0x1E600820);                      // fmul d0, d1, d0 (x * scale)
+                    E4(0x9E660000);                      // fmov x0, d0
+                    DblLibm1("_round");                  // round(x * scale)
+                    E4(0x9E670000);                      // fmov d0, x0 (rounded)
+                    E4(0x9E670261);                      // fmov d1, x19 (scale)
+                    E4(0x1E611800);                      // fdiv d0, d0, d1
+                    E4(0x9E660000);                      // fmov x0, d0
+                    return;
+                }
                 if (mn == "Pow" && e.kids.Count == 2) {
                     // same ordering discipline as the double Max/Min path:
                     // no value may sit in d0 across a GenExpr call
@@ -1554,6 +1739,134 @@ partial class Ngen {
                 LoadImm(1, 1024);
                 BLExtern("_fgets");
                 E4(0xF84107E0);                          // pop buf -> x0
+                return;
+            }
+            // Convert built-ins: gen0 lowers ToString/ToInt32/ToInt64/ToInt/
+            // ToDouble with one argument inline (stepping aside per member
+            // when the program declares its own Convert member).
+            if (recv != null && recv.kind == AK.Ident() && recv.sval == "Convert") {
+                string mn = callee.sval;
+                if (e.kids.Count == 1 && !UserDefinesConvert(mn)) {
+                    Node arg = e.kids[0];
+                    if (mn == "ToString") {
+                        // gen0's ordering: string -> owned copy, char ->
+                        // the character, double -> shortest-round-trip
+                        // text, ulong unsigned decimal, rest signed
+                        if (IsStrExpr(arg)) {
+                            GenExpr(arg);
+                            E4(0xF81F0FE0);              // push s
+                            LoadStr(InternStr(""), 0);   // x0 = ""
+                            E4(0xF84107E1);              // pop -> x1 (x0="", x1=s)
+                            BLInternal("_zan_rt_strcat2");
+                        } else if (IsCharExpr(arg)) {
+                            GenExpr(arg);
+                            BLInternal("_zan_rt_chrstr");
+                        } else if (IsDblExpr(arg)) {
+                            GenExpr(arg);
+                            BLInternal("_zan_rt_dbl2str");
+                        } else if (IsUlongExpr(arg)) {
+                            GenExpr(arg);
+                            BLInternal("_zan_rt_uint2str");
+                        } else {
+                            GenExpr(arg);
+                            BLInternal("_zan_rt_int2str");
+                        }
+                        return;
+                    }
+                    if (mn == "ToInt32" || mn == "ToInt64" || mn == "ToInt") {
+                        if (IsStrExpr(arg)) {
+                            // strtoll(s, NULL, 10): full signed 64-bit
+                            GenExpr(arg);
+                            E4(0xF81F0FE0);              // push s
+                            LoadImm(1, 0);               // endptr = NULL
+                            LoadImm(2, 10);
+                            E4(0xF84107E0);              // pop -> x0 = s
+                            BLExtern("_strtoll");
+                        } else if (IsDblExpr(arg)) {
+                            GenExpr(arg);
+                            E4(0x9E670000);              // fmov d0, x0
+                            E4(0x9E780000);              // fcvtzs x0, d0
+                        } else {
+                            GenExpr(arg);                // int slots are i64 already
+                        }
+                        return;
+                    }
+                    if (mn == "ToDouble") {
+                        if (IsStrExpr(arg)) {
+                            GenExpr(arg);
+                            LoadImm(1, 0);               // endptr = NULL
+                            BLExtern("_zan_rt_dbl_parse");
+                            E4(0x9E660000);              // fmov x0, d0
+                        } else if (IsDblExpr(arg)) {
+                            GenExpr(arg);                // bits unchanged
+                        } else {
+                            GenExpr(arg);
+                            E4(0x9E620000);              // scvtf d0, x0
+                            E4(0x9E660000);              // fmov x0, d0
+                        }
+                        return;
+                    }
+                }
+            }
+            // X.Parse(s) for the numeric primitive types: gen0 fronts
+            // strtoll for the integer forms and zan_rt_dbl_parse (strtod
+            // with NaN/Infinity spellings) for the floating forms
+            if (recv != null && recv.kind == AK.Ident() && callee.sval == "Parse"
+                    && e.kids.Count == 1) {
+                string rn = recv.sval;
+                bool intRecv = rn == "int" || rn == "long" || rn == "Int32" || rn == "Int64";
+                bool dblRecv = rn == "double" || rn == "float" || rn == "Double" || rn == "Single";
+                if (intRecv || dblRecv) {
+                    GenExpr(e.kids[0]);
+                    if (intRecv) {
+                        E4(0xF81F0FE0);                  // push s
+                        LoadImm(1, 0);                   // endptr = NULL
+                        LoadImm(2, 10);
+                        E4(0xF84107E0);                  // pop -> x0 = s
+                        BLExtern("_strtoll");
+                    } else {
+                        LoadImm(1, 0);                   // endptr = NULL
+                        BLExtern("_zan_rt_dbl_parse");
+                        E4(0x9E660000);                  // fmov x0, d0
+                    }
+                    return;
+                }
+            }
+            // scalar x.ToString(): gen0 routes these through the same
+            // renderers as Console.Write (class receivers dispatch instead,
+            // which ScalarToStringTy's null answer leaves to the fallthrough)
+            if (callee.sval == "ToString" && e.kids.Count == 0
+                    && ScalarToStringTy(recv) != null) {
+                string sty = ScalarToStringTy(recv);
+                if (sty == "bool") {
+                    GenExpr(recv);
+                    int fls = NL();
+                    int doneb = NL();
+                    CbzReg(0, fls);
+                    LoadStr(InternStr("true"), 0);
+                    EmitB(doneb);
+                    Mark(fls);
+                    LoadStr(InternStr("false"), 0);
+                    Mark(doneb);
+                } else if (sty == "string") {
+                    GenExpr(recv);
+                    E4(0xF81F0FE0);                      // push s
+                    LoadStr(InternStr(""), 0);           // x0 = ""
+                    E4(0xF84107E1);                      // pop -> x1 (owned copy)
+                    BLInternal("_zan_rt_strcat2");
+                } else if (sty == "char") {
+                    GenExpr(recv);
+                    BLInternal("_zan_rt_chrstr");
+                } else if (sty == "double") {
+                    GenExpr(recv);
+                    BLInternal("_zan_rt_dbl2str");
+                } else if (sty == "ulong") {
+                    GenExpr(recv);
+                    BLInternal("_zan_rt_uint2str");
+                } else {
+                    GenExpr(recv);
+                    BLInternal("_zan_rt_int2str");
+                }
                 return;
             }
             // List<T> built-ins (gen0-compatible inline sequences)
@@ -1612,6 +1925,22 @@ partial class Ngen {
             }
             // string instance methods (gen0: Substring checks start <= len
             // and folds to 0; IndexOf is strstr with a -1 miss)
+            if (e.kids.Count == 2 && IsStrExpr(recv) && callee.sval == "Substring") {
+                // two-argument form: substr3 clamps the window against the
+                // string's own length (an out-of-range window answers empty,
+                // not a crash -- gen0's soft-continue behavior)
+                GenExpr(recv);
+                E4(0xF81F0FE0);                  // push s
+                GenExpr(e.kids[0]);
+                E4(0xF81F0FE0);                  // push start
+                GenExpr(e.kids[1]);
+                E4(0xF81F0FE0);                  // push len
+                E4(0xF84107E2);                  // pop len -> x2
+                E4(0xF84107E1);                  // pop start -> x1
+                E4(0xF84107E0);                  // pop s -> x0
+                BLInternal("_zan_rt_substr3");
+                return;
+            }
             if (e.kids.Count == 1 && IsStrExpr(recv)) {
                 if (callee.sval == "Substring") {
                     GenExpr(recv);
@@ -1660,6 +1989,31 @@ partial class Ngen {
                     Mark(miss);
                     LoadImm(0, -1);
                     Mark(done);
+                    return;
+                }
+            }
+            // static call through the class name: Cls.Method(args) -- the
+            // receiver names a user class and the member is one of its
+            // static methods (e.g. Point.Of(9))
+            if (recv != null && recv.kind == AK.Ident() && FindClass(recv.sval) != null) {
+                int si = FindStaticInCls(recv.sval, callee.sval);
+                if (si >= 0) {
+                    if (e.kids.Count != ParamCount(methNodes[si])) {
+                        diags.Error("ngen: arity mismatch calling '" + callee.sval + "'", e.line, e.col);
+                        return;
+                    }
+                    int i = 0;
+                    while (i < e.kids.Count) {
+                        GenExpr(e.kids[i]);
+                        E4(0xF81F0FE0);                      // str x0, [sp, #-16]! (arg)
+                        i = i + 1;
+                    }
+                    int r = e.kids.Count - 1;
+                    while (r >= 0) {
+                        E4(0xF84107E0 | r);                  // ldr xr, [sp], #16
+                        r = r - 1;
+                    }
+                    BLInternal("_" + methCls[si] + "_" + callee.sval);
                     return;
                 }
             }

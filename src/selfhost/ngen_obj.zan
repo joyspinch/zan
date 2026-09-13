@@ -244,6 +244,7 @@ partial class Ngen {
         RtEmitPrintUint();
         RtEmitChrstr();
         RtEmitSubstr2();
+        RtEmitSubstr3();
         RtEmitStrjoin();
         RtEmitEhState();
     }
@@ -404,6 +405,78 @@ partial class Ngen {
         StrU(0, 9, 0);
         LdrU(0, 31, 0);                        // return dst
         AddSPImm(64, true);                    // pop dst/subl/start/s
+        RtEpilogue();
+    }
+
+    // ptr zan_rt_substr3(s, start, len) -- two-argument Substring. gen0's
+    // safe-window clamp: any out-of-range window (negative start/len,
+    // start past the end, or start+len crossing the NUL) answers the empty
+    // string, exactly like the IR backend's select pair.
+    // Frame slots: [0]=len [16]=start [32]=s [48]=dst.
+    void RtEmitSubstr3() {
+        syms.Add(new Sym("_zan_rt_substr3", txt.Count));
+        RtPrologue();
+        E4(0xF81F0FE0);                        // push s
+        E4(0xF81F0FE1);                        // push start
+        E4(0xF81F0FE2);                        // push len
+        LdrU(1, 31, 32);                       // x1 = s
+        E4(0xD1002022);                        // sub x2, x1, #8
+        E4(0xF9400042);                        // ldr x2, [x2]
+        E4(0xD3407C42);                        // ubfm x2, x2, #0, #31 (slen)
+        LdrU(3, 31, 16);                       // x3 = start
+        LdrU(4, 31, 0);                        // x4 = len
+        int c1 = NL();
+        E4(0xEB1F007F);                        // cmp x3, xzr
+        EmitBcond(10, c1);                     // b.ge -- start is not negative
+        int badL = NL();
+        EmitB(badL);
+        Mark(c1);
+        int c2 = NL();
+        E4(0xEB1F009F);                        // cmp x4, xzr
+        EmitBcond(10, c2);                     // b.ge -- len is not negative
+        EmitB(badL);
+        Mark(c2);
+        int c3 = NL();
+        E4(0xEB02007F);                        // cmp x3, x2
+        EmitBcond(13, c3);                     // b.le -- start within the string
+        EmitB(badL);
+        Mark(c3);
+        E4(0xCB030045);                        // sub x5, x2, x3 (remaining)
+        int c4 = NL();
+        E4(0xEB05009F);                        // cmp x4, x5
+        EmitBcond(13, c4);                     // b.le -- window fits
+        EmitB(badL);
+        Mark(c4);
+        int okL = NL();
+        EmitB(okL);
+        Mark(badL);
+        LoadImm(3, 0);                         // bad window: start = len = 0
+        LoadImm(4, 0);
+        Mark(okL);
+        StrU(4, 31, 0);                        // [sp] = clamped len
+        StrU(3, 31, 16);                       // [sp+16] = clamped start
+        LdrU(0, 31, 0);
+        E4(0x91000400);                        // add x0, x0, #1 (size)
+        BLInternal("_zan_rt_str_alloc");       // x0 = dst
+        E4(0xF81F0FE0);                        // push dst
+        LdrU(0, 31, 0);                        // dst
+        LdrU(1, 31, 48);                       // s
+        LdrU(2, 31, 32);                       // start
+        E4(0x8B020021);                        // add x1, x1, x2 (s + start)
+        LdrU(2, 31, 16);                       // len
+        BLExtern("_memcpy");
+        LdrU(0, 31, 0);                        // dst
+        LdrU(1, 31, 16);                       // len
+        E4(0x8B010000);                        // add x0, x0, x1
+        Strb0(0);                              // *end = 0
+        LdrU(0, 31, 0);                        // dst
+        E4(0xD1002009);                        // sub x9, x0, #8
+        LoadImm(1, 0x5A414E5300000000);
+        LdrU(2, 31, 16);                       // len
+        E4(0xAA020020);                        // orr x0, x1, x2 (hdr | len)
+        StrU(0, 9, 0);
+        LdrU(0, 31, 0);                        // return dst
+        AddSPImm(64, true);                    // pop dst/len/start/s
         RtEpilogue();
     }
 
