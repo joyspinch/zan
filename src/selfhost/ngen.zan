@@ -164,6 +164,7 @@ partial class Ngen {
 
     void CollectMethods(Node cls) {
         int i = 0;
+        bool hasCtor = false;
         while (i < cls.kids.Count) {
             Node m = cls.kids[i];
             if (m.kind == AK.MethodDecl() && !HasMod(m, MOD.Extern()) && !IsAsync(m)) {
@@ -173,11 +174,22 @@ partial class Ngen {
                 methStat.Add(HasMod(m, MOD.Static()) ? 1 : 0);
             }
             if (m.kind == AK.CtorDecl()) {
+                hasCtor = true;
                 methNodes.Add(m);
                 methCls.Add(cls.sval);
                 methStat.Add(2);
             }
             i = i + 1;
+        }
+        // a class with no declared ctors gets the synthesized parameterless
+        // one, which is what runs its instance field initializers (and the
+        // base chain) when `new T()` finds it
+        if (!hasCtor) {
+            Node dc = new Node(AK.CtorDecl());
+            dc.mods = HasMod(cls, MOD.Static()) ? MOD.Static() : 0;
+            methNodes.Add(dc);
+            methCls.Add(cls.sval);
+            methStat.Add(2);
         }
     }
 
@@ -458,6 +470,16 @@ partial class Ngen {
         syms.Add(new Sym("_main", txt.Count));
         E4(0xA9BF7BFD);                                  // stp x29, x30, [sp, #-16]! (save lr: bl below clobbers it)
         BLInternal("_zan_rt_strpool_init");              // stamp literals first
+        // static field initializers run before Main, in declaration order
+        int si2 = 0;
+        while (si2 < sfInitCls.Count) {
+            curCls = sfInitCls[si2];
+            GenExpr(sfInitExpr[si2]);
+            LoadSymRef(sfInitSym[si2], 9);
+            StrU(0, 9, 0);
+            si2 = si2 + 1;
+        }
+        curCls = mainCls;
         BLInternal("_" + mainCls + "_Main");
         E4(0xD2800000);                                  // movz x0, #0
         E4(0xA8C17BFD);                                  // ldp x29, x30, [sp], #16
@@ -556,7 +578,23 @@ partial class Ngen {
                 }
             }
         }
-        GenStmt(m.d);
+        // instance field initializers run after the base chain and before
+        // the body, once per ctor (a `: this(...)` delegator lets the
+        // chain target run them, so it skips its own)
+        if (methStat[mi] == 2 && m.c == null) {
+            int fi2 = 0;
+            while (fi2 < ifInitCls.Count) {
+                if (ifInitCls[fi2] == cls) {
+                    GenExpr(ifInitExpr[fi2]);
+                    E4(0xF81F0FE0);                          // push value
+                    LoadLocal(0, 0);                         // this -> x0
+                    E4(0xF84107E1);                          // pop value -> x1
+                    StrU(1, 0, FieldOff(cls, ifInitName[fi2]));
+                }
+                fi2 = fi2 + 1;
+            }
+        }
+        if (m.d != null) { GenStmt(m.d); }
         E4(0xD2800000);                                  // movz x0, #0 (fallthrough)
         Epilogue();
     }
@@ -896,7 +934,7 @@ partial class Ngen {
             LoadLocal(li, 0);
         } else if (k == AK.MemberAccess()) {
             if (e.sval == "Count" && ExprCls(e.a) == "List") { GenListCount(e.a); }
-            else if ((e.sval == "Length" || e.sval == "Count") && IsArrExpr(e.a)) {
+            else if ((e.sval == "Length" || e.sval == "Count") && ArrContainerTy(e.a) != null) {
                 // gen0: null report (reads the zeroed scratch afterwards),
                 // length is the i64 count at arr-16; .Count is aliased to
                 // .Length so a params bundle answers the List spelling too
@@ -1245,10 +1283,10 @@ partial class Ngen {
                 LoadImm(0, 0);                       // safe index
                 Mark(cont);
                 E4(0x38606820);                      // ldrb w0, [x1, x0]
-            } else if (IsArrExpr(e.a)) {
+            } else if (ArrContainerTy(e.a) != null) {
                 // array element get: len = i64 at arr-16; a bad index reports
                 // and continues with index 0 (gen0 parity). int[] stores i32.
-                int esz = ArrElemSize(ArrTyOf(e.a));
+                int esz = ArrElemSize(ArrContainerTy(e.a));
                 GenExpr(e.a);
                 E4(0xF81F0FE0);                      // push arr
                 GenExpr(e.b);
@@ -1336,10 +1374,10 @@ partial class Ngen {
                     return;
                 }
                 StoreLocal(li, 0);
-            } else if (e.a != null && e.a.kind == AK.Index() && IsArrExpr(e.a.a)) {
+            } else if (e.a != null && e.a.kind == AK.Index() && ArrContainerTy(e.a.a) != null) {
                 // array element set: same bounds rule as the get; the value
                 // and index survive the guard call on the stack
-                int esz = ArrElemSize(ArrTyOf(e.a.a));
+                int esz = ArrElemSize(ArrContainerTy(e.a.a));
                 E4(0xF81F0FE0);                      // push value
                 GenExpr(e.a.a);
                 E4(0xF81F0FE0);                      // push arr
@@ -1528,15 +1566,27 @@ partial class Ngen {
             StrU(1, 0, 0);                               // obj->vptr = table
         }
         E4(0xF81F0FE0);                                  // str x0, [sp, #-16]! (obj)
-        // ctor arguments: provided args first, trailing defaults filled in;
-        // a class without any ctor allocates bare (no call)
-        int cix = FitCtorIdx(cls, e, false, null);
+        // ctor arguments: for a brace object initializer (`new C(a) { X = v }`)
+        // the first e.op kids are the paren args and the rest are field
+        // initializers; otherwise every kid is an argument. Provided args
+        // first, trailing defaults filled in; a class without any ctor
+        // allocates bare (no call).
+        Node callN = e;
+        if (e.ival == 2) {
+            Node tmp = new Node(AK.Call());
+            tmp.line = e.line;
+            tmp.col = e.col;
+            int ai = 0;
+            while (ai < e.op && ai < e.kids.Count) { tmp.Add(e.kids[ai]); ai = ai + 1; }
+            callN = tmp;
+        }
+        int cix = FitCtorIdx(cls, callN, false, null);
         int pushed;
         if (cix >= 0) {
-            pushed = PushCallArgs(methNodes[cix], e);
+            pushed = PushCallArgs(methNodes[cix], callN);
         } else if (CtorCountNg(cls) > 0) {
             diags.Error("ngen: no constructor of '" + cls + "' takes "
-                + e.kids.Count + " argument(s)", e.line, e.col);
+                + callN.kids.Count + " argument(s)", e.line, e.col);
             return;
         } else {
             pushed = 0;
@@ -1547,6 +1597,29 @@ partial class Ngen {
         E4(0xF81F0FE0);                                  // str x0, [sp, #-16]! (keep obj across the void ctor)
         if (cix >= 0) {
             BLInternal(CtorSymNg(cls, methNodes[cix]));
+        }
+        // field initializers store through the object still on the stack
+        if (e.ival == 2) {
+            int bi = e.op;
+            while (bi < e.kids.Count) {
+                Node it = e.kids[bi];
+                if (it.kind == AK.Assignment() && it.a != null && it.a.kind == AK.Ident()) {
+                    int foff = FieldOff(cls, it.a.sval);
+                    if (foff < 0) {
+                        diags.Error("ngen: unknown field '" + it.a.sval + "' in initializer", it.line, it.col);
+                    } else {
+                        GenExpr(it.b);
+                        E4(0xF81F0FE0);                  // push value
+                        E4(0xF84107E1);                  // pop value -> x1 (top)
+                        E4(0xF84107E0);                  // pop obj -> x0
+                        StrU(1, 0, foff);                // obj->field = value
+                        E4(0xF81F0FE0);                  // push obj back for the next item
+                    }
+                } else {
+                    diags.Error("ngen: unsupported object initializer item", it.line, it.col);
+                }
+                bi = bi + 1;
+            }
         }
         E4(0xF84107E0);                                  // ldr x0, [sp], #16 (obj)
     }
@@ -1622,8 +1695,8 @@ partial class Ngen {
     string ElemTyOf(Node e) {
         if (e == null || e.a == null) { return null; }
         string el = null;
-        if (IsArrExpr(e.a)) {
-            string at = ArrTyOf(e.a);
+        if (ArrContainerTy(e.a) != null) {
+            string at = ArrContainerTy(e.a);
             if (at != null && at.Length > 2) { el = at.Substring(0, at.Length - 2); }
         } else if (ExprCls(e.a) == "List") {
             string ct = StaticTyOf(e.a);
@@ -1770,7 +1843,11 @@ partial class Ngen {
     string StaticTyOf(Node e) {
         if (e == null) { return null; }
         if (e.kind == AK.ThisExpr()) { return curCls; }
-        if (e.kind == AK.NewExpr()) { return e.type != null ? e.type.sval : null; }
+        if (e.kind == AK.NewExpr()) {
+            if (e.type == null) { return null; }
+            if (e.ival != 1) { return TypeFullName(e.type); }
+            return TypeFullName(e.type) + ArrSuffix(1 + e.op);
+        }
         if (e.kind == AK.CastExpr() && e.type != null) { return e.type.sval; }
         if (e.kind == AK.AsExpr() && e.type != null) { return e.type.sval; }
         if (e.kind == AK.Ident()) { return NamedSlotTy(e.sval); }
@@ -1914,7 +1991,7 @@ partial class Ngen {
                 && t.kids[0].sval != null && t.kids[0].sval != "") {
             n = n + "<" + t.kids[0].sval + ">";
         }
-        if (t.ival == 1) { n = n + "[]"; }               // array type
+        n = n + ArrSuffix(t.ival);                       // array levels
         return n;
     }
 
@@ -1936,6 +2013,14 @@ partial class Ngen {
         }
         return false;
     }
+    // n copies of the array suffix ("[][]" for 2)
+    string ArrSuffix(int n2) {
+        string s2 = "";
+        int i = 0;
+        while (i < n2) { s2 = s2 + "[]"; i = i + 1; }
+        return s2;
+    }
+
     string ArrTyOf(Node e) {
         if (e.kind == AK.Ident()) {
             int li = LocalIdx(e.sval);
@@ -1945,9 +2030,61 @@ partial class Ngen {
             return "int[]";
         }
         if (e.kind == AK.NewExpr() && e.type != null && e.ival == 1) {
-            return TypeFullName(e.type) + "[]";
+            return TypeFullName(e.type) + ArrSuffix(1 + e.op);
         }
         return "int[]";
+    }
+
+    // declared array type of an expression usable as an element container:
+    // a local, an instance field (implicit this or through a receiver), a
+    // static field (of the current class or class-qualified), `new T[]`,
+    // a cast/as to an array type, a nested element read of an
+    // array-of-arrays, or a call returning an array. Unlike ArrTyOf this
+    // never guesses -- null means "not a known array".
+    string ArrContainerTy(Node e) {
+        if (e == null) { return null; }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0 && IsArrTy(locTy[li])) { return locTy[li]; }
+            Fld f = CurField(e.sval);
+            if (f != null && IsArrTy(f.ty)) { return f.ty; }
+            string st = FindStaticTy(curCls, e.sval);
+            if (st != null && IsArrTy(st)) { return st; }
+            return null;
+        }
+        if (e.kind == AK.NewExpr() && e.type != null && e.ival == 1) {
+            return TypeFullName(e.type) + ArrSuffix(1 + e.op);
+        }
+        if (e.kind == AK.CastExpr() && e.type != null) {
+            string ct = TypeFullName(e.type);
+            if (IsArrTy(ct)) { return ct; }
+            return null;
+        }
+        if (e.kind == AK.AsExpr() && e.type != null) {
+            string at2 = TypeFullName(e.type);
+            if (IsArrTy(at2)) { return at2; }
+            return null;
+        }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            if (f != null && IsArrTy(f.ty)) { return f.ty; }
+            if (e.a != null && e.a.kind == AK.Ident() && FindClass(e.a.sval) != null) {
+                string st = FindStaticTy(e.a.sval, e.sval);
+                if (st != null && IsArrTy(st)) { return st; }
+            }
+            return null;
+        }
+        if (e.kind == AK.Index()) {
+            string et = ElemTyOf(e);
+            if (et != null && IsArrTy(et)) { return et; }
+            return null;
+        }
+        if (e.kind == AK.Call()) {
+            string rt = CallRetTy(e);
+            if (IsArrTy(rt)) { return rt; }
+            return null;
+        }
+        return null;
     }
     int ArrElemSize(string t) {
         string el = t.Substring(0, t.Length - 2);
@@ -2169,7 +2306,9 @@ partial class Ngen {
     string MethRetTy(string name) {
         int i = 0;
         while (i < methNodes.Count) {
-            if (methNodes[i].sval == name && methNodes[i].type != null) { return methNodes[i].type.sval; }
+            // TypeFullName keeps the array suffix and generic argument;
+            // type.sval alone would turn a `byte[]` return into "byte"
+            if (methNodes[i].sval == name && methNodes[i].type != null) { return TypeFullName(methNodes[i].type); }
             i = i + 1;
         }
         return "";
