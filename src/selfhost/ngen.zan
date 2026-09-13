@@ -675,9 +675,10 @@ partial class Ngen {
             LoadLocal(li, 0);
         } else if (k == AK.MemberAccess()) {
             if (e.sval == "Count" && ExprCls(e.a) == "List") { GenListCount(e.a); }
-            else if (e.sval == "Length" && IsArrExpr(e.a)) {
+            else if ((e.sval == "Length" || e.sval == "Count") && IsArrExpr(e.a)) {
                 // gen0: null report (reads the zeroed scratch afterwards),
-                // length is the i64 count at arr-16
+                // length is the i64 count at arr-16; .Count is aliased to
+                // .Length so a params bundle answers the List spelling too
                 GenExpr(e.a);
                 int badn = NL();
                 int contn = NL();
@@ -1264,6 +1265,12 @@ partial class Ngen {
         string cls = e.type != null ? e.type.sval : null;
         if (cls == "List") { GenListNew(); return; }
         if (e.ival == 1) {
+            if (e.kids.Count > 0) {
+                // array initializer: `new T[] { a, b, c }` (an explicit size,
+                // if any, must equal the element count)
+                GenArrInit(e, ArrElemSize(TypeFullName(e.type) + "[]"));
+                return;
+            }
             GenArrNew(e.b, ArrElemSize(TypeFullName(e.type) + "[]"));
             return;
         }
@@ -1289,10 +1296,6 @@ partial class Ngen {
         int cix = FindCtorIdx(cls);
         int pushed;
         if (cix >= 0) {
-            if (e.kids.Count > ParamCount(methNodes[cix])) {
-                diags.Error("ngen: too many arguments calling '" + cls + "' constructor", e.line, e.col);
-                return;
-            }
             pushed = PushCallArgs(methNodes[cix], e);
         } else {
             int i2 = 0;
@@ -1309,6 +1312,31 @@ partial class Ngen {
         E4(0xF81F0FE0);                                  // str x0, [sp, #-16]! (keep obj across the void ctor)
         BLInternal("_" + cls + "_ctor");
         E4(0xF84107E0);                                  // ldr x0, [sp], #16 (obj)
+    }
+
+    // `new T[] { a, b, c }`: allocate with the element count, then store each
+    // initializer expression at its slot (no bounds check -- the count is
+    // static). The array stays on the stack across element evaluation.
+    void GenArrInit(Node e, int esz) {
+        int n = e.kids.Count;
+        Node cnt = new Node(AK.IntLit());
+        cnt.ival = n;
+        GenArrNew(cnt, esz);
+        E4(0xF81F0FE0);                                  // push arr
+        int k = 0;
+        while (k < n) {
+            GenExpr(e.kids[k]);                          // x0 = element value
+            E4(0xF84107E1);                              // pop arr -> x1
+            E4((int)(0xD2800000 | (((long)k) << 5) | 2)); // movz x2, #k
+            if (esz == 4) {
+                E4(0xB8227820);                          // str w0, [x1, x2, lsl #2]
+            } else {
+                E4(0xF8227820);                          // str x0, [x1, x2, lsl #3]
+            }
+            E4(0xF81F0FE1);                              // push arr back
+            k = k + 1;
+        }
+        E4(0xF84107E0);                                  // pop arr -> x0
     }
 
     void GenFieldLoad(Node mem) {
@@ -2433,10 +2461,6 @@ partial class Ngen {
                 diags.Error("ngen: unknown method '" + callee.sval + "'", e.line, e.col);
                 return;
             }
-            if (e.kids.Count > ParamCount(methNodes[mi])) {
-                diags.Error("ngen: too many arguments calling '" + callee.sval + "'", e.line, e.col);
-                return;
-            }
             GenExpr(recv);
             E4(0xF81F0FE0);                              // str x0, [sp, #-16]! (receiver)
             int pushed = PushCallArgs(methNodes[mi], e);
@@ -2456,12 +2480,9 @@ partial class Ngen {
             return;
         }
         Node m = methNodes[si];
-        if (e.kids.Count > ParamCount(m)) {
-            diags.Error("ngen: too many arguments calling '" + callee.sval + "'", e.line, e.col);
-            return;
-        }
         // evaluate args left to right (defaults fill omitted trailing
-        // arguments), spilling each; reload into x0.. reversed
+        // arguments, a params tail bundles the extras), spilling each;
+        // reload into x0.. reversed
         int pushed = PushCallArgs(m, e);
         int q = pushed - 1;
         while (q >= 0) {
@@ -2502,34 +2523,97 @@ partial class Ngen {
         return null;
     }
 
+    // is this expression already the params bundle (an array value)? A call
+    // whose single tail argument is the array itself passes it through
+    // unpacked, as in C#
+    bool IsArrValExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.NewExpr() && e.ival == 1) { return true; }
+        string t = StaticTyOf(e);
+        return t != null && IsArrTy(t);
+    }
+
     // evaluate call arguments left to right, spilling each onto the stack;
     // omitted trailing arguments fall back to the callee's default parameter
-    // values (gen0 fills them at the call site). Returns the count pushed --
-    // the caller pops exactly that many into x0.. in reverse.
+    // values, and a `params T[]` tail bundles every extra argument into a
+    // freshly allocated array (gen0 packs the bundle at the call site).
+    // Returns the count pushed -- the caller pops exactly that many into
+    // x0.. in reverse.
     int PushCallArgs(Node m, Node e) {
         string calleeName = e.a != null ? e.a.sval : "constructor";
         int pc = ParamCount(m);
-        if (e.kids.Count > pc) {
+        Node lastP = pc > 0 ? ParamAt(m, pc - 1) : null;
+        bool variadic = lastP != null && lastP.op == 1;
+        int fixedc = variadic ? pc - 1 : pc;
+        int prov = e.kids.Count;
+        if (!variadic && prov > pc) {
             diags.Error("ngen: too many arguments calling '" + calleeName + "'", e.line, e.col);
             return pc;
         }
+        if (variadic && prov < fixedc) {
+            diags.Error("ngen: arity mismatch calling '" + calleeName + "'", e.line, e.col);
+            return pc;
+        }
+        // whole-bundle passthrough: the single tail argument is already an
+        // array value, so it is handed over as-is
+        if (variadic && prov == pc && IsArrValExpr(e.kids[prov - 1])) {
+            int k = 0;
+            while (k < prov) {
+                GenExpr(e.kids[k]);
+                E4(0xF81F0FE0);                          // str x0, [sp, #-16]!
+                k = k + 1;
+            }
+            return prov;
+        }
         int i = 0;
-        while (i < e.kids.Count) {
+        while (i < prov && i < fixedc) {
             GenExpr(e.kids[i]);
             E4(0xF81F0FE0);                              // str x0, [sp, #-16]!
             i = i + 1;
         }
-        while (i < pc) {
+        while (i < fixedc) {
             Node p = ParamAt(m, i);
             if (p == null || p.b == null) {
                 diags.Error("ngen: arity mismatch calling '" + calleeName + "'", e.line, e.col);
-                return pc;
+                return i;
             }
             GenExpr(p.b);
             E4(0xF81F0FE0);
             i = i + 1;
         }
-        return pc;
+        if (variadic) {
+            int esz = ArrElemSize(TypeFullName(lastP.type));
+            int n = prov > fixedc ? prov - fixedc : 0;
+            // spill the tail elements left to right, then allocate the
+            // bundle array and store them at their slots
+            int j2 = fixedc;
+            while (j2 < prov) {
+                GenExpr(e.kids[j2]);
+                E4(0xF81F0FE0);
+                j2 = j2 + 1;
+            }
+            Node cnt = new Node(AK.IntLit());
+            cnt.ival = n;
+            GenArrNew(cnt, esz);
+            E4(0xF81F0FE0);                              // push arr
+            int k2 = n - 1;                              // stack top holds the last element
+            while (k2 >= 0) {
+                E4(0xF84107E1);                          // pop arr -> x1
+                E4(0xF84107E0);                          // pop element -> x0
+                E4((int)(0xD2800000 | (((long)k2) << 5) | 2)); // movz x2, #k2
+                if (esz == 4) {
+                    E4(0xB8227820);                      // str w0, [x1, x2, lsl #2]
+                } else {
+                    E4(0xF8227820);                      // str x0, [x1, x2, lsl #3]
+                }
+                E4(0xF81F0FE1);                          // push arr back
+                k2 = k2 - 1;
+            }
+            E4(0xF84107E0);                              // pop arr -> x0
+            E4(0xF81F0FE0);                              // push the bundle as the tail arg
+            i = i + 1;
+        }
+        return i;
     }
 
     int FindCtorIdx(string cls) {

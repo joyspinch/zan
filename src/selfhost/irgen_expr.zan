@@ -1217,7 +1217,13 @@ partial class Irgen {
         if (e.ival == 1) {
             // array new: T[n] as i64* (n zeroed slots after an i64 length header)
             ExprVal nsz = new ExprVal("0", MkType("int"));
+            bool init = e.kids.Count > 0;
             if (e.b != null) { nsz = GenExpr(e.b); }
+            else if (init) {
+                // array initializer `new T[] { a, b, c }`: the element count
+                // is the number of initializer expressions
+                nsz = new ExprVal("" + e.kids.Count, MkType("int"));
+            }
             string bytes = NT();
             L("  " + bytes + " = mul i64 " + nsz.op + ", 8");
             string tot = NT();
@@ -1229,6 +1235,18 @@ partial class Irgen {
             L("  store i64 " + nsz.op + ", i64* " + hdr);
             string arr = NT();
             L("  " + arr + " = getelementptr i64, i64* " + hdr + ", i64 1");
+            if (init) {
+                Node et = MkType(ty.sval);
+                int jn = 0;
+                while (jn < e.kids.Count) {
+                    ExprVal iv = GenExpr(e.kids[jn]);
+                    string sv = ToSlot(iv, et);
+                    string ep = NT();
+                    L("  " + ep + " = getelementptr i64, i64* " + hdr + ", i64 " + (jn + 1));
+                    L("  store i64 " + sv + ", i64* " + ep);
+                    jn = jn + 1;
+                }
+            }
             Node at = MkType(ty.sval); at.ival = 1;
             return new ExprVal(arr, at);
         }
@@ -2398,10 +2416,9 @@ partial class Irgen {
             i = i + 1;
         }
         int np = pnames.Count;
-        // `params T[] rest` tail: bundle extra positional args into a List<T>
-        // collection-initializer node (the parameter type is already List<T>).
-        // A single trailing List value (or explicit `new List<T>{...}`) passes
-        // through unpacked.
+        // `params T[] rest` tail: bundle extra positional args into a real
+        // array (`new T[]{...}`, gen0 semantics). A single trailing argument
+        // that is already the array bundle passes through unpacked.
         Node lastParam = null;
         i = m.kids.Count - 1;
         while (i >= 0) {
@@ -2416,15 +2433,15 @@ partial class Irgen {
                 bool passthrough = false;
                 if (e.kids.Count == np) {
                     Node la = e.kids[np - 1];
-                    if (la.kind == AK.NewExpr()) { passthrough = true; }
+                    if (la.kind == AK.NewExpr() && la.ival == 1) { passthrough = true; }
                     if (la.kind == AK.Ident()) {
                         int li = LocalIdx(la.sval);
-                        if (li >= 0 && IsListType(locType[li])) { passthrough = true; }
+                        if (li >= 0 && locType[li] != null && locType[li].ival == 1) { passthrough = true; }
                     }
                 }
                 if (!passthrough) {
                     Node packed = new Node(AK.NewExpr());
-                    packed.ival = 2;
+                    packed.ival = 1;
                     packed.type = lastParam.type;
                     packed.line = e.line; packed.col = e.col;
                     int w = np - 1;
