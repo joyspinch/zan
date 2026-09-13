@@ -924,7 +924,7 @@ partial class Ngen {
 
     // new List<T>(): alloc 24+16 (calloc-zeroed count), cap = 8,
     // data = calloc(8, 8) -- mirrors gen0's collection initializer
-    void GenListNew() {
+    void GenListNew(Node e) {
         LoadImm(0, 24 + 16);
         LoadImm(1, 0);
         BLInternal("_zan_rt_alloc");
@@ -937,6 +937,54 @@ partial class Ngen {
         E4(0xF84107E1);                              // ldr x1, [sp], #16 (obj)
         StrU(0, 1, 16);                              // obj->data = x0
         MovRR(0, 1);                                 // result = obj
+        // collection initializer: `new List<T> { a, b, c }` appends each
+        // item through the same growth path as Add
+        if (e != null && e.ival == 2) {
+            E4(0xF81F0FE0);                          // push list
+            int j = 0;
+            while (j < e.kids.Count) {
+                GenExpr(e.kids[j]);
+                MovRR(1, 0);                         // x1 = value
+                LdrU(0, 31, 0);                      // x0 = list (peek)
+                ListAppendRaw();
+                j = j + 1;
+            }
+            E4(0xF84107E0);                          // pop list -> x0
+        }
+    }
+
+    // append with x0 = list and x1 = value: grows the backing store when
+    // full, stores the value, bumps the count
+    void ListAppendRaw() {
+        // re-push list+value as one pair: the str-only push leaves the
+        // upper half of the slot stale (callee-saved LR from earlier calls)
+        E4(0xA9BF07E0);                              // stp x0, x1, [sp, #-16]!
+        LdrU(2, 0, 0);                               // count
+        LdrU(3, 0, 8);                               // cap
+        E4(0xEB03005F);                              // cmp x2, x3
+        int skip = NL();
+        EmitBcond(1, skip);                          // b.ne skip (cond 1 = NE)
+        AddRR(3, 3, 3);                              // ncap = cap * 2
+        StrU(3, 0, 8);                               // cap = ncap
+        LdrU(4, 0, 16);                              // old data
+        MovRR(9, 3);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);                              // x9 = ncap * 8 bytes
+        MovRR(0, 4);
+        MovRR(1, 9);
+        BLExtern("_realloc");
+        LdrU(5, 31, 0);                              // x5 = list
+        StrU(0, 5, 16);                              // list->data = new data
+        Mark(skip);
+        LdrU(0, 31, 0);                              // list
+        LdrU(2, 0, 0);                               // count
+        LdrU(3, 0, 16);                              // data
+        LdrU(1, 31, 8);                              // value
+        E4(0xF8207800 | (2 << 16) | (3 << 5) | 1);   // str x1, [x3, x2, lsl #3]
+        AddImm(2, 2, 1);                             // count + 1
+        StrU(2, 0, 0);                               // list->count
+        AddSPImm(16, true);                          // pop the stp'd pair
     }
 
     // new T[count]: gen0's inline array allocation. Layout from the user
@@ -1022,37 +1070,9 @@ partial class Ngen {
         GenExpr(recv);
         E4(0xF81F0FE0);                              // push list
         GenExpr(arg);
-        E4(0xF81F0FE0);                              // push value
-        E4(0xF84107E1);                              // ldr x1, [sp], #16 (value)
-        E4(0xF84107E0);                              // ldr x0, [sp], #16 (list)
-        // re-push list+value as one pair: the str-only push leaves the
-        // upper half of the slot stale (callee-saved LR from earlier calls)
-        E4(0xA9BF07E0);                              // stp x0, x1, [sp, #-16]!
-        LdrU(2, 0, 0);                               // count
-        LdrU(3, 0, 8);                               // cap
-        E4(0xEB03005F);                              // cmp x2, x3
-        int skip = NL();
-        EmitBcond(1, skip);                          // b.ne skip (cond 1 = NE)
-        AddRR(3, 3, 3);                              // ncap = cap * 2
-        StrU(3, 0, 8);                               // cap = ncap
-        LdrU(4, 0, 16);                              // old data
-        MovRR(9, 3);
-        AddRR(9, 9, 9);
-        AddRR(9, 9, 9);
-        AddRR(9, 9, 9);                              // x9 = ncap * 8 bytes
-        MovRR(0, 4);
-        MovRR(1, 9);
-        BLExtern("_realloc");
-        LdrU(5, 31, 0);                              // x5 = list
-        StrU(0, 5, 16);                              // list->data = new data
-        Mark(skip);
-        LdrU(0, 31, 0);                              // list
-        LdrU(2, 0, 0);                               // count
-        LdrU(3, 0, 16);                              // data
-        LdrU(1, 31, 8);                              // value
-        E4(0xF8207800 | (2 << 16) | (3 << 5) | 1);   // str x1, [x3, x2, lsl #3]
-        AddImm(2, 2, 1);                             // count + 1
-        StrU(2, 0, 0);                               // list->count
-        AddSPImm(16, true);                          // pop the stp'd pair
+        MovRR(1, 0);                                 // x1 = value
+        LdrU(0, 31, 0);                              // x0 = list (peek)
+        ListAppendRaw();
+        AddSPImm(16, true);                          // pop list
     }
 }

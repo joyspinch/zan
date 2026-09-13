@@ -414,13 +414,13 @@ partial class Ngen {
         return false;
     }
 
-    // does the program itself declare a member of class "Convert" with this
+    // does the program itself declare a member of that class with this
     // name? (gen0 steps its built-ins aside per member, so defining one
-    // Convert method does not disable the others)
-    bool UserDefinesConvert(string name) {
+    // Convert or Math method does not disable the others)
+    bool UserDefinesClsMember(string cls, string name) {
         int i = 0;
         while (i < methNodes.Count) {
-            if (methCls[i] == "Convert" && methNodes[i].sval == name) { return true; }
+            if (methCls[i] == cls && methNodes[i].sval == name) { return true; }
             i = i + 1;
         }
         return false;
@@ -687,7 +687,7 @@ partial class Ngen {
         } else if (k == AK.VarDecl()) {
             if (s.b != null) {
                 GenExpr(s.b);
-                if (s.type != null && TypeFullName(s.type) == "double" && !IsDblExpr(s.b)) { ConvI2D(); }
+                if (s.type != null && IsDblTy(TypeFullName(s.type)) && !IsDblExpr(s.b)) { ConvI2D(); }
                 StoreLocal(LocalIdx(s.sval), 0);
             }
         } else if (k == AK.ExprStmt()) {
@@ -1235,7 +1235,13 @@ partial class Ngen {
         } else if (k == AK.Unary()) {
             GenExpr(e.a);
             if (e.op == TK.Minus()) {
-                E4(0xCB0003E0);                      // neg x0, x0 (sub x0, xzr, x0)
+                if (IsDblExpr(e.a)) {
+                    E4(0x9E670000);                  // fmov d0, x0
+                    E4(0x1E614000);                  // fneg d0, d0
+                    E4(0x9E660000);                  // fmov x0, d0
+                } else {
+                    E4(0xCB0003E0);                  // neg x0, x0 (sub x0, xzr, x0)
+                }
             } else if (e.op == TK.Bang()) {
                 // cset needs fresh flags: cmp against 1 so any nonzero-ish
                 // bool (0/1 in practice) negates correctly
@@ -1355,8 +1361,28 @@ partial class Ngen {
             }
         } else if (k == AK.Assignment()) {
             string tgtTy = AssignTargetTy(e.a);
-            GenExpr(e.b);
-            if (tgtTy == "double" && !IsDblExpr(e.b)) { ConvI2D(); }
+            if (tgtTy != null && tgtTy == "float") { tgtTy = "double"; }
+            if (e.op != TK.Eq() && e.op != TK.QQEq()) {
+                // compound assignment reads the target through the ordinary
+                // Binary path (which knows ints, doubles, ulongs and string
+                // concat) and stores through the same chain as `=`
+                int bop2 = CompoundBinOp(e.op);
+                if (bop2 == 0) {
+                    diags.Error("ngen: unsupported compound assignment operator", e.line, e.col);
+                    return;
+                }
+                Node bin2 = new Node(AK.Binary());
+                bin2.op = bop2;
+                bin2.line = e.line;
+                bin2.col = e.col;
+                bin2.a = e.a;
+                bin2.b = e.b;
+                GenExpr(bin2);
+                if (tgtTy == "double" && !IsDblExpr(bin2)) { ConvI2D(); }
+            } else {
+                GenExpr(e.b);
+                if (tgtTy == "double" && !IsDblExpr(e.b)) { ConvI2D(); }
+            }
             if (e.a != null && e.a.kind == AK.Ident()) {
                 int li = LocalIdx(e.a.sval);
                 if (li < 0) {
@@ -1530,7 +1556,7 @@ partial class Ngen {
 
     void GenNew(Node e) {
         string cls = e.type != null ? e.type.sval : null;
-        if (cls == "List") { GenListNew(); return; }
+        if (cls == "List") { GenListNew(e); return; }
         if (e.ival == 1) {
             if (e.kids.Count > 0) {
                 // array initializer: `new T[] { a, b, c }` (an explicit size,
@@ -1728,6 +1754,21 @@ partial class Ngen {
                 || t == "double[]" || t == "string[]" || t == "bool[]"
                 || t == "char[]")) { return null; }
         return t;
+    }
+
+    // binary operator behind a compound assignment (+= -> +, ...), or 0
+    int CompoundBinOp(int k2) {
+        if (k2 == TK.PlusEq()) { return TK.Plus(); }
+        if (k2 == TK.MinusEq()) { return TK.Minus(); }
+        if (k2 == TK.StarEq()) { return TK.Star(); }
+        if (k2 == TK.SlashEq()) { return TK.Slash(); }
+        if (k2 == TK.PercentEq()) { return TK.Percent(); }
+        if (k2 == TK.AmpEq()) { return TK.Amp(); }
+        if (k2 == TK.PipeEq()) { return TK.Pipe(); }
+        if (k2 == TK.CaretEq()) { return TK.Caret(); }
+        if (k2 == TK.LessLessEq()) { return TK.LessLess(); }
+        if (k2 == TK.GreaterGreaterEq()) { return TK.GreaterGreater(); }
+        return 0;
     }
 
     // x is T / x is null. With single inheritance the receiver's static type
@@ -2117,6 +2158,8 @@ partial class Ngen {
         if (e == null) { return false; }
         if (e.kind == AK.StringLit()) { return true; }
         if (e.kind == AK.Binary()) { return e.op == TK.Plus() && (IsStrExpr(e.a) || IsStrExpr(e.b)); }
+        // both arms strings: the conditional yields a heap string either way
+        if (e.kind == AK.Conditional()) { return IsStrExpr(e.b) && IsStrExpr(e.c); }
         if (e.kind == AK.MemberAccess()) {
             Fld f = FieldOf(e);
             return f != null && f.ty == "string";
@@ -2138,7 +2181,8 @@ partial class Ngen {
                 if (rj != null && rj.kind == AK.Ident() && rj.sval == "string" && e.a.sval == "Join") { return true; }
                 // Convert.ToString(x) yields a heap string
                 if (rj != null && rj.kind == AK.Ident() && rj.sval == "Convert"
-                        && e.a.sval == "ToString" && e.kids.Count == 1) { return true; }
+                        && e.a.sval == "ToString" && e.kids.Count == 1
+                        && !UserDefinesClsMember("Convert", "ToString")) { return true; }
             }
             return CallRetTy(e) == "string";
         }
@@ -2149,6 +2193,29 @@ partial class Ngen {
     }
 
     // does this expression denote a List<string> (element reads are strings)?
+    // does this expression evaluate to a List<double>/double[]? (element
+    // reads are double bit patterns either way)
+    bool IsDblListOf(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li < 0) { return false; }
+            return IsDblListTy(locTy[li]);
+        }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            return f != null && IsDblListTy(f.ty);
+        }
+        if (e.kind == AK.NewExpr()) {
+            return e.type != null && IsDblListTy(TypeFullName(e.type) + (e.ival == 1 ? "[]" : ""));
+        }
+        return false;
+    }
+
+    bool IsDblListTy(string t) {
+        return t == "List<double>" || t == "List<float>" || t == "double[]" || t == "float[]";
+    }
+
     bool IsStrListOf(Node e) {
         if (e == null) { return false; }
         if (e.kind == AK.Ident()) {
@@ -2167,9 +2234,14 @@ partial class Ngen {
 
     // does this expression evaluate to a double? (float literal / double
     // typed local or field / double-returning method / double arithmetic)
+    // declared floating type: `float` rides the same f64 registers and
+    // conversions as `double` (ngen keeps one floating representation)
+    bool IsDblTy(string t) { return t == "double" || t == "float"; }
+
     bool IsDblExpr(Node e) {
         if (e == null) { return false; }
         if (e.kind == AK.FloatLit()) { return true; }
+        if (e.kind == AK.Unary() && e.op == TK.Minus()) { return IsDblExpr(e.a); }
         if (e.kind == AK.Binary()) {
             int op = e.op;
             if (op == TK.Plus() || op == TK.Minus() || op == TK.Star() || op == TK.Slash()) {
@@ -2177,18 +2249,24 @@ partial class Ngen {
             }
             return false;
         }
-        if (e.kind == AK.CastExpr() && e.type != null) { return e.type.sval == "double"; }
-        if (e.kind == AK.Index()) { return IsArrExpr(e.a) && ArrTyOf(e.a) == "double[]"; }
+        if (e.kind == AK.CastExpr() && e.type != null) { return IsDblTy(e.type.sval); }
+        if (e.kind == AK.Index()) {
+            if (IsArrExpr(e.a)) {
+                string at3 = ArrTyOf(e.a);
+                return at3 == "double[]" || at3 == "float[]";
+            }
+            return IsDblListOf(e.a);
+        }
         if (e.kind == AK.MemberAccess()) {
             Fld f = FieldOf(e);
-            return f != null && f.ty == "double";
+            return f != null && IsDblTy(f.ty);
         }
         if (e.kind == AK.Ident()) {
             int li = LocalIdx(e.sval);
-            if (li >= 0) { return locTy[li] == "double"; }
+            if (li >= 0) { return IsDblTy(locTy[li]); }
             Fld f = CurField(e.sval);
-            if (f != null && f.ty == "double") { return true; }
-            return FindStaticTy(curCls, e.sval) == "double";
+            if (f != null && IsDblTy(f.ty)) { return true; }
+            return IsDblTy(FindStaticTy(curCls, e.sval));
         }
         if (e.kind == AK.Call() && e.a != null) {
             if (e.a.kind == AK.MemberAccess()) {
@@ -2215,7 +2293,7 @@ partial class Ngen {
                     }
                 }
             }
-            return CallRetTy(e) == "double";
+            return IsDblTy(CallRetTy(e));
         }
         return false;
     }
@@ -2462,7 +2540,8 @@ partial class Ngen {
             // the same way for i64). Double forms call libm with the value
             // in d0 (Pow takes d0 + d1) and come back as the bit pattern
             // in x0.
-            if (recv != null && recv.kind == AK.Ident() && recv.sval == "Math") {
+            if (recv != null && recv.kind == AK.Ident() && recv.sval == "Math"
+                    && !UserDefinesClsMember("Math", callee.sval)) {
                 string mn = callee.sval;
                 if (mn == "Abs" && e.kids.Count == 1) {
                     GenExpr(e.kids[0]);
@@ -2484,8 +2563,10 @@ partial class Ngen {
                         GenExpr(e.kids[1]);
                         E4(0xF84107E1);                  // pop a -> x1 (x0 = b)
                         E4(0x9E670001);                  // fmov d1, x0
+                        if (!IsDblExpr(e.kids[1])) { E4(0x9E620022); } // scvtf d1, x1
                         E4(0xAA0103E0);                  // mov x0, x1
                         E4(0x9E670000);                  // fmov d0, x0
+                        if (!IsDblExpr(e.kids[0])) { E4(0x9E620020); } // scvtf d0, x0
                         if (mn == "Max") { BLExtern("_fmax"); } else { BLExtern("_fmin"); }
                         E4(0x9E660000);                  // fmov x0, d0
                     } else {
@@ -2625,7 +2706,7 @@ partial class Ngen {
             // when the program declares its own Convert member).
             if (recv != null && recv.kind == AK.Ident() && recv.sval == "Convert") {
                 string mn = callee.sval;
-                if (e.kids.Count == 1 && !UserDefinesConvert(mn)) {
+                if (e.kids.Count == 1 && !UserDefinesClsMember("Convert", mn)) {
                     Node arg = e.kids[0];
                     if (mn == "ToString") {
                         // gen0's ordering: string -> owned copy, char ->
