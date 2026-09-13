@@ -1124,7 +1124,9 @@ partial class Ngen {
             LoadImm(0, 1);
             Mark(endL);
         } else if (k == AK.Binary()) {
-            if (e.op == TK.Plus() && (IsStrExpr(e.a) || IsStrExpr(e.b))) {
+            if (TryOpOverloadNg(e)) {
+                // the overload call left its result (value or object) in x0
+            } else if (e.op == TK.Plus() && (IsStrExpr(e.a) || IsStrExpr(e.b))) {
                 // string concatenation: non-string operands convert through
                 // zan_rt_int2str (gen0 prints them with "%lld"), then
                 // lhs -> x0, rhs -> x1, zan_rt_strcat2(lhs, rhs)
@@ -2715,6 +2717,67 @@ partial class Ngen {
         return t;
     }
 
+    // dispatch a binary operator to a static op_* overload declared on
+    // either operand's class (mirrors irgen's TryOpOverload): the call goes
+    // through the ordinary static-call machinery, so overload fit, argument
+    // narrowing and double conversion all behave like a written-out call.
+    // Returns false when no overload applies and the builtin paths must run.
+    bool TryOpOverloadNg(Node e) {
+        if (IsStrExpr(e.a) || IsStrExpr(e.b)) { return false; }
+        string mn = OpMethodNameNg(e.op);
+        if (mn == "") { return false; }
+        string owner = null;
+        string ca = ExprCls(e.a);
+        if (ca != null && OpOverloadExists(ca, mn)) { owner = ca; }
+        if (owner == null) {
+            string cb = ExprCls(e.b);
+            if (cb != null && OpOverloadExists(cb, mn)) { owner = cb; }
+        }
+        // gen0 semantics: only the exact op_* dispatches; `!=`/`==` without
+        // their own overload fall back to reference comparison (the builtin
+        // path), NOT to the negation of the paired operator
+        if (owner == null) { return false; }
+        Node callN = new Node(AK.Call());
+        Node tgt = new Node(AK.Ident());
+        tgt.line = e.line;
+        tgt.col = e.col;
+        tgt.sval = mn;
+        callN.a = tgt;
+        callN.line = e.line;
+        callN.col = e.col;
+        callN.kids.Add(e.a);
+        callN.kids.Add(e.b);
+        GenCall(callN);
+        return true;
+    }
+
+    // operator token -> op_* overload method name ("" when not overloadeable)
+    string OpMethodNameNg(int op) {
+        if (op == TK.Plus()) { return "op_add"; }
+        if (op == TK.Minus()) { return "op_sub"; }
+        if (op == TK.Star()) { return "op_mul"; }
+        if (op == TK.Slash()) { return "op_div"; }
+        if (op == TK.Percent()) { return "op_mod"; }
+        if (op == TK.EqEq()) { return "op_eq"; }
+        if (op == TK.BangEq()) { return "op_ne"; }
+        if (op == TK.Less()) { return "op_lt"; }
+        if (op == TK.Greater()) { return "op_gt"; }
+        if (op == TK.LessEq()) { return "op_le"; }
+        if (op == TK.GreaterEq()) { return "op_ge"; }
+        return "";
+    }
+
+    // does this class (or any base) declare a member with that name?
+    bool OpOverloadExists(string cls, string name) {
+        string c2 = cls;
+        while (c2 != null) {
+            if (UserDefinesClsMember(c2, name)) { return true; }
+            Cls cc = FindClass(c2);
+            c2 = cc != null ? cc.baseName : null;
+        }
+        return false;
+    }
+
     void GenCall(Node e) {
         Node callee = e.a;
         if (callee != null && callee.kind == AK.MemberAccess()) {
@@ -3248,6 +3311,7 @@ partial class Ngen {
                 }
                 if (scands2.Count > 1) {
                     int si = FitPickIdx(scands2, e);
+                    if (si < 0) { si = scands2[0]; }
                     int pushed = PushCallArgs(methNodes[si], e);
                     int r = pushed - 1;
                     while (r >= 0) {
