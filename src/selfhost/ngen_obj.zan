@@ -75,6 +75,12 @@ partial class Ngen {
     int emptyIdx;
 
     Cls FindClass(string n) {
+        // instantiated generic names ("Pool<Conn>") resolve to the open
+        // class: erasure keeps one layout and one method table
+        int lt = n.IndexOf("<");
+        if (lt > 0 && n.Substring(n.Length - 1, 1) == ">") {
+            n = n.Substring(0, lt);
+        }
         int i = 0;
         while (i < classes.Count) { if (classes[i].name == n) { return classes[i]; } i = i + 1; }
         return null;
@@ -1184,6 +1190,53 @@ partial class Ngen {
         AddImm(2, 2, 1);                             // count + 1
         StrU(2, 0, 0);                               // list->count
         AddSPImm(16, true);                          // pop the stp'd pair
+    }
+
+    // per-instantiation statics: every generic-class instantiation a body
+    // touched gets its own copy of the class's static fields (globals plus
+    // initializer entries), so Stat<int>.s and Stat<double>.s differ like
+    // gen0's per-instantiation storage
+    void MaterializeInstStatics() {
+        int ci = 0;
+        while (ci < instCls.Count) {
+            string inst = instCls[ci];
+            int lt = inst.IndexOf("<");
+            if (lt > 0) {
+                string open = inst.Substring(0, lt);
+                List<string> args = SplitTyArgs(inst.Substring(lt + 1, inst.Length - lt - 1));
+                Cls c = FindClass(open);
+                if (c != null) {
+                    int n0 = sfNames.Count;
+                    int i0 = sfInitCls.Count;
+                    int si = 0;
+                    while (si < n0) {
+                        if (sfCls[si] == open) {
+                            string dn = "fld." + inst + "." + sfNames[si];
+                            dglbs.Add(new DGlob(dn, 8, dataLen));
+                            dataLen = dataLen + 8;
+                            sfNames.Add(sfNames[si]);
+                            sfCls.Add(inst);
+                            sfSyms.Add(DGlobalSym(dn));
+                            sfTy.Add(SubstTy(sfTy[si], c.tps, args));
+                            // clone this field's initializer, if any
+                            int j = 0;
+                            while (j < i0) {
+                                if (sfInitCls[j] == open && sfInitSym[j] == sfSyms[si]) {
+                                    Node ex = CloneNode(sfInitExpr[j]);
+                                    if (ex != null) { SubstTypeNode(ex, c.tps, args); }
+                                    sfInitCls.Add(inst);
+                                    sfInitSym.Add(DGlobalSym(dn));
+                                    sfInitExpr.Add(ex);
+                                }
+                                j = j + 1;
+                            }
+                        }
+                        si = si + 1;
+                    }
+                }
+            }
+            ci = ci + 1;
+        }
     }
 
     // new T[count]: gen0's inline array allocation. Layout from the user

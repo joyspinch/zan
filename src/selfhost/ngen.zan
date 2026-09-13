@@ -117,6 +117,7 @@ partial class Ngen {
         methCls = new List<string>();
         methStat = new List<int>();
         specMeth = new List<string>();
+        instCls = new List<string>();
         nlabel = 0;
     }
 
@@ -131,6 +132,7 @@ partial class Ngen {
         CollectClasses(unit);
         CollectEnums(unit);
         RunSpecPipeline();
+        MaterializeInstStatics();
         // one lazy vtable slot per polymorphic class (the table itself is
         // built by _vtinit_<Cls> at first `new`)
         int ci = 0;
@@ -546,9 +548,11 @@ partial class Ngen {
         locOff = new List<int>();
         locRef = new List<bool>();
         nloc = 0;
-        // instance methods and ctors take `this` as their first argument
+        // instance methods and ctors take `this` as their first argument;
+        // a specialization of a generic-class method types `this` as the
+        // instantiation ("Pool<Conn>") so field types substitute
         if (inst) {
-            AddLoc("this", "", false);
+            AddLoc("this", m.sval2 != null && m.sval2 != "" ? m.sval2 : "", false);
         }
         // params get frame slots; the prologue stores x0.. into them in order.
         // An out/ref parameter's slot holds the caller's storage ADDRESS
@@ -2455,6 +2459,22 @@ partial class Ngen {
         SubstTypeNode(n.b, tps, args);
         SubstTypeNode(n.c, tps, args);
         SubstTypeNode(n.d, tps, args);
+        if (n.kind == AK.MemberAccess() && n.sval2 != null && n.sval2 != ""
+                && n.a != null && n.a.kind == AK.Ident()) {
+            // class-qualified static access inside a spec body: rewrite
+            // `Stat<T>.s` to the concrete instantiation `Stat<double>.s`
+            string s2 = n.sval2;
+            int i = 0;
+            while (i < tps.Count && i < args.Count) {
+                s2 = s2.Replace("__" + tps[i], "__" + args[i])
+                      .Replace(tps[i] + "__", args[i] + "__");
+                if (s2 == tps[i]) { s2 = args[i]; }
+                i = i + 1;
+            }
+            n.a.sval = n.a.sval + "<" + Undunder(s2) + ">";
+            n.sval2 = null;
+            RegisterInstCls(n.a.sval);
+        }
         if (n.kind == AK.Call() && n.sval2 != null && n.sval2 != "") {
             // explicit instantiation args ride on sval2 ("__"-joined):
             // substitute the same way so nested generic calls specialize
@@ -2473,6 +2493,7 @@ partial class Ngen {
     }
 
     List<string> specMeth;  // mangled names of registered specializations
+    List<string> instCls;   // instantiated generic classes in use ("Stat<int>")
 
     // find the generic method declaration for a call name: an instance or
     // static method with type parameters; first match wins
@@ -2553,6 +2574,50 @@ partial class Ngen {
         callNode.a.b = null;
     }
 
+    // "__"-joined type-arg string back to comma form ("int__double" -> "int,double")
+    string Undunder(string s) {
+        return s.Replace("__", ",");
+    }
+
+    void RegisterInstCls(string instName) {
+        if (IndexOfStrNg(instCls, instName) < 0) { instCls.Add(instName); }
+    }
+
+    // specialize method methName of the instantiated generic class instName
+    // ("Pool<Conn>") for the class's type parameters, rewriting the call site
+    void SpecRegisterClass(string instName, string methName, bool isStatic, Node callNode) {
+        int lt = instName.IndexOf("<");
+        if (lt <= 0) { return; }
+        string open = instName.Substring(0, lt);
+        Cls c = FindClass(open);
+        if (c == null || c.tps.Count == 0) { return; }
+        int wantStat = isStatic ? 1 : 0;
+        int di = -1;
+        int i = 0;
+        while (i < methNodes.Count) {
+            if (methStat[i] == wantStat && methCls[i] == open
+                    && methNodes[i].sval == methName && !HasTypeParams(methNodes[i])) { di = i; break; }
+            i = i + 1;
+        }
+        if (di < 0) { return; }
+        string mangled = methName + "$" + instName.Substring(lt + 1, instName.Length - lt - 2);
+        if (IndexOfStrNg(specMeth, mangled) >= 0) {
+            callNode.a.sval = mangled;
+            return;
+        }
+        List<string> args = SplitTyArgs(instName.Substring(lt + 1, instName.Length - lt - 1));
+        Node spec = CloneNode(methNodes[di]);
+        if (spec == null) { spec = new Node(methNodes[di].kind); }
+        spec.sval = mangled;
+        if (!isStatic) { spec.sval2 = instName; }   // spec's `this` type
+        SubstTypeNode(spec, c.tps, args);
+        methNodes.Add(spec);
+        methCls.Add(isStatic ? instName : open);
+        methStat.Add(wantStat);
+        specMeth.Add(mangled);
+        callNode.a.sval = mangled;
+    }
+
     int FindGenericDecl(string name) {
         int i = 0;
         while (i < methNodes.Count) {
@@ -2565,6 +2630,13 @@ partial class Ngen {
 
     void CollectSpecs(Node n) {
         if (n == null) { return; }
+        if (n.kind == AK.MemberAccess() && n.sval2 != null && n.sval2 != ""
+                && n.a != null && n.a.kind == AK.Ident()
+                && KnownTyName(Undunder(n.sval2))) {
+            // class-qualified static access through a concrete
+            // instantiation: remember it so its statics get materialized
+            RegisterInstCls(n.a.sval + "<" + Undunder(n.sval2) + ">");
+        }
         if (n.kind == AK.Call() && n.a != null
                 && (n.a.kind == AK.Ident() || n.a.kind == AK.MemberAccess())
                 && n.sval2 != null && n.sval2 != "") {
@@ -2623,7 +2695,10 @@ partial class Ngen {
                 locOff = new List<int>();
                 locRef = new List<bool>();
                 nloc = 0;
-                if (inst) { AddLoc("this", curCls, false); }
+                if (inst) {
+                    string thisTy = m.sval2 != null && m.sval2 != "" ? m.sval2 : curCls;
+                    AddLoc("this", thisTy, false);
+                }
                 int pi = 0;
                 while (pi < m.kids.Count) {
                     if (m.kids[pi].kind == AK.Param()) {
