@@ -778,13 +778,17 @@ partial class Ngen {
         } else if (k == AK.VarDecl()) {
             if (s.b != null) {
                 GenExpr(s.b);
+                GenCloneIfStruct(s.b);
                 if (s.type != null && IsDblTy(TypeFullName(s.type)) && !IsDblExpr(s.b)) { ConvI2D(); }
                 StoreLocal(LocalIdx(s.sval), 0);
             }
         } else if (k == AK.ExprStmt()) {
             GenExpr(s.a);
         } else if (k == AK.ReturnStmt()) {
-            if (s.a != null) { GenExpr(s.a); }
+            if (s.a != null) {
+                GenExpr(s.a);
+                GenCloneIfStruct(s.a);
+            }
             E4(0xF81F0FE0);                          // hold the result value
             EmitPendingFins(false);                  // C# runs every finally
             EhDisarmBase();                          // and disarms what they leave
@@ -1597,6 +1601,7 @@ partial class Ngen {
                 if (tgtTy == "double" && !IsDblExpr(bin2)) { ConvI2D(); }
             } else {
                 GenExpr(e.b);
+                GenCloneIfStruct(e.b);
                 if (tgtTy == "double" && !IsDblExpr(e.b)) { ConvI2D(); }
             }
             if (e.a != null && e.a.kind == AK.Ident()) {
@@ -2276,6 +2281,27 @@ partial class Ngen {
         if (SpecWantsDouble(spec) && sty == "int") { ConvI2D(); }
         LoadStr(InternStr(pf), 1);
         BLInternal("_zan_rt_fmt");
+    }
+
+    // struct value semantics: when expression e is struct-typed, replace x0
+    // with a fresh copy of the object (gen0 keeps structs inline with value
+    // semantics; ngen models them as heap objects, so every slot a struct
+    // lands in -- assignment, initialization, argument, return -- copies).
+    // The clone duplicates the descriptor word (class site) and all fields.
+    void GenCloneIfStruct(Node e) {
+        string t = StaticTyOf(e);
+        Cls c = t != null ? FindClass(t) : null;
+        if (c == null || c.isStruct != 1) { return; }
+        E4(0xF81F0FE0);                          // push src BEFORE x0 is reused
+        LoadImm(0, c.size + 16);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");             // x0 = dst
+        E4(0xF84107E1);                          // pop src -> x1
+        LoadImm(2, c.size + 16);
+        SubImm(0, 0, 8);                         // dst - 8 (descriptor)
+        SubImm(1, 1, 8);                         // src - 8
+        BLExtern("_memcpy");
+        AddImm(0, 0, 8);                         // x0 = dst
     }
 
     // ---- enums ----
@@ -4060,6 +4086,7 @@ partial class Ngen {
             int k = 0;
             while (k < prov) {
                 GenExpr(ak[k]);
+                GenCloneIfStruct(ak[k]);
                 ConvArg(m, k, ak[k]);
                 E4(0xF81F0FE0);                          // str x0, [sp, #-16]!
                 k = k + 1;
@@ -4078,6 +4105,7 @@ partial class Ngen {
                 GenRefArg(ae);                        // x0 = storage address
             } else {
                 GenExpr(ae);
+                GenCloneIfStruct(ae);                 // structs pass by value
                 ConvArg(m, i, ae);
             }
             E4(0xF81F0FE0);                              // str x0, [sp, #-16]!
@@ -4090,6 +4118,7 @@ partial class Ngen {
                 return i;
             }
             GenExpr(p.b);
+            GenCloneIfStruct(p.b);
             ConvArg(m, i, p.b);
             E4(0xF81F0FE0);
             i = i + 1;
@@ -4107,6 +4136,7 @@ partial class Ngen {
                     GenRefArg(ak[j2]);                   // x0 = storage address
                 } else {
                     GenExpr(ak[j2]);
+                    GenCloneIfStruct(ak[j2]);
                     if (elTy == "double" && !IsDblExpr(ak[j2])) { ConvI2D(); }
                 }
                 E4(0xF81F0FE0);
