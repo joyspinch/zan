@@ -404,14 +404,17 @@ partial class Ngen {
     }
 
     void Epilogue() {
-        if (frame > 0) { AddSPImm(frame, true); }        // add sp, sp, #frame
+        // reset sp from the frame pointer first: a `return` from inside a
+        // switch/loop construct can leave its stack temporaries (e.g. the
+        // switch discriminant) still pushed, and `add sp, sp, #frame` alone
+        // would make the ldp below read x29/x30 from the wrong slot
+        E4(0x910003BF);                                  // mov sp, x29
         E4(0xA8C17BFD);                                  // ldp x29, x30, [sp], #16
         E4(0xD65F03C0);                                  // ret
     }
 
     // ---- statements ----
-    void GenStmt(Node s) {
-        if (s == null) { return; }
+    void GenStmt(Node s) {        if (s == null) { return; }
         if (s.line > 0) { curLine = s.line; curCol = s.col; }
         int k = s.kind;
         if (k == AK.Block()) {
@@ -436,6 +439,8 @@ partial class Ngen {
             Mark(els);
             if (s.c != null) { GenStmt(s.c); }
             Mark(end);
+        } else if (k == AK.SwitchStmt()) {
+            GenSwitchStmt(s);
         } else if (k == AK.WhileStmt()) {
             int top = NL(); int outL = NL(); int cnt = NL();
             brkL.Add(outL); cntL.Add(cnt);
@@ -542,6 +547,63 @@ partial class Ngen {
     }
 
     // ---- expressions: result in x0 ----
+    // switch (disc) { case C: ... default: ... }: a compare chain like
+    // gen0's constant lowering (the selfhost parser only produces constant
+    // cases). The discriminant stays at [sp] for the whole statement; every
+    // case body and the default arm end at the shared exit, where it is
+    // popped. `break` inside a case targets the switch exit, not an
+    // enclosing loop; `continue` keeps targeting the loop.
+    void GenSwitchStmt(Node s) {
+        int endL = NL();
+        int defL = NL();
+        GenExpr(s.a);
+        E4(0xF81F0FE0);                                  // push discriminant
+        int nc = s.kids.Count;
+        int[] bodies = new int[nc];
+        int defIdx = -1;
+        int i = 0;
+        while (i < nc) {
+            Node c = s.kids[i];
+            if (c.a == null) { defIdx = i; i = i + 1; continue; }
+            bodies[i] = NL();
+            if (IsStrExpr(s.a)) {
+                GenExpr(c.a);                            // x0 = case label
+                LdrU(1, 31, 0);                          // x1 = discriminant
+                BLExtern("_strcmp");
+                E4(0xEB1F001F);                          // cmp x0, xzr
+            } else {
+                GenExpr(c.a);                            // x0 = case label
+                E4(0xF81F0FE0);                          // push label
+                LdrU(1, 31, 16);                         // x1 = discriminant
+                E4(0xF84107E0);                          // pop label -> x0
+                E4(0xEB01001F);                          // cmp x0, x1
+            }
+            EmitBcond(0, bodies[i]);                     // b.eq body
+            i = i + 1;
+        }
+        EmitB(defIdx >= 0 ? defL : endL);
+        brkL.Add(endL);
+        i = 0;
+        while (i < nc) {
+            Node c = s.kids[i];
+            if (c.a == null) { i = i + 1; continue; }
+            Mark(bodies[i]);
+            GenStmt(c.b);
+            // an empty case body falls through to the next case (C# rule);
+            // only a body that emitted code needs the jump to the exit
+            if (c.b == null || c.b.kids.Count > 0) { EmitB(endL); }
+            i = i + 1;
+        }
+        if (defIdx >= 0) {
+            Mark(defL);
+            GenStmt(s.kids[defIdx].b);
+            EmitB(endL);
+        }
+        brkL.RemoveAt(brkL.Count - 1);
+        Mark(endL);
+        E4(0xF84107E0);                                  // pop discriminant
+    }
+
     void GenExpr(Node e) {
         int k = e.kind;
         if (k == AK.IntLit()) {
