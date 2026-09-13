@@ -545,7 +545,16 @@ partial class Ngen {
     void GenExpr(Node e) {
         int k = e.kind;
         if (k == AK.IntLit()) {
-            LoadImm(0, e.ival);
+            // gen0's int-literal rule: an unsuffixed radix-2/8/16 literal in
+            // the uint range types as int, so its runtime value is the
+            // int-domain (two's-complement) one
+            long v = e.ival;
+            int sfx = e.suffix - (e.suffix / 4) * 4;
+            int rad = e.suffix >= 16 ? 16 : (e.suffix >= 8 ? 8 : 0);
+            if (sfx == 0 && rad != 0 && v > 2147483647 && v <= 4294967295) {
+                v = v - 4294967296;
+            }
+            LoadImm(0, v);
         } else if (k == AK.NullLit()) {
             LoadImm(0, 0);
         } else if (k == AK.StringLit()) {
@@ -1716,6 +1725,10 @@ partial class Ngen {
     // ulong is the only integer type whose slot can set the high bit)
     bool IsUlongExpr(Node e) {
         if (e == null) { return false; }
+        if (e.kind == AK.IntLit()) {
+            // a UL/lu-suffixed literal types as ulong (gen0's checker)
+            return e.suffix - (e.suffix / 4) * 4 == 3;
+        }
         if (e.kind == AK.Binary()) {
             int op = e.op;
             if (op == TK.Plus() || op == TK.Minus() || op == TK.Star()
@@ -2521,9 +2534,17 @@ partial class Ngen {
     }
 
     long ShiftRight(long v, int bits) {
+        // arithmetic (floor) shift: plain halving truncates toward zero, so
+        // e.g. 0xFF378ADD's narrowed int32 value -13137187 >> 16 must give
+        // -201 (chunk 0xFF37), not -200 (chunk 0xFF38)
         long r = v;
         int n = bits;
-        while (n > 0) { r = r / 2; n = n - 1; }
+        while (n > 0) {
+            long prev = r;
+            r = prev / 2;
+            if (prev < 0 && r * 2 != prev) { r = r - 1; }
+            n = n - 1;
+        }
         return r;
     }
 
