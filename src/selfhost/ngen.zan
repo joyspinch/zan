@@ -116,6 +116,7 @@ partial class Ngen {
         methNodes = new List<Node>();
         methCls = new List<string>();
         methStat = new List<int>();
+        specMeth = new List<string>();
         nlabel = 0;
     }
 
@@ -129,6 +130,7 @@ partial class Ngen {
         }
         CollectClasses(unit);
         CollectEnums(unit);
+        RunSpecPipeline();
         // one lazy vtable slot per polymorphic class (the table itself is
         // built by _vtinit_<Cls> at first `new`)
         int ci = 0;
@@ -169,7 +171,11 @@ partial class Ngen {
         EmitMainShim();
         int mi = 0;
         while (mi < methNodes.Count) {
-            EmitMethod(methCls[mi], methNodes[mi], mi);
+            // generic declarations are templates: only their
+            // specializations carry bodies (RunSpecPipeline built them)
+            if (!HasTypeParams(methNodes[mi])) {
+                EmitMethod(methCls[mi], methNodes[mi], mi);
+            }
             mi = mi + 1;
         }
         ci = 0;
@@ -2399,6 +2405,237 @@ partial class Ngen {
         SubImm(1, 1, 8);                         // src - 8
         BLExtern("_memcpy");
         AddImm(0, 0, 8);                         // x0 = dst
+    }
+
+    // ---- generic method monomorphization ----
+    // A generic method's body is per-instantiation: calls that carry explicit
+    // type arguments get a specialized copy (type parameters substituted with
+    // the concrete classes) under a mangled name, and the call site is
+    // rewritten to that name. Worklist order handles nested generic calls
+    // inside specialized bodies.
+
+    bool HasTypeParams(Node m) {
+        int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.TypeParam()) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    Node CloneNode(Node n) {
+        if (n == null) { return null; }
+        Node c = new Node(n.kind);
+        c.sval = n.sval;
+        c.sval2 = n.sval2;
+        c.ival = n.ival;
+        c.op = n.op;
+        c.mods = n.mods;
+        c.line = n.line;
+        c.col = n.col;
+        c.type = CloneNode(n.type);
+        c.a = CloneNode(n.a);
+        c.b = CloneNode(n.b);
+        c.c = CloneNode(n.c);
+        c.d = CloneNode(n.d);
+        int i = 0;
+        while (i < n.kids.Count) { c.Add(CloneNode(n.kids[i])); i = i + 1; }
+        return c;
+    }
+
+    // rewrite type-parameter names inside type references of a cloned body
+    void SubstTypeNode(Node n, List<string> tps, List<string> args) {
+        if (n == null) { return; }
+        if (n.kind == AK.TypeRef() && n.sval != null) {
+            int pi = IndexOfStrNg(tps, n.sval);
+            if (pi >= 0 && pi < args.Count) { n.sval = args[pi]; }
+        }
+        SubstTypeNode(n.type, tps, args);
+        SubstTypeNode(n.a, tps, args);
+        SubstTypeNode(n.b, tps, args);
+        SubstTypeNode(n.c, tps, args);
+        SubstTypeNode(n.d, tps, args);
+        if (n.kind == AK.Call() && n.sval2 != null && n.sval2 != "") {
+            // explicit instantiation args ride on sval2 ("__"-joined):
+            // substitute the same way so nested generic calls specialize
+            string s = n.sval2;
+            int i = 0;
+            while (i < tps.Count && i < args.Count) {
+                s = s.Replace("__" + tps[i], "__" + args[i])
+                      .Replace(tps[i] + "__", args[i] + "__");
+                if (s == tps[i]) { s = args[i]; }
+                i = i + 1;
+            }
+            n.sval2 = s;
+        }
+        int i2 = 0;
+        while (i2 < n.kids.Count) { SubstTypeNode(n.kids[i2], tps, args); i2 = i2 + 1; }
+    }
+
+    List<string> specMeth;  // mangled names of registered specializations
+
+    // find the generic method declaration for a call name: an instance or
+    // static method with type parameters; first match wins
+    // is this a concrete type name (class, enum, primitive, container of
+    // those)? open type parameters like "T" resolve to nothing
+    bool KnownTyName(string t) {
+        if (t == null || t == "") { return false; }
+        if (IsArrTy(t)) { return KnownTyName(t.Substring(0, t.Length - 2)); }
+        int lt = t.IndexOf("<");
+        if (lt > 0) {
+            if (t.Substring(t.Length - 1, 1) != ">") { return false; }
+            List<string> inner = SplitTyArgs(t.Substring(lt + 1, t.Length - lt - 2));
+            int i = 0;
+            while (i < inner.Count) {
+                if (!KnownTyName(inner[i])) { return false; }
+                i = i + 1;
+            }
+            t = t.Substring(0, lt);
+        }
+        if (t == "int" || t == "long" || t == "ulong" || t == "double"
+                || t == "bool" || t == "char" || t == "string" || t == "object"
+                || t == "byte" || t == "sbyte" || t == "short" || t == "ushort"
+                || t == "uint" || t == "float" || t == "nint") { return true; }
+        if (t == "List") { return true; }
+        return FindClass(t) != null;
+    }
+
+    List<string> DeclTps(Node m) {
+        List<string> tps = new List<string>();
+        int k = 0;
+        while (k < m.kids.Count) {
+            if (m.kids[k].kind == AK.TypeParam()) { tps.Add(m.kids[k].sval); }
+            k = k + 1;
+        }
+        return tps;
+    }
+
+    // resolve name+type-args to a specialization: register the mangled copy
+    // on first use and rewrite the call site's callee to the mangled name.
+    // Open type parameters as arguments mean the call lives in an
+    // unspecialized template body -- skip; the template's own
+    // specialization re-scans with concrete args.
+    void SpecRegister(string name, List<string> args, Node callNode) {
+        bool open = false;
+        int oi = 0;
+        while (oi < args.Count) {
+            if (!KnownTyName(args[oi])) { open = true; }
+            oi = oi + 1;
+        }
+        if (open) { return; }
+        int di = FindGenericDecl(name);
+        if (di < 0) { return; }
+        string mangled = name + "$";
+        int mj = 0;
+        while (mj < args.Count) {
+            if (mj > 0) { mangled = mangled + "__"; }
+            mangled = mangled + args[mj];
+            mj = mj + 1;
+        }
+        Node decl = methNodes[di];
+        if (IndexOfStrNg(specMeth, mangled) < 0) {
+            List<string> tps = DeclTps(decl);
+            Node spec = CloneNode(decl);
+            if (spec == null) { spec = new Node(decl.kind); }
+            int nk = 0;
+            while (nk < spec.kids.Count) {
+                if (spec.kids[nk].kind == AK.TypeParam()) { spec.kids.RemoveAt(nk); }
+                else { nk = nk + 1; }
+            }
+            spec.sval = mangled;
+            SubstTypeNode(spec, tps, args);
+            methNodes.Add(spec);
+            methCls.Add(methCls[di]);
+            methStat.Add(methStat[di]);
+            specMeth.Add(mangled);
+        }
+        callNode.a.sval = mangled;
+        callNode.a.b = null;
+    }
+
+    int FindGenericDecl(string name) {
+        int i = 0;
+        while (i < methNodes.Count) {
+            if (methStat[i] != 2 && methStat[i] != 3 && methNodes[i].sval == name
+                    && HasTypeParams(methNodes[i])) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    void CollectSpecs(Node n) {
+        if (n == null) { return; }
+        if (n.kind == AK.Call() && n.a != null
+                && (n.a.kind == AK.Ident() || n.a.kind == AK.MemberAccess())
+                && n.sval2 != null && n.sval2 != "") {
+            string name = n.a.sval;
+            List<string> args = new List<string>();
+            // the parser pre-joins the explicit args with "__"
+            int i = 0;
+            int start = 0;
+            string s2 = n.sval2;
+            while (i <= s2.Length - 2) {
+                if (s2.Substring(i, 2) == "__") {
+                    args.Add(s2.Substring(start, i - start));
+                    start = i + 2;
+                    i = i + 2;
+                } else { i = i + 1; }
+            }
+            args.Add(s2.Substring(start, s2.Length - start));
+            SpecRegister(name, args, n);
+        } else if (n.kind == AK.Call() && n.a != null
+                && (n.a.kind == AK.Ident() || n.a.kind == AK.MemberAccess())
+                && (n.sval2 == null || n.sval2 == "")
+                && n.kids.Count > 0 && FindGenericDecl(n.a.sval) >= 0) {
+            // un-annotated call: infer the single type parameter from the
+            // first argument (gen0's inference)
+            List<string> tps0 = DeclTps(methNodes[FindGenericDecl(n.a.sval)]);
+            if (tps0.Count == 1) {
+                string st = StaticTyOf(n.kids[0]);
+                if (st != null && KnownTyName(st)) {
+                    List<string> iargs = new List<string>();
+                    iargs.Add(st);
+                    SpecRegister(n.a.sval, iargs, n);
+                }
+            }
+        }
+        CollectSpecs(n.a);
+        CollectSpecs(n.b);
+        CollectSpecs(n.c);
+        CollectSpecs(n.d);
+        int ki = 0;
+        while (ki < n.kids.Count) { CollectSpecs(n.kids[ki]); ki = ki + 1; }
+    }
+
+    void RunSpecPipeline() {
+        // process the worklist: each appended spec's body is scanned for
+        // further explicit-generic calls until fixpoint. A light locals
+        // table (params + declarations) backs StaticTyOf during the scan,
+        // so inference can read a call argument's type.
+        int processed = 0;
+        while (processed < methNodes.Count) {
+            Node m = methNodes[processed];
+            if (methStat[processed] != 3) {
+                bool inst = methStat[processed] == 0 || methStat[processed] == 2;
+                curCls = methCls[processed];
+                locName = new List<string>();
+                locTy = new List<string>();
+                locOff = new List<int>();
+                locRef = new List<bool>();
+                nloc = 0;
+                if (inst) { AddLoc("this", curCls, false); }
+                int pi = 0;
+                while (pi < m.kids.Count) {
+                    if (m.kids[pi].kind == AK.Param()) {
+                        AddLoc(m.kids[pi].sval, TypeFullName(m.kids[pi].type), m.kids[pi].ival == 1);
+                    }
+                    pi = pi + 1;
+                }
+                ReserveLocals(m.d);
+                CollectSpecs(m);
+            }
+            processed = processed + 1;
+        }
     }
 
     // ---- enums ----
