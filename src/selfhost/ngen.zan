@@ -26,9 +26,10 @@ class Fixup {
 
 class StrRef {
     public int adrpPos;  // text offset of the adrp instruction
-    public int addPos;   // text offset of the add instruction
-    public string sym;   // target symbol name (l_.str.N / l_.g.NAME)
-    public StrRef(int a, int b, string s) { adrpPos = a; addPos = b; sym = s; }
+    public int addPos;   // text offset of the add/ldr instruction
+    public string sym;   // target symbol name (l_.str.N / l_.g.NAME / __stdinp)
+    public int got;      // 1: adrp + ldr through the GOT (dylib data symbols)
+    public StrRef(int a, int b, string s) { adrpPos = a; addPos = b; sym = s; got = 0; }
 }
 
 class Sym {
@@ -1015,7 +1016,14 @@ partial class Ngen {
             return f != null && f.ty == "string";
         }
         if (e.kind == AK.Call() && e.a != null) {
-            if (e.a.kind == AK.MemberAccess() && e.a.sval == "Substring") { return true; }
+            if (e.a.kind == AK.MemberAccess()) {
+                // string.Join(sep, List<string>) yields a heap string;
+                // Substring too; any other member call falls through to
+                // the user-method return type below
+                if (e.a.sval == "Substring") { return true; }
+                Node rj = e.a.a;
+                if (rj != null && rj.kind == AK.Ident() && rj.sval == "string" && e.a.sval == "Join") { return true; }
+            }
             return MethRetTy(e.a.sval) == "string";
         }
         // List<string> element reads yield heap strings (string indexing
@@ -1066,6 +1074,19 @@ partial class Ngen {
             return f != null && f.ty == "double";
         }
         if (e.kind == AK.Call() && e.a != null) {
+            if (e.a.kind == AK.MemberAccess()) {
+                // Math library calls: Sqrt/Floor/Ceiling/Pow are always
+                // double; Abs/Max/Min are double when any argument is
+                Node rm = e.a.a;
+                if (rm != null && rm.kind == AK.Ident() && rm.sval == "Math") {
+                    string mn = e.a.sval;
+                    if (mn == "Sqrt" || mn == "Floor" || mn == "Ceiling" || mn == "Pow") { return true; }
+                    if (mn == "Abs" && e.kids.Count == 1) { return IsDblExpr(e.kids[0]); }
+                    if ((mn == "Max" || mn == "Min") && e.kids.Count == 2) {
+                        return IsDblExpr(e.kids[0]) || IsDblExpr(e.kids[1]);
+                    }
+                }
+            }
             return MethRetTy(e.a.sval) == "double";
         }
         return false;
@@ -1224,10 +1245,160 @@ partial class Ngen {
                 AddSPImm(16, true);
                 return;
             }
+            // Math static methods. Integer forms: Abs is a negate and
+            // Max/Min are a csel over a signed compare (gen0 lowers them
+            // the same way for i64). Double forms call libm with the value
+            // in d0 (Pow takes d0 + d1) and come back as the bit pattern
+            // in x0.
+            if (recv != null && recv.kind == AK.Ident() && recv.sval == "Math") {
+                string mn = callee.sval;
+                if (mn == "Abs" && e.kids.Count == 1) {
+                    GenExpr(e.kids[0]);
+                    if (IsDblExpr(e.kids[0])) {
+                        DblLibm1("_fabs");
+                    } else {
+                        E4(0xCB0003E0);                  // neg x0, x0
+                    }
+                    return;
+                }
+                if ((mn == "Max" || mn == "Min") && e.kids.Count == 2) {
+                    if (IsDblExpr(e.kids[0]) || IsDblExpr(e.kids[1])) {
+                        // both arguments move to d0/d1 only after BOTH are
+                        // evaluated: GenExpr may call strtod (returning in
+                        // d0) for lazy double literals, which would clobber
+                        // a value parked in d0 early
+                        GenExpr(e.kids[0]);
+                        E4(0xF81F0FE0);                  // push a
+                        GenExpr(e.kids[1]);
+                        E4(0xF84107E1);                  // pop a -> x1 (x0 = b)
+                        E4(0x9E670001);                  // fmov d1, x0
+                        E4(0xAA0103E0);                  // mov x0, x1
+                        E4(0x9E670000);                  // fmov d0, x0
+                        if (mn == "Max") { BLExtern("_fmax"); } else { BLExtern("_fmin"); }
+                        E4(0x9E660000);                  // fmov x0, d0
+                    } else {
+                        GenExpr(e.kids[0]);
+                        E4(0xF81F0FE0);                  // push a
+                        GenExpr(e.kids[1]);
+                        E4(0xF84107E1);                  // pop a -> x1 (x0 = b)
+                        E4(0xEB01001F);                  // cmp x0, x1
+                        if (mn == "Max") { E4(0x9A81C000); } // csel x0, x0, x1, gt
+                        else { E4(0x9A81B000); }             // csel x0, x0, x1, lt
+                    }
+                    return;
+                }
+                if (mn == "Sqrt" && e.kids.Count == 1) {
+                    GenExpr(e.kids[0]);
+                    DblLibm1("_sqrt");
+                    return;
+                }
+                if (mn == "Floor" && e.kids.Count == 1) {
+                    GenExpr(e.kids[0]);
+                    DblLibm1("_floor");
+                    return;
+                }
+                if (mn == "Ceiling" && e.kids.Count == 1) {
+                    GenExpr(e.kids[0]);
+                    DblLibm1("_ceil");
+                    return;
+                }
+                if (mn == "Pow" && e.kids.Count == 2) {
+                    // same ordering discipline as the double Max/Min path:
+                    // no value may sit in d0 across a GenExpr call
+                    GenExpr(e.kids[0]);
+                    E4(0xF81F0FE0);                      // push a
+                    GenExpr(e.kids[1]);
+                    E4(0xF84107E1);                      // pop a -> x1 (x0 = b)
+                    E4(0x9E670001);                      // fmov d1, x0
+                    E4(0xAA0103E0);                      // mov x0, x1
+                    E4(0x9E670000);                      // fmov d0, x0
+                    BLExtern("_pow");
+                    E4(0x9E660000);                      // fmov x0, d0
+                    return;
+                }
+            }
+            // string.Join(sep, List<string>): gen0 runs two passes over the
+            // list -- one strlen pass for the total size, one copy pass --
+            // and mirrors that here (joining a string[] crashes gen0's own
+            // runtime, so the List form is the only shape to match).
+            if (recv != null && recv.kind == AK.Ident() && recv.sval == "string"
+                    && callee.sval == "Join" && e.kids.Count == 2) {
+                GenExpr(e.kids[1]);                      // list
+                E4(0xF81F0FE0);                          // push list
+                GenExpr(e.kids[0]);                      // sep
+                E4(0xF84107E1);                          // pop list -> x1 (x0 = sep)
+                BLInternal("_zan_rt_strjoin");
+                return;
+            }
+            // Console.ReadLine: gen0 allocates a 1024-byte string, NUL-
+            // terminates it up front, fgets()s into it keeping the trailing
+            // newline, and yields the buffer regardless of the fgets result
+            // (an EOF reads back as the empty string).
+            if (recv != null && recv.kind == AK.Ident() && recv.sval == "Console"
+                    && callee.sval == "ReadLine" && e.kids.Count == 0) {
+                LoadImm(0, 1024);
+                BLInternal("_zan_rt_str_alloc");         // x0 = buf
+                E4(0xF81F0FE0);                          // push buf
+                Strb0(0);                                // buf[0] = NUL
+                // the Mach-O symbol is the C name plus one underscore
+                // (LLVM adds it automatically for @__stdinp)
+                LoadSymRefGOT("___stdinp", 2);
+                LdrU(2, 2, 0);                           // x2 = stdin
+                LdrU(0, 31, 0);                          // x0 = buf
+                LoadImm(1, 1024);
+                BLExtern("_fgets");
+                E4(0xF84107E0);                          // pop buf -> x0
+                return;
+            }
             // List<T> built-ins (gen0-compatible inline sequences)
             if (ExprCls(recv) == "List") {
                 if (callee.sval == "Add" && e.kids.Count == 1) {
                     GenListAdd(recv, e.kids[0]);
+                    return;
+                }
+                if (callee.sval == "Clear" && e.kids.Count == 0) {
+                    GenExpr(recv);
+                    E4(0xF900001F);                      // str xzr, [x0] (count = 0)
+                    return;
+                }
+                if (callee.sval == "Contains" && e.kids.Count == 1) {
+                    GenExpr(recv);
+                    E4(0xF81F0FE0);                      // push list
+                    GenExpr(e.kids[0]);
+                    E4(0xF84107E1);                      // pop list -> x1 (x0 = value)
+                    // loop state lives in callee-saved x19..x23: the string
+                    // form calls strcmp, which clobbers every caller-saved
+                    // register the loop would otherwise keep there
+                    MovRR(19, 1);                        // x19 = list
+                    MovRR(22, 0);                        // x22 = value
+                    LdrU(20, 19, 0);                     // x20 = count
+                    LdrU(21, 19, 16);                    // x21 = data
+                    E4(0xD2800017);                      // movz x23, #0 (i)
+                    int lp = NL();
+                    int nof = NL();
+                    int yes = NL();
+                    int donec = NL();
+                    Mark(lp);
+                    E4(0xEB1402FF);                      // cmp x23, x20
+                    EmitBcond(10, nof);                  // b.ge nof
+                    E4(0xF8777AA0);                      // ldr x0, [x21, x23, lsl #3]
+                    if (IsStrExpr(e.kids[0])) {
+                        MovRR(1, 22);                    // x1 = value
+                        BLExtern("_strcmp");
+                        E4(0x7100001F);                  // cmp w0, #0
+                        EmitBcond(0, yes);               // b.eq yes
+                    } else {
+                        E4(0xEB16001F);                  // cmp x0, x22
+                        EmitBcond(0, yes);               // b.eq yes
+                    }
+                    AddImm(23, 23, 1);
+                    EmitB(lp);
+                    Mark(nof);
+                    E4(0xD2800000);                      // movz x0, #0
+                    EmitB(donec);
+                    Mark(yes);
+                    E4(0xD2800020);                      // movz x0, #1
+                    Mark(donec);
                     return;
                 }
                 diags.Error("ngen: unsupported List operation '" + callee.sval + "'", e.line, e.col);
@@ -1533,11 +1704,30 @@ partial class Ngen {
         E4(0x91000000 | (reg << 5) | reg);               // add reg, reg, sym@PAGEOFF
         strRefs.Add(new StrRef(a, txt.Count - 4, sym));
     }
+    // adrp + ldr through the GOT. dylib DATA symbols (__stdinp etc.) cannot
+    // bind through adrp+add: their page offsets are filled at runtime by the
+    // dynamic loader, so the address must come from a GOT slot instead.
+    void LoadSymRefGOT(string sym, int reg) {
+        E4(0x90000000 | reg);                            // adrp reg, sym@GOTPAGE
+        int a = txt.Count - 4;
+        E4(0xF9400000 | (reg << 5) | reg);               // ldr reg, [reg, sym@GOTPAGEOFF]
+        StrRef r = new StrRef(a, txt.Count - 4, sym);
+        r.got = 1;
+        strRefs.Add(r);
+    }
     void LoadStr(int si, int reg) {
         // literals live in the startup pool as stamped heap strings; the
         // l_.g.strp.N slot holds the pointer (see RtEmitStrpool)
         LoadSymRef("l_.g.strp." + si, reg);
         LdrU(reg, reg, 0);
+    }
+
+    // one-argument libm double call: the value arrives as its bit pattern
+    // in x0, moves to d0, and the result comes back the same way
+    void DblLibm1(string f) {
+        E4(0x9E670000);                                  // fmov d0, x0
+        BLExtern(f);
+        E4(0x9E660000);                                  // fmov x0, d0
     }
 
     // ---- fixup resolution (text offsets are final here) ----

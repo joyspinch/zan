@@ -162,6 +162,7 @@ partial class Ngen {
         RtEmitPrintUint();
         RtEmitChrstr();
         RtEmitSubstr2();
+        RtEmitStrjoin();
         RtEmitEhState();
     }
 
@@ -321,6 +322,145 @@ partial class Ngen {
         StrU(0, 9, 0);
         LdrU(0, 31, 0);                        // return dst
         AddSPImm(64, true);                    // pop dst/subl/start/s
+        RtEpilogue();
+    }
+
+    // ptr zan_rt_strjoin(sep, list) -- string.Join(sep, List<string>).
+    // Two passes exactly like gen0's __zan_str_join: one strlen pass for
+    // the total (sep counted n-1 times, only when n > 0), then str_alloc
+    // of align32(total + 1) (min 32) and a copy pass with the sep between
+    // elements. Null elements count as "". No length header is written.
+    // Frame slots: [0]=total [8]=i [16]=list [24]=sep [32]=seplen
+    // [40]=pos [48]=buf [56]=elem [64]=sl.
+    void RtEmitStrjoin() {
+        syms.Add(new Sym("_zan_rt_strjoin", txt.Count));
+        RtPrologue();
+        AddSPImm(80, false);
+        StrU(1, 31, 16);                       // [sp+16] = list (x1)
+        StrU(0, 31, 24);                       // [sp+24] = sep (x0)
+        LdrU(0, 31, 24);
+        BLExtern("_strlen");                   // x0 = seplen
+        StrU(0, 31, 32);
+        // total = n > 0 ? seplen * (n - 1) : 0
+        E4(0xD2800004);                        // movz x4, #0
+        LdrU(2, 31, 16);
+        LdrU(2, 2, 0);                         // x2 = n
+        int sepskip = NL();
+        CbzReg(2, sepskip);
+        LdrU(3, 31, 32);
+        E4(0xD1000442);                        // sub x2, x2, #1
+        E4(0x9B027C64);                        // mul x4, x3, x2
+        Mark(sepskip);
+        StrU(4, 31, 0);                        // [sp] = total
+        E4(0xD2800000);                        // movz x0, #0
+        StrU(0, 31, 8);                        // i = 0
+        // pass 1: total += strlen(elem or "")
+        int l1 = NL();
+        int d1 = NL();
+        int isn1 = NL();
+        int isa1 = NL();
+        Mark(l1);
+        LdrU(0, 31, 8);                        // i
+        LdrU(2, 31, 16);
+        LdrU(2, 2, 0);                         // n
+        E4(0xEB02001F);                        // cmp x0, x2
+        EmitBcond(10, d1);                     // b.ge d1
+        LdrU(3, 31, 16);
+        LdrU(3, 3, 16);                        // x3 = data
+        E4(0xF8607860);                        // ldr x0, [x3, x0, lsl #3]
+        CbzReg(0, isn1);
+        BLExtern("_strlen");                   // x0 = sl
+        EmitB(isa1);
+        Mark(isn1);
+        E4(0xD2800000);                        // movz x0, #0
+        Mark(isa1);
+        LdrU(1, 31, 0);
+        AddRR(1, 1, 0);
+        StrU(1, 31, 0);                        // total += sl
+        LdrU(0, 31, 8);
+        AddImm(0, 0, 1);
+        StrU(0, 31, 8);                        // i++
+        EmitB(l1);
+        Mark(d1);
+        // buf = str_alloc(max(align32(total + 1), 32))
+        LdrU(0, 31, 0);
+        AddImm(0, 0, 1);
+        AddImm(0, 0, 31);
+        E4(0x927BE800);                        // and x0, x0, #-32
+        LoadImm(9, 32);
+        E4(0xEB09001F);                        // cmp x0, x9
+        int ok32 = NL();
+        EmitBcond(2, ok32);                    // b.hs ok32
+        LoadImm(0, 32);
+        Mark(ok32);
+        BLInternal("_zan_rt_str_alloc");
+        StrU(0, 31, 48);                       // [sp+48] = buf
+        E4(0xD2800000);                        // movz x0, #0
+        StrU(0, 31, 40);                       // pos = 0
+        StrU(0, 31, 8);                        // i = 0
+        // pass 2: copy element, sep when i + 1 < n, NUL at the end
+        int l2 = NL();
+        int d2 = NL();
+        int nosep = NL();
+        int isn2 = NL();
+        int isa2 = NL();
+        Mark(l2);
+        LdrU(0, 31, 8);                        // i
+        LdrU(2, 31, 16);
+        LdrU(2, 2, 0);                         // n
+        E4(0xEB02001F);                        // cmp x0, x2
+        EmitBcond(10, d2);                     // b.ge d2
+        LdrU(3, 31, 16);
+        LdrU(3, 3, 16);                        // x3 = data
+        E4(0xF8607863);                        // ldr x3, [x3, x0, lsl #3]
+        StrU(3, 31, 56);                       // [sp+56] = elem
+        CbzReg(3, isn2);
+        LdrU(0, 31, 56);
+        BLExtern("_strlen");
+        StrU(0, 31, 64);                       // [sp+64] = sl
+        EmitB(isa2);
+        Mark(isn2);
+        E4(0xD2800000);                        // movz x0, #0
+        StrU(0, 31, 64);
+        Mark(isa2);
+        LdrU(0, 31, 48);                       // buf
+        LdrU(9, 31, 40);                       // pos
+        E4(0x8B090000);                        // add x0, x0, x9 (dst)
+        LdrU(1, 31, 56);                       // elem
+        LdrU(2, 31, 64);                       // sl
+        BLExtern("_memcpy");
+        LdrU(1, 31, 64);
+        LdrU(2, 31, 40);
+        AddRR(2, 2, 1);
+        StrU(2, 31, 40);                       // pos += sl
+        LdrU(0, 31, 8);                        // i
+        AddImm(0, 0, 1);                       // i + 1
+        LdrU(2, 31, 16);
+        LdrU(2, 2, 0);                         // n
+        E4(0xEB02001F);                        // cmp i+1, n
+        EmitBcond(10, nosep);                  // b.ge nosep
+        LdrU(0, 31, 48);                       // buf
+        LdrU(9, 31, 40);                       // pos
+        E4(0x8B090000);                        // add x0, x0, x9 (dst)
+        LdrU(1, 31, 24);                       // sep
+        LdrU(2, 31, 32);                       // seplen
+        BLExtern("_memcpy");
+        LdrU(1, 31, 32);
+        LdrU(2, 31, 40);
+        AddRR(2, 2, 1);
+        StrU(2, 31, 40);                       // pos += seplen
+        Mark(nosep);
+        LdrU(0, 31, 8);
+        AddImm(0, 0, 1);
+        StrU(0, 31, 8);                        // i++
+        EmitB(l2);
+        Mark(d2);
+        LdrU(0, 31, 48);                       // buf
+        LdrU(9, 31, 40);                       // pos
+        E4(0x8B090000);                        // add x0, x0, x9
+        Strb0(0);                              // buf[pos] = NUL
+        LdrU(0, 31, 48);                       // return buf
+        AddSPImm(80, true);
         RtEpilogue();
     }
 
