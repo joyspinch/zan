@@ -454,6 +454,7 @@ partial class Ngen {
     // rendering (null = not a scalar: leave the call to method dispatch)?
     string ScalarToStringTy(Node e) {
         if (e == null) { return null; }
+        if (e.kind == AK.IntLit()) { return "int"; }
         if (IsBoolExpr(e)) { return "bool"; }
         if (IsStrExpr(e)) { return "string"; }
         if (IsCharExpr(e)) { return "char"; }
@@ -1994,6 +1995,12 @@ partial class Ngen {
         if (IsArrTy(t) && (t == "int[]" || t == "long[]" || t == "ulong[]"
                 || t == "double[]" || t == "string[]" || t == "bool[]"
                 || t == "char[]")) { return null; }
+        // generics are erased: `GBox<bool>` names the open class `GBox`
+        int lt = t.IndexOf("<");
+        if (lt > 0) {
+            string open = t.Substring(0, lt);
+            if (FindClass(open) != null) { return open; }
+        }
         return t;
     }
 
@@ -2148,6 +2155,127 @@ partial class Ngen {
         }
         if (e.kind == AK.Index()) { return ElemTyOf(e); }
         return null;
+    }
+
+    // map an interpolation format specifier to a printf pattern, mirroring
+    // gen0's interp_format_to_printf exactly (the conformance suite pins the
+    // mapping); "" means the default rendering
+    string FormatSpecToPrintf(string spec, bool isUlong) {
+        if (spec == null || spec.Length == 0) { return ""; }
+        string code = spec.Substring(0, 1);
+        int digits = 0;
+        int i = 1;
+        while (i < spec.Length) {
+            int d = spec[i] - 48;
+            if (d >= 0 && d <= 9) { digits = digits * 10 + d; }
+            i = i + 1;
+        }
+        if (code == "D" || code == "d") {
+            // decimal, zero-padded to `digits`
+            if (isUlong) { return digits <= 0 ? "" : "%0" + Convert.ToString(digits) + "llu"; }
+            return digits <= 0 ? "" : "%0" + Convert.ToString(digits) + "lld";
+        }
+        if (code == "X" || code == "x") {
+            // hex (upper/lower), zero-padded to `digits`
+            return digits <= 0 ? "" : "%0" + Convert.ToString(digits) + "llX";
+        }
+        if (code == "F" || code == "f") { return "%." + Convert.ToString(digits) + "lf"; }
+        if (code == "E" || code == "e") { return "%." + Convert.ToString(digits) + "E"; }
+        if (code == "G" || code == "g") {
+            // general: default is the shortest round-trip render; a digit
+            // count means significant digits ({v:G3} -> %.3g)
+            return digits > 0 ? "%." + Convert.ToString(digits) + "g" : "";
+        }
+        if (code == "0" || code == "#") {
+            // custom numeric: 0 = required digit, # = optional
+            int ipad = 0;
+            int frac = 0;
+            bool afterDot = false;
+            bool haveDot = false;
+            i = 0;
+            while (i < spec.Length) {
+                string ch = spec.Substring(i, 1);
+                if (ch == ".") { afterDot = true; haveDot = true; }
+                else if (ch == "0" || ch == "#") {
+                    if (afterDot) { frac = frac + 1; }
+                    else if (ch == "0") { ipad = ipad + 1; }
+                }
+                i = i + 1;
+            }
+            if (haveDot) { return "%." + Convert.ToString(frac) + "lf"; }
+            if (ipad > 0) {
+                string u = isUlong ? "llu" : "lld";
+                return "%0" + Convert.ToString(ipad) + u;
+            }
+            return "";
+        }
+        return "";                             // unrecognized: default format
+    }
+
+    // does the mapped printf pattern render as a double (fixed/scientific
+    // spec on an integer widens it first, like C#)?
+    bool SpecWantsDouble(string spec) {
+        if (spec == null || spec.Length == 0) { return false; }
+        string code = spec.Substring(0, 1);
+        if (code == "F" || code == "f" || code == "E" || code == "e") { return true; }
+        if (code == "0" || code == "#") {
+            int i = 0;
+            while (i < spec.Length) {
+                if (spec.Substring(i, 1) == ".") { return true; }
+                i = i + 1;
+            }
+        }
+        return false;
+    }
+
+    // scalar x.ToString("spec"): the compiler-mapped printf render (the
+    // lexer splice turns an interpolation hole `{v:D4}` into
+    // `v.ToString("D4")`). bool/string/char ignore the spec like gen0;
+    // int-family receivers widen to double for fixed/scientific patterns.
+    void GenScalarToStringFmt(Node e, Node recv, string spec) {
+        string sty = ScalarToStringTy(recv);
+        if (sty == "bool") {
+            GenExpr(recv);
+            int fls = NL();
+            int doneb = NL();
+            CbzReg(0, fls);
+            LoadStr(InternStr("true"), 0);
+            EmitB(doneb);
+            Mark(fls);
+            LoadStr(InternStr("false"), 0);
+            Mark(doneb);
+            return;
+        }
+        if (sty == "string") { GenExpr(recv); return; }
+        if (sty == "char") {
+            GenExpr(recv);
+            BLInternal("_zan_rt_chrstr");
+            return;
+        }
+        // gen0's is_float rule: a double receiver ignores decimal/hex
+        // padding specs (D/X) and renders with the default path
+        string c0 = spec != null && spec.Length > 0 ? spec.Substring(0, 1) : "";
+        bool dblNoFmt = sty == "double"
+            && (c0 == "D" || c0 == "d" || c0 == "X" || c0 == "x");
+        string pf = dblNoFmt ? "" : FormatSpecToPrintf(spec, sty == "ulong");
+        if (pf == "") {
+            // default rendering: the plain paths
+            if (sty == "double") {
+                GenExpr(recv);
+                BLInternal("_zan_rt_dbl2str");
+            } else if (sty == "ulong") {
+                GenExpr(recv);
+                BLInternal("_zan_rt_uint2str");
+            } else {
+                GenExpr(recv);
+                BLInternal("_zan_rt_int2str");
+            }
+            return;
+        }
+        GenExpr(recv);
+        if (SpecWantsDouble(spec) && sty == "int") { ConvI2D(); }
+        LoadStr(InternStr(pf), 1);
+        BLInternal("_zan_rt_fmt");
     }
 
     // ---- enums ----
@@ -2837,6 +2965,11 @@ partial class Ngen {
     // Returns false when no overload applies and the builtin paths must run.
     bool TryOpOverloadNg(Node e) {
         if (IsStrExpr(e.a) || IsStrExpr(e.b)) { return false; }
+        // comparisons against the null literal stay reference compares, so
+        // an op_eq body can null-check without recursing into itself
+        // (gen0 irgen's null_cmp rule)
+        if ((e.a != null && e.a.kind == AK.NullLit())
+                || (e.b != null && e.b.kind == AK.NullLit())) { return false; }
         string mn = OpMethodNameNg(e.op);
         if (mn == "") { return false; }
         string owner = null;
@@ -2872,7 +3005,7 @@ partial class Ngen {
         if (op == TK.Slash()) { return "op_div"; }
         if (op == TK.Percent()) { return "op_mod"; }
         if (op == TK.EqEq()) { return "op_eq"; }
-        if (op == TK.BangEq()) { return "op_ne"; }
+        if (op == TK.BangEq()) { return "op_neq"; }
         if (op == TK.Less()) { return "op_lt"; }
         if (op == TK.Greater()) { return "op_gt"; }
         if (op == TK.LessEq()) { return "op_le"; }
@@ -3224,6 +3357,15 @@ partial class Ngen {
                     }
                     return;
                 }
+            }
+            // scalar x.ToString("spec"): the printf-mapped render (spliced
+            // from interpolation holes); non-scalar receivers dispatch to
+            // user methods instead
+            if (callee.sval == "ToString" && e.kids.Count == 1
+                    && e.kids[0] != null && e.kids[0].kind == AK.StringLit()
+                    && ScalarToStringTy(recv) != null) {
+                GenScalarToStringFmt(e, recv, e.kids[0].sval);
+                return;
             }
             // EnumType.TryParse(text, out value): compiler-lowered probe of
             // the declaration-order member names (gen0 parity), storing the
@@ -3755,6 +3897,76 @@ partial class Ngen {
         return null;
     }
 
+    // scalar/enum type names a one-argument class constructor can materialize
+    // (gen0's is_implicit_ctor_source)
+    bool CtorSrcTy(string t) {
+        if (t == null) { return false; }
+        if (t == "bool" || t == "sbyte" || t == "byte" || t == "short"
+                || t == "ushort" || t == "int" || t == "uint" || t == "long"
+                || t == "ulong" || t == "nint" || t == "char") { return true; }
+        return FindEnum(t) >= 0;
+    }
+
+    // static type of an argument for ctor-wrap purposes: literals carry no
+    // StaticTyOf answer, so name the usual scalar shapes directly
+    string ArgSrcTy(Node e) {
+        if (e == null) { return null; }
+        if (e.kind == AK.BoolLit()) { return "bool"; }
+        if (e.kind == AK.IntLit()) { return "int"; }
+        if (e.kind == AK.CharLit()) { return "char"; }
+        if (e.kind == AK.Unary()) {
+            if (e.op == TK.Bang()) { return "bool"; }
+            if (e.op == TK.Minus() && e.a != null && e.a.kind == AK.IntLit()) { return "int"; }
+            return null;
+        }
+        if (e.kind == AK.Binary()) {
+            int op = e.op;
+            if (op == TK.EqEq() || op == TK.BangEq() || op == TK.Less()
+                    || op == TK.Greater() || op == TK.LessEq()
+                    || op == TK.GreaterEq() || op == TK.AmpAmp()
+                    || op == TK.PipePipe()) { return "bool"; }
+            return null;
+        }
+        if (e.kind == AK.Conditional()) {
+            string ct = ArgSrcTy(e.b);
+            return ct != null && ct == ArgSrcTy(e.c) ? ct : null;
+        }
+        return StaticTyOf(e);
+    }
+
+    // a bool/integer/char/enum argument converts to a class parameter through
+    // a matching one-argument constructor: rewrite the call-site argument to
+    // `new Target(arg)` (gen0 wrap_implicit_ctor_arg), giving the same ARC
+    // ownership and value as an explicit new. Returns the replacement node,
+    // or null when the argument is left as written.
+    Node WrapImplicitCtorArg(Node p, Node arg) {
+        if (arg == null) { return null; }
+        if (arg.kind == AK.NewExpr() || arg.kind == AK.NullLit()
+                || arg.kind == AK.OutArg() || arg.kind == AK.ThisExpr()
+                || arg.kind == AK.Lambda()) { return null; }
+        string pt = ClassTyOf(TypeFullName(p.type));
+        if (pt == null || FindClass(pt) == null) { return null; }
+        string st = ArgSrcTy(arg);
+        if (st == null || !CtorSrcTy(st) || st == pt) { return null; }
+        Node c1 = new Node(AK.Call());
+        c1.line = arg.line;
+        c1.col = arg.col;
+        c1.Add(arg);
+        if (FitCtorIdx(pt, c1, false, null) < 0) {
+            diags.Error("ngen: cannot convert '" + st + "' to '" + pt
+                + "' in argument: no matching constructor", arg.line, arg.col);
+            return null;
+        }
+        Node tr = new Node(AK.TypeRef());
+        tr.sval = pt;
+        Node ne = new Node(AK.NewExpr());
+        ne.type = tr;
+        ne.line = arg.line;
+        ne.col = arg.col;
+        ne.Add(arg);
+        return ne;
+    }
+
     // evaluate call arguments left to right, spilling each onto the stack;
     // omitted trailing arguments fall back to the callee's default parameter
     // values, and a `params T[]` tail bundles every extra argument into a
@@ -3856,11 +4068,17 @@ partial class Ngen {
         }
         int i = 0;
         while (i < prov && i < fixedc) {
-            if (ak[i].kind == AK.OutArg()) {
-                GenRefArg(ak[i]);                        // x0 = storage address
+            Node ae = ak[i];
+            Node pa2 = ParamAt(m, i);
+            if (pa2 != null) {
+                Node wrapped = WrapImplicitCtorArg(pa2, ae);
+                if (wrapped != null) { ak[i] = wrapped; ae = wrapped; }
+            }
+            if (ae.kind == AK.OutArg()) {
+                GenRefArg(ae);                        // x0 = storage address
             } else {
-                GenExpr(ak[i]);
-                ConvArg(m, i, ak[i]);
+                GenExpr(ae);
+                ConvArg(m, i, ae);
             }
             E4(0xF81F0FE0);                              // str x0, [sp, #-16]!
             i = i + 1;

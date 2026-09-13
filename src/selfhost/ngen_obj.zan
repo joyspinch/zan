@@ -383,6 +383,7 @@ partial class Ngen {
         RtEmitDbl2Str();
         RtEmitPrintDouble();
         RtEmitUint2Str();
+        RtEmitFmt();
         RtEmitPrintUint();
         RtEmitChrstr();
         RtEmitSubstr2();
@@ -463,6 +464,52 @@ partial class Ngen {
         AddSPImm(16, true);
         RtEpilogue();
     }
+
+    // ptr zan_rt_fmt(i64 vbits, ptr cfmt): snprintf-render a value under a
+    // printf pattern the compiler mapped from an interpolation format
+    // specifier ({v:D4} -> "%08lld"), returned as a heap string. The value
+    // arrives as its i64 bit pattern (our expression model carries doubles
+    // that way) and is the trailing variadic, so it travels on the stack per
+    // AAPCS64 -- unnamed FP arguments are stack slots, not d registers.
+    // Frame (48 below the saved pair): cfmt@-16, buf@-24, vbits@-32, len@-40.
+    void RtEmitFmt() {
+        syms.Add(new Sym("_zan_rt_fmt", txt.Count));
+        RtPrologue();
+        AddSPImm(48, false);
+        RtStur(0, 29, -32);                    // vbits
+        RtStur(1, 29, -16);                    // cfmt
+        // probe: snprintf(NULL, 0, cfmt, v)
+        LoadImm(0, 0);
+        LoadImm(1, 0);
+        RtLdur(2, 29, -16);
+        RtLdur(3, 29, -32);
+        StrU(3, 31, 0);                        // [sp] = v (variadic slot)
+        BLExtern("_snprintf");
+        RtStur(0, 29, -40);                    // len
+        AddImm(0, 0, 1);                       // + NUL
+        BLInternal("_zan_rt_str_alloc");       // x0 = buf
+        RtStur(0, 29, -24);
+        // render: snprintf(buf, len+1, cfmt, v)
+        RtLdur(0, 29, -24);
+        RtLdur(1, 29, -40);
+        AddImm(1, 1, 1);
+        RtLdur(2, 29, -16);
+        RtLdur(3, 29, -32);
+        StrU(3, 31, 0);
+        BLExtern("_snprintf");
+        // stamp the header at buf-8: 0x5A414E53_00000000 | strlen(buf)
+        RtLdur(0, 29, -24);
+        BLExtern("_strlen");
+        LoadImm(4, 0x5A414E5300000000);
+        E4(0xAA040001);                        // orr x1, x0, x4
+        RtLdur(5, 29, -24);
+        SubImm(5, 5, 8);
+        RtStur(1, 5, 0);                       // str x1, [x5] (== buf-8)
+        RtLdur(0, 29, -24);
+        AddSPImm(48, true);
+        RtEpilogue();
+    }
+
 
     // ptr zan_rt_dbl2str(i64 bits) -- the value arrives as the i64 bit
     // pattern our expression model carries; renders with the C runtime's
