@@ -1113,11 +1113,13 @@ partial class Ngen {
                 E4(0xF8207882);                      // str x2, [x4, x0, lsl #3]
             } else if (e.a != null && e.a.kind == AK.MemberAccess()) {
                 // class-qualified static write: Program.starting = v
+                // (the value was already evaluated into x0 at the top)
                 if (e.a.a != null && e.a.a.kind == AK.Ident()) {
                     string ssym = FindStaticSym(e.a.a.sval, e.a.sval);
                     if (ssym != null) {
-                        GenExpr(e.b);                        // value -> x0
-                        LoadSymRef(ssym, 1);                 // x1 = &slot
+                        E4(0xF81F0FE0);                  // push value across LoadSymRef
+                        LoadSymRef(ssym, 1);             // x1 = &slot
+                        E4(0xF84107E0);                  // pop value -> x0
                         StrU(0, 1, 0);
                         return;
                     }
@@ -1249,6 +1251,8 @@ partial class Ngen {
         if (e == null) { return null; }
         if (e.kind == AK.ThisExpr()) { return curCls; }
         if (e.kind == AK.NewExpr()) { return e.type != null ? e.type.sval : null; }
+        if (e.kind == AK.CastExpr() && e.type != null) { return ClassTyOf(e.type.sval); }
+        if (e.kind == AK.Index()) { return ClassTyOf(ElemTyOf(e)); }
         if (e.kind == AK.Call() && e.a != null) {
             // method results carry a class identity when the method's
             // declared return type names one (ChartOption.Create().x)
@@ -1258,6 +1262,29 @@ partial class Ngen {
             return ClassTyOf(NamedSlotTy(e.sval));
         }
         return null;
+    }
+
+    // element type name of an index expression ("l[i]" with l declared as
+    // "List<Pt>" or "Pt[]"), or null; struct elements return null too, since
+    // gen0 keeps them inline in the container with value semantics -- pointer
+    // field access would silently alias
+    string ElemTyOf(Node e) {
+        if (e == null || e.a == null) { return null; }
+        string el = null;
+        if (IsArrExpr(e.a)) {
+            string at = ArrTyOf(e.a);
+            if (at != null && at.Length > 2) { el = at.Substring(0, at.Length - 2); }
+        } else if (ExprCls(e.a) == "List") {
+            string ct = StaticTyOf(e.a);
+            if (ct != null && ct.Length > 5 && ct.Substring(0, 5) == "List<"
+                    && ct.Substring(ct.Length - 1, 1) == ">") {
+                el = ct.Substring(5, ct.Length - 6);
+            }
+        }
+        if (el == null) { return null; }
+        Cls ec = FindClass(el);
+        if (ec != null && ec.isStruct == 1) { return null; }
+        return el;
     }
 
     // normalize a declared type name to its class identity ("List<string>"
@@ -1366,6 +1393,7 @@ partial class Ngen {
             Fld f = FieldOf(e);
             return f != null ? f.ty : null;
         }
+        if (e.kind == AK.Index()) { return ElemTyOf(e); }
         return null;
     }
 
