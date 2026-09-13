@@ -77,6 +77,12 @@ partial class Ngen {
     List<int> methStat;     // 0 = instance, 1 = static, 2 = ctor
     string mainCls;
 
+    List<string> enName;    // enum type name per declaration
+    List<int> enOff;        // start index into the flat member arrays
+    List<int> enCnt;        // member count
+    List<string> enMem;     // flat member names
+    List<long> enVal;       // flat member constants (C# running counter)
+
     public Ngen(Binder b, Diags d, string file) {
         diags = d;
         srcFile = file;
@@ -103,6 +109,7 @@ partial class Ngen {
             i = i + 1;
         }
         CollectClasses(unit);
+        CollectEnums(unit);
         EmitRtCore();
         guardDivIdx = InternStr("division by zero\n");
         guardModIdx = InternStr("division by zero (modulo)\n");
@@ -625,6 +632,11 @@ partial class Ngen {
                 E4(0xD1002009);                      // sub x9, x0, #8
                 E4(0xF9400120);                      // ldr x0, [x9]
                 E4(0xD3407C00);                      // ubfm x0, x0, #0, #31
+            }
+            else if (e.a != null && e.a.kind == AK.Ident()
+                    && FindEnumMemIdx(e.a.sval, e.sval) >= 0) {
+                // EnumType.Member constant
+                LoadImm(0, enVal[FindEnumMemIdx(e.a.sval, e.sval)]);
             }
             else { GenFieldLoad(e); }
         } else if (k == AK.Binary() && e.op == TK.AmpAmp()) {
@@ -1349,10 +1361,110 @@ partial class Ngen {
         if (e.kind == AK.Ident()) { return NamedSlotTy(e.sval); }
         if (e.kind == AK.Call()) { return MethRetTy(e.a != null ? e.a.sval : null); }
         if (e.kind == AK.MemberAccess()) {
+            // EnumType.Member constants carry their enum identity
+            if (e.a != null && e.a.kind == AK.Ident() && FindEnum(e.a.sval) >= 0) { return e.a.sval; }
             Fld f = FieldOf(e);
             return f != null ? f.ty : null;
         }
         return null;
+    }
+
+    // ---- enums ----
+    void CollectEnums(Node unit) {
+        enName = new List<string>();
+        enOff = new List<int>();
+        enCnt = new List<int>();
+        enMem = new List<string>();
+        enVal = new List<long>();
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node dcl = unit.kids[i];
+            if (dcl.kind == AK.EnumDecl()) {
+                enName.Add(dcl.sval);
+                enOff.Add(enMem.Count);
+                int cnt = 0;
+                long val = 0;
+                int k = 0;
+                while (k < dcl.kids.Count) {
+                    Node m = dcl.kids[k];
+                    if (m.sval != null && m.sval != "") {
+                        // an explicit `= n` (int literal, possibly negated)
+                        // resets the running counter, like gen0's fold
+                        if (m.a != null && m.a.kind == AK.IntLit()) { val = m.a.ival; }
+                        else if (m.a != null && m.a.kind == AK.Unary()
+                                && m.a.op == TK.Minus() && m.a.a != null
+                                && m.a.a.kind == AK.IntLit()) { val = -m.a.a.ival; }
+                        enMem.Add(m.sval);
+                        enVal.Add(val);
+                        cnt = cnt + 1;
+                        val = val + 1;
+                    }
+                    k = k + 1;
+                }
+                enCnt.Add(cnt);
+            }
+            i = i + 1;
+        }
+    }
+
+    int FindEnum(string n) {
+        int i = 0;
+        while (i < enName.Count) { if (enName[i] == n) { return i; } i = i + 1; }
+        return -1;
+    }
+
+    // flat index of member `mem` of enum `en`, or -1
+    int FindEnumMemIdx(string en, string mem) {
+        int ei = FindEnum(en);
+        if (ei < 0) { return -1; }
+        int i = 0;
+        while (i < enCnt[ei]) {
+            if (enMem[enOff[ei] + i] == mem) { return enOff[ei] + i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // the enum type an expression's static type names, or null
+    string EnumTyOf(Node e) {
+        if (e == null) { return null; }
+        string t = StaticTyOf(e);
+        if (t != null && FindEnum(t) >= 0) { return t; }
+        return null;
+    }
+
+    // enum x.ToString(): the name of the first member whose constant equals
+    // the value (declaration order wins duplicates, like gen0); an unmatched
+    // value formats as its number
+    void GenEnumToString(Node recv, string et) {
+        int ei = FindEnum(et);
+        GenExpr(recv);
+        E4(0xF81F0FE0);                                  // push v
+        int numL = NL();
+        int joinL = NL();
+        int cnt = enCnt[ei];
+        int[] hits = new int[cnt];
+        int i = 0;
+        while (i < cnt) {
+            hits[i] = NL();
+            LdrU(1, 31, 0);                              // x1 = [sp] (peek v)
+            LoadImm(2, enVal[enOff[ei] + i]);
+            E4(0xEB02003F);                              // cmp x1, x2
+            EmitBcond(0, hits[i]);                       // b.eq
+            i = i + 1;
+        }
+        E4(0xF84107E0);                                  // pop v -> x0
+        BLInternal("_zan_rt_int2str");                   // numeric fallback
+        EmitB(joinL);
+        i = 0;
+        while (i < cnt) {
+            Mark(hits[i]);
+            E4(0xF84107E0);                              // pop v (discard)
+            LoadStr(InternStr(enMem[enOff[ei] + i]), 0);
+            EmitB(joinL);
+            i = i + 1;
+        }
+        Mark(joinL);
     }
 
     // true when sub's base chain reaches anc (equal counts)
@@ -1971,6 +2083,16 @@ partial class Ngen {
                         BLExtern("_zan_rt_dbl_parse");
                         E4(0x9E660000);                  // fmov x0, d0
                     }
+                    return;
+                }
+            }
+            // enum x.ToString(): member-name lookup with numeric fallback,
+            // like gen0 (run before the scalar paths, which would render the
+            // raw number)
+            if (callee.sval == "ToString" && e.kids.Count == 0) {
+                string et = EnumTyOf(recv);
+                if (et != null) {
+                    GenEnumToString(recv, et);
                     return;
                 }
             }
