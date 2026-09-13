@@ -281,7 +281,7 @@ partial class Ngen {
         curCls = cls;
         bool inst = methStat[mi] != 1;
         if (methStat[mi] == 2) {
-            syms.Add(new Sym("_" + cls + "_ctor", txt.Count));
+            syms.Add(new Sym(CtorSymNg(cls, m), txt.Count));
         } else {
             syms.Add(new Sym("_" + cls + "_" + m.sval, txt.Count));
         }
@@ -327,13 +327,31 @@ partial class Ngen {
             }
             pi = pi + 1;
         }
-        // implicit base-ctor chaining (gen0 parity): a ctor runs its base
-        // class ctor on `this` first, when that ctor exists
+        // base-ctor chaining (gen0 parity): `: base(args)` explicitly, or the
+        // parameterless base ctor implicitly -- base fields are a layout
+        // prefix, so the base ctor runs on `this` before the body
         if (methStat[mi] == 2) {
             Cls c = FindClass(cls);
-            if (c != null && c.baseName != null && ClassHasCtor(c.baseName)) {
-                LoadLocal(0, 0);                             // this -> x0
-                BLInternal("_" + c.baseName + "_ctor");
+            if (c != null && c.baseName != null) {
+                int bix;
+                if (m.b != null) {
+                    bix = FitCtorIdx(c.baseName, m.b, false);
+                } else {
+                    Node zerocall = new Node(AK.Call());
+                    bix = FitCtorIdx(c.baseName, zerocall, true);
+                }
+                if (bix >= 0) {
+                    int bpushed;
+                    if (m.b != null) {
+                        bpushed = PushCallArgs(methNodes[bix], m.b);
+                    } else {
+                        bpushed = 0;
+                    }
+                    int br = bpushed;
+                    while (br >= 1) { E4(0xF84107E0 | br); br = br - 1; } // args reversed
+                    LoadLocal(0, 0);                             // this -> x0
+                    BLInternal(CtorSymNg(c.baseName, methNodes[bix]));
+                }
             }
         }
         GenStmt(m.d);
@@ -1292,25 +1310,26 @@ partial class Ngen {
         E4(0xAA020021);                                  // orr x1, x1, x2
         RtStur(1, 0, -8);                                // stur x1, [x0, #-8]
         E4(0xF81F0FE0);                                  // str x0, [sp, #-16]! (obj)
-        // ctor arguments: provided args first, trailing defaults filled in
-        int cix = FindCtorIdx(cls);
+        // ctor arguments: provided args first, trailing defaults filled in;
+        // a class without any ctor allocates bare (no call)
+        int cix = FitCtorIdx(cls, e, false);
         int pushed;
         if (cix >= 0) {
             pushed = PushCallArgs(methNodes[cix], e);
+        } else if (CtorCountNg(cls) > 0) {
+            diags.Error("ngen: no constructor of '" + cls + "' takes "
+                + e.kids.Count + " argument(s)", e.line, e.col);
+            return;
         } else {
-            int i2 = 0;
-            while (i2 < e.kids.Count) {
-                GenExpr(e.kids[i2]);
-                E4(0xF81F0FE0);                          // str x0, [sp, #-16]! (arg)
-                i2 = i2 + 1;
-            }
-            pushed = e.kids.Count;
+            pushed = 0;
         }
         int r = pushed;
         while (r >= 1) { E4(0xF84107E0 | r); r = r - 1; } // ldr xr, [sp], #16 (args reversed)
         E4(0xF84107E0);                                  // ldr x0, [sp], #16 (obj)
         E4(0xF81F0FE0);                                  // str x0, [sp, #-16]! (keep obj across the void ctor)
-        BLInternal("_" + cls + "_ctor");
+        if (cix >= 0) {
+            BLInternal(CtorSymNg(cls, methNodes[cix]));
+        }
         E4(0xF84107E0);                                  // ldr x0, [sp], #16 (obj)
     }
 
@@ -2623,6 +2642,121 @@ partial class Ngen {
             i = i + 1;
         }
         return -1;
+    }
+
+    int CtorCountNg(string cls) {
+        int n = 0; int i = 0;
+        while (i < methNodes.Count) {
+            if (methStat[i] == 2 && methCls[i] == cls) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // parameter-type tag for ctor symbol mangling (mirrors the llvm
+    // backend's TypeTag so the shapes stay analogous)
+    string TypeTagNg(Node t) {
+        if (t == null || t.sval == null || t.sval == "") { return "v"; }
+        string s = t.sval;
+        int i = 0;
+        while (i < t.kids.Count) { s = s + "." + TypeTagNg(t.kids[i]); i = i + 1; }
+        return s;
+    }
+
+    // symbol for a constructor. With a single ctor this stays the historical
+    // `_Type_ctor`; with overloads the parameter types are appended so two
+    // ctors cannot collide on one symbol (mirrors CtorSym in the llvm path)
+    string CtorSymNg(string cls, Node ctor) {
+        if (CtorCountNg(cls) <= 1) { return "_" + cls + "_ctor"; }
+        string s = "_" + cls + "_ctor__";
+        int i = 0;
+        while (i < ctor.kids.Count) {
+            Node p = ctor.kids[i];
+            if (p.kind == AK.Param()) { s = s + "_" + TypeTagNg(p.type); }
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // how well one argument fits one parameter type: exact static/literal
+    // agreement scores high, a known literal/type mismatch disqualifies the
+    // candidate, anything unknown is neutral. gen0 resolves ctor overloads
+    // with full type scoring; ngen sees the declared types and literals.
+    int ArgParamScore(Node arg, string pt) {
+        if (pt == null || pt == "") { return 0; }
+        string at = StaticTyOf(arg);
+        if (at != null) { return at == pt ? 8 : 0; }
+        int k = arg.kind;
+        if (k == AK.IntLit()) {
+            if (pt == "int") { return 8; }
+            if (pt == "long" || pt == "ulong") { return 6; }
+            if (pt == "double") { return 4; }
+            return -100;
+        }
+        if (k == AK.FloatLit()) { return pt == "double" ? 8 : -100; }
+        if (k == AK.StringLit()) { return pt == "string" ? 8 : -100; }
+        if (k == AK.BoolLit()) { return pt == "bool" ? 8 : -100; }
+        if (k == AK.CharLit()) { return pt == "char" ? 8 : (pt == "int" ? 4 : -100); }
+        if (k == AK.NullLit()) {
+            if (ClassTyOf(pt) != null || pt == "List") { return 8; }
+            return -100;
+        }
+        if (IsStrExpr(arg)) { return pt == "string" ? 8 : -100; }
+        return 0;
+    }
+
+    // does candidate ctor `m` accept `argc` arguments: the exact arity, or
+    // trailing default parameters filling the gap (gen0 fills defaults
+    // before ctor resolution; a params tail on a ctor is not a thing)
+    bool CtorAcceptsArity(Node m, int argc) {
+        int pc = ParamCount(m);
+        if (pc == argc) { return true; }
+        if (argc > pc) { return false; }
+        int j = argc;
+        while (j < pc) {
+            Node p = ParamAt(m, j);
+            if (p == null || p.b == null) { return false; }
+            j = j + 1;
+        }
+        return true;
+    }
+
+    // constructor overload resolution for `new C(args)`: among the ctors
+    // whose arity admits the call, pick the best argument-type match
+    // (exact-arity candidates outrank default-filled ones; ties keep the
+    // first declared). `exactOnly` matches gen0's implicit base chain, which
+    // looks for a true parameterless ctor. Returns -1 when nothing fits.
+    int FitCtorIdx(string cls, Node callNode, bool exactOnly) {
+        int argc = callNode != null ? callNode.kids.Count : 0;
+        int exact = -1; int exactScore = -2000000000;
+        int filled = -1; int filledScore = -2000000000;
+        int i = 0;
+        while (i < methNodes.Count) {
+            if (methStat[i] == 2 && methCls[i] == cls && CtorAcceptsArity(methNodes[i], argc)) {
+                int score = 0;
+                bool compatible = true;
+                int j = 0;
+                while (j < argc && compatible) {
+                    Node p = ParamAt(methNodes[i], j);
+                    string pt = p != null && p.type != null ? TypeFullName(p.type) : null;
+                    int s = ArgParamScore(callNode.kids[j], pt);
+                    if (s <= -100) { compatible = false; }
+                    score = score + s;
+                    j = j + 1;
+                }
+                if (compatible) {
+                    bool isExact = ParamCount(methNodes[i]) == argc;
+                    if (isExact) {
+                        if (score > exactScore) { exactScore = score; exact = i; }
+                    } else if (!exactOnly) {
+                        if (score > filledScore) { filledScore = score; filled = i; }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        if (exact >= 0) { return exact; }
+        return filled;
     }
 
     // ---- exceptions: try / catch / throw ----
