@@ -327,18 +327,33 @@ partial class Ngen {
             }
             pi = pi + 1;
         }
-        // base-ctor chaining (gen0 parity): `: base(args)` explicitly, or the
-        // parameterless base ctor implicitly -- base fields are a layout
-        // prefix, so the base ctor runs on `this` before the body
-        if (methStat[mi] == 2) {
+        // ctor initializer chaining (gen0 parity). `: this(args)` runs
+        // another ctor of the same class first (it owns the base chain) and
+        // is mutually exclusive with base chaining; otherwise `: base(args)`
+        // explicitly, or the parameterless base ctor implicitly -- base
+        // fields are a layout prefix, so the base ctor runs on `this`
+        // before the body
+        if (methStat[mi] == 2 && m.c != null) {
+            int tix = FitCtorIdx(cls, m.c, false, m);
+            if (tix >= 0) {
+                int tpushed = PushCallArgs(methNodes[tix], m.c);
+                int tr = tpushed;
+                while (tr >= 1) { E4(0xF84107E0 | tr); tr = tr - 1; } // args reversed
+                LoadLocal(0, 0);                                 // this -> x0
+                BLInternal(CtorSymNg(cls, methNodes[tix]));
+            } else {
+                diags.Error("ngen: no matching 'this' constructor with "
+                    + m.c.kids.Count + " argument(s)", m.line, m.col);
+            }
+        } else if (methStat[mi] == 2) {
             Cls c = FindClass(cls);
             if (c != null && c.baseName != null) {
                 int bix;
+                Node zerocall = new Node(AK.Call());
                 if (m.b != null) {
-                    bix = FitCtorIdx(c.baseName, m.b, false);
+                    bix = FitCtorIdx(c.baseName, m.b, false, null);
                 } else {
-                    Node zerocall = new Node(AK.Call());
-                    bix = FitCtorIdx(c.baseName, zerocall, true);
+                    bix = FitCtorIdx(c.baseName, zerocall, true, null);
                 }
                 if (bix >= 0) {
                     int bpushed;
@@ -1312,7 +1327,7 @@ partial class Ngen {
         E4(0xF81F0FE0);                                  // str x0, [sp, #-16]! (obj)
         // ctor arguments: provided args first, trailing defaults filled in;
         // a class without any ctor allocates bare (no call)
-        int cix = FitCtorIdx(cls, e, false);
+        int cix = FitCtorIdx(cls, e, false, null);
         int pushed;
         if (cix >= 0) {
             pushed = PushCallArgs(methNodes[cix], e);
@@ -2725,14 +2740,17 @@ partial class Ngen {
     // whose arity admits the call, pick the best argument-type match
     // (exact-arity candidates outrank default-filled ones; ties keep the
     // first declared). `exactOnly` matches gen0's implicit base chain, which
-    // looks for a true parameterless ctor. Returns -1 when nothing fits.
-    int FitCtorIdx(string cls, Node callNode, bool exactOnly) {
+    // looks for a true parameterless ctor; `exclude` rules a ctor out (a
+    // `: this(...)` chain must not retarget itself). Returns -1 when
+    // nothing fits.
+    int FitCtorIdx(string cls, Node callNode, bool exactOnly, Node exclude) {
         int argc = callNode != null ? callNode.kids.Count : 0;
         int exact = -1; int exactScore = -2000000000;
         int filled = -1; int filledScore = -2000000000;
         int i = 0;
         while (i < methNodes.Count) {
-            if (methStat[i] == 2 && methCls[i] == cls && CtorAcceptsArity(methNodes[i], argc)) {
+            if (methStat[i] == 2 && methCls[i] == cls && methNodes[i] != exclude
+                    && CtorAcceptsArity(methNodes[i], argc)) {
                 int score = 0;
                 bool compatible = true;
                 int j = 0;

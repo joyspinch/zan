@@ -1241,26 +1241,44 @@ partial class Irgen {
             EmitArcRetain("%p" + j, pt[j]);
             j = j + 1;
         }
-        // chain to the base constructor: `: base(args)` explicitly, or the
-        // parameterless base ctor implicitly (base fields are a layout prefix)
-        Node bcls = BaseClassOf(cls);
-        if (bcls != null) {
-            Node bctor = binder.FindCtor(bcls);
-            if (bctor != null && m.b != null) { bctor = ResolveCtor(bcls, m.b); }
-            if (bctor != null && (m.b != null || CtorParamCount(bctor) == 0)) {
-                string bthis = NT();
-                L("  " + bthis + " = bitcast %" + cls.sval + "* %this to %" + bcls.sval + "*");
-                string bargs = "%" + bcls.sval + "* " + bthis;
-                if (m.b != null) {
-                    int k = 0;
-                    while (k < m.b.kids.Count) {
-                        Node bpty = CtorParamType(bctor, k);
-                        ExprVal av = GenArgExpr(m.b.kids[k], bpty);
-                        bargs = bargs + ", " + MapType(bpty) + " " + CallArg(av, bpty);
-                        k = k + 1;
+        // chain to another ctor of the same class via `: this(args)` (it
+        // owns the base chain), or to the base constructor via `: base(args)`
+        // / implicitly (base fields are a layout prefix)
+        Node thisTarget = null;
+        if (m.c != null) { thisTarget = ResolveCtorEx(cls, m.c, m); }
+        if (thisTarget != null) {
+            string targs = "%" + cls.sval + "* %this";
+            int k = 0;
+            while (k < m.c.kids.Count) {
+                Node tpty = CtorParamType(thisTarget, k);
+                ExprVal av = GenArgExpr(m.c.kids[k], tpty);
+                targs = targs + ", " + MapType(tpty) + " " + CallArg(av, tpty);
+                k = k + 1;
+            }
+            L("  call void @" + CtorSym(cls.sval, thisTarget) + "(" + targs + ")");
+        } else if (m.c != null) {
+            diags.Error("no matching 'this' constructor with "
+                + m.c.kids.Count + " argument(s)", m.line, m.col);
+        } else {
+            Node bcls = BaseClassOf(cls);
+            if (bcls != null) {
+                Node bctor = binder.FindCtor(bcls);
+                if (bctor != null && m.b != null) { bctor = ResolveCtor(bcls, m.b); }
+                if (bctor != null && (m.b != null || CtorParamCount(bctor) == 0)) {
+                    string bthis = NT();
+                    L("  " + bthis + " = bitcast %" + cls.sval + "* %this to %" + bcls.sval + "*");
+                    string bargs = "%" + bcls.sval + "* " + bthis;
+                    if (m.b != null) {
+                        int k = 0;
+                        while (k < m.b.kids.Count) {
+                            Node bpty = CtorParamType(bctor, k);
+                            ExprVal av = GenArgExpr(m.b.kids[k], bpty);
+                            bargs = bargs + ", " + MapType(bpty) + " " + CallArg(av, bpty);
+                            k = k + 1;
+                        }
                     }
+                    L("  call void @" + CtorSym(bcls.sval, bctor) + "(" + bargs + ")");
                 }
-                L("  call void @" + CtorSym(bcls.sval, bctor) + "(" + bargs + ")");
             }
         }
         if (m.d != null) { GenStmt(m.d); }
