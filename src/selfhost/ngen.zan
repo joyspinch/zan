@@ -50,8 +50,16 @@ partial class Ngen {
     List<int> brkL;         // innermost-enclosing-loop break targets
     List<Node> finBodies;   // enclosing try/finally bodies, innermost last
     List<int> finInHandler; // 1 once that try's frame is conceptually disarmed
+    List<int> ehStack;      // try frames open in this activation (compile time)
+    List<bool> brkLoop;     // brkL[i] belongs to a loop (vs a switch)
+    List<int> brkFinBase;   // finallys base for each break target
+    List<int> cntFinBase;   // finallys base at each loop's continue point
     int finCur = -1;        // index of the finally body being emitted right now
     List<int> cntL;         // innermost-enclosing-loop continue targets
+    bool curHasTry;         // method being emitted contains a try anywhere
+    int ehTopLocal;         // #ehtop: mirror of the runtime EH top
+    int ehBaseLocal;        // #ehbase: top at the outermost open try's arm
+    int ehBrkLocal;         // #ehbrk: top at loop entry (break/continue disarm)
 
     string curCls;
     List<string> locName;   // locals of the method being emitted
@@ -100,6 +108,10 @@ partial class Ngen {
         finBodies = new List<Node>();
         finInHandler = new List<int>();
         cntL = new List<int>();
+        ehStack = new List<int>();
+        brkLoop = new List<bool>();
+        brkFinBase = new List<int>();
+        cntFinBase = new List<int>();
         methNodes = new List<Node>();
         methCls = new List<string>();
         methStat = new List<int>();
@@ -545,6 +557,17 @@ partial class Ngen {
             pi = pi + 1;
         }
         ReserveLocals(m.d);
+        curHasTry = HasTry(m.d);
+        if (curHasTry) {
+            // EH bookkeeping locals: the top mirror, the outermost open
+            // try's arm base, and the loop-entry top for break/continue
+            locName.Add("#ehtop"); locTy.Add("int"); locOff.Add(16 * nloc); nloc = nloc + 1;
+            locName.Add("#ehbase"); locTy.Add("int"); locOff.Add(16 * nloc); nloc = nloc + 1;
+            locName.Add("#ehbrk"); locTy.Add("int"); locOff.Add(16 * nloc); nloc = nloc + 1;
+            ehTopLocal = nloc - 3;
+            ehBaseLocal = nloc - 2;
+            ehBrkLocal = nloc - 1;
+        }
         frame = 16 * nloc;
         E4(0xA9BF7BFD);                                  // stp x29, x30, [sp, #-16]!
         E4(0x910003FD);                                  // mov x29, sp
@@ -562,6 +585,11 @@ partial class Ngen {
                 argReg = argReg + 1;
             }
             pi = pi + 1;
+        }
+        if (curHasTry) {
+            BLInternal("_zan_rt_eh_state");              // x0 = state
+            LdrU(1, 0, 0);                               // top at entry
+            StoreLocal(ehTopLocal, 1);                   // start the mirror
         }
         // ctor initializer chaining (gen0 parity). `: this(args)` runs
         // another ctor of the same class first (it owns the base chain) and
@@ -624,6 +652,24 @@ partial class Ngen {
         if (m.d != null) { GenStmt(m.d); }
         E4(0xD2800000);                                  // movz x0, #0 (fallthrough)
         Epilogue();
+    }
+
+    // does this statement subtree contain a try anywhere (clauses chain
+    // through their .b slot)?
+    bool HasTry(Node n) {
+        if (n == null) { return false; }
+        if (n.kind == AK.TryStmt()) { return true; }
+        if (n.kind == AK.CatchClause()) {
+            Node cc = n;
+            while (cc != null) {
+                if (HasTry(cc.a)) { return true; }
+                cc = cc.b;
+            }
+            return false;
+        }
+        int i = 0;
+        while (i < n.kids.Count) { if (HasTry(n.kids[i])) { return true; } i = i + 1; }
+        return HasTry(n.a) || HasTry(n.b) || HasTry(n.c) || HasTry(n.d);
     }
 
     void ReserveLocals(Node blk) {
@@ -720,6 +766,7 @@ partial class Ngen {
             if (s.a != null) { GenExpr(s.a); }
             E4(0xF81F0FE0);                          // hold the result value
             EmitPendingFins(false);                  // C# runs every finally
+            EhDisarmBase();                          // and disarms what they leave
             E4(0xF84107E0);
             Epilogue();
         } else if (k == AK.IfStmt()) {
@@ -736,6 +783,9 @@ partial class Ngen {
         } else if (k == AK.WhileStmt()) {
             int top = NL(); int outL = NL(); int cnt = NL();
             brkL.Add(outL); cntL.Add(cnt);
+            brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
+            cntFinBase.Add(finBodies.Count);
+            if (curHasTry) { LoadLocal(ehTopLocal, 0); StoreLocal(ehBrkLocal, 0); }
             Mark(top);
             GenExpr(s.a);
             EmitCBZ(0, outL);
@@ -745,12 +795,18 @@ partial class Ngen {
             Mark(outL);
             brkL.RemoveAt(brkL.Count - 1);
             cntL.RemoveAt(cntL.Count - 1);
+            brkLoop.RemoveAt(brkLoop.Count - 1);
+            brkFinBase.RemoveAt(brkFinBase.Count - 1);
+            cntFinBase.RemoveAt(cntFinBase.Count - 1);
         } else if (k == AK.ForStmt()) {
             // for (init; cond; step) body: init runs once, cond guards the
             // top, step runs at the continue point before looping back
             if (s.a != null) { GenStmt(s.a); }
             int top = NL(); int outL = NL(); int cnt = NL();
             brkL.Add(outL); cntL.Add(cnt);
+            brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
+            cntFinBase.Add(finBodies.Count);
+            if (curHasTry) { LoadLocal(ehTopLocal, 0); StoreLocal(ehBrkLocal, 0); }
             Mark(top);
             if (s.b != null) {
                 GenExpr(s.b);
@@ -763,20 +819,27 @@ partial class Ngen {
             Mark(outL);
             brkL.RemoveAt(brkL.Count - 1);
             cntL.RemoveAt(cntL.Count - 1);
+            brkLoop.RemoveAt(brkLoop.Count - 1);
+            brkFinBase.RemoveAt(brkFinBase.Count - 1);
+            cntFinBase.RemoveAt(cntFinBase.Count - 1);
         } else if (k == AK.ForeachStmt()) {
             GenForeach(s);
         } else if (k == AK.BreakStmt()) {
             if (brkL.Count == 0) {
                 diags.Error("ngen: break outside loop", s.line, s.col);
             } else {
-                EmitPendingFins(false);
+                EmitPendingFinsFrom(brkFinBase[brkFinBase.Count - 1], false);
+                // a loop break also leaves every try opened inside the loop;
+                // a switch break does not leave any try by itself
+                if (brkLoop[brkLoop.Count - 1]) { EhDisarmLoop(); }
                 EmitB(brkL[brkL.Count - 1]);
             }
         } else if (k == AK.ContinueStmt()) {
             if (cntL.Count == 0) {
                 diags.Error("ngen: continue outside loop", s.line, s.col);
             } else {
-                EmitPendingFins(false);
+                EmitPendingFinsFrom(cntFinBase[cntFinBase.Count - 1], false);
+                EhDisarmLoop();
                 EmitB(cntL[cntL.Count - 1]);
             }
         } else if (k == AK.TryStmt()) {
@@ -801,6 +864,9 @@ partial class Ngen {
         int idxVar = LocalIdx("#fei");
         int top = NL(); int outL = NL(); int cnt = NL();
         brkL.Add(outL); cntL.Add(cnt);
+        brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
+        cntFinBase.Add(finBodies.Count);
+        if (curHasTry) { LoadLocal(ehTopLocal, 0); StoreLocal(ehBrkLocal, 0); }
         LoadImm(0, 0);
         StoreLocal(idxVar, 0);
         Mark(top);
@@ -847,6 +913,9 @@ partial class Ngen {
         Mark(outL);
         brkL.RemoveAt(brkL.Count - 1);
         cntL.RemoveAt(cntL.Count - 1);
+        brkLoop.RemoveAt(brkLoop.Count - 1);
+        brkFinBase.RemoveAt(brkFinBase.Count - 1);
+        cntFinBase.RemoveAt(cntFinBase.Count - 1);
     }
 
     // ---- expressions: result in x0 ----
@@ -886,6 +955,7 @@ partial class Ngen {
         }
         EmitB(defIdx >= 0 ? defL : endL);
         brkL.Add(endL);
+        brkLoop.Add(false); brkFinBase.Add(finBodies.Count);
         i = 0;
         while (i < nc) {
             Node c = s.kids[i];
@@ -903,6 +973,8 @@ partial class Ngen {
             EmitB(endL);
         }
         brkL.RemoveAt(brkL.Count - 1);
+        brkLoop.RemoveAt(brkLoop.Count - 1);
+        brkFinBase.RemoveAt(brkFinBase.Count - 1);
         Mark(endL);
         E4(0xF84107E0);                                  // pop discriminant
     }
@@ -3573,18 +3645,42 @@ partial class Ngen {
     void GenTry(Node s) {
         BLInternal("_zan_rt_eh_state");              // x0 = state (lazy alloc)
         E4(0xF81F0FE0);                              // push state
-        LdrU(1, 0, 0);                               // top
+        LoadLocal(ehTopLocal, 1);                    // top (mirror: it also
+                                                     // survives return/break
+                                                     // paths that skip the
+                                                     // normal-path restore)
         E4(0xF81F0FE1);                              // push saved top
         LoadImm(3, 1024);
         E4(0x9B037C22);                              // mul x2, x1, x3
         AddRR(2, 0, 2);                              // state + top*1024
         AddImm(2, 2, 16);                            // &bufs[top]
+        if (ehStack.Count == 0) {
+            // outermost try opened in this activation: remember the top it
+            // was armed at, so return/break/continue can disarm from here
+            StoreLocal(ehBaseLocal, 1);
+        }
         AddImm(1, 1, 1);                             // top + 1
         StrU(1, 0, 0);                               // state->top = top + 1
+        StoreLocal(ehTopLocal, 1);                   // mirror = top + 1
+        ehStack.Add(1);
         MovRR(0, 2);
         BLExtern("_setjmp");                         // returns 0 (direct) / 1 (thrown)
         EmitCbnz(0, NL());
         int catchL = lblPos.Count - 1;
+        // stamp the buf as live for this activation: the rethrow path checks
+        // the arming fp before longjmping, so a leaked disarm turns into a
+        // clean uncaught exit instead of a wild PC from a dead frame
+        BLInternal("_zan_rt_eh_state");              // x0 = state
+        LoadLocal(ehTopLocal, 1);                    // mirror (= top + 1)
+        SubImm(1, 1, 1);                             // pre-arm top
+        LoadImm(3, 1024);
+        E4(0x9B037C22);                              // mul x2, x1, x3
+        AddRR(2, 0, 2);
+        AddImm(2, 2, 16);                            // &bufs[top]
+        E4(0xAA1D03E3);                              // mov x3, x29 (fp)
+        StrU(3, 2, 1008);                            // arming fp stamp
+        LoadImm(3, 1514933314);                      // "ZANB"
+        StrU(3, 2, 1016);                            // magic stamp
         int endL = NL();
         int finIdx = -1;
         if (s.c != null) {
@@ -3595,6 +3691,8 @@ partial class Ngen {
         // ---- normal path: run the try body, disarm, then the finally ----
         GenStmt(s.a);
         EhRestoreTop();
+        LdrU(1, 31, 0);                              // saved top
+        StoreLocal(ehTopLocal, 1);                   // mirror = saved top
         if (s.c != null) {
             finCur = finIdx;                         // a throw in the finally propagates
             GenStmt(s.c);
@@ -3609,6 +3707,9 @@ partial class Ngen {
         // site, which sorts above every declared class, so a typed walk
         // never matches it and it lands in the first clause (gen0's rule).
         EhRestoreTop();
+        LdrU(1, 31, 0);                              // saved top
+        StoreLocal(ehTopLocal, 1);                   // mirror = saved top
+        LdrU(1, 31, 16);                             // x1 = state again
         if (finIdx >= 0) { finInHandler[finIdx] = 1; }
         LdrU(0, 1, 8);                               // exc (x1 = state)
         LoadImm(2, 0);
@@ -3683,6 +3784,35 @@ partial class Ngen {
             finInHandler.RemoveAt(finInHandler.Count - 1);
         }
         AddSPImm(32, true);                          // pop saved top + state
+        ehStack.RemoveAt(ehStack.Count - 1);
+    }
+
+    // disarm every try this return leaves: the runtime top goes back to the
+    // outermost open try's armed base. Without this, a later throw longjmps
+    // into a stale jmp_buf captured by a frame that already returned -- the
+    // wild-PC crashes gen0 avoids with emit_eh_disarm_from.
+    void EhDisarmBase() {
+        if (ehStack.Count == 0) { return; }
+        BLInternal("_zan_rt_eh_state");              // x0 = state
+        MovRR(1, 0);                                 // x1 = state (before the
+                                                     // base load clobbers x0)
+        LoadLocal(ehBaseLocal, 0);                   // x0 = base top
+        StrU(0, 1, 0);                               // state->top = base
+        LoadLocal(ehBaseLocal, 0);
+        StoreLocal(ehTopLocal, 0);                   // keep the mirror current
+    }
+
+    // break/continue leaves every try opened inside the loop: restore the
+    // loop-entry top
+    void EhDisarmLoop() {
+        if (!curHasTry) { return; }
+        BLInternal("_zan_rt_eh_state");              // x0 = state
+        MovRR(1, 0);                                 // x1 = state (before the
+                                                     // top load clobbers x0)
+        LoadLocal(ehBrkLocal, 0);
+        StrU(0, 1, 0);
+        LoadLocal(ehBrkLocal, 0);
+        StoreLocal(ehTopLocal, 0);
     }
 
     // every class site a thrown descriptor may carry for this clause to hit:
@@ -3734,8 +3864,14 @@ partial class Ngen {
     // re-runs itself: while body i executes, entries at i and above are
     // frozen (gen0's finally_count truncation).
     void EmitPendingFins(bool stopAtBody) {
+        EmitPendingFinsFrom(0, stopAtBody);
+    }
+
+    // run the finally bodies from index `from` down (innermost first); a
+    // loop's break/continue only runs the finallys opened inside it
+    void EmitPendingFinsFrom(int from, bool stopAtBody) {
         int i = finBodies.Count - 1;
-        while (i >= 0) {
+        while (i >= from) {
             if (i <= finCur) { break; }
             if (stopAtBody && finInHandler[i] == 0) { break; }
             if (finBodies[i] != null) {
@@ -3754,8 +3890,11 @@ partial class Ngen {
     // try/catch of its own, which overwrites the stored exception
     void ExcSave() {
         BLInternal("_zan_rt_eh_state");
+        LdrU(1, 0, 8);                               // exc (x0 = state; read
+                                                     // before the push -- [sp+8]
+                                                     // would read the caller's
+                                                     // slot, not state->exc)
         E4(0xF81F0FE0);                              // push state
-        LdrU(1, 31, 8);                              // exc
         E4(0xF81F0FE1);                              // push exc
     }
 
@@ -3801,6 +3940,18 @@ partial class Ngen {
         BLInternal("_zan_rt_eh_state");
         MovRR(1, 0);
         LdrU(2, 1, 0);                               // top
+        LoadImm(3, 64);                              // bufs capacity: an
+                                                     // overflown top means a
+                                                     // disarm leak -- exit
+                                                     // loudly instead of
+                                                     // longjmping into heap
+                                                     // bytes past the block
+        E4(0xEB03005F);                              // cmp x2, x3
+        EmitBcond(3, NL());                          // b.ls (unsigned <=)
+        int okTop = lblPos.Count - 1;
+        LoadImm(0, 99);
+        BLExtern("_exit");
+        Mark(okTop);
         CbzReg(2, NL());
         int uncaught = lblPos.Count - 1;
         SubImm(2, 2, 1);                             // top - 1
@@ -3809,6 +3960,19 @@ partial class Ngen {
         AddRR(2, 1, 2);
         AddImm(2, 2, 16);                            // &bufs[top-1]
         MovRR(0, 2);
+        // liveness stamp: an armed buf carries the arming activation's fp and
+        // a magic word. A target whose stamp is missing or whose fp lies
+        // BELOW the current sp was captured by a dead, deeper frame -- a
+        // disarm leak. Longjmping there lands on the dead frame's registers
+        // (the wild-PC crashes), so treat it as uncaught instead.
+        LoadImm(3, 1514933314);                      // "ZANB" magic
+        LdrU(4, 0, 1016);                            // stamp magic
+        E4(0xEB03009F);                              // cmp x4, x3
+        EmitBcond(1, uncaught);                      // b.ne: never armed
+        LdrU(4, 0, 1008);                            // arming fp
+        E4(0xCB3F0084);                              // sub x4, x4, sp
+        E4(0xD37FFC84);                              // lsr x4, x4, #63
+        EmitCbnz(4, uncaught);                       // fp < sp: dead frame
         LoadImm(1, 1);
         BLExtern("_longjmp");
         Mark(uncaught);
