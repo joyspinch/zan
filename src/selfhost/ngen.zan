@@ -1211,6 +1211,8 @@ partial class Ngen {
             GenNew(e);
         } else if (k == AK.IsExpr()) {
             GenIs(e);
+        } else if (k == AK.AsExpr()) {
+            GenAs(e);
         } else if (k == AK.Call()) {
             GenCall(e);
         } else if (k == AK.Conditional()) {
@@ -1283,13 +1285,25 @@ partial class Ngen {
         E4(0xAA020021);                                  // orr x1, x1, x2
         RtStur(1, 0, -8);                                // stur x1, [x0, #-8]
         E4(0xF81F0FE0);                                  // str x0, [sp, #-16]! (obj)
-        int i = 0;
-        while (i < e.kids.Count) {
-            GenExpr(e.kids[i]);
-            E4(0xF81F0FE0);                              // str x0, [sp, #-16]! (arg)
-            i = i + 1;
+        // ctor arguments: provided args first, trailing defaults filled in
+        int cix = FindCtorIdx(cls);
+        int pushed;
+        if (cix >= 0) {
+            if (e.kids.Count > ParamCount(methNodes[cix])) {
+                diags.Error("ngen: too many arguments calling '" + cls + "' constructor", e.line, e.col);
+                return;
+            }
+            pushed = PushCallArgs(methNodes[cix], e);
+        } else {
+            int i2 = 0;
+            while (i2 < e.kids.Count) {
+                GenExpr(e.kids[i2]);
+                E4(0xF81F0FE0);                          // str x0, [sp, #-16]! (arg)
+                i2 = i2 + 1;
+            }
+            pushed = e.kids.Count;
         }
-        int r = e.kids.Count;
+        int r = pushed;
         while (r >= 1) { E4(0xF84107E0 | r); r = r - 1; } // ldr xr, [sp], #16 (args reversed)
         E4(0xF84107E0);                                  // ldr x0, [sp], #16 (obj)
         E4(0xF81F0FE0);                                  // str x0, [sp, #-16]! (keep obj across the void ctor)
@@ -1323,6 +1337,7 @@ partial class Ngen {
         if (e.kind == AK.ThisExpr()) { return curCls; }
         if (e.kind == AK.NewExpr()) { return e.type != null ? e.type.sval : null; }
         if (e.kind == AK.CastExpr() && e.type != null) { return ClassTyOf(e.type.sval); }
+        if (e.kind == AK.AsExpr() && e.type != null) { return ClassTyOf(e.type.sval); }
         if (e.kind == AK.Index()) { return ClassTyOf(ElemTyOf(e)); }
         if (e.kind == AK.Call() && e.a != null) {
             // method results carry a class identity when the method's
@@ -1409,6 +1424,12 @@ partial class Ngen {
             return;
         }
         GenExpr(e.a);                                    // x0 = receiver
+        if (st == "object") {
+            // object-typed source: identity is unknown statically, always
+            // consult the runtime site (gen0 rule)
+            GenIsSite(tc);
+            return;
+        }
         if (sc == tt || DerivesFrom(sc, tt)) {
             E4(0xEB1F001F);                              // cmp x0, xzr
             E4(0x9A9F07E0);                              // cset x0, ne
@@ -1419,6 +1440,36 @@ partial class Ngen {
             return;
         }
         LoadImm(0, 0);
+    }
+
+    // x as T -- like gen0: upcasts/identity, unrelated static types and
+    // non-class targets pass the value through; a downcast consults the
+    // runtime class site and yields null on failure
+    void GenAs(Node e) {
+        string tt = e.type != null ? e.type.sval : null;
+        string st = StaticTyOf(e.a);
+        Cls tc = tt != null ? FindClass(tt) : null;
+        if (tt == null || tc == null || st == null) { GenExpr(e.a); return; }
+        string sc = ClassTyOf(st);
+        if (sc == null) { GenExpr(e.a); return; }
+        if (st != "object") {
+            if (sc == tt || DerivesFrom(sc, tt)) { GenExpr(e.a); return; }
+            if (!DerivesFrom(tt, sc)) { GenExpr(e.a); return; }
+        }
+        // downcast: keep the value on the stack across the site test
+        GenExpr(e.a);
+        E4(0xF81F0FE0);                                  // push v
+        LdrU(0, 31, 0);                                  // x0 = v
+        GenIsSite(tc);                                   // x0 = 0/1
+        int failL = NL();
+        int endL = NL();
+        CbzReg(0, failL);
+        E4(0xF84107E0);                                  // pop v -> x0
+        EmitB(endL);
+        Mark(failL);
+        E4(0xF84107E0);                                  // pop v (discard)
+        LoadImm(0, 0);                                   // null
+        Mark(endL);
     }
 
     // runtime site check for `x is T` with the object in x0: extract the
@@ -1456,6 +1507,7 @@ partial class Ngen {
         if (e.kind == AK.ThisExpr()) { return curCls; }
         if (e.kind == AK.NewExpr()) { return e.type != null ? e.type.sval : null; }
         if (e.kind == AK.CastExpr() && e.type != null) { return e.type.sval; }
+        if (e.kind == AK.AsExpr() && e.type != null) { return e.type.sval; }
         if (e.kind == AK.Ident()) { return NamedSlotTy(e.sval); }
         if (e.kind == AK.Call()) { return MethRetTy(e.a != null ? e.a.sval : null); }
         if (e.kind == AK.MemberAccess()) {
@@ -2365,17 +2417,8 @@ partial class Ngen {
             if (recv != null && recv.kind == AK.Ident() && FindClass(recv.sval) != null) {
                 int si = FindStaticInCls(recv.sval, callee.sval);
                 if (si >= 0) {
-                    if (e.kids.Count != ParamCount(methNodes[si])) {
-                        diags.Error("ngen: arity mismatch calling '" + callee.sval + "'", e.line, e.col);
-                        return;
-                    }
-                    int i = 0;
-                    while (i < e.kids.Count) {
-                        GenExpr(e.kids[i]);
-                        E4(0xF81F0FE0);                      // str x0, [sp, #-16]! (arg)
-                        i = i + 1;
-                    }
-                    int r = e.kids.Count - 1;
+                    int pushed = PushCallArgs(methNodes[si], e);
+                    int r = pushed - 1;
                     while (r >= 0) {
                         E4(0xF84107E0 | r);                  // ldr xr, [sp], #16
                         r = r - 1;
@@ -2390,19 +2433,14 @@ partial class Ngen {
                 diags.Error("ngen: unknown method '" + callee.sval + "'", e.line, e.col);
                 return;
             }
-            if (e.kids.Count != ParamCount(methNodes[mi])) {
-                diags.Error("ngen: arity mismatch calling '" + callee.sval + "'", e.line, e.col);
+            if (e.kids.Count > ParamCount(methNodes[mi])) {
+                diags.Error("ngen: too many arguments calling '" + callee.sval + "'", e.line, e.col);
                 return;
             }
             GenExpr(recv);
             E4(0xF81F0FE0);                              // str x0, [sp, #-16]! (receiver)
-            int i = 0;
-            while (i < e.kids.Count) {
-                GenExpr(e.kids[i]);
-                E4(0xF81F0FE0);                          // str x0, [sp, #-16]! (arg)
-                i = i + 1;
-            }
-            int r = e.kids.Count;
+            int pushed = PushCallArgs(methNodes[mi], e);
+            int r = pushed;
             while (r >= 1) { E4(0xF84107E0 | r); r = r - 1; } // ldr xr, [sp], #16 (args reversed)
             E4(0xF84107E0);                              // ldr x0, [sp], #16 (receiver)
             BLInternal("_" + methCls[mi] + "_" + callee.sval);
@@ -2418,18 +2456,14 @@ partial class Ngen {
             return;
         }
         Node m = methNodes[si];
-        if (e.kids.Count != ParamCount(m)) {
-            diags.Error("ngen: arity mismatch calling '" + callee.sval + "'", e.line, e.col);
+        if (e.kids.Count > ParamCount(m)) {
+            diags.Error("ngen: too many arguments calling '" + callee.sval + "'", e.line, e.col);
             return;
         }
-        // evaluate args left to right, spilling each; reload into x0.. reversed
-        int j = 0;
-        while (j < e.kids.Count) {
-            GenExpr(e.kids[j]);
-            E4(0xF81F0FE0);                              // str x0, [sp, #-16]!
-            j = j + 1;
-        }
-        int q = e.kids.Count - 1;
+        // evaluate args left to right (defaults fill omitted trailing
+        // arguments), spilling each; reload into x0.. reversed
+        int pushed = PushCallArgs(m, e);
+        int q = pushed - 1;
         while (q >= 0) {
             E4(0xF84107E0 | q);                          // ldr xq, [sp], #16
             q = q - 1;
@@ -2453,6 +2487,58 @@ partial class Ngen {
             i = i + 1;
         }
         return n;
+    }
+
+    // i-th declared parameter of method m (this excluded), or null
+    Node ParamAt(Node m, int idx) {
+        int seen = 0; int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) {
+                if (seen == idx) { return m.kids[i]; }
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // evaluate call arguments left to right, spilling each onto the stack;
+    // omitted trailing arguments fall back to the callee's default parameter
+    // values (gen0 fills them at the call site). Returns the count pushed --
+    // the caller pops exactly that many into x0.. in reverse.
+    int PushCallArgs(Node m, Node e) {
+        string calleeName = e.a != null ? e.a.sval : "constructor";
+        int pc = ParamCount(m);
+        if (e.kids.Count > pc) {
+            diags.Error("ngen: too many arguments calling '" + calleeName + "'", e.line, e.col);
+            return pc;
+        }
+        int i = 0;
+        while (i < e.kids.Count) {
+            GenExpr(e.kids[i]);
+            E4(0xF81F0FE0);                              // str x0, [sp, #-16]!
+            i = i + 1;
+        }
+        while (i < pc) {
+            Node p = ParamAt(m, i);
+            if (p == null || p.b == null) {
+                diags.Error("ngen: arity mismatch calling '" + calleeName + "'", e.line, e.col);
+                return pc;
+            }
+            GenExpr(p.b);
+            E4(0xF81F0FE0);
+            i = i + 1;
+        }
+        return pc;
+    }
+
+    int FindCtorIdx(string cls) {
+        int i = 0;
+        while (i < methNodes.Count) {
+            if (methStat[i] == 2 && methCls[i] == cls) { return i; }
+            i = i + 1;
+        }
+        return -1;
     }
 
     // ---- exceptions: try / catch / throw ----
