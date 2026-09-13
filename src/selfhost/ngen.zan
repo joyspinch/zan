@@ -781,6 +781,16 @@ partial class Ngen {
                 GenCloneIfStruct(s.b);
                 if (s.type != null && IsDblTy(TypeFullName(s.type)) && !IsDblExpr(s.b)) { ConvI2D(); }
                 StoreLocal(LocalIdx(s.sval), 0);
+            } else {
+                // `S x;` with S a struct: a fresh zero-filled value (gen0
+                // zero-inits inline storage); other types start unassigned
+                Cls dc = s.type != null ? FindClass(TypeFullName(s.type)) : null;
+                if (dc != null && dc.isStruct == 1) {
+                    LoadImm(0, dc.size + 16);
+                    LoadImm(1, 0);
+                    BLInternal("_zan_rt_alloc");
+                    StoreLocal(LocalIdx(s.sval), 0);
+                }
             }
         } else if (k == AK.ExprStmt()) {
             GenExpr(s.a);
@@ -1156,6 +1166,39 @@ partial class Ngen {
         } else if (k == AK.Binary()) {
             if (TryOpOverloadNg(e)) {
                 // the overload call left its result (value or object) in x0
+            } else if ((e.op == TK.EqEq() || e.op == TK.BangEq())
+                    && StructEqPair(e.a, e.b) != null) {
+                // struct equality without an overload: field-wise value
+                // compare (gen0's aggregate equality; a pointer compare
+                // would answer false for equal copies)
+                Cls sa = StructEqPair(e.a, e.b);
+                if (sa != null) {
+                    GenExpr(e.a);
+                    E4(0xF81F0FE0);                  // push a
+                    GenExpr(e.b);
+                    MovRR(1, 0);                     // x1 = b (a peeked below)
+                    int neq = NL();
+                    int doneq = NL();
+                    int fi = 0;
+                    while (fi < sa.flds.Count) {
+                        LdrU(2, 1, sa.flds[fi].off);     // b.f
+                        E4(0xF84003E3);                  // ldur x3, [sp] (a)
+                        LdrU(3, 3, sa.flds[fi].off);     // a.f
+                        E4(0xEB02007F);                  // cmp x3, x2
+                        EmitBcond(1, neq);               // b.ne
+                        fi = fi + 1;
+                    }
+                    LoadImm(0, 1);
+                    EmitB(doneq);
+                    Mark(neq);
+                    LoadImm(0, 0);
+                    Mark(doneq);
+                    AddSPImm(16, true);                  // drop a
+                    if (e.op == TK.BangEq()) {
+                        E4(0x7100001F);                  // cmp w0, #0
+                        E4(0x9A9F17E0);                  // cset x0, eq (1 = equal)
+                    }
+                }
             } else if (e.op == TK.Plus() && (IsStrExpr(e.a) || IsStrExpr(e.b))) {
                 // string concatenation: non-string operands convert through
                 // zan_rt_int2str (gen0 prints them with "%lld"), then
@@ -1968,9 +2011,9 @@ partial class Ngen {
     }
 
     // element type name of an index expression ("l[i]" with l declared as
-    // "List<Pt>" or "Pt[]"), or null; struct elements return null too, since
-    // gen0 keeps them inline in the container with value semantics -- pointer
-    // field access would silently alias
+    // "List<Pt>" or "Pt[]"), or null. Struct elements resolve too: values
+    // clone at every storage boundary now, so slots hold independent
+    // objects and member access goes through the element pointer.
     string ElemTyOf(Node e) {
         if (e == null || e.a == null) { return null; }
         string el = null;
@@ -1985,8 +2028,6 @@ partial class Ngen {
             }
         }
         if (el == null) { return null; }
-        Cls ec = FindClass(el);
-        if (ec != null && ec.isStruct == 1) { return null; }
         return el;
     }
 
@@ -2281,6 +2322,23 @@ partial class Ngen {
         if (SpecWantsDouble(spec) && sty == "int") { ConvI2D(); }
         LoadStr(InternStr(pf), 1);
         BLInternal("_zan_rt_fmt");
+    }
+
+    // the struct class when the expression is struct-typed, else null
+    Cls StructOf(Node e) {
+        string t = StaticTyOf(e);
+        Cls c = t != null ? FindClass(t) : null;
+        return c != null && c.isStruct == 1 ? c : null;
+    }
+
+    // the shared struct type when BOTH operands are the same struct, else
+    // null (guards field-wise ==/!= emission)
+    Cls StructEqPair(Node a, Node b) {
+        Cls sa = StructOf(a);
+        if (sa == null) { return null; }
+        Cls sb = StructOf(b);
+        if (sb == null || sb != sa) { return null; }
+        return sa;
     }
 
     // struct value semantics: when expression e is struct-typed, replace x0
@@ -3050,6 +3108,78 @@ partial class Ngen {
         return false;
     }
 
+    // symbol of a static op_* method declared on cls, or null
+    string OpStaticSym(string cls, string name) {
+        int i = 0;
+        while (i < methNodes.Count) {
+            if (methStat[i] == 1 && methCls[i] == cls
+                    && methNodes[i].sval == name) {
+                return MethSymNg(cls, methNodes[i]);
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // shared IndexOf/Contains loop: value equality per element kind --
+    // strings by strcmp, structs by their op_eq (when declared) else
+    // field-wise, primitives by register compare (gen0 parity)
+    void GenListFind(Node recv, Node arg, bool wantIndex) {
+        GenExpr(recv);
+        E4(0xF81F0FE0);                          // push list
+        GenExpr(arg);
+        E4(0xF84107E1);                          // pop list -> x1 (x0 = value)
+        MovRR(19, 1);                            // x19 = list
+        MovRR(22, 0);                            // x22 = value
+        LdrU(20, 19, 0);                         // x20 = count
+        LdrU(21, 19, 16);                        // x21 = data
+        E4(0xD2800017);                          // movz x23, #0 (i)
+        Cls es = StructOf(arg);
+        string eqSym = es != null ? OpStaticSym(es.name, "op_eq") : null;
+        int lp = NL();
+        int nof = NL();
+        int yes = NL();
+        int done = NL();
+        Mark(lp);
+        E4(0xEB1402FF);                          // cmp x23, x20
+        EmitBcond(10, nof);                      // b.ge nof
+        E4(0xF8777AA0);                          // ldr x0, [x21, x23, lsl #3]
+        if (IsStrExpr(arg)) {
+            MovRR(1, 22);
+            BLExtern("_strcmp");
+            E4(0x7100001F);                      // cmp w0, #0
+            EmitBcond(0, yes);                   // b.eq
+        } else if (eqSym != null) {
+            MovRR(1, 22);
+            BLInternal(eqSym);                   // bool op_eq(elem, value)
+            EmitCbnz(0, yes);                    // non-zero -> hit
+        } else if (es != null) {
+            // field-wise: every slot must match
+            int fail = NL();
+            int fi = 0;
+            while (fi < es.flds.Count) {
+                LdrU(2, 0, es.flds[fi].off);
+                LdrU(3, 22, es.flds[fi].off);
+                E4(0xEB03005F);                  // cmp x3, x2
+                EmitBcond(1, fail);              // b.ne
+                fi = fi + 1;
+            }
+            EmitB(yes);
+            Mark(fail);
+        } else {
+            E4(0xEB16001F);                      // cmp x0, x22
+            EmitBcond(0, yes);                   // b.eq
+        }
+        AddImm(23, 23, 1);
+        EmitB(lp);
+        Mark(nof);
+        if (wantIndex) { LoadImm(0, -1); } else { LoadImm(0, 0); }
+        EmitB(done);
+        Mark(yes);
+        if (wantIndex) { MovRR(0, 23); } else { LoadImm(0, 1); }
+        Mark(done);
+    }
+
     void GenCall(Node e) {
         Node callee = e.a;
         if (callee != null && callee.kind == AK.MemberAccess()) {
@@ -3461,43 +3591,53 @@ partial class Ngen {
                     return;
                 }
                 if (callee.sval == "Contains" && e.kids.Count == 1) {
+                    GenListFind(recv, e.kids[0], false);
+                    return;
+                }
+                if (callee.sval == "RemoveAt" && e.kids.Count == 1) {
                     GenExpr(recv);
-                    E4(0xF81F0FE0);                      // push list
+                    E4(0xF81F0FE0);                  // push list
                     GenExpr(e.kids[0]);
-                    E4(0xF84107E1);                      // pop list -> x1 (x0 = value)
-                    // loop state lives in callee-saved x19..x23: the string
-                    // form calls strcmp, which clobbers every caller-saved
-                    // register the loop would otherwise keep there
-                    MovRR(19, 1);                        // x19 = list
-                    MovRR(22, 0);                        // x22 = value
-                    LdrU(20, 19, 0);                     // x20 = count
-                    LdrU(21, 19, 16);                    // x21 = data
-                    E4(0xD2800017);                      // movz x23, #0 (i)
-                    int lp = NL();
-                    int nof = NL();
-                    int yes = NL();
-                    int donec = NL();
-                    Mark(lp);
-                    E4(0xEB1402FF);                      // cmp x23, x20
-                    EmitBcond(10, nof);                  // b.ge nof
-                    E4(0xF8777AA0);                      // ldr x0, [x21, x23, lsl #3]
-                    if (IsStrExpr(e.kids[0])) {
-                        MovRR(1, 22);                    // x1 = value
-                        BLExtern("_strcmp");
-                        E4(0x7100001F);                  // cmp w0, #0
-                        EmitBcond(0, yes);               // b.eq yes
-                    } else {
-                        E4(0xEB16001F);                  // cmp x0, x22
-                        EmitBcond(0, yes);               // b.eq yes
-                    }
-                    AddImm(23, 23, 1);
-                    EmitB(lp);
-                    Mark(nof);
-                    E4(0xD2800000);                      // movz x0, #0
-                    EmitB(donec);
-                    Mark(yes);
-                    E4(0xD2800020);                      // movz x0, #1
-                    Mark(donec);
+                    MovRR(2, 0);                     // x2 = idx
+                    E4(0xF84107E0);                  // pop list -> x0
+                    MovRR(1, 2);                     // x1 = idx
+                    BLInternal("_zan_rt_list_removeat");
+                    return;
+                }
+                if (callee.sval == "Insert" && e.kids.Count == 2) {
+                    GenExpr(recv);
+                    E4(0xF81F0FE0);                  // push list
+                    GenExpr(e.kids[0]);              // idx
+                    E4(0xF81F0FE0);
+                    GenExpr(e.kids[1]);              // value -> x0
+                    MovRR(2, 0);                     // x2 = value
+                    E4(0xF84107E1);                  // pop idx -> x1
+                    E4(0xF84107E0);                  // pop list -> x0
+                    BLInternal("_zan_rt_list_insert");
+                    return;
+                }
+                if (callee.sval == "Reverse" && e.kids.Count == 0) {
+                    GenExpr(recv);
+                    BLInternal("_zan_rt_list_reverse");
+                    return;
+                }
+                if (callee.sval == "IndexOf" && e.kids.Count == 1) {
+                    GenListFind(recv, e.kids[0], true);
+                    return;
+                }
+                if (callee.sval == "AddRange" && e.kids.Count == 1) {
+                    GenExpr(recv);
+                    E4(0xF81F0FE0);                  // push dst
+                    GenExpr(e.kids[0]);
+                    MovRR(2, 0);                     // x2 = src
+                    E4(0xF84107E0);                  // pop dst -> x0
+                    MovRR(1, 2);                     // x1 = src
+                    BLInternal("_zan_rt_list_addrange");
+                    return;
+                }
+                if (callee.sval == "ToArray" && e.kids.Count == 0) {
+                    GenExpr(recv);
+                    BLInternal("_zan_rt_list_toarray");
                     return;
                 }
                 diags.Error("ngen: unsupported List operation '" + callee.sval + "'", e.line, e.col);

@@ -384,6 +384,7 @@ partial class Ngen {
         RtEmitPrintDouble();
         RtEmitUint2Str();
         RtEmitFmt();
+        RtEmitListOps();
         RtEmitPrintUint();
         RtEmitChrstr();
         RtEmitSubstr2();
@@ -1268,10 +1269,317 @@ partial class Ngen {
         GenExpr(recv);
         E4(0xF81F0FE0);                              // push list
         GenExpr(arg);
+        // List<double>.Add(3) coerces the int at the boundary (gen0's
+        // int-coerce path); the slot then carries the double bit pattern
+        if (StaticTyOf(recv) == "List<double>" && !IsDblExpr(arg)) { ConvI2D(); }
         GenCloneIfStruct(arg);                       // element copies by value
         MovRR(1, 0);                                 // x1 = value
         LdrU(0, 31, 0);                              // x0 = list (peek)
         ListAppendRaw();
         AddSPImm(16, true);                          // pop list
     }
+
+    // ---- List<T> operation family (gen0-compatible inline sequences;
+    // layout: [list+0] count, [list+8] cap, [list+16] data of 8-byte slots) ----
+
+    // one shared prologue discipline: frame 32 below the saved pair
+    void RtListFrame(string name) {
+        syms.Add(new Sym(name, txt.Count));
+        RtPrologue();
+        AddSPImm(32, false);
+    }
+    void RtListReturn() {
+        AddSPImm(32, true);
+        RtEpilogue();
+    }
+
+    void RtEmitListOps() {
+        RtEmitListRemoveAt();
+        RtEmitListInsert();
+        RtEmitListReverse();
+        RtEmitListIndexOf(false);
+        RtEmitListIndexOf(true);
+        RtEmitListAddRange();
+        RtEmitListToArray();
+    }
+
+    // void _zan_rt_list_removeat(ptr list, i64 idx): an out-of-range idx
+    // leaves the list untouched
+    void RtEmitListRemoveAt() {
+        RtListFrame("_zan_rt_list_removeat");
+        RtStur(0, 29, -16);                    // list
+        RtStur(1, 29, -24);                    // idx
+        LdrU(2, 0, 0);                         // count
+        RtLdur(3, 29, -24);
+        int ok = NL();
+        E4(0xEB02007F);                        // cmp x3(idx), x2(count)
+        EmitBcond(3, ok);                      // b.lo (unsigned: negatives fail)
+        RtListReturn();
+        Mark(ok);
+        LdrU(4, 0, 16);                        // data
+        RtLdur(3, 29, -24);
+        // x0 = data + idx*8 (dst), x1 = x0 + 8 (src): elements shift LEFT
+        E4(0x8B000000 | (3 << 16) | (3 << 10) | (4 << 5) | 0); // add x0, x4, x3, lsl #3
+        AddImm(1, 0, 8);
+        // x2 = (count - idx - 1) * 8
+        E4(0xCB030042);                        // sub x2, x2, x3
+        SubImm(2, 2, 1);
+        E4(0xD37DF042);                        // lsl x2, x2, #3
+        BLExtern("_memmove");
+        RtLdur(0, 29, -16);                    // x0 = list (memmove returns dst)
+        LdrU(2, 0, 0);
+        SubImm(2, 2, 1);
+        StrU(2, 0, 0);                         // count - 1
+        RtListReturn();
+    }
+
+    // void _zan_rt_list_insert(ptr list, i64 idx, i64 value): idx == count
+    // appends; out of range leaves the list untouched
+    void RtEmitListInsert() {
+        RtListFrame("_zan_rt_list_insert");
+        AddSPImm(16, false);                   // value@-32 (frame 48 total)
+        RtStur(0, 29, -16);                    // list
+        RtStur(1, 29, -24);                    // idx
+        RtStur(2, 29, -32);                    // value
+        LdrU(2, 0, 0);                         // count
+        RtLdur(3, 29, -24);
+        int oki = NL();
+        E4(0xEB02007F);                        // cmp x3(idx), x2(count)
+        EmitBcond(3, oki);                     // b.lo ok (idx < count)
+        E4(0xEB02007F);                        // cmp idx, count
+        EmitBcond(0, oki);                     // b.eq ok (idx == count)
+        AddSPImm(48, true);
+        RtEpilogue();
+        Mark(oki);
+        LdrU(6, 0, 0);
+        AddImm(6, 6, 1);                       // wanted = count + 1
+        ListGrow();
+        RtLdur(0, 29, -16);                    // x0 = list (ListGrow clobbers x0)
+        // shift: memmove(data + (idx+1)*8, data + idx*8, (count - idx) * 8)
+        LdrU(4, 0, 16);
+        RtLdur(3, 29, -24);
+        E4(0x8B000000 | (3 << 16) | (3 << 10) | (4 << 5) | 1); // x1 = data + idx*8
+        AddImm(0, 1, 8);                       // x0 = x1 + 8
+        RtLdur(2, 29, -16);                    // x2 = list (x0 is dst now)
+        LdrU(2, 2, 0);                         // count
+        E4(0xCB030042);                        // sub x2, x2, x3
+        E4(0xD37DF042);                        // lsl x2, x2, #3
+        BLExtern("_memmove");
+        RtLdur(0, 29, -16);                    // x0 = list (memmove returns dst)
+        // data[idx] = value; count + 1
+        LdrU(4, 0, 16);
+        RtLdur(3, 29, -24);
+        RtLdur(6, 29, -32);
+        E4(0xF8207800 | (3 << 16) | (4 << 5) | 6);   // str x6, [x4, x3, lsl #3]
+        LdrU(2, 0, 0);
+        AddImm(2, 2, 1);
+        StrU(2, 0, 0);
+        AddSPImm(48, true);
+        RtEpilogue();
+    }
+
+    // grow the list in x0 until cap >= x6 (the wanted count): doubles from 4
+    // and reallocs; list lives at [x29-16]. Clobbers x2..x5, x9, x0, x1 --
+    // reload pointers from the frame afterwards.
+    void ListGrow() {
+        LdrU(2, 0, 0);                         // count
+        LdrU(3, 0, 8);                         // cap
+        int have = NL();
+        CbnzReg(3, have);
+        LoadImm(3, 4);                         // first growth from zero
+        Mark(have);
+        int chk = NL();
+        int grown = NL();
+        Mark(chk);
+        E4(0xEB06007F);                        // cmp cap(x3), wanted(x6)
+        EmitBcond(8, grown);                   // b.hi cap > wanted: done
+        AddRR(3, 3, 3);                        // cap *= 2
+        EmitB(chk);
+        Mark(grown);
+        StrU(3, 0, 8);                         // list->cap
+        LdrU(4, 0, 16);                        // old data
+        MovRR(9, 3);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);                        // x9 = cap * 8
+        MovRR(0, 4);
+        MovRR(1, 9);
+        BLExtern("_realloc");
+        RtLdur(5, 29, -16);                    // list
+        StrU(0, 5, 16);                        // list->data
+    }
+
+    // void _zan_rt_list_reverse(ptr list)
+    void RtEmitListReverse() {
+        RtListFrame("_zan_rt_list_reverse");
+        RtStur(0, 29, -16);
+        LdrU(2, 0, 0);                         // count
+        LoadImm(3, 2);
+        int go = NL();
+        E4(0xEB03005F);                        // cmp count, 2
+        EmitBcond(10, go);                     // b.ge (>= 2)
+        RtListReturn();
+        Mark(go);
+        LdrU(4, 0, 16);                        // data
+        E4(0xD2800005);                        // x5 = i = 0
+        SubImm(6, 2, 1);                       // x6 = j = count - 1
+        int lp2 = NL();
+        int fin = NL();
+        Mark(lp2);
+        E4(0xEB0600BF);                        // cmp i, j
+        EmitBcond(10, fin);                    // b.ge done
+        E4(0xF8607800 | (5 << 16) | (4 << 5) | 7);   // x7 = data[i]
+        E4(0xF8607800 | (6 << 16) | (4 << 5) | 8);   // x8 = data[j]
+        E4(0xF8207800 | (5 << 16) | (4 << 5) | 8);   // data[i] = x8
+        E4(0xF8207800 | (6 << 16) | (4 << 5) | 7);   // data[j] = x7
+        AddImm(5, 5, 1);
+        SubImm(6, 6, 1);
+        EmitB(lp2);
+        Mark(fin);
+        RtListReturn();
+    }
+
+    // i64 _zan_rt_list_indexof[_str](ptr list, i64 value): first equal slot,
+    // or -1; the _str form compares strings by value
+    void RtEmitListIndexOf(bool strForm) {
+        RtListFrame(strForm ? "_zan_rt_list_indexof_str" : "_zan_rt_list_indexof");
+        RtStur(0, 29, -16);
+        RtStur(1, 29, -24);
+        LdrU(4, 0, 16);                        // data
+        LdrU(5, 0, 0);                         // count
+        RtLdur(7, 29, -24);                    // value
+        E4(0xD2800006);                        // i = 0
+        int lp = NL();
+        int miss = NL();
+        int hit = NL();
+        Mark(lp);
+        E4(0xEB0500DF);                        // cmp i(x6), count(x5)
+        EmitBcond(10, miss);                   // b.ge -> -1
+        E4(0xF8607800 | (6 << 16) | (4 << 5) | 0);   // x0 = data[i]
+        if (strForm) {
+            MovRR(1, 7);
+            BLExtern("_strcmp");
+            E4(0x7100001F);                    // cmp w0, #0
+            EmitBcond(0, hit);
+        } else {
+            E4(0xEB07001F);                    // cmp x0, value
+            EmitBcond(0, hit);
+        }
+        AddImm(6, 6, 1);
+        EmitB(lp);
+        Mark(miss);
+        LoadImm(0, -1);
+        RtListReturn();
+        Mark(hit);
+        MovRR(0, 6);
+        RtListReturn();
+    }
+
+    // void _zan_rt_list_addrange(ptr dst, ptr src): appends every src slot;
+    // self-append is safe (reads [0, oldCount), writes [oldCount, ...)).
+    // State lives in callee-saved x19-x23 (realloc/memcpy preserve them),
+    // so there are no frame-slot reloads to get out of sync.
+    void RtEmitListAddRange() {
+        syms.Add(new Sym("_zan_rt_list_addrange", txt.Count));
+        RtPrologue();
+        AddSPImm(48, false);                   // saves: x19@-16..x23@-48
+        RtStur(19, 29, -16);
+        RtStur(20, 29, -24);
+        RtStur(21, 29, -32);
+        RtStur(22, 29, -40);
+        RtStur(23, 29, -48);
+        MovRR(19, 0);                          // x19 = dst
+        MovRR(20, 1);                          // x20 = src
+        CbzReg(20, NL());
+        int snul = lblPos.Count - 1;
+        LdrU(21, 20, 0);                       // x21 = n
+        CbzReg(21, snul);
+        // grow dst until cap >= count + n
+        LdrU(22, 19, 0);                       // x22 = wanted = count
+        AddRR(22, 22, 21);
+        LdrU(23, 19, 8);                       // x23 = cap
+        int have = NL();
+        CbnzReg(23, have);
+        LoadImm(23, 4);
+        Mark(have);
+        int chk = NL();
+        int grown = NL();
+        Mark(chk);
+        E4(0xEB000000 | (22 << 16) | (23 << 5) | 31);   // cmp cap(x23), wanted(x22)
+        EmitBcond(8, grown);                   // b.hi
+        AddRR(23, 23, 23);
+        EmitB(chk);
+        Mark(grown);
+        StrU(23, 19, 8);                       // dst->cap
+        LdrU(0, 19, 16);                       // old data
+        MovRR(9, 23);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);                        // cap * 8
+        MovRR(1, 9);
+        BLExtern("_realloc");
+        StrU(0, 19, 16);                       // dst->data
+        // memcpy(dst->data + count*8, src->data, n*8)
+        LdrU(4, 19, 16);
+        LdrU(6, 19, 0);
+        E4(0x8B000000 | (6 << 16) | (3 << 10) | (4 << 5) | 0);   // x0 = dstdata + count*8
+        LdrU(1, 20, 16);
+        E4(0xD37DF000 | (21 << 5) | 2);        // lsl x2, x21, #3
+        BLExtern("_memcpy");
+        // dst.count += n
+        LdrU(3, 19, 0);
+        AddRR(3, 3, 21);
+        StrU(3, 19, 0);
+        RtLdur(19, 29, -16);
+        RtLdur(20, 29, -24);
+        RtLdur(21, 29, -32);
+        RtLdur(22, 29, -40);
+        RtLdur(23, 29, -48);
+        AddSPImm(48, true);
+        RtEpilogue();
+        Mark(snul);
+        RtLdur(19, 29, -16);
+        RtLdur(20, 29, -24);
+        RtLdur(21, 29, -32);
+        RtLdur(22, 29, -40);
+        RtLdur(23, 29, -48);
+        AddSPImm(48, true);
+        RtEpilogue();
+    }
+
+    // ptr _zan_rt_list_toarray(ptr list): a gen0-layout array (count at
+    // arr-16, magic at arr-24, data at arr+0)
+    void RtEmitListToArray() {
+        RtListFrame("_zan_rt_list_toarray");
+        RtStur(0, 29, -16);
+        LdrU(2, 0, 0);                         // n
+        E4(0xD37DF043);                        // lsl x3, x2, #3
+        AddImm(3, 3, 32);                      // bytes = n*8 + 32
+        MovRR(0, 3);
+        LoadImm(1, 1);
+        BLExtern("_calloc");                   // raw
+        RtStur(0, 29, -24);
+        LoadImm(2, 1);
+        StrU(2, 0, 0);                         // rc = 1
+        LoadImm(2, 25404552263127619);
+        StrU(2, 0, 8);                         // rcmagic
+        RtLdur(2, 29, -16);
+        LdrU(2, 2, 0);                         // n
+        StrU(2, 0, 16);                        // count
+        LoadImm(2, 6503565379360670041);
+        StrU(2, 0, 24);                        // magic2
+        // memcpy(raw + 32, data, n * 8)
+        RtLdur(0, 29, -24);
+        AddImm(0, 0, 32);
+        RtLdur(1, 29, -16);
+        LdrU(1, 1, 16);
+        RtLdur(2, 29, -16);
+        LdrU(2, 2, 0);
+        E4(0xD37DF042);                        // lsl x2, x2, #3
+        BLExtern("_memcpy");
+        RtLdur(0, 29, -24);
+        AddImm(0, 0, 32);                      // arr = raw + 32
+        RtListReturn();
+    }
+
 }
