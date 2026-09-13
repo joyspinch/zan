@@ -1101,16 +1101,21 @@ partial class Ngen {
                 GenExpr(e.b);
                 E4(0xF84107E1);                          // ldr x1, [sp], #16
                 int op = e.op;
-                if (IsUlongExpr(e.a) || IsUlongExpr(e.b)) {
+                if (IsUlongExpr(e.a) || IsUlongExpr(e.b)
+                        || (Int32Kind(e.a) == 2 && Int32Kind(e.b) == 2)) {
                     // unsigned 64-bit: add/sub/mul wrap identically, but
                     // division drops the MIN/-1 fold, comparisons go
                     // unsigned, and >> is logical (mirrors gen0's IR)
+                    bool bothU = Int32Kind(e.a) == 2 && Int32Kind(e.b) == 2;
                     if (op == TK.Plus()) {
                         E4(0x8B000020);                  // add x0, x1, x0
+                        if (bothU) { Wrap32(2); }
                     } else if (op == TK.Minus()) {
                         E4(0xCB000020);                  // sub x0, x1, x0
+                        if (bothU) { Wrap32(2); }
                     } else if (op == TK.Star()) {
                         E4(0x9B007C20);                  // mul x0, x1, x0
+                        if (bothU) { Wrap32(2); }
                     } else if (op == TK.Slash() || op == TK.Percent()) {
                         int bad = NL();
                         int cont = NL();
@@ -1152,18 +1157,24 @@ partial class Ngen {
                         E4(0xEB00003F);
                         E4(0x9A9F07E0);                  // cset x0, ne
                     } else if (op == TK.LessLess()) {
+                        if (bothU) { E4(0x92401000); }   // and x0, x0, #31
                         E4(0x9AC02020);                  // lslv x0, x1, x0
+                        if (bothU) { Wrap32(2); }
                     } else if (op == TK.GreaterGreater()) {
+                        if (bothU) { E4(0x92401000); }   // and x0, x0, #31
                         E4(0x9AC02420);                  // lsrv x0, x1, x0
                     } else {
                         diags.Error("ngen: unsupported ulong operator " + op, e.line, e.col);
                     }
                 } else if (op == TK.Plus()) {
                     E4(0x8B000020);                      // add x0, x1, x0
+                    if (Int32Kind(e.a) == 1 && Int32Kind(e.b) == 1) { Wrap32(1); }
                 } else if (op == TK.Minus()) {
                     E4(0xCB000020);                      // sub x0, x1, x0
+                    if (Int32Kind(e.a) == 1 && Int32Kind(e.b) == 1) { Wrap32(1); }
                 } else if (op == TK.Star()) {
                     E4(0x9B007C20);                      // mul x0, x1, x0
+                    if (Int32Kind(e.a) == 1 && Int32Kind(e.b) == 1) { Wrap32(1); }
                 } else if (op == TK.Slash() || op == TK.Percent()) {
                     // divide/modulo: x1 = dividend, x0 = divisor. A zero
                     // divisor reports through zan_rt_guard_fail3 -- the same
@@ -1196,6 +1207,9 @@ partial class Ngen {
                     Mark(safe);
                     if (op == TK.Slash()) {
                         E4(0x9AC00C20);                  // sdiv x0, x1, x0
+                        // the 64-bit quotient of INT_MIN / -1 is +2^31;
+                        // int semantics wrap it back to INT_MIN
+                        if (Int32Kind(e.a) == 1 && Int32Kind(e.b) == 1) { Wrap32(1); }
                     } else {
                         E4(0x9AC00C24);                  // sdiv x4, x1, x0
                         E4(0x9B008480);                  // msub x0, x4, x0, x1
@@ -1219,9 +1233,15 @@ partial class Ngen {
                     E4(0xEB00003F);                      // cmp x1, x0
                     E4(0x9A9F07E0);                      // cset x0, ne
                 } else if (op == TK.LessLess()) {
+                    int sl32 = Int32Kind(e.a);
+                    if (sl32 != 0) { E4(0x92401000); }   // and x0, x0, #31
                     E4(0x9AC02020);                      // lslv x0, x1, x0
+                    if (sl32 != 0) { Wrap32(sl32); }
                 } else if (op == TK.GreaterGreater()) {
+                    int sr32 = Int32Kind(e.a);
+                    if (sr32 != 0) { E4(0x92401000); }   // and x0, x0, #31
                     E4(0x9AC02820);                      // asrv x0, x1, x0
+                    if (sr32 != 0) { Wrap32(sr32); }
                 } else if (op == TK.Amp()) {
                     E4(0x8A000020);                      // and x0, x1, x0
                 } else if (op == TK.Pipe()) {
@@ -1241,6 +1261,8 @@ partial class Ngen {
                     E4(0x9E660000);                  // fmov x0, d0
                 } else {
                     E4(0xCB0003E0);                  // neg x0, x0 (sub x0, xzr, x0)
+                    int ku32 = Int32Kind(e.a);
+                    if (ku32 != 0) { Wrap32(ku32); }
                 }
             } else if (e.op == TK.Bang()) {
                 // cset needs fresh flags: cmp against 1 so any nonzero-ish
@@ -1263,8 +1285,17 @@ partial class Ngen {
                 GenExpr(e.b);
                 E4(0x9E670000);                      // fmov d0, x0
                 E4(0x9E780000);                      // fcvtzs x0, d0
+                if (ty == "int") { E4(0x93407C00); } // wrap the saturated i64 down to i32
             } else {
                 GenExpr(e.b);                        // int<->ulong (and dbl->dbl): bits unchanged
+                // narrow casts wrap at the declared width, like gen0's
+                // truncating integer conversions
+                if (ty == "int") { E4(0x93407C00); }             // sbfm #31
+                else if (ty == "uint") { E4(0xD3407C00); }       // ubfm #31
+                else if (ty == "short") { E4(0x93403C00); }      // sbfm #15
+                else if (ty == "ushort" || ty == "char") { E4(0xD3403C00); }  // ubfm #15
+                else if (ty == "sbyte") { E4(0x93401C00); }      // sbfm #7
+                else if (ty == "byte") { E4(0xD3401C00); }       // ubfm #7
             }
         } else if (k == AK.Index()) {
             if (IsStrExpr(e.a)) {
@@ -2356,6 +2387,70 @@ partial class Ngen {
             return CallRetTy(e) == "ulong";
         }
         return false;
+    }
+
+    // 32-bit-ness of an integer expression: 1 = signed int, 2 = unsigned
+    // uint, 0 = long/ulong/unknown (leave 64-bit arithmetic alone). gen0
+    // wraps int/uint arithmetic at the declared width.
+    int Int32Kind(Node e) {
+        if (e == null) { return 0; }
+        if (e.kind == AK.IntLit()) {
+            // lexer code: 1 = L, 2 = U, 3 = UL; only a bare or U-suffixed
+            // literal stays in the 32-bit domain
+            int sfx = e.suffix - (e.suffix / 4) * 4;
+            if (sfx == 0 && e.ival >= -2147483648 && e.ival <= 2147483647) { return 1; }
+            if (sfx == 2 && e.ival >= 0 && e.ival <= 4294967295) { return 2; }
+            return 0;
+        }
+        if (e.kind == AK.Unary() && e.op == TK.Minus()) { return Int32Kind(e.a); }
+        if (e.kind == AK.Binary()) {
+            int op = e.op;
+            if (op == TK.Plus() || op == TK.Minus() || op == TK.Star()
+                    || op == TK.Slash() || op == TK.Percent()) {
+                int ka = Int32Kind(e.a);
+                int kb = Int32Kind(e.b);
+                if (ka == 2 && kb == 2) { return 2; }
+                if (ka == 1 && kb == 1) { return 1; }
+                return 0;
+            }
+            return 0;
+        }
+        if (e.kind == AK.CastExpr() && e.type != null) {
+            if (e.type.sval == "int") { return 1; }
+            if (e.type.sval == "uint") { return 2; }
+            return 0;
+        }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            if (f != null && f.ty == "int") { return 1; }
+            if (f != null && f.ty == "uint") { return 2; }
+            return 0;
+        }
+        if (e.kind == AK.Ident()) {
+            string t = null;
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { t = locTy[li]; }
+            Fld f = CurField(e.sval);
+            if (f != null) { t = f.ty; }
+            if (t == null) { t = FindStaticTy(curCls, e.sval); }
+            if (t == "int") { return 1; }
+            if (t == "uint") { return 2; }
+            return 0;
+        }
+        if (e.kind == AK.Call() && e.a != null) {
+            string rt = CallRetTy(e);
+            if (rt == "int") { return 1; }
+            if (rt == "uint") { return 2; }
+            return 0;
+        }
+        return 0;
+    }
+
+    // truncate x0 to its 32-bit slot width: signed re-extends the sign,
+    // unsigned fills with zeros (gen0's declared-width arithmetic)
+    void Wrap32(int kind) {
+        if (kind == 1) { E4(0x93407C00); }           // sbfm x0, x0, #0, #31
+        else if (kind == 2) { E4(0xD3407C00); }      // ubfm x0, x0, #0, #31
     }
 
     // does this expression evaluate to a bool? (comparisons / bool locals,
