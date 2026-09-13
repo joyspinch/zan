@@ -65,6 +65,7 @@ partial class Ngen {
     List<string> locName;   // locals of the method being emitted
     List<string> locTy;     // declared type name per local ("" for this/params of unknown)
     List<int> locOff;       // frame offset (bytes from sp)
+    List<bool> locRef;      // by-ref slots (out/ref params): the slot holds an address
     int nloc;
     int frame;
     int nlabel;
@@ -123,7 +124,7 @@ partial class Ngen {
         int i = 0;
         while (i < unit.kids.Count) {
             Node dcl = unit.kids[i];
-            if (dcl.kind == AK.ClassDecl()) { CollectMethods(dcl); }
+            if (dcl.kind == AK.ClassDecl() || dcl.kind == AK.StructDecl()) { CollectMethods(dcl); }
             i = i + 1;
         }
         CollectClasses(unit);
@@ -536,23 +537,20 @@ partial class Ngen {
         locName = new List<string>();
         locTy = new List<string>();
         locOff = new List<int>();
+        locRef = new List<bool>();
         nloc = 0;
         // instance methods and ctors take `this` as their first argument
         if (inst) {
-            locName.Add("this");
-            locTy.Add("");
-            locOff.Add(16 * nloc);
-            nloc = nloc + 1;
+            AddLoc("this", "", false);
         }
-        // params get frame slots; the prologue stores x0.. into them in order
+        // params get frame slots; the prologue stores x0.. into them in order.
+        // An out/ref parameter's slot holds the caller's storage ADDRESS
+        // (gen0's byref protocol): reads and writes go through it
         int pi = 0;
         while (pi < m.kids.Count) {
             Node p = m.kids[pi];
             if (p.kind == AK.Param()) {
-                locName.Add(p.sval);
-                locTy.Add(TypeFullName(p.type));
-                locOff.Add(16 * nloc);
-                nloc = nloc + 1;
+                AddLoc(p.sval, TypeFullName(p.type), p.ival == 1);
             }
             pi = pi + 1;
         }
@@ -561,9 +559,9 @@ partial class Ngen {
         if (curHasTry) {
             // EH bookkeeping locals: the top mirror, the outermost open
             // try's arm base, and the loop-entry top for break/continue
-            locName.Add("#ehtop"); locTy.Add("int"); locOff.Add(16 * nloc); nloc = nloc + 1;
-            locName.Add("#ehbase"); locTy.Add("int"); locOff.Add(16 * nloc); nloc = nloc + 1;
-            locName.Add("#ehbrk"); locTy.Add("int"); locOff.Add(16 * nloc); nloc = nloc + 1;
+            AddLoc("#ehtop", "int", false);
+            AddLoc("#ehbase", "int", false);
+            AddLoc("#ehbrk", "int", false);
             ehTopLocal = nloc - 3;
             ehBaseLocal = nloc - 2;
             ehBrkLocal = nloc - 1;
@@ -677,11 +675,11 @@ partial class Ngen {
         int i = 0;
         while (i < blk.kids.Count) {
             Node s = blk.kids[i];
+            // `out T x` call arguments declare caller slots; scan every
+            // statement's expression tree so the slot exists before codegen
+            ReserveOutDecls(s);
             if (s.kind == AK.VarDecl()) {
-                locName.Add(s.sval);
-                locTy.Add(TypeFullName(s.type));
-                locOff.Add(16 * nloc);
-                nloc = nloc + 1;
+                AddLoc(s.sval, TypeFullName(s.type), false);
             } else if (s.kind == AK.Block()) {
                 ReserveLocals(s);
             } else if (s.kind == AK.IfStmt()) {
@@ -693,21 +691,12 @@ partial class Ngen {
                 // the init VarDecl is a bare node (no kids block), so it
                 // must be reserved inline rather than via ReserveLocals
                 if (s.a != null && s.a.kind == AK.VarDecl()) {
-                    locName.Add(s.a.sval);
-                    locTy.Add(TypeFullName(s.a.type));
-                    locOff.Add(16 * nloc);
-                    nloc = nloc + 1;
+                    AddLoc(s.a.sval, TypeFullName(s.a.type), false);
                 }
                 ReserveLocals(s.d);
             } else if (s.kind == AK.ForeachStmt()) {
-                locName.Add(s.sval);
-                locTy.Add(TypeFullName(s.type));
-                locOff.Add(16 * nloc);
-                nloc = nloc + 1;
-                locName.Add("#fei");
-                locTy.Add("int");
-                locOff.Add(16 * nloc);
-                nloc = nloc + 1;
+                AddLoc(s.sval, TypeFullName(s.type), false);
+                AddLoc("#fei", "int", false);
                 ReserveLocals(s.c);
             } else if (s.kind == AK.TryStmt()) {
                 ReserveLocals(s.a);
@@ -716,11 +705,8 @@ partial class Ngen {
                     if (cc2.sval != null && cc2.sval != "") {
                         // catch variable type: the declared type (string for
                         // bare throws, Exception for typed throws)
-                        locName.Add(cc2.sval);
-                        if (cc2.type != null) { locTy.Add(TypeFullName(cc2.type)); }
-                        else { locTy.Add("string"); }
-                        locOff.Add(16 * nloc);
-                        nloc = nloc + 1;
+                        if (cc2.type != null) { AddLoc(cc2.sval, TypeFullName(cc2.type), false); }
+                        else { AddLoc(cc2.sval, "string", false); }
                     }
                     ReserveLocals(cc2.a);
                     cc2 = cc2.b;
@@ -728,6 +714,40 @@ partial class Ngen {
                 ReserveLocals(s.c);
             }
             i = i + 1;
+        }
+    }
+
+    // register one frame slot (name, type, by-ref flag) in declaration order
+    void AddLoc(string name, string ty, bool isRef) {
+        locName.Add(name);
+        locTy.Add(ty);
+        locOff.Add(16 * nloc);
+        locRef.Add(isRef);
+        nloc = nloc + 1;
+    }
+
+    // walk a statement's expression tree reserving slots for `out T x`
+    // declaration arguments. A name already spoken for keeps its single slot
+    // (the flat frame has one variable per name, so a redeclaration in a
+    // loop body shares it, like LocalIdx's lookup).
+    void ReserveOutDecls(Node n) {
+        if (n == null) { return; }
+        if (n.kind == AK.OutArg()) {
+            if (n.type != null && n.sval != null && n.sval != "" && LocalIdx(n.sval) < 0) {
+                AddLoc(n.sval, TypeFullName(n.type), false);
+            }
+            return;
+        }
+        ReserveOutDecls(n.a);
+        ReserveOutDecls(n.b);
+        ReserveOutDecls(n.c);
+        ReserveOutDecls(n.d);
+        if (n.kids != null) {
+            int i = 0;
+            while (i < n.kids.Count) {
+                ReserveOutDecls(n.kids[i]);
+                i = i + 1;
+            }
         }
     }
 
@@ -1045,6 +1065,11 @@ partial class Ngen {
                 }
                 diags.Error("ngen: unknown identifier '" + e.sval + "'", e.line, e.col);
                 LoadImm(0, 0);
+                return;
+            }
+            if (locRef[li]) {
+                LoadLocal(li, 1);                            // slot holds an address
+                LdrU(0, 1, 0);                               // read through it
                 return;
             }
             LoadLocal(li, 0);
@@ -1595,6 +1620,11 @@ partial class Ngen {
                     diags.Error("ngen: unknown identifier '" + e.a.sval + "'", e.line, e.col);
                     return;
                 }
+                if (locRef[li]) {
+                    LoadLocal(li, 1);                        // address in the slot
+                    StrU(0, 1, 0);                           // store through it
+                    return;
+                }
                 StoreLocal(li, 0);
             } else if (e.a != null && e.a.kind == AK.Index() && ArrContainerTy(e.a.a) != null) {
                 // array element set: same bounds rule as the get; the value
@@ -1716,10 +1746,21 @@ partial class Ngen {
             if (tgt != null && tgt.kind == AK.Ident()) {
                 int li = LocalIdx(tgt.sval);
                 if (li >= 0) {
-                    LoadLocal(li, 0);
+                    if (locRef[li]) {
+                        LoadLocal(li, 1);
+                        LdrU(0, 1, 0);                       // old value (through)
+                    } else {
+                        LoadLocal(li, 0);
+                    }
                     E4(0xF81F0FE0);                      // push old
                     if (e.op == TK.PlusPlus()) { AddImm(0, 0, 1); } else { SubImm(0, 0, 1); }
-                    StoreLocal(li, 0);
+                    if (locRef[li]) {
+                        E4(0xF84107E1);                  // pop new -> x1
+                        LoadLocal(li, 2);                // address
+                        StrU(1, 2, 0);                   // store through it
+                    } else {
+                        StoreLocal(li, 0);
+                    }
                     E4(0xF84107E0);                      // pop old -> x0
                 } else {
                     Fld fld = CurField(tgt.sval);
@@ -1739,6 +1780,10 @@ partial class Ngen {
                 diags.Error("ngen: unsupported ++/-- target", e.line, e.col);
                 LoadImm(0, 0);
             }
+        } else if (k == AK.OutArg()) {
+            // an out/ref argument evaluated in expression position yields
+            // its storage ADDRESS (gen0's emit_expr of a ref arg)
+            GenRefArg(e);
         } else {
             diags.Error("ngen: unsupported expression kind " + k, e.line, e.col);
         }
@@ -1906,6 +1951,12 @@ partial class Ngen {
         }
         if (e.kind == AK.Ident()) {
             return ClassTyOf(NamedSlotTy(e.sval));
+        }
+        if (e.kind == AK.MemberAccess()) {
+            // field chains resolve to the field's declared class
+            // (`x.next.n` needs ExprCls of `x.next`)
+            Fld mf = FieldOf(e);
+            return mf != null ? ClassTyOf(mf.ty) : null;
         }
         return null;
     }
@@ -2195,6 +2246,52 @@ partial class Ngen {
             i = i + 1;
         }
         Mark(joinL);
+    }
+
+    // EnumType.TryParse(text, out value): a case-sensitive probe over the
+    // declaration-order member names, like gen0 -- a hit stores the member
+    // constant through the out address and yields 1, a miss stores
+    // default(T) and yields 0
+    void GenEnumTryParse(Node e) {
+        string en = e.a.a.sval;
+        int ei = FindEnum(en);
+        GenRefArg(e.kids[1]);                            // x0 = out address
+        E4(0xF81F0FE0);                                  // push addr
+        GenExpr(e.kids[0]);                              // x0 = text
+        E4(0xF81F0FE0);                                  // push text (strcmp0
+                                                        // clobbers x0-x17, so
+                                                        // every probe peeks)
+        int cnt = enCnt[ei];
+        int miss = NL();
+        int join = NL();
+        int[] hits = new int[cnt];
+        int i = 0;
+        while (i < cnt) {
+            hits[i] = NL();
+            E4(0xF84003E1);                              // ldur x1, [sp] (text)
+            LoadStr(InternStr(enMem[enOff[ei] + i]), 0);
+            BLInternal("_zan_rt_strcmp0");               // w0 = 0 iff equal
+            E4(0x7100001F);                              // cmp w0, #0
+            EmitBcond(0, hits[i]);                       // b.eq hit
+            i = i + 1;
+        }
+        E4(0xF84107E0);                                  // pop text (discard)
+        E4(0xF84107E1);                                  // pop addr -> x1
+        StrU(31, 1, 0);                                  // str xzr, [x1] (default)
+        LoadImm(0, 0);
+        EmitB(join);
+        i = 0;
+        while (i < cnt) {
+            Mark(hits[i]);
+            E4(0xF84107E0);                              // pop text (discard)
+            E4(0xF84107E1);                              // pop addr -> x1
+            LoadImm(2, enVal[enOff[ei] + i]);
+            StrU(2, 1, 0);                               // member constant
+            LoadImm(0, 1);
+            EmitB(join);
+            i = i + 1;
+        }
+        Mark(join);
     }
 
     // true when sub's base chain reaches anc (equal counts)
@@ -2674,6 +2771,11 @@ partial class Ngen {
                 && (EnumTyOf(e.a.a) != null || ScalarToStringTy(e.a.a) != null)) {
             return "string";
         }
+        if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.sval == "TryParse"
+                && e.kids != null && e.kids.Count == 2 && e.a.a != null
+                && e.a.a.kind == AK.Ident() && FindEnum(e.a.a.sval) >= 0) {
+            return "bool";
+        }
         string rty = MethRetTy(e.a != null ? e.a.sval : null);
         if (rty == null || rty == "") { return rty; }
         if (e.a == null || e.a.kind != AK.MemberAccess() || e.a.a == null) { return rty; }
@@ -3123,6 +3225,15 @@ partial class Ngen {
                     return;
                 }
             }
+            // EnumType.TryParse(text, out value): compiler-lowered probe of
+            // the declaration-order member names (gen0 parity), storing the
+            // member constant through the out address
+            if (callee.sval == "TryParse" && e.kids.Count == 2
+                    && recv != null && recv.kind == AK.Ident()
+                    && FindEnum(recv.sval) >= 0) {
+                GenEnumTryParse(e);
+                return;
+            }
             // enum x.ToString(): member-name lookup with numeric fallback,
             // like gen0 (run before the scalar paths, which would render the
             // raw number)
@@ -3480,6 +3591,149 @@ partial class Ngen {
         if (TypeFullName(p.type) == "double" && !IsDblExpr(arg)) { ConvI2D(); }
     }
 
+    // evaluate an out/ref call argument into x0 = the callee's storage
+    // address (gen0 emit_ref_arg contract): `out T x` declares a fresh
+    // zero-filled caller slot; a bare local passes its frame address (a
+    // by-ref parameter's slot already holds an address and passes it
+    // through); a field name means this.field; a class-qualified name
+    // means the static's data-global slot; member and index places resolve
+    // obj+off / element addresses with the same bounds guards as the
+    // corresponding stores
+    void GenRefArg(Node oa) {
+        if (oa.type != null) {
+            int li = LocalIdx(oa.sval);
+            if (li < 0) {
+                diags.Error("ngen: out declaration '" + oa.sval + "' has no slot", oa.line, oa.col);
+                LoadImm(0, 0);
+                return;
+            }
+            LoadImm(0, 0);                               // default(T): 0 / null
+            StoreLocal(li, 0);
+            LoadImm(0, LocFpOff(locOff[li]));
+            AddRR(0, 29, 0);                             // x0 = x29 + slot offset
+            return;
+        }
+        if (oa.a == null) {
+            diags.Error("ngen: out/ref argument has no target", oa.line, oa.col);
+            LoadImm(0, 0);
+            return;
+        }
+        AddrOf(oa.a);
+    }
+
+    // x0 = the address of place t (a variable, field, static, or element)
+    void AddrOf(Node t) {
+        if (t.kind == AK.Ident()) {
+            int li = LocalIdx(t.sval);
+            if (li >= 0) {
+                if (locRef[li]) {
+                    LoadLocal(li, 0);                    // slot holds the address
+                } else {
+                    LoadImm(0, LocFpOff(locOff[li]));
+                    AddRR(0, 29, 0);
+                }
+                return;
+            }
+            Fld fld = CurField(t.sval);
+            if (fld != null) {
+                LoadLocal(LocalIdx("this"), 0);
+                AddImm(0, 0, fld.off);
+                return;
+            }
+            string ssym = FindStaticSym(curCls, t.sval);
+            if (ssym != null) {
+                LoadSymRef(ssym, 0);                     // the slot is the storage
+                return;
+            }
+            diags.Error("ngen: out/ref target '" + t.sval + "' is not a variable or field", t.line, t.col);
+            LoadImm(0, 0);
+            return;
+        }
+        if (t.kind == AK.MemberAccess()) {
+            // Class.static first: the receiver names a class (not a local)
+            // and the member is one of its statics
+            if (t.a != null && t.a.kind == AK.Ident() && LocalIdx(t.a.sval) < 0) {
+                string ssym = FindStaticSym(t.a.sval, t.sval);
+                if (ssym != null) {
+                    LoadSymRef(ssym, 0);
+                    return;
+                }
+            }
+            Fld f2 = FieldOf(t);
+            if (f2 != null) {
+                GenExpr(t.a);                            // receiver -> x0
+                AddImm(0, 0, f2.off);
+                return;
+            }
+            diags.Error("ngen: unknown field '" + t.sval + "' in out/ref target", t.line, t.col);
+            LoadImm(0, 0);
+            return;
+        }
+        if (t.kind == AK.Index() && ExprCls(t.a) == "List") {
+            GenExpr(t.a);                                // list -> x0
+            E4(0xF81F0FE0);                              // push list
+            GenExpr(t.b);                                // idx -> x0
+            E4(0xF84107E1);                              // pop list -> x1
+            LdrU(3, 1, 0);                               // count
+            LdrU(4, 1, 16);                              // data
+            int badl = NL();
+            int contl = NL();
+            E4(0xEB03001F);                              // cmp x0, x3
+            EmitBcond(10, badl);
+            E4(0xEB1F001F);                              // cmp x0, xzr
+            EmitBcond(11, badl);
+            EmitB(contl);
+            Mark(badl);
+            E4(0xF81F0FE4);                              // keep data (guard clobbers x4)
+            E4(0xF81F0FE0);                              // keep idx
+            LoadSymRef("l_.str." + guardFileIdx, 0);
+            LoadImm(1, t.line);
+            LoadImm(2, t.col);
+            LoadSymRef("l_.str." + guardListIdx, 3);
+            BLExtern("_zan_rt_guard_fail3");
+            E4(0xF84107E0);                              // pop idx
+            E4(0xF84107E4);                              // pop data
+            LoadImm(0, 0);
+            Mark(contl);
+            E4(0x8B000C89);                              // add x9, x4, x0, lsl #3
+            MovRR(0, 9);
+            return;
+        }
+        if (t.kind == AK.Index() && ArrContainerTy(t.a) != null) {
+            int esz = ArrElemSize(ArrContainerTy(t.a));
+            GenExpr(t.a);                                // container -> x0
+            E4(0xF81F0FE0);                              // push container
+            GenExpr(t.b);                                // idx -> x0
+            E4(0xF84107E1);                              // pop container -> x1
+            E4(0xF85F0023);                              // ldur x3, [x1, #-16] (len)
+            int bad = NL();
+            int cont = NL();
+            E4(0xEB03001F);                              // cmp x0, x3
+            EmitBcond(10, bad);
+            E4(0xEB1F001F);                              // cmp x0, xzr
+            EmitBcond(11, bad);
+            EmitB(cont);
+            Mark(bad);
+            E4(0xF81F0FE1);                              // keep arr (guard clobbers x1)
+            E4(0xF81F0FE0);                              // keep idx
+            LoadSymRef("l_.str." + guardFileIdx, 0);
+            LoadImm(1, t.line);
+            LoadImm(2, t.col);
+            LoadSymRef("l_.str." + guardArrIdx, 3);
+            BLExtern("_zan_rt_guard_fail3");
+            E4(0xF84107E0);                              // pop idx
+            E4(0xF84107E1);                              // pop arr
+            LoadImm(0, 0);
+            Mark(cont);
+            // add x9, x1, idx, lsl #esz (arr points at the data; len at arr-16)
+            E4(esz == 4 ? 0x8B000829 : 0x8B000C29);
+            MovRR(0, 9);
+            return;
+        }
+        diags.Error("ngen: out/ref argument must be a variable, a field, or an element", t.line, t.col);
+        LoadImm(0, 0);
+    }
+
     // declared type of an assignment target ("double", ...), or null
     string AssignTargetTy(Node a) {
         if (a == null) { return null; }
@@ -3602,8 +3856,12 @@ partial class Ngen {
         }
         int i = 0;
         while (i < prov && i < fixedc) {
-            GenExpr(ak[i]);
-            ConvArg(m, i, ak[i]);
+            if (ak[i].kind == AK.OutArg()) {
+                GenRefArg(ak[i]);                        // x0 = storage address
+            } else {
+                GenExpr(ak[i]);
+                ConvArg(m, i, ak[i]);
+            }
             E4(0xF81F0FE0);                              // str x0, [sp, #-16]!
             i = i + 1;
         }
@@ -3627,8 +3885,12 @@ partial class Ngen {
             // bundle array and store them at their slots
             int j2 = fixedc;
             while (j2 < prov) {
-                GenExpr(ak[j2]);
-                if (elTy == "double" && !IsDblExpr(ak[j2])) { ConvI2D(); }
+                if (ak[j2].kind == AK.OutArg()) {
+                    GenRefArg(ak[j2]);                   // x0 = storage address
+                } else {
+                    GenExpr(ak[j2]);
+                    if (elTy == "double" && !IsDblExpr(ak[j2])) { ConvI2D(); }
+                }
                 E4(0xF81F0FE0);
                 j2 = j2 + 1;
             }

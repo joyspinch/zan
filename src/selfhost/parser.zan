@@ -269,6 +269,7 @@ class Parser {
             else { Node d = ParseTypeDecl(); if (d != null) { unit.Add(d); } }
         }
         MergePartials(unit);
+        FlattenNested(unit);
         DesugarEvents(unit);
         DesugarIterators(unit);
         Jsongen jg = new Jsongen();
@@ -562,6 +563,46 @@ class Parser {
         unit.kids = merged;
     }
 
+    // Nested type declarations lift to the unit top level under their simple
+    // name (mirrors the C host's zan_parser_flatten_nested_types): the binder
+    // and ngen see flat type tables only. Recursion lifts deeper nesting
+    // first, member lists keep their order, and hoisted types land after
+    // their enclosing class like the C host.
+    void FlattenNested(Node unit) {
+        int di = 0;
+        while (di < unit.kids.Count) {
+            Node d = unit.kids[di];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()
+                    || d.kind == AK.EnumDecl()) {
+                HoistNested(unit, d);
+            }
+            di = di + 1;
+        }
+    }
+
+    int HoistNested(Node unit, Node typeNode) {
+        int hoisted = 0;
+        int mi = 0;
+        while (mi < typeNode.kids.Count) {
+            Node mem = typeNode.kids[mi];
+            if (mem.kind == AK.ClassDecl() || mem.kind == AK.StructDecl()
+                    || mem.kind == AK.EnumDecl()) {
+                hoisted = hoisted + HoistNested(unit, mem);
+                unit.Add(mem);
+                hoisted = hoisted + 1;
+                int k = mi;
+                while (k < typeNode.kids.Count - 1) {
+                    typeNode.kids[k] = typeNode.kids[k + 1];
+                    k = k + 1;
+                }
+                typeNode.kids.RemoveAt(typeNode.kids.Count - 1);
+            } else {
+                mi = mi + 1;
+            }
+        }
+        return hoisted;
+    }
+
     Node ParseUsing() {
         Next(); // using
         Node u = new Node(AK.UsingDecl());
@@ -804,6 +845,13 @@ class Parser {
         // `event` is contextual: a field modifier only when introducing an
         // event field (`event D E;`), so identifiers named `event` still work.
         if (At(TK.Ident()) && Cur().text == "event" && K1() == TK.Ident()) { Next(); mods = mods + MOD.Event(); }
+        // nested type declarations parse like top-level ones and lift to the
+        // unit top level afterwards (FlattenNested, mirroring the C host's
+        // zan_parser_flatten_nested_types)
+        int nk = K();
+        if (nk == TK.Class() || nk == TK.Struct()) { return ParseClass(mods, nk); }
+        if (nk == TK.Interface()) { return ParseInterface(mods); }
+        if (nk == TK.Enum()) { return ParseEnum(mods); }
         // destructor / finalizer:  ~Name() { ... }  (~ is lexed as Bang)
         if (At(TK.Bang())) {
             Next(); // '~'
@@ -1590,12 +1638,29 @@ class Parser {
                 if (!Eat(TK.Comma())) { }
                 continue;
             }
-            // out argument: `out T name` declares, `out name` references
+            // out argument: `out T name` declares, `out place` references --
+            // the place is a full expression (`out x`, `out b.a`, `out arr[i]`,
+            // `out Box.sv`), matching the C host's parse_call_arg
             if (At(TK.Ident()) && Cur().text == "out" && (IsTypeKeyword(K1()) || K1() == TK.Ident())) {
                 Next();
                 Node oa = new Node(AK.OutArg());
-                if (IsTypeKeyword(K()) || (At(TK.Ident()) && K1() == TK.Ident())) { oa.type = ParseType(); }
-                if (At(TK.Ident())) { oa.sval = Next().text; }
+                if (IsTypeKeyword(K())) {
+                    oa.type = ParseType();
+                    if (At(TK.Ident())) { oa.sval = Next().text; }
+                } else {
+                    // `out Foo x` (class-typed declaration): the expression
+                    // parse consumes the type name; a following identifier
+                    // flips the node to a declaration
+                    Node pe = ParseExpr();
+                    if (pe != null && pe.kind == AK.Ident() && At(TK.Ident())) {
+                        Node ty = new Node(AK.TypeRef());
+                        ty.sval = pe.sval;
+                        oa.type = ty;
+                        oa.sval = Next().text;
+                    } else {
+                        oa.a = pe;
+                    }
+                }
                 call.Add(oa);
                 if (!Eat(TK.Comma())) { }
                 continue;
