@@ -89,6 +89,7 @@ partial class Ngen {
     List<string> methCls;
     List<int> methStat;     // 0 = instance, 1 = static, 2 = ctor
     string mainCls;
+    Node curMeth;           // method being emitted (spec sval2 = this type)
 
     List<string> enName;    // enum type name per declaration
     List<int> enOff;        // start index into the flat member arrays
@@ -535,6 +536,7 @@ partial class Ngen {
 
     void EmitMethod(string cls, Node m, int mi) {
         curCls = cls;
+        curMeth = m;
         bool inst = methStat[mi] == 0 || methStat[mi] == 2;
         if (methStat[mi] == 2) {
             syms.Add(new Sym(CtorSymNg(cls, m), txt.Count));
@@ -2569,6 +2571,18 @@ partial class Ngen {
             }
             spec.sval = mangled;
             SubstTypeNode(spec, tps, args);
+            // the call may sit on an instantiated generic receiver
+            // (`ps.Pair<int>(3)` with ps: Pool<string>): carry that
+            // instantiation on the spec so its `this`-relative field types
+            // resolve (CurField reads sval2), like SpecRegisterClass does
+            if (callNode.a != null && callNode.a.kind == AK.MemberAccess()
+                    && callNode.a.a != null) {
+                string rt = StaticTyOf(callNode.a.a);
+                if (rt != null && rt.IndexOf("<") > 0 && FindClass(rt.Substring(0, rt.IndexOf("<"))) != null) {
+                    spec.sval2 = rt;
+                    RegisterInstCls(rt);
+                }
+            }
             methNodes.Add(spec);
             methCls.Add(methCls[di]);
             methStat.Add(methStat[di]);
@@ -2616,7 +2630,7 @@ partial class Ngen {
             callNode.a.sval = mangled;
             return;
         }
-        List<string> args = SplitTyArgs(instName.Substring(lt + 1, instName.Length - lt - 1));
+        List<string> args = SplitTyArgs(instName.Substring(lt + 1, instName.Length - lt - 2));
         Node spec = CloneNode(methNodes[di]);
         if (spec == null) { spec = new Node(methNodes[di].kind); }
         spec.sval = mangled;
@@ -3044,9 +3058,17 @@ partial class Ngen {
         return nf;
     }
 
-    // field of the class being emitted (implicit `this` references)
+    // field of the class being emitted (implicit `this` references). A
+    // specialization's `this` carries the instantiation (meth.sval2, e.g.
+    // "Pool<string>"), so a field declared with the class's type parameter
+    // ("T item") resolves through it: `item.ToString()` in Pair$int sees a
+    // string field, not an unresolvable "T"
     Fld CurField(string name) {
-        return FindField(FindClass(curCls), name);
+        Cls c = FindClass(curCls);
+        Fld f = FindField(c, name);
+        if (f == null || c == null || c.tps.Count == 0) { return f; }
+        if (curMeth == null || curMeth.sval2 == null || curMeth.sval2 == "") { return f; }
+        return FieldOfInst(curMeth.sval2, name);
     }
 
     // does this expression evaluate to a string? (local type / field type /
