@@ -22,25 +22,11 @@ if(NOT ZANC OR NOT SELFHOST_DIR OR NOT PROG OR NOT GEN1 OR NOT OUTLL)
 endif()
 
 # The driver (main.zan) must come first so its Program.Main is the entry point.
-set(_srcs
-  ${SELFHOST_DIR}/main.zan
-  ${SELFHOST_DIR}/irgen.zan
-  ${SELFHOST_DIR}/irgen_async.zan
-  ${SELFHOST_DIR}/irgen_stmt.zan
-  ${SELFHOST_DIR}/irgen_expr.zan
-  ${SELFHOST_DIR}/checker.zan
-  ${SELFHOST_DIR}/binder.zan
-  ${SELFHOST_DIR}/diag.zan
-  ${SELFHOST_DIR}/parser.zan
-  ${SELFHOST_DIR}/jsongen.zan
-  ${SELFHOST_DIR}/dbgen.zan
-  ${SELFHOST_DIR}/lexer.zan
-  ${SELFHOST_DIR}/ngen.zan
-  ${SELFHOST_DIR}/ngen_macho.zan
-  ${SELFHOST_DIR}/ngen_obj.zan
-  ${SELFHOST_DIR}/nio.zan
-  ${SELFHOST_DIR}/ast.zan
-  ${SELFHOST_DIR}/token.zan)
+file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/../scripts/selfhost_sources.txt" _source_names)
+set(_srcs)
+foreach(_name IN LISTS _source_names)
+  list(APPEND _srcs "${SELFHOST_DIR}/${_name}.zan")
+endforeach()
 
 # ---- Stage 1: build gen1 (the self-hosted compiler) with the C host ----
 list(GET _srcs 0 _first)

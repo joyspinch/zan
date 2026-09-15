@@ -14,7 +14,26 @@ LLVM 依赖**。本仓库从 zan-lang monorepo 独立出来，以避开主仓库
 
 当前 pin：`BOOTSTRAP_ZANC_VERSION = zan-lang main @ 2b847bbd（待首次构建后填入版本号）`
 
-## 状态（2026-09-13）
+## 当前验收边界
+
+原生路线已达到一个可核验固定点：`build/native-bootstrap/run.nYdDdi/`
+的 `stage2.o == stage3.o`，native-born stage2 回归 39/39 通过，另有 15 项
+集成回归（转换/委托/显式布局/C 字符串读取/packed out 写回/整数窄化边界等）全部通过。
+该代际链直接输出 macOS arm64 Mach-O 对象，由系统 `ld` 链接，不调用 clang、
+不传项目 C runtime 对象；动态依赖只有 libSystem。最新增量还包含 `var` 局部
+类型推断、Dictionary 整数键校验、`Keys/Values` 链式类型与 packed int 数组
+元素的 TryGetValue 写回宽度修复。详情与哈希见
+[原生自举验收记录](docs/native-bootstrap-acceptance.md)。
+
+这不代表完整语言能力已与 C host 等价。后续源码修改需重验固定点，完整兼容性
+仍以阶段对拍结果为准，不能因自举闭合就提前删除参考编译器。
+
+统一的编译器输入清单位于 `scripts/selfhost_sources.txt`，Shell 与 CMake
+自举脚本共同读取它。定向测试入口为 `scripts/native_regression.py`；与原 C
+编译器对拍使用 `scripts/native_parity.py`，全量扫描必须显式传 `--all`。
+对拍记录编译、链接、运行退出码和原始 stdout/stderr，保留种子与输入哈希。
+
+## 首次闭合记录（2026-09-13）
 
 - **M0 已达成**：自举闭合恢复。`gen0 → gen1 → g2.ll → gen2（clang 链接）→
   g3.ll`，`g2.ll == g3.ll`（5,073,570 字节，首次在 macOS 上闭合）。
@@ -64,6 +83,9 @@ LLVM 依赖**。本仓库从 zan-lang monorepo 独立出来，以避开主仓库
 ## 运行
 
 ```sh
-ZANC=/path/to/zanc ./scripts/bootstrap.sh          # 完整自举闭包
-ZANC=/path/to/zanc zanc src/selfhost/main.zan ...  # 见 tests/run_selfhost.cmake
+ZANC=/path/to/zanc ./scripts/bootstrap.sh          # 过渡 LLVM 固定点
+SEED=/path/to/gen1 RT_OBJS="/path/to/runtime.o ..." ./scripts/native_bootstrap.sh
+python3 scripts/native_regression.py --seed /path/to/gen1 --runtime "/path/to/runtime.o ..."
+python3 scripts/native_parity.py --seed /path/to/gen1 --reference /path/to/gen0 \
+  --runtime "/path/to/runtime.o ..." generic_statics exceptions_basic
 ```

@@ -1,0 +1,648 @@
+using System;
+using System.Collections;
+namespace Zan;
+
+// Optional native delegate slice; add this file to compiler source lists.
+// Hooks (all BEFORE ordinary fallbacks):
+//  GenExprInEnvNg(e): if (TryGenDelegateExpr(e)) { return; }
+//  GenNew(e): if (TryGenDelegateNew(e)) { return; }
+//  GenCall(e): if (TryGenDelegateCall(e)) { return; }
+//  CallRetTy(e): string dt = DelegateCallRetTy(e); if (dt != null) return dt;
+//  GenStmtInEnvNg(s): PrepareDelegateStmt(s);
+//  PushCallArgs, after WrapImplicitCtorArg, before GenExpr(ae):
+//      if (pa2 != null) { PrepareDelegateValue(ae, TypeFullName(pa2.type)); }
+//  Gen: EmitDelegateThunks() AFTER the method/vtable emission loops and BEFORE
+//      RtEmitStrpool(), Patch(), BuildMachO(). The queue can grow during emission.
+//
+// ABI: heap {thunk pointer, env pointer}; x0=env, x1..x7=arguments, x0=result.
+// Native single-word scalar/reference values only, at most seven arguments.
+// Env contains VALUE snapshots, like irgen's current CollectCaptures lowering;
+// it never contains an enclosing frame address. Captured writes and ref/out
+// captures are rejected, not misrepresented as shared mutable C# boxes.
+// Supports Func/Action, typed/target-typed lambdas, static and nonvirtual bound
+// method groups, delegate parameters/returns/fields and .Invoke. No named
+// delegates, variance, multicast/equality interning, generic method-group
+// specialization, struct copy ABI, stack arguments, or closure GC protocol.
+// Heap lifetime follows _zan_rt_alloc's existing process-lifetime native lane.
+partial class Ngen {
+    List<Node> delegateThunks;
+    List<string> delegateOwners;
+    List<Node> delegateValues;
+    List<string> delegateTypes;
+    List<string> dlgGroupKeys;  // method-group identity -> shared thunk id
+    List<int> dlgGroupIds;
+    bool dlgInternDone;         // _zan_dlg_intern emitted for this object
+
+    void InitDelegateNg() {
+        if (delegateThunks != null) { return; }
+        delegateThunks = new List<Node>();
+        delegateOwners = new List<string>();
+        delegateValues = new List<Node>();
+        delegateTypes = new List<string>();
+        dlgGroupKeys = new List<string>();
+        dlgGroupIds = new List<int>();
+    }
+
+    bool IsDelegateTyNg(string ty) {
+        if (ty == null) { return false; }
+        if (ty == "Action" || ty.IndexOf("Action<") == 0 || (ty.IndexOf("Func<") == 0)) { return true; }
+        // named (non-generic) delegate declarations lower to the same
+        // {thunk, env} pair the Func/Action forms use
+        return NamedDelegateDeclNg(ty) != null;
+    }
+
+    // the `delegate R Name(params);` declaration for a simple type name, or
+    // null (generic delegates have no lowering here)
+    Node NamedDelegateDeclNg(string ty) {
+        if (ty == null || ty.Length == 0 || ty.IndexOf("<") >= 0) { return null; }
+        Node d = layoutBinder.FindDelegate(ty);
+        if (d == null) { return null; }
+        int i = 0;
+        while (i < d.kids.Count) {
+            if (d.kids[i].kind == AK.TypeParam()) { return null; }
+            i = i + 1;
+        }
+        return d;
+    }
+
+    List<string> DelegateArgsNg(string ty) {
+        List<string> ps = new List<string>();
+        Node d = NamedDelegateDeclNg(ty);
+        if (d != null) {
+            int i = 0;
+            while (i < d.kids.Count) {
+                if (d.kids[i].kind == AK.Param()) { ps.Add(TypeFullName(d.kids[i].type)); }
+                i = i + 1;
+            }
+            return ps;
+        }
+        if (ty == "Action") { return ps; }
+        int p = ty.IndexOf("<");
+        return SplitTyArgs(ty.Substring(p + 1, ty.Length - p - 2));
+    }
+
+    int DelegateArityNg(string ty) {
+        List<string> ts = DelegateArgsNg(ty);
+        return ts.Count - ((ty.IndexOf("Func<") == 0) ? 1 : 0);
+    }
+
+    string DelegateRetNg(string ty) {
+        Node d = NamedDelegateDeclNg(ty);
+        if (d != null) { return TypeFullName(d.type); }
+        if (!(ty.IndexOf("Func<") == 0)) { return "void"; }
+        List<string> ts = DelegateArgsNg(ty);
+        return ts.Count > 0 ? ts[ts.Count - 1] : "void";
+    }
+
+    Node DelegateTypeNodeNg(string ty) {
+        Node n = new Node(AK.TypeRef());
+        int p = ty.IndexOf("<");
+        if (p < 0) { n.sval = ty; return n; }
+        n.sval = ty.Substring(0, p);
+        List<string> ts = SplitTyArgs(ty.Substring(p + 1, ty.Length - p - 2));
+        int i = 0;
+        while (i < ts.Count) { n.Add(DelegateTypeNodeNg(ts[i])); i = i + 1; }
+        return n;
+    }
+
+    bool DelegateWordNg(string ty, bool ret) {
+        if (ty == "void") { return ret; }
+        if (ty == "int" || ty == "long" || ty == "ulong" || ty == "uint"
+                || ty == "bool" || ty == "char" || ty == "string"
+                || ty == "byte" || ty == "sbyte" || ty == "short"
+                || ty == "ushort" || ty == "double" || ty == "float"
+                || ty == "object" || ty == "nint") { return true; }
+        if (IsDelegateTyNg(ty)) { return true; }
+        if (ty != null && IsArrTy(ty)) { return true; }
+        Cls c = ty != null ? FindClass(ty) : null;
+        return c != null && c.isStruct == 0 && c.tps.Count == 0;
+    }
+
+    bool CheckDelegateTyNg(string ty, Node site) {
+        if (!IsDelegateTyNg(ty)) { return false; }
+        int count = DelegateArityNg(ty);
+        bool ok = count >= 0 && count <= 7 && DelegateWordNg(DelegateRetNg(ty), true);
+        List<string> ts = DelegateArgsNg(ty);
+        int i = 0;
+        while (i < count) { if (!DelegateWordNg(ts[i], false)) { ok = false; } i = i + 1; }
+        if (!ok) { diags.Error("ngen delegate: requires concrete word-value signature and at most seven parameters", site.line, site.col); }
+        return ok;
+    }
+
+    void PrepareDelegateValue(Node e, string ty) {
+        if (e == null || !IsDelegateTyNg(ty)) { return; }
+        if (e.kind != AK.Lambda() && e.kind != AK.Ident() && e.kind != AK.MemberAccess()) { return; }
+        InitDelegateNg();
+        int i = 0;
+        while (i < delegateValues.Count) {
+            if (delegateValues[i] == e) { delegateTypes[i] = ty; return; }
+            i = i + 1;
+        }
+        delegateValues.Add(e); delegateTypes.Add(ty);
+    }
+
+    void PrepareDelegateStmt(Node s) {
+        if (s.kind == AK.VarDecl() && s.type != null) {
+            PrepareDelegateValue(s.b, TypeFullName(s.type));
+        } else if (s.kind == AK.ReturnStmt() && curMeth != null && curMeth.type != null) {
+            PrepareDelegateValue(s.a, TypeFullName(curMeth.type));
+        }
+    }
+
+    string DelegateExpectedNg(Node e) {
+        if (delegateValues == null) { return null; }
+        int i = delegateValues.Count - 1;
+        while (i >= 0) {
+            if (delegateValues[i] == e) { return delegateTypes[i]; }
+            i = i - 1;
+        }
+        return null;
+    }
+
+    Node DelegateCalleeNg(Node e) {
+        if (e == null || e.kind != AK.Call() || e.a == null) { return null; }
+        Node c = e.a;
+        if (c.kind == AK.MemberAccess() && c.sval == "Invoke") { c = c.a; }
+        return c;
+    }
+
+    string DelegateCallRetTy(Node e) {
+        Node c = DelegateCalleeNg(e);
+        if (c == null) { return null; }
+        string ty = StaticTyOf(c);
+        if (!IsDelegateTyNg(ty)) { return null; }
+        return DelegateRetNg(ty);
+    }
+
+    bool TryGenDelegateCall(Node e) {
+        Node c = DelegateCalleeNg(e);
+        if (c == null) { return false; }
+        string ty = StaticTyOf(c);
+        // `E(args)` on an event holder instance dispatches through the
+        // holder's static op_call (the event desugar emits it, null-safe).
+        // A written `.Invoke(...)` on the holder is an ordinary instance
+        // method, so only the bare-call shape takes this path.
+        if (e.a == c && ty != null && FindClass(ty) != null && OpStaticSym(ty, "op_call") != null) {
+            Node ma = new Node(AK.MemberAccess());
+            Node t = new Node(AK.Ident()); t.sval = ty; ma.a = t; ma.sval = "op_call";
+            Node call = new Node(AK.Call()); call.a = ma; call.Add(c);
+            int ai = 0;
+            while (ai < e.kids.Count) { call.Add(e.kids[ai]); ai = ai + 1; }
+            GenCall(call);
+            return true;
+        }
+        if (!IsDelegateTyNg(ty)) { return false; }
+        if (!CheckDelegateTyNg(ty, e)) { return true; }
+        if (e.kids.Count != DelegateArityNg(ty)) {
+            diags.Error("ngen delegate: invocation arity mismatch", e.line, e.col); return true;
+        }
+        GenExpr(c); E4(0xF81F0FE0); // closure stays alive across argument evaluation
+        List<string> ts = DelegateArgsNg(ty);
+        int i = 0;
+        while (i < e.kids.Count) {
+            Node a = e.kids[i];
+            if (a.kind == AK.OutArg() || (a.sval2 != null && a.sval2 != "")) {
+                diags.Error("ngen delegate: ref/out and named invocation arguments are unsupported", e.line, e.col);
+            }
+            PrepareDelegateValue(a, ts[i]);
+            GenExpr(a);
+            if (IsDblTy(ts[i]) && !IsDblExpr(a)) { ConvI2D(); }
+            E4(0xF81F0FE0); i = i + 1;
+        }
+        i = e.kids.Count;
+        while (i > 0) { E4(0xF84107E0 | i); i = i - 1; }
+        E4(0xF84107E0); // closure -> x0
+        int live = NL(); EmitCbnz(0, live);
+        LoadImm(0, 1); BLExtern("_exit"); // null invocation fails closed
+        Mark(live);
+        LdrU(9, 0, 0); LdrU(0, 0, 8);
+        E4(0xD63F0120); // blr x9
+        return true;
+    }
+
+    bool TryGenDelegateNew(Node e) {
+        if (e.type == null || !IsDelegateTyNg(TypeFullName(e.type)) || e.ival != 0) { return false; }
+        string ty = TypeFullName(e.type);
+        if (!CheckDelegateTyNg(ty, e)) { return true; }
+        if (e.kids.Count != 1) {
+            diags.Error("ngen delegate: constructor needs one lambda or method group", e.line, e.col); return true;
+        }
+        Node v = e.kids[0]; PrepareDelegateValue(v, ty);
+        if (!TryGenDelegateExpr(v)) {
+            if (StaticTyOf(v) == ty) { GenExpr(v); }
+            else { diags.Error("ngen delegate: constructor argument is not a compatible delegate", e.line, e.col); }
+        }
+        return true;
+    }
+
+    bool TryGenDelegateExpr(Node e) {
+        if (e.kind == AK.Assignment() && e.a != null) {
+            PrepareDelegateValue(e.b, StaticTyOf(e.a)); return false;
+        }
+        if (e.kind == AK.Lambda()) { GenDelegateLambdaNg(e); return true; }
+        string expected = DelegateExpectedNg(e);
+        if (expected == null) {
+            // A method group in a context that registered no target type --
+            // a builtin List.Add argument, for instance -- still converts:
+            // invent the delegate signature from the unique matching method,
+            // like the untargeted-lambda fallback does.
+            if (e.kind != AK.Ident() && e.kind != AK.MemberAccess()) { return false; }
+            string inv = InferGroupTyNg(e);
+            if (inv == null) { return false; }
+            PrepareDelegateValue(e, inv);
+            GenDelegateGroupNg(e, inv); return true;
+        }
+        if (IsDelegateTyNg(StaticTyOf(e))) { return false; }
+        if (e.kind != AK.Ident() && e.kind != AK.MemberAccess()) { return false; }
+        GenDelegateGroupNg(e, expected); return true;
+    }
+
+    // unique concrete method under a method group's owner, as an invented
+    // Func<...>/Action<...> type string; null when none or ambiguous
+    string InferGroupTyNg(Node e) {
+        string owner = curCls; string name = e.sval; Node receiver = null;
+        if (e.kind == AK.MemberAccess()) {
+            if (e.a != null && e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0 && FindClass(e.a.sval) != null) { owner = e.a.sval; }
+            else { receiver = e.a; owner = ExprCls(receiver); }
+        } else if (LocalIdx(e.sval) >= 0) {
+            return null;
+        }
+        if (owner == null || name == null) { return null; }
+        int found = -1;
+        int i = 0;
+        while (i < methNodes.Count) {
+            Node m = methNodes[i];
+            bool ok = methCls[i] == owner && m.sval == name && !HasTypeParams(m)
+                && !HasMod(m, MOD.Extern()) && (methStat[i] == 0 || methStat[i] == 1)
+                && (receiver == null || methStat[i] == 0);
+            if (ok && !DelegateWordNg(TypeFullName(m.type), true)) { ok = false; }
+            int p = 0;
+            while (ok && p < ParamCount(m)) {
+                Node a = ParamAt(m, p);
+                if (a.ival != 0 || a.b != null || a.op == 1 || !DelegateWordNg(TypeFullName(a.type), false)) { ok = false; }
+                p = p + 1;
+            }
+            if (ok) {
+                if (found >= 0) { return null; }
+                found = i;
+            }
+            i = i + 1;
+        }
+        if (found < 0) { return null; }
+        string ty = "";
+        int q = 0;
+        while (q < ParamCount(methNodes[found])) {
+            ty = ty + TypeFullName(ParamAt(methNodes[found], q).type) + ",";
+            q = q + 1;
+        }
+        string rt = TypeFullName(methNodes[found].type);
+        if (rt == "void") {
+            if (ty == "") { return "Action"; }
+            return "Action<" + ty.Substring(0, ty.Length - 1) + ">";
+        }
+        return "Func<" + ty + rt + ">";
+    }
+
+    // Free-name walk uses lexical declaration order. Lambda/block declarations
+    // shadow outer locals, including inside nested lambdas. Capturing an outer
+    // name used only by a nested lambda is necessary for escaping nested envs.
+    List<string> DelegateNamesCopyNg(List<string> names) {
+        List<string> copy = new List<string>(); int i = 0;
+        while (i < names.Count) { copy.Add(names[i]); i = i + 1; }
+        return copy;
+    }
+
+    void DelegateCaptureNameNg(string name, List<string> bound, Node caps, Node site, bool write) {
+        if (IndexOf(bound, name) >= 0) { return; }
+        int slot = LocalIdx(name);
+        if (slot < 0) {
+            // Bare instance field references are emitted through implicit this.
+            if (name != "this" && LocalIdx("this") >= 0) {
+                List<int> methods = new List<int>();
+                InstanceCands(curCls, name, methods);
+                if (FieldOff(curCls, name) >= 0 || methods.Count > 0) {
+                    DelegateCaptureNameNg("this", bound, caps, site, false);
+                }
+            }
+            return;
+        }
+        if (write || locRef[slot] || !DelegateWordNg(locTy[slot], false)) {
+            diags.Error("ngen delegate: unsupported captured write, ref/out, or non-word value '" + name + "'", site.line, site.col);
+            return;
+        }
+        int i = 0;
+        while (i < caps.kids.Count) { if (caps.kids[i].sval == name) { return; } i = i + 1; }
+        Node cap = new Node(AK.Param()); cap.sval = name; cap.ival = slot;
+        cap.type = DelegateTypeNodeNg(locTy[slot]); caps.Add(cap);
+    }
+
+    void DelegateCapturesNg(Node n, List<string> bound, Node caps, bool write) {
+        if (n == null) { return; }
+        int k = n.kind;
+        if (k == AK.Ident() || k == AK.ThisExpr()) {
+            DelegateCaptureNameNg(k == AK.ThisExpr() ? "this" : n.sval, bound, caps, n, write); return;
+        }
+        if (k == AK.Lambda()) {
+            List<string> inner = DelegateNamesCopyNg(bound); int i = 0;
+            while (i < n.kids.Count) { inner.Add(n.kids[i].sval); i = i + 1; }
+            DelegateCapturesNg(n.a, inner, caps, false); DelegateCapturesNg(n.d, inner, caps, false); return;
+        }
+        if (k == AK.Block()) {
+            List<string> inner = DelegateNamesCopyNg(bound); int i = 0;
+            while (i < n.kids.Count) {
+                Node s = n.kids[i]; DelegateCapturesNg(s, inner, caps, false);
+                if (s.kind == AK.VarDecl()) { inner.Add(s.sval); }
+                i = i + 1;
+            }
+            return;
+        }
+        if (k == AK.ForStmt()) {
+            List<string> inner = DelegateNamesCopyNg(bound);
+            DelegateCapturesNg(n.a, inner, caps, false);
+            if (n.a != null && n.a.kind == AK.VarDecl()) { inner.Add(n.a.sval); }
+            DelegateCapturesNg(n.b, inner, caps, false); DelegateCapturesNg(n.c, inner, caps, false);
+            DelegateCapturesNg(n.d, inner, caps, false); return;
+        }
+        if (k == AK.ForeachStmt()) {
+            DelegateCapturesNg(n.b, bound, caps, false);
+            List<string> inner = DelegateNamesCopyNg(bound); inner.Add(n.sval);
+            DelegateCapturesNg(n.c, inner, caps, false); return;
+        }
+        if (k == AK.Assignment()) {
+            DelegateCapturesNg(n.a, bound, caps, true); DelegateCapturesNg(n.b, bound, caps, false); return;
+        }
+        if (k == AK.PostfixUnary() || k == AK.OutArg()) {
+            DelegateCapturesNg(n.a, bound, caps, true); return;
+        }
+        // Member/index assignment mutates the referenced object, not the capture.
+        DelegateCapturesNg(n.a, bound, caps, false); DelegateCapturesNg(n.b, bound, caps, false);
+        DelegateCapturesNg(n.c, bound, caps, false); DelegateCapturesNg(n.d, bound, caps, false);
+        int i = 0;
+        while (i < n.kids.Count) { DelegateCapturesNg(n.kids[i], bound, caps, false); i = i + 1; }
+    }
+
+    void DelegateAllocateNg(Node thunk, int id, Node receiver) {
+        Node caps = thunk.b;
+        int nc = caps.kids.Count;
+        // Delegate identity: the pair is interned through _zan_dlg_intern,
+        // which hands back the ONE heap block for a given (thunk, captures)
+        // combination -- `==`/`!=` stay plain pointer compares (the fallback
+        // for reference kinds) while behaving like C#'s (target, method)
+        // equality for re-converted method groups. Capture values go through
+        // an sp-relative scratch buffer; the call keeps x0-x2 as arguments.
+        int bytes = ((nc + 1) / 2) * 16;   // 16-aligned scratch (0 when nc==0)
+        if (bytes > 4080) {
+            diags.Error("ngen delegate: too many captured values", thunk.line, thunk.col);
+            return;
+        }
+        if (bytes > 0) { SubImm(31, 31, bytes); }
+        int i = 0;
+        while (i < nc) {
+            if (receiver != null) { GenExpr(receiver); }
+            else { LoadLocal((int)caps.kids[i].ival, 0); }
+            StrU(0, 31, i * 8);
+            i = i + 1;
+        }
+        LoadSymRef("_zan_delegate_" + id, 0);
+        LoadImm(1, nc);
+        if (nc > 0) { E4(0x910003E2); }          // mov x2, sp (add x2, sp, #0)
+        else { LoadImm(2, 0); }
+        BLInternal("_zan_dlg_intern");
+        if (bytes > 0) { AddImm(31, 31, bytes); }
+    }
+
+    // _zan_dlg_intern(i64 thunk, i64 ncaps, i64* caps) -> i64 block:
+    // scan the interned list for a block with the same thunk and capture
+    // words and return it; otherwise allocate {thunk, env=&block[24],
+    // ncaps, caps...}, remember it, and return it. Blocks live on the native
+    // lane's process-lifetime heap; the list is a fixed-slot array that
+    // simply stops interning when full. x19-x25 hold loop state across the
+    // _zan_rt_alloc call (calloc preserves them, standard ABI).
+    void EmitDlgInternNg() {
+        if (dlgInternDone) { return; }
+        dlgInternDone = true;
+        dglbs.Add(new DGlob("dlg.slots", 2048 * 8, dataLen));
+        dataLen = dataLen + 2048 * 8;
+        dglbs.Add(new DGlob("dlg.cnt", 8, dataLen));
+        dataLen = dataLen + 8;
+        syms.Add(new Sym("_zan_dlg_intern", txt.Count));
+        RtPrologue();
+        MovRR(19, 0);                            // x19 = thunk
+        MovRR(20, 1);                            // x20 = ncaps
+        MovRR(21, 2);                            // x21 = caps
+        LoadSymRef(DGlobalSym("dlg.cnt"), 22);   // x22 = &count
+        LoadSymRef(DGlobalSym("dlg.slots"), 24); // x24 = slots base
+        LdrU(23, 22, 0);                         // x23 = count
+        LoadImm(25, 0);                          // x25 = i
+        int scan = NL();
+        int appnd = NL();
+        Mark(scan);
+        E4(0xEB17033F);                          // cmp x25, x23
+        EmitBcond(10, appnd);                    // b.ge append
+        E4(0xF8797B09);                          // ldr x9, [x24, x25, lsl #3]
+        LdrU(10, 9, 0);                          // cand thunk
+        E4(0xEB13015F);                          // cmp x10, x19
+        int nxt = NL();
+        EmitBcond(1, nxt);                       // b.ne next
+        LdrU(11, 9, 16);                         // cand ncaps
+        E4(0xEB14017F);                          // cmp x11, x20
+        EmitBcond(1, nxt);                       // b.ne next
+        LdrU(11, 9, 8);                          // cand env (caps start)
+        LoadImm(12, 0);                          // x12 = j
+        int inlp = NL();
+        int hit = NL();
+        Mark(inlp);
+        E4(0xEB14019F);                          // cmp x12, x20
+        EmitBcond(10, hit);                      // b.ge hit
+        E4(0xF86C796D);                          // ldr x13, [x11, x12, lsl #3]
+        E4(0xF86C7AAE);                          // ldr x14, [x21, x12, lsl #3]
+        E4(0xEB0D01DF);                          // cmp x14, x13
+        EmitBcond(1, nxt);                       // b.ne next
+        AddImm(12, 12, 1);
+        EmitB(inlp);
+        Mark(hit);
+        MovRR(0, 9);
+        int retL = NL(); EmitB(retL);            // b retL
+        Mark(nxt);
+        AddImm(25, 25, 1);
+        EmitB(scan);
+        Mark(appnd);
+        E4(0x8B140FE0);                          // add x0, xzr, x20, lsl #3 (8*ncaps)
+        AddImm(0, 0, 24);                        // + 24-byte header
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");             // x0 = zeroed block
+        AddImm(9, 0, 24);
+        StrU(9, 0, 8);                           // block.env = block+24
+        StrU(19, 0, 0);                          // block.thunk
+        StrU(20, 0, 16);                         // block.ncaps
+        LoadImm(12, 0);
+        int cplp = NL();
+        int cpend = NL();
+        Mark(cplp);
+        E4(0xEB14019F);                          // cmp x12, x20
+        EmitBcond(10, cpend);                    // b.ge done
+        E4(0xF86C7AAD);                          // ldr x13, [x21, x12, lsl #3]
+        E4(0xF82C792D);                          // str x13, [x9, x12, lsl #3]
+        AddImm(12, 12, 1);
+        EmitB(cplp);
+        Mark(cpend);
+        LdrU(10, 22, 0);                         // count
+        LoadImm(11, 2048);
+        E4(0xEB0B015F);                          // cmp x10, x11
+        int full = NL();
+        EmitBcond(10, full);                     // b.ge full (no intern slot)
+        E4(0xF82A7B00);                          // str x0, [x24, x10, lsl #3]
+        AddImm(10, 10, 1);
+        StrU(10, 22, 0);                         // count++
+        Mark(full);
+        Mark(retL);
+        RtEpilogue();
+    }
+
+    void GenDelegateLambdaNg(Node lam) {
+        InitDelegateNg();
+        string ty = DelegateExpectedNg(lam);
+        if (ty == null) {
+            // Untargeted lambdas retain gen0's int fallback, but typed targets
+            // always win; no generic signature is invented here.
+            ty = "Func<"; int p = 0;
+            while (p < lam.kids.Count) {
+                string pt = TypeFullName(lam.kids[p].type);
+                if (pt == null || pt == "" || pt == "var") { pt = "int"; }
+                ty = ty + pt + ","; p = p + 1;
+            }
+            ty = ty + (lam.type != null ? TypeFullName(lam.type) : "int") + ">";
+        }
+        if (!CheckDelegateTyNg(ty, lam)) { return; }
+        if (lam.kids.Count != DelegateArityNg(ty) || HasTry(lam.d)) {
+            diags.Error("ngen delegate: lambda arity mismatch or unsupported try body", lam.line, lam.col); return;
+        }
+        Node m = new Node(AK.MethodDecl()); m.ival = -1;
+        m.type = DelegateTypeNodeNg(DelegateRetNg(ty)); m.b = new Node(AK.Block());
+        List<string> args = DelegateArgsNg(ty); List<string> bound = new List<string>();
+        int i = 0;
+        while (i < lam.kids.Count) {
+            Node lp = lam.kids[i]; Node p = new Node(AK.Param()); p.sval = lp.sval;
+            string explicitTy = TypeFullName(lp.type);
+            if (explicitTy != null && explicitTy != "" && explicitTy != "var" && explicitTy != args[i]) {
+                diags.Error("ngen delegate: lambda parameter type does not match target", lam.line, lam.col);
+            }
+            p.type = DelegateTypeNodeNg(args[i]); m.Add(p); bound.Add(p.sval); i = i + 1;
+        }
+        DelegateCapturesNg(lam.a, bound, m.b, false); DelegateCapturesNg(lam.d, bound, m.b, false);
+        if (lam.d != null) { m.d = lam.d; }
+        else {
+            m.d = new Node(AK.Block());
+            Node s = new Node(m.type.sval == "void" ? AK.ExprStmt() : AK.ReturnStmt());
+            s.a = lam.a;
+            if (IsDblTy(TypeFullName(m.type))) {
+                Node cast = new Node(AK.CastExpr()); cast.type = m.type; cast.b = lam.a; s.a = cast;
+            }
+            m.d.Add(s);
+        }
+        int id = delegateThunks.Count;
+        delegateThunks.Add(m); delegateOwners.Add(curCls);
+        DelegateAllocateNg(m, id, null);
+    }
+
+    void GenDelegateGroupNg(Node e, string ty) {
+        if (!CheckDelegateTyNg(ty, e)) { return; }
+        string owner = curCls; string name = e.sval; Node receiver = null;
+        if (e.kind == AK.MemberAccess()) {
+            if (e.a != null && e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0 && FindClass(e.a.sval) != null) { owner = e.a.sval; }
+            else { receiver = e.a; owner = ExprCls(receiver); }
+        } else if (LocalIdx(e.sval) >= 0) {
+            diags.Error("ngen delegate: value is not a method group", e.line, e.col); return;
+        }
+        int found = -1; int i = 0; List<string> args = DelegateArgsNg(ty);
+        while (i < methNodes.Count) {
+            Node m = methNodes[i];
+            bool ok = methCls[i] == owner && m.sval == name && !HasTypeParams(m)
+                && !HasMod(m, MOD.Extern()) && (methStat[i] == 0 || methStat[i] == 1)
+                && ParamCount(m) == DelegateArityNg(ty) && TypeFullName(m.type) == DelegateRetNg(ty);
+            if (receiver != null && methStat[i] != 0) { ok = false; }
+            int p = 0;
+            while (ok && p < ParamCount(m)) {
+                Node a = ParamAt(m, p);
+                if (a.ival != 0 || TypeFullName(a.type) != args[p]) { ok = false; }
+                p = p + 1;
+            }
+            if (ok) {
+                if (found >= 0) { diags.Error("ngen delegate: ambiguous method group", e.line, e.col); return; }
+                found = i;
+            }
+            i = i + 1;
+        }
+        if (found < 0) { diags.Error("ngen delegate: no concrete compatible method group", e.line, e.col); return; }
+        if (methStat[found] == 0) {
+            Cls cls = FindClass(owner);
+            if (cls == null || cls.isStruct != 0 || cls.poly == 1) {
+                diags.Error("ngen delegate: bound group requires nonvirtual reference receiver", e.line, e.col); return;
+            }
+            if (receiver == null) {
+                if (LocalIdx("this") < 0) { diags.Error("ngen delegate: instance group needs receiver", e.line, e.col); return; }
+                receiver = new Node(AK.ThisExpr());
+            }
+        }
+        InitDelegateNg();
+        // One thunk per method-group identity (owner/name/target/shape), so
+        // two conversions of the same group carry the same thunk pointer and
+        // _zan_dlg_intern hands back the same pair for the same receiver --
+        // that shared identity is what `==`/`-=` compare.
+        string gkey = owner + "#" + name + "#" + found + "#" + (receiver != null ? 1 : 0);
+        int id = -1;
+        int gi = 0;
+        while (gi < dlgGroupKeys.Count) {
+            if (dlgGroupKeys[gi] == gkey) { id = dlgGroupIds[gi]; gi = dlgGroupKeys.Count; }
+            gi = gi + 1;
+        }
+        if (id < 0) {
+            Node thunk = new Node(AK.MethodDecl()); thunk.ival = found; thunk.b = new Node(AK.Block());
+            if (receiver != null) { thunk.b.Add(new Node(AK.Param())); }
+            id = delegateThunks.Count;
+            delegateThunks.Add(thunk); delegateOwners.Add(owner);
+            dlgGroupKeys.Add(gkey); dlgGroupIds.Add(id);
+        }
+        DelegateAllocateNg(delegateThunks[id], id, receiver);
+    }
+
+    void EmitDelegateThunks() {
+        if (delegateThunks == null) { return; }
+        EmitDlgInternNg();
+        int id = 0;
+        while (id < delegateThunks.Count) {
+            Node m = delegateThunks[id];
+            syms.Add(new Sym("_zan_delegate_" + id, txt.Count));
+            if (m.ival >= 0) {
+                int mi = (int)m.ival;
+                RtPrologue();
+                if (methStat[mi] == 0) { LdrU(0, 0, 0); }
+                else {
+                    int p = 0;
+                    while (p < ParamCount(methNodes[mi])) { MovRR(p, p + 1); p = p + 1; }
+                }
+                BLInternal(MethSymNg(methCls[mi], methNodes[mi])); RtEpilogue();
+            } else {
+                curCls = delegateOwners[id]; curMeth = m; curHasTry = false;
+                InitLocalsNg(); AddLoc("#delegateEnv", "nint", false);
+                int i = 0;
+                while (i < m.kids.Count) { AddLoc(m.kids[i].sval, TypeFullName(m.kids[i].type), false); i = i + 1; }
+                int capStart = nloc; i = 0;
+                while (i < m.b.kids.Count) {
+                    Node c = m.b.kids[i]; AddLoc(c.sval, TypeFullName(c.type), false); i = i + 1;
+                }
+                ReserveLocals(m.d); frame = 16 * nloc;
+                if (frame >= 4096) { diags.Error("ngen delegate: lambda frame exceeds native immediate limit", m.line, m.col); }
+                RtPrologue(); if (frame > 0) { AddSPImm(frame, false); }
+                i = 0;
+                while (i <= m.kids.Count) { StoreLocal(i, i); i = i + 1; }
+                i = 0;
+                while (i < m.b.kids.Count) {
+                    LoadLocal(0, 1); LdrU(0, 1, i * 8); StoreLocal(capStart + i, 0); i = i + 1;
+                }
+                GenStmt(m.d); LoadImm(0, 0); Epilogue();
+            }
+            id = id + 1;
+        }
+    }
+}

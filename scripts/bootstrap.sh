@@ -11,17 +11,10 @@ RT_OBJS="${RT_OBJS:-}"
 LDFLAGS="${LDFLAGS:--L$ROOT/stdlib-link -lSystem}"
 mkdir -p "$BUILD"
 
-SRCS=(
-  "$ROOT/src/selfhost/main.zan" "$ROOT/src/selfhost/irgen.zan"
-  "$ROOT/src/selfhost/irgen_async.zan" "$ROOT/src/selfhost/irgen_stmt.zan"
-  "$ROOT/src/selfhost/irgen_expr.zan" "$ROOT/src/selfhost/checker.zan"
-  "$ROOT/src/selfhost/binder.zan" "$ROOT/src/selfhost/diag.zan"
-  "$ROOT/src/selfhost/parser.zan" "$ROOT/src/selfhost/jsongen.zan"
-  "$ROOT/src/selfhost/dbgen.zan" "$ROOT/src/selfhost/lexer.zan"
-  "$ROOT/src/selfhost/ngen.zan" "$ROOT/src/selfhost/ngen_macho.zan"
-  "$ROOT/src/selfhost/ngen_obj.zan" "$ROOT/src/selfhost/nio.zan"
-  "$ROOT/src/selfhost/ast.zan" "$ROOT/src/selfhost/token.zan"
-)
+SRCS=()
+while IFS= read -r name; do
+  [[ -n "$name" ]] && SRCS+=("$ROOT/src/selfhost/$name.zan")
+done < "$ROOT/scripts/selfhost_sources.txt"
 
 src_hash() {
   for f in "${SRCS[@]}"; do shasum -a 256 "$f"; done

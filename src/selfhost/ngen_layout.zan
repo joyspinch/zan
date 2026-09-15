@@ -1,0 +1,83 @@
+using System;
+namespace Zan;
+
+partial class Ngen {
+    Binder layoutBinder;
+    // Only explicit fields adopt natural storage widths. The ordinary native
+    // object ABI, locals, statics and expression float-as-double ABI are unchanged.
+    int ExplicitFieldWidth(string ty) {
+        if (ty == "bool" || ty == "byte" || ty == "sbyte") { return 1; }
+        if (ty == "short" || ty == "ushort") { return 2; }
+        if (ty == "int" || ty == "uint" || ty == "char" || ty == "float") { return 4; }
+        if (ty == "long" || ty == "ulong" || ty == "double") { return 8; }
+        if (ty == "string" || ty == "object" || IsArrTy(ty)) { return 8; }
+        Node d = layoutBinder.FindType(ty);
+        if (d != null && d.kind == AK.ClassDecl()) { return 8; }
+        // A boxed native struct is not its language-level inline representation.
+        // Do not guess a pointer width for embedded structs or open type params.
+        return 0;
+    }
+
+    // Materialize a byte address for large or unaligned offsets. Select a
+    // scratch that cannot alias either the base or the source/destination.
+    int FieldMemBase(Fld f, int rn, int valueReg) {
+        if (f.off % f.width == 0 && f.off / f.width <= 4095) { return rn; }
+        int scratch = 16;
+        if (rn == scratch || valueReg == scratch) { scratch = 17; }
+        if (rn == scratch || valueReg == scratch) { scratch = 15; }
+        LoadImm(scratch, f.off);
+        AddRR(scratch, rn, scratch);
+        return scratch;
+    }
+
+    int FieldMemOffset(Fld f) {
+        if (f.off % f.width != 0 || f.off / f.width > 4095) { return 0; }
+        return (f.off / f.width) << 10;
+    }
+
+    void LoadFieldNg(int rd, int rn, Fld f) {
+        if (!f.explicitLayout) { LdrU(rd, rn, f.off); return; }
+        int baseReg = FieldMemBase(f, rn, rd);
+        int bits = FieldMemOffset(f) | (baseReg << 5);
+        if (f.ty == "float") {
+            E4(0xBD400000 | bits | 31);              // ldr s31, [base, off]
+            E4(0x1E22C3FF);                         // fcvt d31, s31
+            E4(0x9E6603E0 | rd);                    // fmov xd, d31
+            return;
+        }
+        int op = 0xF9400000;
+        if (f.width == 1) { op = f.ty == "sbyte" ? 0x39800000 : 0x39400000; }
+        if (f.width == 2) { op = f.ty == "short" ? 0x79800000 : 0x79400000; }
+        if (f.width == 4) { op = f.ty == "int" ? 0xB9800000 : 0xB9400000; }
+        E4(op | bits | rd);
+    }
+
+    void StoreFieldNg(int rt, int rn, Fld f) {
+        if (!f.explicitLayout) { StrU(rt, rn, f.off); return; }
+        int baseReg = FieldMemBase(f, rn, rt);
+        int bits = FieldMemOffset(f) | (baseReg << 5);
+        if (f.ty == "float") {
+            E4(0x9E67001F | (rt << 5));              // fmov d31, xt
+            E4(0x1E6243FF);                         // fcvt s31, d31
+            E4(0xBD000000 | bits | 31);              // str s31, [base, off]
+            return;
+        }
+        int op = 0xF9000000;
+        if (f.width == 1) { op = 0x39000000; }
+        if (f.width == 2) { op = 0x79000000; }
+        if (f.width == 4) { op = 0xB9000000; }
+        E4(op | bits | rt);
+    }
+
+    void FieldAddressNg(Fld f, Node place) {
+        // ref/out currently dereferences legacy 8-byte slots; passing a narrow
+        // union field would overwrite adjacent bytes (float also has a distinct ABI).
+        if (f.explicitLayout && f.width != 8) {
+            diags.Error("ngen: ref/out of a narrow explicit-layout field is unsupported", place.line, place.col);
+            LoadImm(0, 0);
+            return;
+        }
+        if (f.off <= 4095) { AddImm(0, 0, f.off); }
+        else { LoadImm(16, f.off); AddRR(0, 0, 16); }
+    }
+}

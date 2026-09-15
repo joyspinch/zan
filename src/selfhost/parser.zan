@@ -14,6 +14,8 @@ class Parser {
     public bool attrDll;      // last ParseAttrs saw [DllImport]
     public string attrEntry;  // DllImport EntryPoint override ("" if none)
     public bool attrJsonIgnore; // last ParseAttrs saw [JsonIgnore]
+    public bool attrLayoutExplicit;
+    public int attrFieldOffset = -1;
 
     public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; attrJsonIgnore = false; }
 
@@ -28,6 +30,8 @@ class Parser {
         attrDll = false;
         attrEntry = "";
         attrJsonIgnore = false;
+        attrLayoutExplicit = false;
+        attrFieldOffset = -1;
         while (At(TK.LBracket())) {
             Next(); // [
             if (At(TK.Ident()) && Cur().text == "DllImport") {
@@ -46,6 +50,24 @@ class Parser {
                     }
                     Expect(TK.RParen());
                 }
+            } else if (At(TK.Ident()) && Cur().text == "StructLayout") {
+                Next();
+                if (Eat(TK.LParen())) {
+                    // Preserve layout kind, not unrelated named attribute args.
+                    if (At(TK.Ident()) && Cur().text == "LayoutKind") {
+                        Next(); Expect(TK.Dot());
+                        if (At(TK.Ident()) && Cur().text == "Explicit") { attrLayoutExplicit = true; }
+                    }
+                    while (!At(TK.RParen()) && !At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
+                    Expect(TK.RParen());
+                }
+            } else if (At(TK.Ident()) && Cur().text == "FieldOffset") {
+                Token attr = Next();
+                Expect(TK.LParen());
+                if (At(TK.IntLit()) && Cur().intVal >= 0) { attrFieldOffset = (int)Next().intVal; }
+                else { diags.Error("FieldOffset requires a nonnegative integer literal", attr.line, attr.col); }
+                while (!At(TK.RParen()) && !At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
+                Expect(TK.RParen());
             } else if (At(TK.Ident()) && Cur().text == "JsonIgnore") {
                 attrJsonIgnore = true;
                 Next();
@@ -105,6 +127,16 @@ class Parser {
     // generics like List<List<int>> still parse).
     bool IsShrEq() {
         return At(TK.Greater()) && K1() == TK.GreaterEq() && AdjAt(0);
+    }
+    // ">>>": three adjacent ">" tokens; ">>>=" keeps the ">=" shape so the
+    // two stay disjoint (kept out of the lexer for nested generics, like >>)
+    bool IsUshr() {
+        return At(TK.Greater()) && K1() == TK.Greater() && K2() == TK.Greater()
+                && AdjAt(0) && AdjAt(1);
+    }
+    bool IsUshrEq() {
+        return At(TK.Greater()) && K1() == TK.Greater() && K2() == TK.GreaterEq()
+                && AdjAt(0) && AdjAt(1);
     }
     Token Next() { Token t = Cur(); if (pos < toks.Count) { pos = pos + 1; } return t; }
     bool At(int k) { return K() == k; }
@@ -271,6 +303,7 @@ class Parser {
         MergePartials(unit);
         FlattenNested(unit);
         DesugarEvents(unit);
+        DesugarDispatchRt(unit);
         DesugarIterators(unit);
         Jsongen jg = new Jsongen();
         jg.Run(unit, diags);
@@ -407,6 +440,8 @@ class Parser {
             s.c = RewriteYieldOne(s.c);
         } else if (k == AK.WhileStmt()) {
             s.b = RewriteYieldOne(s.b);
+        } else if (k == AK.DoWhileStmt()) {
+            s.b = RewriteYieldOne(s.b);
         } else if (k == AK.ForStmt()) {
             s.d = RewriteYieldOne(s.d);
         } else if (k == AK.ForeachStmt()) {
@@ -501,8 +536,7 @@ class Parser {
         }
     }
 
-    void GenEventHolder(Node unit, Node ddecl, string dn, string hn) {
-        string s = "class " + hn + " {\n";
+    void GenEventHolder(Node unit, Node ddecl, string dn, string hn) {        string s = "class " + hn + " {\n";
         s = s + "    List<" + dn + "> hs;\n";
         s = s + "    static " + hn + " op_add(" + hn + " self, " + dn + " h) {\n";
         s = s + "        " + hn + " r = self;\n";
@@ -548,6 +582,32 @@ class Parser {
         s = s + "            i = i + 1;\n";
         s = s + "        }\n";
         s = s + "    }\n";
+        // `E(args)` raises the event, as in C#. The holder is null until the
+        // first subscription, and a call with no subscribers does nothing --
+        // the `E?.Invoke(...)` shape C# code writes by hand.
+        s = s + "    static void op_call(" + hn + " self";
+        int np = 0;
+        int pi = 0;
+        while (pi < ddecl.kids.Count) {
+            Node p = ddecl.kids[pi];
+            if (p.kind == AK.Param()) {
+                if (np > 0) { s = s + ", "; }
+                s = s + ", " + TypeName(p.type) + " a" + np;
+                np = np + 1;
+            }
+            pi = pi + 1;
+        }
+        s = s + ") {\n";
+        s = s + "        if (self == null) { return; }\n";
+        s = s + "        self.Invoke(";
+        int ai = 0;
+        while (ai < np) {
+            if (ai > 0) { s = s + ", "; }
+            s = s + "a" + ai;
+            ai = ai + 1;
+        }
+        s = s + ");\n";
+        s = s + "    }\n";
         s = s + "}\n";
         Lexer lx = new Lexer(s);
         List<Token> gt = lx.Run();
@@ -555,6 +615,123 @@ class Parser {
         Node gu = gp.ParseUnit();
         int j = 0;
         while (j < gu.kids.Count) { unit.Add(gu.kids[j]); j = j + 1; }
+    }
+
+    // The UI-thread dispatch queue (`zan_dispatch_init/post/take` CRT entry
+    // points) has no native-lane implementation, so `[DllImport] extern`
+    // declarations targeting those symbols are rewritten into real forwarder
+    // methods over a generated `__DispatchQ` FIFO class (a static List of
+    // posted delegates). The declared signatures keep their delegate types,
+    // so call sites need no rewriting; extern ABI limits never apply.
+    void DesugarDispatchRt(Node unit) {
+        bool gen = false;
+        int di = 0;
+        while (di < unit.kids.Count) {
+            Node d = unit.kids[di];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
+                int mi = 0;
+                while (mi < d.kids.Count) {
+                    Node m = d.kids[mi];
+                    if (m.kind == AK.MethodDecl() && HasModBit(m.mods, MOD.Extern())
+                            && m.sval2 != null && m.sval2.IndexOf("zan_dispatch_") == 0) {
+                        string op = m.sval2.Substring(13);
+                        int argc = 0;
+                        int ki = 0;
+                        Node arg0 = null;
+                        while (ki < m.kids.Count) {
+                            if (m.kids[ki].kind == AK.Param()) {
+                                argc = argc + 1;
+                                if (arg0 == null) { arg0 = m.kids[ki]; }
+                            }
+                            ki = ki + 1;
+                        }
+                        Node body = DispatchFwdBody(m, op, argc, arg0);
+                        if (body != null) {
+                            m.mods = m.mods - MOD.Extern();
+                            m.sval2 = "";
+                            m.d = body;
+                            gen = true;
+                        }
+                    }
+                    mi = mi + 1;
+                }
+            }
+            di = di + 1;
+        }
+        if (!gen) { return; }
+        int ui = 0;
+        while (ui < unit.kids.Count) {
+            Node u = unit.kids[ui];
+            if (u.kind == AK.ClassDecl() && u.sval == "__DispatchQ") { return; }
+            ui = ui + 1;
+        }
+        string src = "class __DispatchQ {\n";
+        src = src + "    static List<object> q;\n";
+        src = src + "    static void Init() {\n";
+        src = src + "        q = new List<object>();\n";
+        src = src + "    }\n";
+        src = src + "    static int Post(object h) {\n";
+        src = src + "        if (q == null) { q = new List<object>(); }\n";
+        src = src + "        q.Add(h);\n";
+        src = src + "        return 0;\n";
+        src = src + "    }\n";
+        src = src + "    static object Take() {\n";
+        src = src + "        if (q == null) { return null; }\n";
+        src = src + "        if (q.Count == 0) { return null; }\n";
+        src = src + "        object h = q[0];\n";
+        src = src + "        q.RemoveAt(0);\n";
+        src = src + "        return h;\n";
+        src = src + "    }\n";
+        src = src + "}\n";
+        Lexer dx = new Lexer(src);
+        List<Token> dt = dx.Run();
+        Parser dp = new Parser(dt, diags);
+        Node du = dp.ParseUnit();
+        int dj = 0;
+        while (dj < du.kids.Count) { unit.Add(du.kids[dj]); dj = dj + 1; }
+    }
+
+    // forwarder body for a dispatch entry point, or null when the shape does
+    // not fit the FIFO protocol (the extern declaration is then left for the
+    // backend to diagnose)
+    Node DispatchFwdBody(Node m, string op, int argc, Node arg0) {
+        if (op == "init" && argc == 0) {
+            Node blk = new Node(AK.Block());
+            Node es = new Node(AK.ExprStmt());
+            es.a = DispatchCall("Init", null);
+            blk.Add(es);
+            return blk;
+        }
+        if (op == "post" && argc == 1 && arg0 != null) {
+            Node id = new Node(AK.Ident());
+            id.sval = arg0.sval;
+            id.line = m.line; id.col = m.col;
+            Node blk2 = new Node(AK.Block());
+            Node ret = new Node(AK.ReturnStmt());
+            ret.a = DispatchCall("Post", id);
+            blk2.Add(ret);
+            return blk2;
+        }
+        if (op == "take" && argc == 0) {
+            Node blk3 = new Node(AK.Block());
+            Node ret2 = new Node(AK.ReturnStmt());
+            ret2.a = DispatchCall("Take", null);
+            blk3.Add(ret2);
+            return blk3;
+        }
+        return null;
+    }
+
+    Node DispatchCall(string meth, Node arg) {
+        Node ma = new Node(AK.MemberAccess());
+        Node t = new Node(AK.Ident());
+        t.sval = "__DispatchQ";
+        ma.a = t;
+        ma.sval = meth;
+        Node c = new Node(AK.Call());
+        c.a = ma;
+        if (arg != null) { c.Add(arg); }
+        return c;
     }
 
     // Merge `partial` type declarations: members (and base) of later parts are
@@ -767,8 +944,8 @@ class Parser {
         return d;
     }
 
-    // An interface is modelled as an abstract class: no fields, every method is
-    // an abstract vtable slot that implementers override.
+    // Interfaces share the class vtable representation. A method with a body
+    // implements a virtual slot; a bodyless declaration leaves it abstract.
     Node ParseInterface(int mods) {
         Next(); // interface
         Node cls = new Node(AK.ClassDecl());
@@ -784,8 +961,14 @@ class Parser {
         while (!At(TK.RBrace()) && !At(TK.Eof())) {
             Node m = ParseMember(cls.sval);
             if (m != null) {
-                if (m.kind == AK.MethodDecl()) { m.mods = m.mods + MOD.Abstract(); }
+                if (m.kind == AK.MethodDecl()) {
+                    int flag = m.d != null ? MOD.Virtual() : MOD.Abstract();
+                    if ((m.mods & flag) == 0) { m.mods = m.mods + flag; }
+                }
                 cls.Add(m);
+                // multi-declarator fields: flatten extra FieldDecl kids
+                int fi = 0;
+                while (fi < m.kids.Count && m.kind == AK.FieldDecl()) { cls.Add(m.kids[fi]); fi = fi + 1; }
             }
         }
         Expect(TK.RBrace());
@@ -793,8 +976,10 @@ class Parser {
     }
 
     Node ParseClass(int mods, int kw) {
+        bool explicitLayout = attrLayoutExplicit;
         Next(); // class/struct
         Node cls = new Node(AK.ClassDecl());
+        cls.layoutExplicit = explicitLayout;
         if (kw == TK.Struct()) { cls.kind = AK.StructDecl(); }
         cls.mods = mods;
         if (At(TK.Ident())) { cls.sval = Next().text; }
@@ -848,6 +1033,11 @@ class Parser {
             return;
         }
         cls.Add(m);
+        // multi-declarator fields: flatten extra FieldDecl kids
+        if (m.kind == AK.FieldDecl()) {
+            int i = 0;
+            while (i < m.kids.Count) { cls.Add(m.kids[i]); i = i + 1; }
+        }
     }
 
     Node ParseEnum(int mods) {
@@ -871,6 +1061,7 @@ class Parser {
         ParseAttrs();
         bool wantExtern = attrDll;
         string entry = attrEntry;
+        int fieldOffset = attrFieldOffset;
         int mods = ParseMods();
         if (attrJsonIgnore) { mods = mods + MOD.JsonIgnore(); }
         // `event` is contextual: a field modifier only when introducing an
@@ -919,10 +1110,17 @@ class Parser {
             ctor.d = ParseBlock();
             return ctor;
         }
+        // Conversion declarations have no leading return type: the type is
+        // AFTER `operator`. Keep contextual identifiers usable as type names.
+        if (At(TK.Ident()) && (Cur().text == "implicit" || Cur().text == "explicit")
+                && K1() == TK.Ident() && toks[pos + 1].text == "operator") {
+            return ParseConversionOperator(mods);
+        }
         Node type = ParseType();
         Node member = new Node(AK.FieldDecl());
         member.mods = mods;
         member.type = type;
+        member.fieldOffset = fieldOffset;
         // Stamp the member name's position so jsongen's unsupported-field
         // diagnostics point at the offending field (defaults to 0:0).
         member.line = Cur().line; member.col = Cur().col;
@@ -975,10 +1173,55 @@ class Parser {
         if (At(TK.LBrace()) || At(TK.Arrow())) {
             return ParseProperty(type, member.sval, mods);
         }
-        // field
+        // field (multi-declarator: `int a, b = 7, c;` -- extra declarators
+        // ride as FieldDecl kids; the class-body loop flattens them)
         if (Eat(TK.Eq())) { member.b = ParseExpr(); }
+        while (At(TK.Comma())) {
+            Next();
+            Node fd = new Node(AK.FieldDecl());
+            fd.mods = mods; fd.type = type; fd.fieldOffset = fieldOffset;
+            fd.line = Cur().line; fd.col = Cur().col;
+            if (HasModBit(mods, MOD.Weak())) { fd.type.mods = fd.type.mods + MOD.Weak(); }
+            if (At(TK.Ident())) { fd.sval = Next().text; }
+            if (Eat(TK.Eq())) { fd.b = ParseExpr(); }
+            member.Add(fd);
+        }
         Expect(TK.Semicolon());
         return member;
+    }
+
+    Node ParseConversionOperator(int mods) {
+        Token kw = Next();
+        Next(); // contextual `operator`, checked by the caller
+        Node m = new Node(AK.MethodDecl());
+        m.line = kw.line; m.col = kw.col;
+        m.mods = mods;
+        if (!HasModBit(m.mods, MOD.Static())) { m.mods = m.mods + MOD.Static(); }
+        m.sval = kw.text == "implicit" ? "op_implicit" : "op_explicit";
+        m.type = ParseType();
+        ParseParams(m);
+        int count = 0; int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) {
+                count = count + 1;
+                if (p.ival == 1 || p.op == 1 || p.b != null) {
+                    diags.Error("conversion operator requires one by-value parameter without a default", m.line, m.col);
+                }
+            }
+            i = i + 1;
+        }
+        if (count != 1) { diags.Error("conversion operator requires exactly one parameter", m.line, m.col); }
+        if (At(TK.Arrow())) {
+            Next();
+            m.d = new Node(AK.Block());
+            Node ret = new Node(AK.ReturnStmt());
+            ret.a = ParseExpr();
+            m.d.Add(ret);
+            Expect(TK.Semicolon());
+        } else if (At(TK.LBrace())) { m.d = ParseBlock(); }
+        else { Expect(TK.Semicolon()); }
+        return m;
     }
 
     // Map an operator token to the mangled method name (must match irgen).
@@ -1167,6 +1410,7 @@ class Parser {
         if (k == TK.LBrace()) { return ParseBlock(); }
         if (k == TK.If()) { return ParseIf(); }
         if (k == TK.While()) { return ParseWhile(); }
+        if (k == TK.Do()) { return ParseDoWhile(); }
         if (k == TK.For()) { return ParseFor(); }
         if (k == TK.Foreach()) { return ParseForeach(); }
         if (k == TK.Return()) { return ParseReturn(); }
@@ -1193,6 +1437,16 @@ class Parser {
         if (At(TK.Var())) { Next(); vd.type = null; } else { vd.type = ParseType(); }
         if (At(TK.Ident())) { vd.sval = Next().text; }
         if (Eat(TK.Eq())) { vd.b = ParseExpr(); }
+        while (At(TK.Comma())) {
+            // multi-declarator: extra declarators ride along as kids with
+            // the same type node (each consumer loops over them)
+            Next();
+            Node d = new Node(AK.VarDecl());
+            d.type = vd.type;
+            if (At(TK.Ident())) { d.sval = Next().text; }
+            if (Eat(TK.Eq())) { d.b = ParseExpr(); }
+            vd.Add(d);
+        }
         Expect(TK.Semicolon());
         return vd;
     }
@@ -1237,6 +1491,18 @@ class Parser {
         return n;
     }
 
+    Node ParseDoWhile() {
+        Next(); // do
+        Node n = new Node(AK.DoWhileStmt());
+        n.b = ParseStmt();
+        Expect(TK.While());
+        Expect(TK.LParen());
+        n.a = ParseExpr();
+        Expect(TK.RParen());
+        Expect(TK.Semicolon());
+        return n;
+    }
+
     Node ParseFor() {
         Next();
         Node n = new Node(AK.ForStmt());
@@ -1258,6 +1524,14 @@ class Parser {
         if (At(TK.Var())) { Next(); } else { vd.type = ParseType(); }
         if (At(TK.Ident())) { vd.sval = Next().text; }
         if (Eat(TK.Eq())) { vd.b = ParseExpr(); }
+        while (At(TK.Comma())) {
+            Next();
+            Node d = new Node(AK.VarDecl());
+            d.type = vd.type;
+            if (At(TK.Ident())) { d.sval = Next().text; }
+            if (Eat(TK.Eq())) { d.b = ParseExpr(); }
+            vd.Add(d);
+        }
         return vd;
     }
 
@@ -1406,6 +1680,13 @@ class Parser {
             n.op = TK.QQEq(); n.a = left; n.b = right;
             return n;
         }
+        if (IsUshrEq()) {
+            Next(); Next(); Next();
+            Node right = ParseAssign();
+            Node n = new Node(AK.Assignment());
+            n.op = TK.GreaterGreaterGreaterEq(); n.a = left; n.b = right;
+            return n;
+        }
         if (IsShrEq()) {
             Next(); Next();
             Node right = ParseAssign();
@@ -1503,6 +1784,12 @@ class Parser {
         Node left = ParseAdd();
         while (true) {
             if (At(TK.LessLess())) { int op = Next().kind; Node r = ParseAdd(); left = Bin(op, left, r); }
+            else if (IsUshrEq()) { break; }
+            else if (IsUshr()) {
+                Next(); Next(); Next();
+                Node r = ParseAdd();
+                left = Bin(TK.GreaterGreaterGreater(), left, r);
+            }
             else if (At(TK.Greater()) && K1() == TK.Greater() && AdjNext() && !IsShrEq()) {
                 Next(); Next();
                 Node r = ParseAdd();
@@ -1544,6 +1831,14 @@ class Parser {
             return n;
         }
         int k = K();
+        if (k == TK.PlusPlus() || k == TK.MinusMinus()) {
+            // prefix ++/-- yields the NEW value (like the reference: an
+            // AST unary with the ++/-- op); the statement form discards it
+            int op = Next().kind;
+            Node n = new Node(AK.Unary());
+            n.op = op; n.a = ParseUnary();
+            return n;
+        }
         if (k == TK.Bang() || k == TK.Minus() || k == TK.Plus()) {
             int op = Next().kind;
             Node n = new Node(AK.Unary());

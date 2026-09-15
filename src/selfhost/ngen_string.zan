@@ -1,0 +1,325 @@
+using System;
+using System.Collections;
+namespace Zan;
+
+// Integration (no edits to ngen.zan/ngen_obj.zan in this partial):
+//  * GenExprInEnvNg: if (TryGenStringRead(e)) { return; } BEFORE legacy
+//    MemberAccess/Index handling (inside GenExpr's lexical environment).
+//    Handles string.Length and string[index]; no pre-evaluated inputs/pushes.
+//  * GenCall: if (TryGenStringCall(e)) { return; } BEFORE legacy IndexOf.
+//  * CallRetTy: string st = StringCallRetTy(e); if (st != null) { return st; }
+//    This also feeds IsStrExpr, inferred locals and chained Replace calls.
+//  * Assignment: if (TryGenStringStore(e.a)) { return; } immediately AFTER
+//    RHS/compound-result generation/conversion, BEFORE the target-store chain.
+//    Entry is VALUE IN x0, NOT a pushed value. False emits nothing. True
+//    balances all pushes and returns the original assignment value in x0.
+//  * Gen: EmitStringRuntime() once after EmitRtCore, before strpool/Patch.
+// Sources: C irgen_call.c IndexOf/Replace, irgen_builtins.c get_str_replace_fn,
+// irgen_expr.c string store/reliable bounds, irgen_generics.c safe bounds.
+// Null method operands deliberately reach libc, as in C/IR (not empty-string
+// coalescing). Invalid IndexOf starts return -1 WITHOUT probing a wild address.
+// All libc-crossing state is in allocated 16-aligned frames, never x9/x18.
+partial class Ngen {
+    string StringCallRetTy(Node e) {
+        if (e == null || e.kind != AK.Call() || e.a == null
+                || e.a.kind != AK.MemberAccess() || !IsStrExpr(e.a.a)) { return null; }
+        if (e.a.sval == "Replace" && e.kids.Count == 2) { return "string"; }
+        if (e.a.sval == "IndexOf" && (e.kids.Count == 1 || e.kids.Count == 2)) { return "int"; }
+        return null;
+    }
+
+    bool TryGenStringCall(Node e) {
+        string ty = StringCallRetTy(e);
+        if (ty == null) { return false; }
+        GenExpr(e.a.a);
+        E4(0xF81F0FE0); // push receiver
+        if (e.a.sval == "IndexOf") {
+            // C evaluates receiver, start, needle (NOT receiver, needle, start).
+            if (e.kids.Count == 2) { GenExpr(e.kids[1]); }
+            else { LoadImm(0, 0); }
+            E4(0xF81F0FE0);
+            if (e.kids.Count == 2) {
+                // C's Length probe reports null before evaluating needle;
+                // soft continues with length zero, hard exits with 70.
+                LdrU(0, 31, 16);
+                int nonnull = NL(); int lengthDone = NL(); CbnzReg(0, nonnull);
+                StringStoreGuard(e, "null reference where a string/byte buffer is required (length probe)");
+                LoadImm(0, 0); EmitB(lengthDone);
+                Mark(nonnull); BLInternal("_zan_string_length");
+                Mark(lengthDone); E4(0xF81F0FE0); // length BEFORE needle effects
+            }
+            GenExpr(e.kids[0]);
+            if (IsCharExpr(e.kids[0])) { BLInternal("_zan_rt_chrstr"); }
+            MovRR(1, 0);
+            if (e.kids.Count == 2) { E4(0xF84107E3); } // saved length
+            E4(0xF84107E2); // start
+            E4(0xF84107E0); // receiver
+            BLInternal(e.kids.Count == 1 ? "_zan_string_index1" : "_zan_string_index2");
+        } else {
+            GenExpr(e.kids[0]);
+            if (IsCharExpr(e.kids[0])) { BLInternal("_zan_rt_chrstr"); }
+            E4(0xF81F0FE0);
+            GenExpr(e.kids[1]);
+            if (IsCharExpr(e.kids[1])) { BLInternal("_zan_rt_chrstr"); }
+            MovRR(2, 0);
+            E4(0xF84107E1);
+            E4(0xF84107E0);
+            BLInternal("_zan_string_replace");
+        }
+        return true;
+    }
+
+    // GenExprInEnvNg: call this BEFORE legacy MemberAccess/Index branches.
+    // False emits nothing. True leaves Length/zero-extended byte in x0 and
+    // balances its stack. GenExpr's lexical environment must already be active.
+    bool TryGenStringRead(Node e) {
+        if (e == null) { return false; }
+        bool length = e.kind == AK.MemberAccess() && e.sval == "Length";
+        bool index = e.kind == AK.Index();
+        if ((!length && !index) || !IsStrExpr(e.a)) { return false; }
+        GenExpr(e.a); E4(0xF81F0FE0); // base
+        if (index) { GenExpr(e.b); } else { LoadImm(0, 0); }
+        E4(0xF81F0FE0); // index@0, base@16
+        LdrU(0, 31, 16);
+        int nonnull = NL(); int done = NL(); int bad = NL(); int load = NL();
+        CbnzReg(0, nonnull);
+        StringStoreGuard(e, length
+            ? "null reference where a string/byte buffer is required (length probe)"
+            : "null reference where a string/byte buffer is required (element access)");
+        if (length) { LoadImm(0, 0); EmitB(done); }
+        else {
+            LoadSymRef("l_.g.string.scratch", 0); StrU(0, 31, 16);
+            if (!StringReliableBounds(e.a)) {
+                LdrU(9, 31, 0); StringCmp(9, 31); EmitBcond(11, bad);
+                StrU(31, 31, 0); EmitB(load);
+            }
+        }
+        Mark(nonnull);
+        if (length) {
+            BLInternal("_zan_string_length"); EmitB(done);
+        } else {
+            if (StringReliableBounds(e.a)) {
+                BLInternal("_zan_string_buffer_len");
+                LdrU(9, 31, 0); StringCmp(9, 0); EmitBcond(10, bad);
+            }
+            // Parameters/fields/direct extern locals may carry binary data:
+            // gen0 intentionally checks only null/negative, not strlen upper.
+            LdrU(9, 31, 0); StringCmp(9, 31); EmitBcond(11, bad);
+            EmitB(load);
+            Mark(bad); StringStoreGuard(e, "string index out of bounds");
+            StrU(31, 31, 0);
+            Mark(load); LdrU(1, 31, 16); LdrU(0, 31, 0);
+            E4(0x38606820); // ldrb w0,[x1,x0], including fail-soft index zero
+        }
+        Mark(done); AddSPImm(32, true); return true;
+    }
+
+    bool StringReliableBounds(Node e) {
+        if (e.kind == AK.StringLit()) { return true; }
+        if (e.kind != AK.Ident()) { return false; }
+        int li = LocalIdx(e.sval);
+        if (li < 0 || locTy[li] != "string") { return false; }
+        // Parameters have no declaration slot. Direct extern initializers
+        // mark opaque locals in gen0; fields/calls also have no upper bound.
+        Node decl = locDecl[li];
+        if (decl == null) { return false; }
+        Node init = decl.b;
+        if (init != null && init.kind == AK.Call()) {
+            int mi = ResolveStaticNg(init);
+            if (mi >= 0 && HasMod(methNodes[mi], MOD.Extern())) { return false; }
+        }
+        return true;
+    }
+
+    bool TryGenStringStore(Node lhs) {
+        if (lhs == null || lhs.kind != AK.Index() || !IsStrExpr(lhs.a)) { return false; }
+        bool reliable = StringReliableBounds(lhs.a);
+        E4(0xF81F0FE0); // value (entry x0)
+        GenExpr(lhs.a);
+        E4(0xF81F0FE0); // base
+        GenExpr(lhs.b);
+        E4(0xF81F0FE0); // index; frame: idx@0, base@16, value@32
+        LdrU(0, 31, 16);
+        int baseOk = NL(); int bad = NL(); int store = NL(); int finish = NL();
+        CbnzReg(0, baseOk);
+        StringStoreGuard(lhs, "null reference where a string/byte buffer is required (element access)");
+        LoadSymRef("l_.g.string.scratch", 0);
+        StrU(0, 31, 16);
+        if (!reliable) {
+            // Opaque null accesses always fold to byte zero, but a negative
+            // index still reports its own guard (dedup is runtime policy).
+            LdrU(9, 31, 0); StringCmp(9, 31); EmitBcond(11, bad);
+            StrU(31, 31, 0); EmitB(store);
+        }
+        Mark(baseOk);
+        if (reliable) {
+            LdrU(0, 31, 16);
+            BLInternal("_zan_string_buffer_len");
+            LdrU(9, 31, 0); StringCmp(9, 0); EmitBcond(10, bad);
+        }
+        LdrU(9, 31, 0); StringCmp(9, 31); EmitBcond(11, bad);
+        EmitB(store);
+        Mark(bad);
+        StringStoreGuard(lhs, "string index out of bounds");
+        StrU(31, 31, 0); // fail-soft writes byte zero, not a skipped store
+        Mark(store);
+        LdrU(0, 31, 16); LdrU(1, 31, 0); LdrU(2, 31, 32);
+        E4(0x38216802); // strb w2, [x0, x1] (low 8 bits only)
+        // Eagerly refresh a writable managed header instead of leaving the
+        // unknown sentinel: current ngen's Length/index readers read low32
+        // directly. This is observably the same as C's invalidate + lazy scan.
+        BLInternal("_zan_string_header"); // safe snapshot: x1=header,x2=rc
+        CbzReg(0, finish);
+        MovRR(9, 1);
+        E4(0xD360FD2A); // lsr x10,x9,#32
+        LoadImm(11, 0x5A414E53); StringCmp(10, 11); EmitBcond(1, finish);
+        LoadImm(11, -1); StringCmp(2, 11); EmitBcond(0, finish);
+        LdrU(0, 31, 16); BLExtern("_strlen");
+        LoadImm(9, 0x5A414E5300000000); AddRR(9, 9, 0);
+        LdrU(10, 31, 16); SubImm(10, 10, 8); StrU(9, 10, 0);
+        Mark(finish);
+        AddSPImm(32, true); E4(0xF84107E0); // discard idx/base, return value
+        return true;
+    }
+
+    void StringStoreGuard(Node lhs, string msg) {
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, lhs.line); LoadImm(2, lhs.col);
+        LoadSymRef("l_.str." + InternStr(msg), 3);
+        BLInternal("_zan_rt_guard_fail3"); // provided by ngen_guard
+    }
+    void StringCmp(int a, int b) { E4(0xEB00001F | (b << 16) | (a << 5)); }
+    void StringSub(int d, int a, int b) { E4(0xCB000000 | (b << 16) | (a << 5) | d); }
+    void StringFrame(string name, int size) {
+        syms.Add(new Sym(name, txt.Count)); RtPrologue(); AddSPImm(size, false);
+    }
+    void StringReturn(int size) { AddSPImm(size, true); RtEpilogue(); }
+
+    void EmitStringRuntime() {
+        // Header padding makes the normal ABI probe safe on the scratch page.
+        dglbs.Add(new DGlob("string.padding", 16, dataLen)); dataLen = dataLen + 16;
+        dglbs.Add(new DGlob("string.scratch", 256, dataLen)); dataLen = dataLen + 256;
+        StringEmitHeader();
+        StringEmitBufferLen();
+        StringEmitIndex(false); StringEmitIndex(true);
+        StringEmitReplace();
+    }
+
+    // Safe 16-byte header snapshot. Input x0=VALID readable payload; output
+    // x0=success, x1=word at -8, x2=word at -16. Never blindly dereference -8.
+    // Darwin arm64 VM pages are >=4K. If payload and header are in the SAME
+    // 4K block, readable payload implies readable header (page protections
+    // cannot split that block). This keeps ordinary managed Length O(1).
+    // At a boundary use mach_vm_read_overwrite into our own stack: an unmapped
+    // or PROT_NONE preceding page returns a kernel error, not SIGSEGV. Consume
+    // the COPIED bytes only; no probe-then-dereference race on that slow path.
+    // As with strlen, caller must keep the payload alive during the operation.
+    void StringEmitHeader() {
+        StringFrame("_zan_string_header", 48);
+        int fail = NL(); int slow = NL(); int ready = NL();
+        CbzReg(0, fail);
+        LoadImm(9, 4095); E4(0x8A090009); // and x9,x0,x9
+        LoadImm(10, 16); StringCmp(9, 10); EmitBcond(3, slow);
+        E4(0xF85F8001); // ldur x1,[x0,#-8], same readable page
+        E4(0xF85F0002); // ldur x2,[x0,#-16], same readable page
+        EmitB(ready);
+        Mark(slow);
+        SubImm(1, 0, 16);
+        LoadSymRefGOT("_mach_task_self_", 9);
+        E4(0xB9400120); // ldr w0,[x9] (mach_port_t, NOT an 8-byte load)
+        LoadImm(2, 16); AddImm(3, 31, 0); AddImm(4, 31, 16);
+        StrU(31, 31, 16);
+        BLExtern("_mach_vm_read_overwrite");
+        E4(0x7100001F); EmitBcond(1, fail); // kern_return_t is w0
+        LdrU(9, 31, 16); LoadImm(10, 16); StringCmp(9, 10); EmitBcond(1, fail);
+        LdrU(1, 31, 8); LdrU(2, 31, 0);
+        Mark(ready); LoadImm(0, 1); StringReturn(48);
+        Mark(fail); LoadImm(0, 0); LoadImm(1, 0); LoadImm(2, 0); StringReturn(48);
+    }
+
+    // Tagged strings use cached length; byte[] buffers use allocation count;
+    // unknown/foreign buffers use strlen. No cache writes to foreign/literals.
+    void StringEmitBufferLen() {
+        syms.Add(new Sym("_zan_string_length", txt.Count));
+        LoadImm(1, 0); int probe = NL(); EmitB(probe);
+        syms.Add(new Sym("_zan_string_buffer_len", txt.Count));
+        LoadImm(1, 1); Mark(probe); RtPrologue(); AddSPImm(32, false);
+        StrU(0, 31, 0); StrU(1, 31, 8);
+        int arr = NL(); int scan = NL(); int done = NL();
+        CbzReg(0, done); // public read/call hooks report null at source location
+        BLInternal("_zan_string_header"); CbzReg(0, scan);
+        MovRR(9, 1);
+        LoadImm(10, 0x5A414E4152524159); StringCmp(9, 10); EmitBcond(0, arr);
+        E4(0xD360FD2A); LoadImm(11, 0x5A414E53);
+        StringCmp(10, 11); EmitBcond(1, scan);
+        E4(0xD3407D29); // low32 x9
+        LoadImm(10, 0x54524D47); StringCmp(9, 10); EmitBcond(0, scan);
+        MovRR(0, 9); EmitB(done);
+        Mark(arr); LdrU(9, 31, 8); CbzReg(9, scan); MovRR(0, 2); EmitB(done);
+        Mark(scan); LdrU(0, 31, 0); BLExtern("_strlen");
+        Mark(done); StringReturn(32);
+    }
+
+    // (s=x0, needle=x1, start=x2, pre-needle Length=x3 for index2)
+    // -> signed byte offset or -1.
+    // In particular the ORIGINAL base is reloaded after strstr: x9 is volatile.
+    void StringEmitIndex(bool withStart) {
+        StringFrame(withStart ? "_zan_string_index2" : "_zan_string_index1", 32);
+        StrU(0, 31, 0); StrU(1, 31, 8); StrU(2, 31, 16);
+        int miss = NL(); int done = NL();
+        if (withStart) {
+            // C's valid_start is 0 <= start <= Length. Clamp by branching
+            // before strstr, rather than C IR's speculative out-of-range GEP.
+            StringCmp(2, 31); EmitBcond(11, miss);
+            StringCmp(2, 3); EmitBcond(12, miss);
+            LdrU(0, 31, 0); AddRR(0, 0, 2); LdrU(1, 31, 8);
+        }
+        BLExtern("_strstr");
+        CbzReg(0, miss);
+        LdrU(9, 31, 0); StringSub(0, 0, 9); EmitB(done);
+        Mark(miss); LoadImm(0, -1);
+        Mark(done); StringReturn(32);
+    }
+
+    // Two passes, exactly C's non-overlapping count/build algorithm.
+    // frame: s0, old8, new16, ls24, lo32, ln40, count48, cursor56,
+    // out64, dest72, hit80, prefix88, newlen96 (112 allocated).
+    void StringEmitReplace() {
+        StringFrame("_zan_string_replace", 112);
+        StrU(0, 31, 0); StrU(1, 31, 8); StrU(2, 31, 16);
+        BLExtern("_strlen"); StrU(0, 31, 24);
+        LdrU(0, 31, 8); BLExtern("_strlen"); StrU(0, 31, 32);
+        LdrU(0, 31, 16); BLExtern("_strlen"); StrU(0, 31, 40);
+        StrU(31, 31, 48); LdrU(0, 31, 0); StrU(0, 31, 56);
+        int count = NL(); int alloc = NL(); int build = NL(); int rest = NL();
+        LdrU(0, 31, 32); CbzReg(0, alloc);
+        Mark(count);
+        LdrU(0, 31, 56); LdrU(1, 31, 8); BLExtern("_strstr"); CbzReg(0, alloc);
+        LdrU(1, 31, 32); AddRR(0, 0, 1); StrU(0, 31, 56);
+        LdrU(0, 31, 48); AddImm(0, 0, 1); StrU(0, 31, 48); EmitB(count);
+        Mark(alloc);
+        LdrU(0, 31, 40); LdrU(1, 31, 32); StringSub(0, 0, 1);
+        LdrU(1, 31, 48); E4(0x9B017C00); // mul x0,x0,x1
+        LdrU(1, 31, 24); AddRR(0, 0, 1); StrU(0, 31, 96);
+        AddImm(0, 0, 1); BLInternal("_zan_rt_str_alloc");
+        StrU(0, 31, 64); StrU(0, 31, 72);
+        LdrU(9, 31, 96); LoadImm(10, 0x5A414E5300000000); AddRR(9, 9, 10);
+        SubImm(10, 0, 8); StrU(9, 10, 0);
+        LdrU(0, 31, 0); StrU(0, 31, 56);
+        LdrU(0, 31, 32); CbzReg(0, rest); // empty old: independent copy
+        Mark(build);
+        LdrU(0, 31, 56); LdrU(1, 31, 8); BLExtern("_strstr"); CbzReg(0, rest);
+        StrU(0, 31, 80);
+        LdrU(1, 31, 56); StringSub(2, 0, 1); StrU(2, 31, 88);
+        LdrU(0, 31, 72); BLExtern("_memcpy");
+        LdrU(0, 31, 72); LdrU(1, 31, 88); AddRR(0, 0, 1); StrU(0, 31, 72);
+        LdrU(1, 31, 16); LdrU(2, 31, 40); BLExtern("_memcpy");
+        LdrU(0, 31, 72); LdrU(1, 31, 40); AddRR(0, 0, 1); StrU(0, 31, 72);
+        LdrU(0, 31, 80); LdrU(1, 31, 32); AddRR(0, 0, 1); StrU(0, 31, 56);
+        EmitB(build);
+        Mark(rest);
+        LdrU(0, 31, 56); BLExtern("_strlen"); AddImm(2, 0, 1);
+        LdrU(0, 31, 72); LdrU(1, 31, 56); BLExtern("_memcpy");
+        LdrU(0, 31, 64); StringReturn(112);
+    }
+}
