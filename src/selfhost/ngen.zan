@@ -98,6 +98,7 @@ partial class Ngen {
     List<string> methCls;
     List<int> methStat;     // 0 = instance, 1 = static, 2 = ctor
     string mainCls;
+    bool mainAsync;     // Main is async: the shim ramps + pumps instead of calling it
     Node curMeth;           // method being emitted (spec sval2 = this type)
 
     List<string> enName;    // enum type name per declaration
@@ -215,10 +216,13 @@ partial class Ngen {
             Node m = cls.kids[i];
             if (m.kind == AK.MethodDecl()) {
                 // ngen_async hook E: async methods join the signature tables
-                // (their ramps are call targets) but Main stays synchronous --
-                // an async Main is diagnosed by EmitAsyncMethodNg
+                // (their ramps are call targets); an async Main is driven by
+                // the entry shim (hook F) instead of a direct call
                 if (HasMod(m, MOD.Extern())) { CheckExternNg(m); }
-                if (m.sval == "Main" && HasMod(m, MOD.Static()) && !HasMod(m, MOD.Extern()) && !IsAsync(m)) { mainCls = cls.sval; }
+                if (m.sval == "Main" && HasMod(m, MOD.Static()) && !HasMod(m, MOD.Extern())) {
+                    mainCls = cls.sval;
+                    mainAsync = IsAsync(m);
+                }
                 methNodes.Add(m);
                 methCls.Add(cls.sval);
                 methStat.Add(HasMod(m, MOD.Static()) ? 1 : 0);
@@ -705,8 +709,13 @@ partial class Ngen {
             Node p = ParamAt(methNodes[mainIdx], 0);
             if (p.type != null && TypeFullName(p.type) == "string[]") { EmitMainArgsNg(); }
         }
-        BLInternal("_" + mainCls + "_Main");
-        E4(0xD2800000);                                  // movz x0, #0
+        if (mainAsync && mainIdx >= 0) {
+            // ngen_async hook F: async Main runs through the shim's pump
+            EmitAsyncMainDriveNg(mainIdx);               // x0 = exit code
+        } else {
+            BLInternal("_" + mainCls + "_Main");
+            E4(0xD2800000);                              // movz x0, #0
+        }
         E4(0xA8C17BFD);                                  // ldp x29, x30, [sp], #16
         E4(0xD65F03C0);                                  // ret
     }
@@ -3669,6 +3678,7 @@ partial class Ngen {
     // string literal / concatenation / method with a string return type)
     bool IsStrExpr(Node e) {
         if (e == null) { return false; }
+        if (e.kind == AK.AwaitExpr()) { return AsyncAwaitElemTyNg(e.a) == "string"; }
         if (e.kind == AK.Call() && HostCallRetTy(e) == "string") { return true; }
         if (e.kind == AK.StringLit()) { return true; }
         if (e.kind == AK.Binary()) {
@@ -3767,6 +3777,10 @@ partial class Ngen {
 
     bool IsDblExpr(Node e) {
         if (e == null) { return false; }
+        if (e.kind == AK.AwaitExpr()) {
+            string at2 = AsyncAwaitElemTyNg(e.a);
+            return at2 == "double" || at2 == "float";
+        }
         if (e.kind == AK.Conditional()) { return IsDblExpr(e.b) || IsDblExpr(e.c); }
         if (e.kind == AK.FloatLit()) { return true; }
         if (e.kind == AK.Unary() && e.op == TK.Minus()) { return IsDblExpr(e.a); }
@@ -3832,6 +3846,7 @@ partial class Ngen {
     // zan_rt_chrstr)
     bool IsCharExpr(Node e) {
         if (e == null) { return false; }
+        if (e.kind == AK.AwaitExpr()) { return AsyncAwaitElemTyNg(e.a) == "char"; }
         if (e.kind == AK.CharLit()) { return true; }
         if (e.kind == AK.Index()) { return IsStrExpr(e.a); }
         if (e.kind == AK.CastExpr() && e.type != null) { return e.type.sval == "char"; }
@@ -3854,6 +3869,7 @@ partial class Ngen {
     // ulong is the only integer type whose slot can set the high bit)
     bool IsUlongExpr(Node e) {
         if (e == null) { return false; }
+        if (e.kind == AK.AwaitExpr()) { return AsyncAwaitElemTyNg(e.a) == "ulong"; }
         if (e.kind == AK.IntLit()) {
             // a UL/lu-suffixed literal types as ulong (gen0's checker)
             return e.suffix - (e.suffix / 4) * 4 == 3;
@@ -3955,6 +3971,7 @@ partial class Ngen {
     // fields and method results -- WriteLine renders those true/false)
     bool IsBoolExpr(Node e) {
         if (e == null) { return false; }
+        if (e.kind == AK.AwaitExpr()) { return AsyncAwaitElemTyNg(e.a) == "bool"; }
         if (e.kind == AK.BoolLit()) { return true; }
         if (e.kind == AK.Binary()) {
             int op = e.op;
@@ -4323,9 +4340,14 @@ partial class Ngen {
                     GenExpr(arg); BLInternal("_zan_rt_int2str");
                 }
                 E4(0xF81F0FE0);                      // push s (stack variadic)
+                if (EnvTargetElf() == 1) {
+                    LdrU(1, 31, 0);                  // Linux: x1 = s (register vararg)
+                }
                 LoadSymRef("l_.str." + fmtwIdx, 0);  // x0 = "%s"
                 BLExtern("_printf");
-                AddSPImm(16, true);
+                if (EnvTargetElf() == 0) {
+                    AddSPImm(16, true);              // drop the Darwin stack slot
+                }
                 return;
             }
             // Math static methods. Integer forms: Abs is a negate and
