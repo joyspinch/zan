@@ -16,8 +16,10 @@ class Parser {
     public bool attrJsonIgnore; // last ParseAttrs saw [JsonIgnore]
     public bool attrLayoutExplicit;
     public int attrFieldOffset = -1;
+    public Node curClsNode;   // class being parsed: local functions hoist here
+    public int synthUsing;    // counter for `using (expr)` temp names
 
-    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; attrJsonIgnore = false; }
+    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; attrJsonIgnore = false; curClsNode = null; synthUsing = 0; }
 
     bool HasModBit(int mods, int bit) { return (mods / bit) - ((mods / bit) / 2) * 2 == 1; }
 
@@ -256,7 +258,16 @@ class Parser {
     bool IsDeclStart() {
         int k = K();
         if (k == TK.Var()) { return true; }
-        if (IsTypeKeyword(k)) { return true; }
+        if (IsTypeKeyword(k)) {
+            // `int x` declares, but `int.Parse(s)` is an expression
+            // statement: require an identifier after the (possibly
+            // generic/qualified/array-suffixed) type before claiming a decl
+            int save = pos;
+            SkipType();
+            bool ok = (K() == TK.Ident());
+            pos = save;
+            return ok;
+        }
         if (k == TK.Ident()) {
             int save = pos;
             SkipType();
@@ -998,15 +1009,22 @@ class Parser {
         }
         // base list
         if (Eat(TK.Colon())) {
-            if (At(TK.Ident())) { cls.sval2 = Next().text; }
-            while (Eat(TK.Comma())) { if (At(TK.Ident())) { Next(); } }
+            if (At(TK.Ident())) {
+                cls.sval2 = Next().text;
+                SkipTypeArgs();   // first base may be generic
+            }
+            // extra interfaces may be generic (`IEnumerable<int>, ...`)
+            while (Eat(TK.Comma())) { SkipType(); }
         }
         SkipWhereClauses();
         Expect(TK.LBrace());
+        Node prevCls = curClsNode;
+        curClsNode = cls;
         while (!At(TK.RBrace()) && !At(TK.Eof())) {
             Node m = ParseMember(cls.sval);
             AddMember(cls, m);
         }
+        curClsNode = prevCls;
         Expect(TK.RBrace());
         return cls;
     }
@@ -1021,6 +1039,20 @@ class Parser {
                    && !(At(TK.Ident()) && Cur().text == "where")) {
                 Next();
             }
+        }
+    }
+
+    // skip a balanced `<T, U>` type-argument list at the current position
+    void SkipTypeArgs() {
+        if (!At(TK.Less())) { return; }
+        int depth = 0;
+        while (!At(TK.Eof())) {
+            int kk = K();
+            if (kk == TK.Less()) { depth = depth + 1; }
+            else if (kk == TK.Greater()) { depth = depth - 1; }
+            else if (kk == TK.GreaterGreater()) { depth = depth - 2; }
+            Next();
+            if (depth <= 0) { break; }
         }
     }
 
@@ -1135,6 +1167,12 @@ class Parser {
             if (At(TK.LBrace())) { member.d = ParseBlock(); }
             else { Expect(TK.Semicolon()); }
             return member;
+        }
+        // indexer:  T this[T0 i0, ...] { get ... set ... }  |  T this[i] => expr;
+        // Lowers to op_index / op_index_set instance methods (the protocol
+        // obj[i] calls dispatch through), like src/compiler/parser.c.
+        if (At(TK.This()) && K1() == TK.LBracket()) {
+            return ParseIndexer(type, mods);
         }
         // generic method type params:  Name <T, ...> ( ... )
         if (At(TK.Less()) && member.sval != "operator") {
@@ -1288,12 +1326,136 @@ class Parser {
         if (getBody == null && setBody == null) {
             Node f = new Node(AK.FieldDecl());
             f.mods = mods; f.type = type; f.sval = name;
+            // auto-property initializer:  T Name { get; set; } = expr;
+            if (Eat(TK.Eq())) { f.b = ParseExpr(); }
+            Eat(TK.Semicolon());
             group.Add(f);
             return group;
         }
         if (getBody != null) { group.Add(MakeGetter(name, type, mods, getBody)); }
         if (setBody != null) { group.Add(MakeSetter(name, type, mods, setBody)); }
         return group;
+    }
+
+    // C# indexer:  T this[T0 i0, ...] { get {...} set {...} }  or the
+    // expression-bodied read-only form  T this[i] => expr;
+    // Synthesizes instance op_index(index...) / op_index_set(index..., value)
+    // methods; a bodyless (automatic) accessor is skipped, mirroring the
+    // reference parser (src/compiler/parser.c).
+    Node ParseIndexer(Node type, int mods) {
+        Next(); // this
+        Expect(TK.LBracket());
+        Node m = new Node(AK.MethodDecl());   // reuses ParseParams: '[' in place of '('
+        while (!At(TK.RBracket()) && !At(TK.Eof())) {
+            Node p = new Node(AK.Param());
+            p.type = ParseType();
+            if (At(TK.Ident())) { p.sval = Next().text; }
+            if (Eat(TK.Eq())) { p.b = ParseExpr(); }
+            m.Add(p);
+            if (!Eat(TK.Comma())) { }
+        }
+        Expect(TK.RBracket());
+        Node getterBody = null;
+        Node setterBody = null;
+        if (At(TK.Arrow())) {
+            Next();
+            getterBody = new Node(AK.Block());
+            Node ret = new Node(AK.ReturnStmt());
+            ret.a = ParseExpr();
+            getterBody.Add(ret);
+            Expect(TK.Semicolon());
+        } else {
+            Expect(TK.LBrace());
+            while (!At(TK.RBrace()) && !At(TK.Eof())) {
+                ParseMods(); // accessor-level modifiers, if any
+                if (At(TK.Get())) {
+                    Next();
+                    if (At(TK.LBrace())) { getterBody = ParseBlock(); } else { Expect(TK.Semicolon()); }
+                } else if (At(TK.Set())) {
+                    Next();
+                    if (At(TK.LBrace())) { setterBody = ParseBlock(); } else { Expect(TK.Semicolon()); }
+                } else { Next(); }
+            }
+            Expect(TK.RBrace());
+        }
+        Node group = new Node(AK.Block());   // spliced by AddMember
+        if (getterBody != null) {
+            Node g = new Node(AK.MethodDecl());
+            g.mods = mods;
+            g.type = type;
+            g.sval = "op_index";
+            int pi = 0;
+            while (pi < m.kids.Count) { g.Add(m.kids[pi]); pi = pi + 1; }
+            g.d = getterBody;
+            group.Add(g);
+        }
+        if (setterBody != null) {
+            Node s = new Node(AK.MethodDecl());
+            s.mods = mods;
+            s.type = new Node(AK.TypeRef());
+            s.type.sval = "void";
+            s.sval = "op_index_set";
+            int pi2 = 0;
+            while (pi2 < m.kids.Count) { s.Add(m.kids[pi2]); pi2 = pi2 + 1; }
+            Node vp = new Node(AK.Param());
+            vp.type = type;
+            vp.sval = "value";
+            s.Add(vp);
+            s.d = setterBody;
+            group.Add(s);
+        }
+        if (group.kids.Count == 0) {
+            diags.Error("indexer has no accessors", type != null ? type.line : 0, type != null ? type.col : 0);
+        }
+        return group;
+    }
+
+    // `using (res) body` / `using (Type name = expr) body` -- deterministic
+    // disposal. Lowers to try/finally + a Dispose() call on the resource:
+    //   using (R r = new R()) { body }  ->
+    //     { R r = new R(); try { body } finally { r.Dispose(); } }
+    // A bare expression gets a synthetic temp to hold the resource.
+    Node ParseUsingStmt() {
+        Next(); // using
+        Expect(TK.LParen());
+        Node outer = new Node(AK.Block());
+        Node decl = new Node(AK.VarDecl());
+        if (At(TK.Var())) {
+            // using (var name = expr): inferred type (null type node)
+            Next();
+            decl.type = null;
+            if (At(TK.Ident())) { decl.sval = Next().text; }
+            if (Eat(TK.Eq())) { decl.b = ParseExpr(); }
+        } else if (LooksLikeTypedParam()) {
+            // using (Type name = expr): the closing ')' ends it
+            decl.type = ParseType();
+            if (At(TK.Ident())) { decl.sval = Next().text; }
+            if (Eat(TK.Eq())) { decl.b = ParseExpr(); }
+        } else {
+            // using (expr): synthetic temp of inferred type
+            decl.b = ParseExpr();
+            decl.sval = "__using" + Convert.ToString(synthUsing);
+            synthUsing = synthUsing + 1;
+        }
+        outer.Add(decl);
+        Expect(TK.RParen());
+        Node body = ParseStmt();
+        Node tryNode = new Node(AK.TryStmt());
+        tryNode.a = body;
+        Node fin = new Node(AK.Block());
+        Node callee = new Node(AK.MemberAccess());
+        Node resRef = new Node(AK.Ident());
+        resRef.sval = decl.sval;
+        callee.a = resRef;
+        callee.sval = "Dispose";
+        Node disposeCall = new Node(AK.Call());
+        disposeCall.a = callee;
+        Node estmt = new Node(AK.ExprStmt());
+        estmt.a = disposeCall;
+        fin.Add(estmt);
+        tryNode.c = fin;
+        outer.Add(tryNode);
+        return outer;
     }
 
     void ParseParams(Node fn) {
@@ -1425,11 +1587,86 @@ class Parser {
         // and the ordinary variable path handles the initializer
         if ((k == TK.Const() || (k == TK.Ident() && Cur().text == "const"))
                 && (IsTypeKeyword(K1()) || K1() == TK.Ident())) { Next(); }
+        // local function:  T Name(...) {...}  |  T Name(...) => expr;
+        // declared inside a method body. Hoisted to a private static method
+        // of the enclosing type so bare calls inside the method resolve to
+        // it (forward calls and recursion included).
+        if (curClsNode != null && IsDeclStart() && ParseLocalFuncAhead()) {
+            ParseLocalFunc();
+            return null;
+        }
+        // `using (res) body`: deterministic disposal, lowered to
+        // try/finally + Dispose() (see ParseUsingStmt)
+        if (k == TK.Using() && K1() == TK.LParen()) { return ParseUsingStmt(); }
         if (IsDeclStart()) { return ParseVarDecl(); }
         Node es = new Node(AK.ExprStmt());
         es.a = ParseExpr();
         Expect(TK.Semicolon());
         return es;
+    }
+
+    // Lookahead for a local-function declaration: a type, then a name, then
+    // either `(` directly or a `<T, ...>` type-parameter list and `(`.
+    // Pure token scan: pos is restored either way.
+    bool ParseLocalFuncAhead() {
+        int save = pos;
+        SkipType();
+        bool ok = false;
+        if (At(TK.Ident())) {
+            Next();
+            if (At(TK.LParen())) { ok = true; }
+            else if (At(TK.Less())) {
+                int save2 = pos;
+                int depth = 0;
+                while (!At(TK.Eof())) {
+                    int kk = K();
+                    if (kk == TK.Less()) { depth = depth + 1; }
+                    else if (kk == TK.Greater()) { depth = depth - 1; }
+                    else if (kk == TK.GreaterGreater()) { depth = depth - 2; }
+                    else if (kk == TK.LParen()) { break; }
+                    Next();
+                    if (depth <= 0) { break; }
+                }
+                ok = depth <= 0 && At(TK.LParen());
+                if (!ok) { pos = save2; }
+            }
+        }
+        pos = save;
+        return ok;
+    }
+
+    // Parse and hoist a local function as `private static` MethodDecl of the
+    // enclosing class (the declaration itself leaves no statement behind).
+    void ParseLocalFunc() {
+        Node m = new Node(AK.MethodDecl());
+        m.mods = MOD.Private() + MOD.Static();
+        m.type = ParseType();
+        if (At(TK.Ident())) { m.sval = Next().text; }
+        // generic local function type params:  T Name<T, ...>( ...)
+        if (At(TK.Less())) {
+            Next();
+            while (!At(TK.Greater()) && !At(TK.Eof())) {
+                if (At(TK.Ident())) { Node mtp = new Node(AK.TypeParam()); mtp.sval = Next().text; m.Add(mtp); }
+                else { Next(); }
+                Eat(TK.Comma());
+            }
+            Expect(TK.Greater());
+        }
+        ParseParams(m);
+        SkipWhereClauses();
+        // expression body:  T Name(...) => expr;
+        if (At(TK.Arrow())) {
+            Next();
+            Node blk = new Node(AK.Block());
+            Node ret = new Node(AK.ReturnStmt());
+            ret.a = ParseExpr();
+            blk.Add(ret);
+            m.d = blk;
+            Expect(TK.Semicolon());
+        } else {
+            m.d = ParseBlock();
+        }
+        curClsNode.Add(m);
     }
 
     Node ParseVarDecl() {

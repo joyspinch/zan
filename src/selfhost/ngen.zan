@@ -444,6 +444,134 @@ partial class Ngen {
         }
     }
 
+    // extension-method dispatch: `recv.Name(args)` with no instance or
+    // static-through-instance match names a static method whose first
+    // parameter is `this T` with T the receiver's static type (declared by
+    // fn.ival == 1 in ParseParams). Candidates are ranked by temporarily
+    // letting the receiver occupy the first argument slot, so the remaining
+    // arguments score against parameters 1.. exactly like FitPickIdx.
+    // Returns the chosen method index without mutating callNode, or -1.
+    int ResolveExtNg(Node recv, string name, Node callNode) {
+        string rt = ExtRecvTy(recv);
+        if (rt == null) { return -1; }
+        List<int> cands = new List<int>();
+        int i = 0;
+        while (i < methNodes.Count) {
+            Node m = methNodes[i];
+            if (methStat[i] == 1 && m.ival == 1 && m.sval == name && m.kids.Count > 0) {
+                Node p0 = ParamAt(m, 0);
+                string pt = p0 != null && p0.type != null ? TypeFullName(p0.type) : null;
+                if (pt == rt || (pt != null && IndexOfStrNg(DeclTps(m), pt) >= 0)) { cands.Add(i); }
+            }
+            i = i + 1;
+        }
+        if (cands.Count == 0) { return -1; }
+        callNode.kids.Insert(0, recv);
+        int pick = FitPickIdx(cands, callNode);
+        callNode.kids.RemoveAt(0);
+        return pick;
+    }
+
+    // static type name of an extension-method receiver: StaticTyOf plus the
+    // literal shapes it does not cover ("hey".Shout(), (3).Twice())
+    string ExtRecvTy(Node e) {
+        if (e == null) { return null; }
+        string t = StaticTyOf(e);
+        if (t != null) { return t; }
+        if (e.kind == AK.IntLit()) {
+            if (e.suffix == 2 || e.suffix == 3) { return "ulong"; }
+            if (e.suffix == 1) { return "long"; }
+            return "int";
+        }
+        if (e.kind == AK.StringLit()) { return "string"; }
+        if (e.kind == AK.FloatLit()) { return "double"; }
+        if (e.kind == AK.BoolLit()) { return "bool"; }
+        if (e.kind == AK.CharLit()) { return "char"; }
+        return null;
+    }
+
+    // the op_index / op_index_set instance method of cls (its base chain),
+    // or null -- the indexer protocol obj[i] dispatches through
+    Node OpIndexMethod(string cls) { return OpMethodInChain(cls, "op_index"); }
+    Node OpIndexSetMethod(string cls) { return OpMethodInChain(cls, "op_index_set"); }
+    Node OpMethodInChain(string cls, string name) {
+        string cur = cls;
+        while (cur != null) {
+            Node m = FindInstanceInCls(cur, name);
+            if (m != null) { return m; }
+            Cls cc = FindClass(cur);
+            cur = cc != null ? cc.baseName : null;
+        }
+        return null;
+    }
+
+    // first method of any kind whose declared name matches, or -1
+    // (specialization lookups by mangled name)
+    int FindMethByNameNg(string name) {
+        int i = 0;
+        while (i < methNodes.Count) {
+            if (methNodes[i].sval == name) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // property-accessor lookup: `name` (get_X / set_X) in cls's base chain,
+    // statics and instance methods both qualify; the declaring class lands
+    // in accOwnerCls so the symbol mangles against the right class
+    string accOwnerCls;
+    Node AccessorInChain(string cls, string name) {
+        string cur = cls;
+        while (cur != null) {
+            int i = 0;
+            while (i < methNodes.Count) {
+                if ((methStat[i] == 0 || methStat[i] == 1) && methCls[i] == cur
+                        && methNodes[i].sval == name) {
+                    accOwnerCls = cur;
+                    return methNodes[i];
+                }
+                i = i + 1;
+            }
+            Cls cc = FindClass(cur);
+            cur = cc != null ? cc.baseName : null;
+        }
+        return null;
+    }
+
+    // among a class's op_index / op_index_set overloads, the one whose index
+    // (and, for setters, value) parameters best fit the operand types, or
+    // null -- indexer overloads are distinguished by their parameter types
+    Node OpIndexFit(string cls, string name, Node idxExpr, Node valExpr) {
+        Node best = null;
+        int bestScore = -2000000000;
+        string cur = cls;
+        while (cur != null) {
+            int i = 0;
+            while (i < methNodes.Count) {
+                if (methStat[i] == 0 && methCls[i] == cur && methNodes[i].sval == name) {
+                    Node m = methNodes[i];
+                    Node ip = ParamAt(m, 0);
+                    if (ip == null || ip.type == null) { i = i + 1; continue; }
+                    int s1 = ArgParamScore(idxExpr, TypeFullName(ip.type));
+                    if (s1 <= -100) { i = i + 1; continue; }
+                    int score = s1;
+                    if (valExpr != null) {
+                        Node vp = ParamAt(m, 1);
+                        if (vp == null || vp.type == null) { i = i + 1; continue; }
+                        int s2 = ArgParamScore(valExpr, TypeFullName(vp.type));
+                        if (s2 <= -100) { i = i + 1; continue; }
+                        score = score + s2;
+                    }
+                    if (score > bestScore) { bestScore = score; best = m; }
+                }
+                i = i + 1;
+            }
+            Cls cc = FindClass(cur);
+            cur = cc != null ? cc.baseName : null;
+        }
+        return best;
+    }
+
     string VSlotImplCls(string cls, string name) {
         string cur = cls;
         while (cur != null) {
@@ -1573,6 +1701,18 @@ partial class Ngen {
                     LdrU(0, 0, 0);
                     return;
                 }
+                // bare property read: the desugared get_Name accessor
+                // (static tried first, then instance through `this`)
+                Node bg = AccessorInChain(curCls, "get_" + e.sval);
+                if (bg != null) {
+                    if (HasMod(bg, MOD.Static())) {
+                        LoadImm(0, 0);
+                    } else {
+                        LoadLocal(LocalIdx("this"), 0);
+                    }
+                    BLInternal(MethSymNg(accOwnerCls, bg));
+                    return;
+                }
                 diags.Error("ngen: unknown identifier '" + e.sval + "'", e.line, e.col);
                 LoadImm(0, 0);
                 return;
@@ -2178,6 +2318,18 @@ partial class Ngen {
                 LoadImm(0, 0);
                 Mark(cont);
                 E4(0xF8607860);                      // ldr x0, [x3, x0, lsl #3]
+            } else if (OpIndexFit(ExprCls(e.a), "op_index", e.b, null) != null) {
+                // class instance with an indexer: `obj[i]` lowers to the
+                // op_index instance-method protocol (x0 receiver, x1 index);
+                // overloads are picked by the index argument's type
+                string oc = ExprCls(e.a);
+                Node om = OpIndexFit(oc, "op_index", e.b, null);
+                GenExpr(e.a);
+                E4(0xF81F0FE0);                      // push receiver
+                GenExpr(e.b);
+                MovRR(1, 0);                         // x1 = index
+                E4(0xF84107E0);                      // pop receiver -> x0
+                BLInternal(MethSymNg(oc, om));
             } else {
                 diags.Error("ngen: unsupported index target", e.line, e.col);
             }
@@ -2223,6 +2375,21 @@ partial class Ngen {
                     if (ssym != null) {
                         LoadSymRef(ssym, 9);
                         StrU(0, 9, 0);
+                        return;
+                    }
+                    // bare property store: the desugared set_Name accessor
+                    // (instance: x0 = receiver, x1 = value; static: the
+                    // value is the first parameter, so it stays in x0)
+                    Node bs = AccessorInChain(curCls, "set_" + e.a.sval);
+                    if (bs != null) {
+                        if (HasMod(bs, MOD.Static())) {
+                            // value already in x0
+                        } else {
+                            E4(0xF81F0FE0);              // push value
+                            LoadLocal(LocalIdx("this"), 0);
+                            E4(0xF84107E1);              // x1 = value
+                        }
+                        BLInternal(MethSymNg(accOwnerCls, bs));
                         return;
                     }
                     diags.Error("ngen: unknown identifier '" + e.a.sval + "'", e.line, e.col);
@@ -2320,6 +2487,23 @@ partial class Ngen {
                 LoadImm(0, 0);
                 Mark(cont);
                 E4(0xF8207882);                      // str x2, [x4, x0, lsl #3]
+            } else if (e.a != null && e.a.kind == AK.Index()
+                    && OpIndexFit(ExprCls(e.a.a), "op_index_set", e.a.b, e.b) != null) {
+                // indexer set: obj[i] = v (or += v -- the read half went
+                // through the ordinary Index path above). The value was
+                // evaluated into x0 at the top; lower to the op_index_set
+                // protocol: x0 receiver, x1 index, x2 value. Overloads are
+                // picked by the index and value argument types.
+                string oc = ExprCls(e.a.a);
+                Node osm = OpIndexFit(oc, "op_index_set", e.a.b, e.b);
+                E4(0xF81F0FE0);                      // push value
+                GenExpr(e.a.a);                      // receiver -> x0
+                E4(0xF81F0FE0);                      // push receiver
+                GenExpr(e.a.b);                      // index -> x0
+                MovRR(1, 0);                         // x1 = index
+                E4(0xF84107E0);                      // pop receiver -> x0
+                E4(0xF84107E2);                      // pop value -> x2
+                BLInternal(MethSymNg(oc, osm));
             } else if (e.a != null && e.a.kind == AK.MemberAccess()) {
                 // class-qualified static write: Program.starting = v
                 // (the value was already evaluated into x0 at the top)
@@ -2335,6 +2519,29 @@ partial class Ngen {
                 }
                 Fld f = FieldOf(e.a);
                 if (f == null) {
+                    // property setter fallback: obj.Prop = v / Cls.Prop = v
+                    // dispatches to the desugared set_Prop accessor
+                    Node sm2 = null;
+                    string sc2 = null;
+                    if (e.a.a != null && e.a.a.kind == AK.Ident() && LocalIdx(e.a.a.sval) < 0
+                            && FindClass(e.a.a.sval) != null) {
+                        sm2 = AccessorInChain(e.a.a.sval, "set_" + e.a.sval);
+                    }
+                    if (sm2 == null) {
+                        sc2 = ExprCls(e.a.a);
+                        sm2 = sc2 != null ? AccessorInChain(sc2, "set_" + e.a.sval) : null;
+                    }
+                    if (sm2 != null) {
+                        if (HasMod(sm2, MOD.Static())) {
+                            // value already in x0 (first parameter)
+                        } else {
+                            E4(0xF81F0FE0);              // push value
+                            GenExpr(e.a.a);              // receiver -> x0
+                            E4(0xF84107E1);              // x1 = value
+                        }
+                        BLInternal(MethSymNg(accOwnerCls, sm2));
+                        return;
+                    }
                     diags.Error("ngen: unknown field '" + e.a.sval + "'", e.line, e.col);
                     return;
                 }
@@ -2562,6 +2769,25 @@ partial class Ngen {
                     return;
                 }
             }
+            // qualified static property read: ClsName.Prop -> get_Prop()
+            if (mem.a != null && mem.a.kind == AK.Ident() && LocalIdx(mem.a.sval) < 0
+                    && FindClass(mem.a.sval) != null) {
+                Node sg = AccessorInChain(mem.a.sval, "get_" + mem.sval);
+                if (sg != null && HasMod(sg, MOD.Static())) {
+                    LoadImm(0, 0);
+                    BLInternal(MethSymNg(accOwnerCls, sg));
+                    return;
+                }
+            }
+            // property getter fallback: `obj.Prop` with no backing field
+            // names the desugared get_Prop accessor
+            string gc = ExprCls(mem.a);
+            Node gm = gc != null ? AccessorInChain(gc, "get_" + mem.sval) : null;
+            if (gm != null) {
+                GenExpr(mem.a);
+                BLInternal(MethSymNg(accOwnerCls, gm));
+                return;
+            }
             diags.Error("ngen: unknown field '" + mem.sval + "'", mem.line, mem.col);
             LoadImm(0, 0);
             return;
@@ -2620,6 +2846,12 @@ partial class Ngen {
                 int comma = inner.IndexOf(",");
                 el = comma >= 0 ? inner.Substring(comma + 1) : null;
             }
+        }
+        if (el == null) {
+            // an indexer's element type is the op_index method's declared
+            // return type (fit against the index expression for overloads)
+            Node om = OpIndexFit(ExprCls(e.a), "op_index", e.b, null);
+            if (om != null && om.type != null) { el = TypeFullName(om.type); }
         }
         if (el == null) { return null; }
         return el;
@@ -3272,6 +3504,7 @@ partial class Ngen {
             List<string> tps0 = DeclTps(methNodes[FindGenericDecl(n.a.sval)]);
             if (tps0.Count == 1) {
                 string st = StaticTyOf(n.kids[0]);
+                if (st == null) { st = ExtRecvTy(n.kids[0]); }   // literal args
                 if (st != null && KnownTyName(st)) {
                     List<string> iargs = new List<string>();
                     iargs.Add(st);
@@ -3654,6 +3887,37 @@ partial class Ngen {
         return FieldOfInst(curMeth.sval2, name);
     }
 
+    // one raw byte 0..255 as a one-byte string (strings are byte sequences;
+    // single-byte code points pass through the char renderer unchanged)
+    string RawByteStr(int b) { return Convert.ToString((char)b); }
+
+    // UTF-8 encoding of a code point as a byte string
+    string CharBytesNg(int cp) {
+        if (cp < 0x80) { return RawByteStr(cp); }
+        if (cp < 0x800) {
+            return RawByteStr(0xC0 + cp / 64) + RawByteStr(0x80 + cp % 64);
+        }
+        if (cp < 0x10000) {
+            return RawByteStr(0xE0 + cp / 4096) + RawByteStr(0x80 + (cp / 64) % 64)
+                + RawByteStr(0x80 + cp % 64);
+        }
+        return RawByteStr(0xF0 + cp / 262144) + RawByteStr(0x80 + (cp / 4096) % 64)
+            + RawByteStr(0x80 + (cp / 64) % 64) + RawByteStr(0x80 + cp % 64);
+    }
+
+    bool IsHexDigNg(int c) {
+        if (c >= 48 && c <= 57) { return true; }
+        if (c >= 97 && c <= 102) { return true; }
+        if (c >= 65 && c <= 70) { return true; }
+        return false;
+    }
+
+    int HexValNg(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (c >= 97 && c <= 102) { return c - 97 + 10; }
+        return c - 65 + 10;
+    }
+
     string DecodeLiteralNg(string raw) {
         string result = "";
         int i = 0;
@@ -3667,6 +3931,35 @@ partial class Ngen {
                 else if (next == 116) { c = "\t"; }
                 else if (next == 114) { c = "\r"; }
                 else if (next == 48) { c = "\0"; }
+                else if (next == 120 || next == 88) {
+                    // \xH[HH..]: greedy 1..4 hex digits (C# rule)
+                    int hv = 0;
+                    int cnt = 0;
+                    i = i + 1;
+                    while (cnt < 4 && i < raw.Length && IsHexDigNg((int)raw[i])) {
+                        hv = hv * 16 + HexValNg((int)raw[i]);
+                        i = i + 1;
+                        cnt = cnt + 1;
+                    }
+                    c = CharBytesNg(hv);
+                    result = result + c;
+                    continue;
+                }
+                else if (next == 117 || next == 85) {
+                    // \uHHHH / \UHHHHHHHH: fixed-width hex code point
+                    int width = next == 117 ? 4 : 8;
+                    int hv2 = 0;
+                    int cnt2 = 0;
+                    i = i + 1;
+                    while (cnt2 < width && i < raw.Length && IsHexDigNg((int)raw[i])) {
+                        hv2 = hv2 * 16 + HexValNg((int)raw[i]);
+                        i = i + 1;
+                        cnt2 = cnt2 + 1;
+                    }
+                    c = CharBytesNg(hv2);
+                    result = result + c;
+                    continue;
+                }
             }
             result = result + c;
             i = i + 1;
@@ -4634,6 +4927,28 @@ partial class Ngen {
                     return;
                 }
             }
+            // string.IsNullOrEmpty(s): a null pointer or a zero length
+            // answers true (strings carry the length at ptr-8)
+            if (recv != null && recv.kind == AK.Ident() && recv.sval == "string"
+                    && callee.sval == "IsNullOrEmpty" && e.kids.Count == 1) {
+                GenExpr(e.kids[0]);                  // s -> x0
+                int emp = NL();
+                int nonempty = NL();
+                int doneIsne = NL();
+                CbzReg(0, emp);                      // null -> empty
+                E4(0xF85F8009);                      // ldur x9, [x0, #-8] (len)
+                E4(0xEB1F013F);                      // cmp x9, xzr
+                EmitBcond(1, nonempty);              // b.ne: non-empty
+                LoadImm(0, 1);                       // zero length -> true
+                EmitB(doneIsne);
+                Mark(nonempty);
+                LoadImm(0, 0);                       // non-empty -> false
+                EmitB(doneIsne);
+                Mark(emp);
+                LoadImm(0, 1);                       // null -> true
+                Mark(doneIsne);
+                return;
+            }
             // X.Parse(s) for the numeric primitive types: gen0 fronts
             // strtoll for the integer forms and zan_rt_dbl_parse (strtod
             // with NaN/Infinity spellings) for the floating forms
@@ -4974,6 +5289,16 @@ partial class Ngen {
                     return;
                 }
             }
+            // a call whose callee was already rewritten to a STATIC
+            // specialization (`Singleton$string`) by the spec pipeline: an
+            // extension-method rewrite names the spec directly, so dispatch
+            // as a static call with the receiver occupying the first
+            // parameter slot. Instance specializations keep the ordinary
+            // instance path -- their receiver is passed separately.
+            if (IndexOfStrNg(specMeth, callee.sval) >= 0) {
+                int prespec = FindMethByNameNg(callee.sval);
+                if (prespec >= 0 && methStat[prespec] == 1) { CallStaticNg(prespec, e); return; }
+            }
             // static call through the class name: Cls.Method(args) -- the
             // receiver names a user class and the member is one of its
             // static methods (e.g. Point.Of(9)); overloads resolve by fit,
@@ -4990,8 +5315,65 @@ partial class Ngen {
             string rc = ExprCls(recv);
             List<int> icands = new List<int>();
             if (rc != null) { InstanceCands(rc, callee.sval, icands); }
-            int mi = icands.Count > 0 ? FitPickIdx(icands, e) : FindInstanceIdx(callee.sval);
+            int mi = icands.Count > 0 ? FitPickIdx(icands, e) : -1;
+            if (mi < 0 && rc != null) {
+                // a static method reached through an instance
+                // (`d.StaticMethod(...)`) is legal: it has no receiver
+                // parameter, so the receiver is not passed and the written
+                // arguments stay unshifted
+                List<int> scands = new List<int>();
+                string sc = rc;
+                while (sc != null) {
+                    int si3 = 0;
+                    while (si3 < methNodes.Count) {
+                        if (methStat[si3] == 1 && methCls[si3] == sc && methNodes[si3].sval == callee.sval) { scands.Add(si3); }
+                        si3 = si3 + 1;
+                    }
+                    Cls cc3 = FindClass(sc);
+                    sc = cc3 != null ? cc3.baseName : null;
+                }
+                if (scands.Count > 0) {
+                    int spick = FitPickIdx(scands, e);
+                    if (spick >= 0) { CallStaticNg(spick, e); return; }
+                }
+            }
+            if (mi < 0) { mi = FindInstanceIdx(callee.sval); }
             if (mi < 0) {
+                // extension method: `recv.Ext(args)` with no instance match
+                // names a static method whose first parameter is `this T`
+                // with T the receiver's static type. The call node is
+                // rewritten to ExtCls.Ext(recv, args...) -- the receiver
+                // occupies the first parameter slot -- and emitted as a
+                // plain static call. A bare type-parameter receiver
+                // (`this T item`) additionally registers a specialization
+                // for the concrete receiver type before the call.
+                int xi = ResolveExtNg(recv, callee.sval, e);
+                if (xi >= 0) {
+                    Node xdecl = methNodes[xi];
+                    Node p0 = ParamAt(xdecl, 0);
+                    string pt0 = p0 != null && p0.type != null ? TypeFullName(p0.type) : null;
+                    Node ci = new Node(AK.Ident());
+                    ci.sval = methCls[xi];
+                    ci.line = e.line;
+                    ci.col = e.col;
+                    Node ma2 = new Node(AK.MemberAccess());
+                    ma2.a = ci;
+                    ma2.sval = callee.sval;
+                    ma2.line = e.line;
+                    ma2.col = e.col;
+                    e.a = ma2;
+                    e.kids.Insert(0, recv);
+                    if (pt0 != null && IndexOfStrNg(DeclTps(xdecl), pt0) >= 0) {
+                        string rt2 = ExtRecvTy(recv);
+                        List<string> xargs = new List<string>();
+                        xargs.Add(rt2);
+                        SpecRegister(callee.sval, xargs, e);
+                        int spx = FindMethByNameNg(e.a.sval);
+                        if (spx >= 0) { xi = spx; }
+                    }
+                    CallStaticNg(xi, e);
+                    return;
+                }
                 diags.Error("ngen: unknown method '" + callee.sval + "'", e.line, e.col);
                 return;
             }
@@ -5158,6 +5540,35 @@ partial class Ngen {
                 if (isInc) { AddImm(0, 0, 1); } else { SubImm(0, 0, 1); }
                 StoreLocal(li, 0);
                 if (!yieldNew) { E4(0xF84107E0); }   // old -> x0
+                return;
+            }
+        }
+        // bare property ++/--: get_Name + 1, then set_Name (the accessor
+        // pair implements the read-modify-write); static accessors run
+        // without a receiver
+        if (tgt.kind == AK.Ident()) {
+            Node bgp = AccessorInChain(curCls, "get_" + tgt.sval);
+            string gOwner = accOwnerCls;
+            Node bsp = bgp != null ? AccessorInChain(curCls, "set_" + tgt.sval) : null;
+            if (bgp != null && bsp != null) {
+                string sOwner = accOwnerCls;
+                bool bstat = HasMod(bsp, MOD.Static());
+                if (bstat) {
+                    LoadImm(0, 0);
+                    BLInternal(MethSymNg(gOwner, bgp));  // x0 = current
+                    if (!yieldNew) { E4(0xF81F0FE0); }   // save old
+                    if (isInc) { AddImm(0, 0, 1); } else { SubImm(0, 0, 1); }
+                    // new value already in x0 (first parameter)
+                } else {
+                    LoadLocal(LocalIdx("this"), 0);
+                    BLInternal(MethSymNg(gOwner, bgp));  // x0 = current
+                    if (!yieldNew) { E4(0xF81F0FE0); }   // save old
+                    if (isInc) { AddImm(0, 0, 1); } else { SubImm(0, 0, 1); }
+                    MovRR(1, 0);                         // x1 = new
+                    LoadLocal(LocalIdx("this"), 0);      // x0 = receiver
+                }
+                BLInternal(MethSymNg(sOwner, bsp));
+                if (!yieldNew) { E4(0xF84107E0); }       // old -> x0
                 return;
             }
         }
