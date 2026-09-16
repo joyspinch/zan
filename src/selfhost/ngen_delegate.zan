@@ -32,6 +32,8 @@ partial class Ngen {
     List<string> dlgGroupKeys;  // method-group identity -> shared thunk id
     List<int> dlgGroupIds;
     bool dlgInternDone;         // _zan_dlg_intern emitted for this object
+    List<string> dlgSubTps;     // last DelegateDeclTyNg match: decl type params
+    List<string> dlgSubArgs;    // and the reference's substituted arguments
 
     void InitDelegateNg() {
         if (delegateThunks != null) { return; }
@@ -47,8 +49,9 @@ partial class Ngen {
         if (ty == null) { return false; }
         if (ty == "Action" || ty.IndexOf("Action<") == 0 || (ty.IndexOf("Func<") == 0)) { return true; }
         // named (non-generic) delegate declarations lower to the same
-        // {thunk, env} pair the Func/Action forms use
-        return NamedDelegateDeclNg(ty) != null;
+        // {thunk, env} pair the Func/Action forms use; generic ones
+        // ("BindGet<string>") resolve through their decl + substitution
+        return NamedDelegateDeclNg(ty) != null || DelegateDeclTyNg(ty) != null;
     }
 
     // the `delegate R Name(params);` declaration for a simple type name, or
@@ -65,13 +68,39 @@ partial class Ngen {
         return d;
     }
 
+    // generic delegate reference: "BindGet<string>" resolves through
+    // FindDelegate("BindGet"); dlgSubTps/dlgSubArgs carry the decl's type
+    // parameters and the reference's arguments for the callers that read
+    // parameter/return type names off the decl
+    Node DelegateDeclTyNg(string ty) {
+        if (ty == null || ty.Length == 0) { return null; }
+        int p = ty.IndexOf("<");
+        if (p < 0) { return null; }
+        Node d = layoutBinder.FindDelegate(ty.Substring(0, p));
+        if (d == null) { return null; }
+        List<string> tps = new List<string>();
+        int i = 0;
+        while (i < d.kids.Count) {
+            if (d.kids[i].kind == AK.TypeParam()) { tps.Add(d.kids[i].sval); }
+            i = i + 1;
+        }
+        if (tps.Count == 0) { dlgSubTps = tps; dlgSubArgs = new List<string>(); return d; }
+        List<string> as2 = SplitTyArgs(ty.Substring(p + 1, ty.Length - p - 2));
+        if (as2.Count != tps.Count) { return null; }
+        dlgSubTps = tps; dlgSubArgs = as2;
+        return d;
+    }
+
     List<string> DelegateArgsNg(string ty) {
         List<string> ps = new List<string>();
         Node d = NamedDelegateDeclNg(ty);
+        if (d == null) { d = DelegateDeclTyNg(ty); }
         if (d != null) {
             int i = 0;
             while (i < d.kids.Count) {
-                if (d.kids[i].kind == AK.Param()) { ps.Add(TypeFullName(d.kids[i].type)); }
+                if (d.kids[i].kind == AK.Param()) {
+                    ps.Add(SubstTy(TypeFullName(d.kids[i].type), dlgSubTps, dlgSubArgs));
+                }
                 i = i + 1;
             }
             return ps;
@@ -88,7 +117,8 @@ partial class Ngen {
 
     string DelegateRetNg(string ty) {
         Node d = NamedDelegateDeclNg(ty);
-        if (d != null) { return TypeFullName(d.type); }
+        if (d == null) { d = DelegateDeclTyNg(ty); }
+        if (d != null) { return SubstTy(TypeFullName(d.type), dlgSubTps, dlgSubArgs); }
         if (!(ty.IndexOf("Func<") == 0)) { return "void"; }
         List<string> ts = DelegateArgsNg(ty);
         return ts.Count > 0 ? ts[ts.Count - 1] : "void";
@@ -114,6 +144,9 @@ partial class Ngen {
                 || ty == "object" || ty == "nint") { return true; }
         if (IsDelegateTyNg(ty)) { return true; }
         if (ty != null && IsArrTy(ty)) { return true; }
+        // a type parameter travels as a word under erasure (open generic
+        // bodies emit before any instantiation is known)
+        if (IsTypeParamErasedNg(ty)) { return true; }
         Cls c = ty != null ? FindClass(ty) : null;
         return c != null && c.isStruct == 0 && c.tps.Count == 0;
     }
@@ -163,6 +196,19 @@ partial class Ngen {
         if (e == null || e.kind != AK.Call() || e.a == null) { return null; }
         Node c = e.a;
         if (c.kind == AK.MemberAccess() && c.sval == "Invoke") { c = c.a; }
+        // a bare delegate-field call with implicit this ("getter(target)")
+        // reads as "this.getter(target)" when no local or static method of
+        // that name shadows the field
+        if (c.kind == AK.Ident() && LocalIdx(c.sval) < 0 && ResolveStaticNg(e) < 0) {
+            Fld f = CurField(c.sval);
+            if (f != null && IsDelegateTyNg(f.ty)) {
+                Node ma = new Node(AK.MemberAccess());
+                ma.a = new Node(AK.ThisExpr());
+                ma.sval = c.sval;
+                e.a = ma;
+                c = ma;
+            }
+        }
         return c;
     }
 
