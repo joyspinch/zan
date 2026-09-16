@@ -61,6 +61,8 @@ partial class Ngen {
     int ehBaseLocal;        // #ehbase: top at the outermost open try's arm
     int ehBrkLocal;         // #ehbrk: top at loop entry (break/continue disarm)
     int ctmpSeq;            // hidden single-eval temps for compound assigns
+    int swSeq;              // hidden result slots for switch expressions
+    int mciSeq;             // hidden receiver slots for member collection inits
 
     string curCls;
     List<string> locName;   // locals of the method being emitted
@@ -81,6 +83,7 @@ partial class Ngen {
     int curLine;
     int curCol;
     int guardDivIdx;
+    int guardOvfIdx;
     int guardModIdx;
     int guardFileIdx;
     int guardStrIdx;
@@ -135,6 +138,7 @@ partial class Ngen {
 
     // ---- entry: returns the object file bytes ----
     public List<int> Gen(Node unit) {
+        TupleSweep(unit);
         int i = 0;
         while (i < unit.kids.Count) {
             Node dcl = unit.kids[i];
@@ -157,6 +161,7 @@ partial class Ngen {
         }
         EmitRtCore();
         guardDivIdx = InternStr("division by zero\n");
+        guardOvfIdx = InternStr("arithmetic overflow\n");
         guardModIdx = InternStr("division by zero (modulo)\n");
         // gen0 bakes guard sites with the source path shortened to its
         // last two components ("selfhost/kernel10.zan")
@@ -1073,14 +1078,47 @@ partial class Ngen {
 
     // Walk expressions left-to-right: an out declaration activates its own
     // slot for following arguments and statements, not an unrelated namesake.
+    // Switch expressions (result slot), switch-arm pattern bindings and `is`
+    // pattern bindings reserve their hidden slots here so every consumer
+    // recorded later sees them.
     void ReserveOutDecls(Node n) {
         if (n == null) { return; }
         if (n.kind == AK.OutArg() && n.type != null && n.sval != null && n.sval != "") {
             AddDeclNg(n, n.sval, TypeFullName(n.type));
         }
+        if (n.kind == AK.SwitchExpr()) {
+            // the hidden result slot is reserved on EVERY reserve pass (the
+            // spec-collect walk stamps the name, the gen walk re-reserves it
+            // into its own frame); reserving by name keeps every lookup
+            // consistent
+            if (n.sval == null || n.sval == "") {
+                n.sval = "#swx" + Convert.ToString(swSeq);
+                swSeq = swSeq + 1;
+            }
+            AddLoc(n.sval, "long", false);
+        }
+        if (n.kind == AK.NewExpr() && n.ival == 2 && n.type == null) {
+            // member-collection bundle (`names = { a, b }` inside an object
+            // initializer): a hidden slot carries the object under
+            // construction so each `member.Add(item)` resolves and evaluates
+            // through the member's declared type
+            if (n.sval == null || n.sval == "") {
+                n.sval = "#mci" + Convert.ToString(mciSeq);
+                mciSeq = mciSeq + 1;
+            }
+            AddLoc(n.sval, "object", false);
+        }
+        if (n.kind == AK.SwitchCase() && n.ival == 1 && n.sval != null && n.sval != ""
+                && n.type != null) {
+            AddDeclNg(n, n.sval, TypeFullName(n.type));
+        }
+        if (n.kind == AK.IsExpr() && n.type != null && n.sval != null && n.sval != "") {
+            AddDeclNg(n, n.sval, TypeFullName(n.type));
+        }
         RecordEnvNg(n);
         ReserveOutDecls(n.a); ReserveOutDecls(n.b);
         ReserveOutDecls(n.c); ReserveOutDecls(n.d);
+        if (n.type != null) { ReserveOutDecls(n.type); }
         int i = 0;
         while (i < n.kids.Count) { ReserveOutDecls(n.kids[i]); i = i + 1; }
     }
@@ -1143,6 +1181,16 @@ partial class Ngen {
             return e.ival == 1 ? TypeFullName(e.type) + ArrSuffix(1 + e.op) : TypeFullName(e.type);
         }
         if (k == AK.CastExpr() || k == AK.AsExpr()) { return e.type != null ? TypeFullName(e.type) : null; }
+        if (k == AK.TupleExpr() && e.op != 1) { return TupleExprTy(e); }
+        if (k == AK.SwitchExpr()) {
+            int ai = 0;
+            while (ai < e.kids.Count) {
+                string at = InferExprTyNg(e.kids[ai].b);
+                if (at != null && at != "") { return at; }
+                ai = ai + 1;
+            }
+            return null;
+        }
         if (k == AK.Call()) { return CallRetTy(e); }
         if (k == AK.Ident()) { return NamedSlotTy(e.sval); }
         if (k == AK.Index()) { return ElemTyOf(e); }
@@ -1236,11 +1284,34 @@ partial class Ngen {
             ReserveOutDecls(s.a);
             int i = 0;
             while (i < s.kids.Count) {
-                ReserveOutDecls(s.kids[i].a);
-                ReserveScopedNg(s.kids[i].b);
+                Node c = s.kids[i];
+                // a pattern binding gets its slot before the body is walked,
+                // so the body's env snapshot includes it
+                if (c.ival == 1 && c.sval != null && c.sval != "" && c.type != null) {
+                    AddDeclNg(c, c.sval, TypeFullName(c.type));
+                }
+                ReserveOutDecls(c.a);
+                if (c.c != null) { ReserveOutDecls(c.c); }
+                ReserveScopedNg(c.b);
                 i = i + 1;
             }
             locHead = saved;
+        } else if (k == AK.DeconDecl()) {
+            ReserveOutDecls(s.b);
+            string tt = InferExprTyNg(s.b);
+            AddDeclNg(s, s.sval, tt != null && tt != "" ? tt : "object");
+            Cls tc = tt != null && tt != "" ? FindClass(tt) : null;
+            int ei = 0;
+            while (ei < s.kids.Count) {
+                Node d = s.kids[ei];
+                string dty = d.type != null ? TypeFullName(d.type) : null;
+                if (dty == null || dty == "") {
+                    Fld ef = tc != null ? FindField(tc, "Item" + Convert.ToString(ei + 1)) : null;
+                    dty = ef != null ? ef.ty : "object";
+                }
+                AddDeclNg(d, d.sval, dty);
+                ei = ei + 1;
+            }
         } else if (k == AK.ExprStmt()) {
             ReserveOutDecls(s.a);
         } else {
@@ -1330,6 +1401,15 @@ partial class Ngen {
             if (locName[i] == name) { return i; }
             i = locPrev[i];
         }
+        // rewound-env fallback: a synthesized/cloned expression (call-arg
+        // copies, pattern arm results) can lose its env record, leaving the
+        // name outside the active chain. The frame reserved every slot, so
+        // resolve to the most recently declared namesake.
+        int j = nloc - 1;
+        while (j >= 0) {
+            if (locName[j] == name) { return j; }
+            j = j - 1;
+        }
         return -1;
     }
 
@@ -1393,6 +1473,21 @@ partial class Ngen {
             Node flat = FlatCompoundAssign(s.a);
             if (flat != null) { GenCompoundTemps(s.a); }
             GenExpr(flat != null ? flat : s.a);
+        } else if (k == AK.DeconDecl()) {
+            // deconstruction: the RHS tuple lands in the hidden slot, then
+            // each element reads its ItemN field into its own slot
+            GenExpr(s.b);
+            StoreLocal(DeclSlotNg(s), 0);
+            int ei = 0;
+            while (ei < s.kids.Count) {
+                Node d = s.kids[ei];
+                string tt = locTy[DeclSlotNg(s)];
+                Fld f = FindField(FindClass(tt), "Item" + Convert.ToString(ei + 1));
+                LoadLocal(DeclSlotNg(s), 0);
+                if (f != null) { LoadFieldNg(0, 0, f); }
+                StoreLocal(DeclSlotNg(d), 0);
+                ei = ei + 1;
+            }
         } else if (k == AK.ReturnStmt()) {
             if (s.a != null) {
                 GenConversionValueNg(s.a, curMeth != null ? TypeFullName(curMeth.type) : null);
@@ -1578,41 +1673,270 @@ partial class Ngen {
     // case body and the default arm end at the shared exit, where it is
     // popped. `break` inside a case targets the switch exit, not an
     // enclosing loop; `continue` keeps targeting the loop.
+    // ---- tuples ----
+    // `(a, b, ...)` literals and `(T1, T2, ...)` type refs lower to a
+    // synthesized `__Tuple_<elements>` class with Item1..N fields and a
+    // positional constructor. The class must exist before the collectors
+    // run, so Gen() sweeps the unit first: declared tuple types carry their
+    // mangled name + element type refs from the parser (op==2); literal
+    // elements are inferred statically (uncacheable shapes are diagnosed at
+    // the use site instead).
+    void TupleSweep(Node unit) {
+        List<string> names = new List<string>();
+        List<Node> elems = new List<Node>();
+        TupleScan(unit, names, elems);
+        int i = 0;
+        while (i < names.Count) {
+            if (FindTupleDecl(unit, names[i]) == null) {
+                Node cls = TupleClassNode(names[i], elems[i]);
+                if (cls != null) { unit.Add(cls); }
+            }
+            i = i + 1;
+        }
+    }
+
+    void TupleScan(Node n, List<string> names, List<Node> elems) {
+        if (n == null) { return; }
+        if (n.kind == AK.TypeRef() && n.op == 2) {
+            TupleNeed(n.sval, n, names, elems);
+        } else if (n.kind == AK.TupleExpr() && n.op != 1) {
+            Node t = new Node(AK.TypeRef());
+            bool ok = true;
+            int i = 0;
+            while (i < n.kids.Count) {
+                string et = StaticInferTy(n.kids[i]);
+                if (et == null || et == "") { ok = false; break; }
+                Node tn = new Node(AK.TypeRef());
+                tn.sval = et;
+                t.Add(tn);
+                i = i + 1;
+            }
+            if (ok && t.kids.Count > 0) {
+                t.sval = TupleNameOf(t);
+                n.sval = t.sval;       // cache: codegen reuses the same class
+                TupleNeed(t.sval, t, names, elems);
+            }
+        }
+        TupleScan(n.a, names, elems);
+        TupleScan(n.b, names, elems);
+        TupleScan(n.c, names, elems);
+        TupleScan(n.d, names, elems);
+        TupleScan(n.type, names, elems);
+        int k = 0;
+        while (k < n.kids.Count) { TupleScan(n.kids[k], names, elems); k = k + 1; }
+    }
+
+    void TupleNeed(string name, Node elemList, List<string> names, List<Node> elems) {
+        if (name == null || name == "" || elemList == null || elemList.kids.Count == 0) { return; }
+        int i = 0;
+        while (i < names.Count) { if (names[i] == name) { return; } i = i + 1; }
+        names.Add(name);
+        elems.Add(elemList);
+    }
+
+    Node FindTupleDecl(Node unit, string name) {
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            if ((d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) && d.sval == name) { return d; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // static element-type inference for tuple literals in the pre-pass
+    // (locals/classes are not known yet, so only literal-shaped elements
+    // resolve)
+    string StaticInferTy(Node e) {
+        if (e == null) { return null; }
+        int k = e.kind;
+        if (k == AK.IntLit()) { return "int"; }
+        if (k == AK.StringLit()) { return "string"; }
+        if (k == AK.FloatLit()) { return "double"; }
+        if (k == AK.BoolLit()) { return "bool"; }
+        if (k == AK.CharLit()) { return "char"; }
+        if (k == AK.NullLit()) { return "object"; }
+        if (k == AK.TupleExpr() && e.sval != null && e.sval != "") { return e.sval; }
+        return StaticTyOf(e);
+    }
+
+    string TupleNameOf(Node elemList) {
+        string s = "__Tuple_";
+        int i = 0;
+        while (i < elemList.kids.Count) {
+            if (i > 0) { s = s + "_"; }
+            s = s + SanTyNg(TypeFullName(elemList.kids[i]));
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // identifier-safe type-name fragment; mirrors the parser's SanTy so both
+    // sides mangle a shape identically
+    string SanTyNg(string s) {
+        string r = "";
+        int i = 0;
+        while (i < s.Length) {
+            int c = s[i];
+            if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)) { r = r + Convert.ToString((char)c); }
+            else if (c == 91) { r = r + "A"; }
+            else if (c == 63) { r = r + "q"; }
+            else if (r.Length > 0 && r.Substring(r.Length - 1, 1) != "_") { r = r + "_"; }
+            i = i + 1;
+        }
+        while (r.Length > 0 && r.Substring(r.Length - 1, 1) == "_") { r = r.Substring(0, r.Length - 1); }
+        return r;
+    }
+
+    // element type rendering for the synthesized class source (tuple element
+    // refs are plain type refs)
+    string RenderTy(Node t) {
+        if (t == null) { return "object"; }
+        if (t.op == 2) { return t.sval; }
+        string s = t.sval;
+        if (t.kids != null && t.kids.Count > 0) {
+            s = s + "<";
+            int i = 0;
+            while (i < t.kids.Count) {
+                if (i > 0) { s = s + ", "; }
+                s = s + RenderTy(t.kids[i]);
+                i = i + 1;
+            }
+            s = s + ">";
+        }
+        if (t.ival >= 1) { s = s + "[]"; }
+        if (t.op == 1) { s = s + "?"; }
+        return s;
+    }
+
+    // synthesize the tuple class by parsing generated source (same pattern
+    // as the parser's event-holder desugar)
+    Node TupleClassNode(string name, Node elems) {
+        string src = "class " + name + " {\n";
+        int i = 0;
+        while (i < elems.kids.Count) {
+            src = src + "    public " + RenderTy(elems.kids[i]) + " Item" + Convert.ToString(i + 1) + ";\n";
+            i = i + 1;
+        }
+        src = src + "    public " + name + "(";
+        i = 0;
+        while (i < elems.kids.Count) {
+            if (i > 0) { src = src + ", "; }
+            src = src + RenderTy(elems.kids[i]) + " a" + Convert.ToString(i);
+            i = i + 1;
+        }
+        src = src + ") {\n";
+        i = 0;
+        while (i < elems.kids.Count) {
+            src = src + "        this.Item" + Convert.ToString(i + 1) + " = a" + Convert.ToString(i) + ";\n";
+            i = i + 1;
+        }
+        src = src + "    }\n}\n";
+        Lexer lx = new Lexer(src);
+        List<Token> gt = lx.Run();
+        Parser gp = new Parser(gt, diags);
+        Node gu = gp.ParseUnit();
+        if (gu.kids.Count > 0) { return gu.kids[0]; }
+        return null;
+    }
+
+    // tuple type name of a literal in codegen context: the pre-pass cache
+    // when static inference succeeded, otherwise infer with locals visible
+    string TupleExprTy(Node e) {
+        if (e.sval != null && e.sval != "") { return e.sval; }
+        Node t = new Node(AK.TypeRef());
+        int i = 0;
+        while (i < e.kids.Count) {
+            string et = InferExprTyNg(e.kids[i]);
+            if (et == null || et == "") { return null; }
+            Node tn = new Node(AK.TypeRef());
+            tn.sval = et;
+            t.Add(tn);
+            i = i + 1;
+        }
+        if (t.kids.Count == 0) { return null; }
+        t.sval = TupleNameOf(t);
+        e.sval = t.sval;
+        return t.sval;
+    }
+
     void GenSwitchStmt(Node s) {
         int endL = NL();
         int defL = NL();
         GenExpr(s.a);
         E4(0xF81F0FE0);                                  // push discriminant
+        string st = StaticTyOf(s.a);
         int nc = s.kids.Count;
         int[] bodies = new int[nc];
+        int[] skips = new int[nc];
         int defIdx = -1;
         int i = 0;
+        int prevSkip = -1;
         while (i < nc) {
             Node c = s.kids[i];
-            if (c.a == null) { defIdx = i; i = i + 1; continue; }
+            if (c.a == null && c.ival != 1) { defIdx = i; i = i + 1; continue; }
+            if (prevSkip >= 0) { Mark(prevSkip); }
             bodies[i] = NL();
-            if (IsStrExpr(s.a)) {
-                GenExpr(c.a);                            // x0 = case label
-                LdrU(1, 31, 0);                          // x1 = discriminant
-                BLExtern("_strcmp");
-                E4(0xEB1F001F);                          // cmp x0, xzr
+            skips[i] = NL();
+            if (c.ival == 1) {
+                // pattern case: predicate on the discriminant, then bind,
+                // then an optional `when` guard
+                LdrU(0, 31, 16);                         // x0 = discriminant
+                if (c.type == null) {
+                    // `case null:`
+                    E4(0xEB1F001F);                      // cmp x0, xzr
+                    E4(0x9A9F17E0);                      // cset x0, eq
+                } else {
+                    GenIsPred(c.type.sval, st);
+                }
+                CbzReg(0, skips[i]);
+                if (c.sval != null && c.sval != "" && c.type != null) {
+                    int bs = DeclSlotNg(c);
+                    LdrU(0, 31, 16);
+                    if (bs >= 0) { StoreLocal(bs, 0); }
+                }
+                if (c.c != null) {
+                    int savedHead = locHead;
+                    int bs2 = DeclSlotNg(c);
+                    if (bs2 >= 0) { locHead = bs2; }
+                    GenExpr(c.c);
+                    locHead = savedHead;
+                    CbzReg(0, skips[i]);
+                }
+                EmitB(bodies[i]);
             } else {
-                GenExpr(c.a);                            // x0 = case label
-                E4(0xF81F0FE0);                          // push label
-                LdrU(1, 31, 16);                         // x1 = discriminant
-                E4(0xF84107E0);                          // pop label -> x0
-                E4(0xEB01001F);                          // cmp x0, x1
+                if (IsStrExpr(s.a)) {
+                    GenExpr(c.a);                            // x0 = case label
+                    LdrU(1, 31, 0);                          // x1 = discriminant
+                    BLExtern("_strcmp");
+                    E4(0xEB1F001F);                          // cmp x0, xzr
+                    E4(0x9A9F17E0);                          // cset x0, eq
+                } else {
+                    GenExpr(c.a);                            // x0 = case label
+                    E4(0xF81F0FE0);                          // push label
+                    LdrU(1, 31, 16);                         // x1 = discriminant
+                    E4(0xF84107E0);                          // pop label -> x0
+                    E4(0xEB01001F);                          // cmp x0, x1
+                    E4(0x9A9F17E0);                          // cset x0, eq
+                }
+                CbzReg(0, skips[i]);
+                if (c.c != null) {
+                    GenExpr(c.c);
+                    CbzReg(0, skips[i]);
+                }
+                EmitB(bodies[i]);
             }
-            EmitBcond(0, bodies[i]);                     // b.eq body
+            prevSkip = skips[i];
             i = i + 1;
         }
+        if (prevSkip >= 0) { Mark(prevSkip); }
         EmitB(defIdx >= 0 ? defL : endL);
         brkL.Add(endL);
         brkLoop.Add(false); brkFinBase.Add(finBodies.Count);
         i = 0;
         while (i < nc) {
             Node c = s.kids[i];
-            if (c.a == null) { i = i + 1; continue; }
+            if (c.a == null && c.ival != 1) { i = i + 1; continue; }
             Mark(bodies[i]);
             GenStmt(c.b);
             // an empty case body falls through to the next case (C# rule);
@@ -1630,6 +1954,91 @@ partial class Ngen {
         brkFinBase.RemoveAt(brkFinBase.Count - 1);
         Mark(endL);
         E4(0xF84107E0);                                  // pop discriminant
+    }
+
+    // switch expression:  o switch { pat => e, ... }. The result lands in a
+    // hidden slot reserved by ReserveOutDecls (sval2); an unmatched operand
+    // keeps the slot's zero initializer (gen0's missing-discard rule).
+    void GenSwitchExprNg(Node e) {
+        int endL = NL();
+        GenExpr(e.a);
+        E4(0xF81F0FE0);                                  // push discriminant
+        string st = StaticTyOf(e.a);
+        int slot = LocalIdx(e.sval);
+        LoadImm(0, 0);
+        if (slot >= 0) { StoreLocal(slot, 0); }
+        int i = 0;
+        while (i < e.kids.Count) {
+            Node arm = e.kids[i];
+            int skip = NL();
+            bool uncond = arm.a == null && arm.ival != 1;   // `_` discard
+            if (!uncond) {
+                LdrU(0, 31, 16);                         // x0 = discriminant
+                if (arm.ival == 1) {
+                    if (arm.type == null) {
+                        E4(0xEB1F001F);
+                        E4(0x9A9F17E0);
+                    } else {
+                        GenIsPred(arm.type.sval, st);
+                    }
+                } else if (arm.a != null && arm.a.kind == AK.NullLit()) {
+                    E4(0xEB1F001F);
+                    E4(0x9A9F17E0);
+                } else if (arm.op == TK.Less() || arm.op == TK.Greater()
+                        || arm.op == TK.LessEq() || arm.op == TK.GreaterEq()) {
+                    // relational pattern: discr in x1, bound in x0
+                    E4(0xF81F0FE0);
+                    GenExpr(arm.a);
+                    E4(0xF84107E1);                      // x1 = discriminant
+                    E4(0xEB00003F);                      // cmp x1, x0
+                    if (arm.op == TK.Less()) { E4(0x9A9FA7E0); }          // cset lt
+                    else if (arm.op == TK.Greater()) { E4(0x9A9FD7E0); }  // cset gt
+                    else if (arm.op == TK.LessEq()) { E4(0x9A9FC7E0); }   // cset le
+                    else { E4(0x9A9FB7E0); }                              // cset ge
+                } else if (IsStrExpr(arm.a) || IsStrExpr(e.a)) {
+                    GenExpr(arm.a);
+                    LdrU(1, 31, 0);
+                    BLExtern("_strcmp");
+                    E4(0xEB1F001F);
+                    E4(0x9A9F17E0);
+                } else {
+                    GenExpr(arm.a);
+                    E4(0xF81F0FE0);
+                    LdrU(1, 31, 16);
+                    E4(0xF84107E0);
+                    E4(0xEB01001F);
+                    E4(0x9A9F17E0);
+                }
+                CbzReg(0, skip);
+            }
+            if (arm.ival == 1 && arm.sval != null && arm.sval != "" && arm.type != null) {
+                int bs = DeclSlotNg(arm);
+                // the binding slot was added during the reserve walk AFTER
+                // this switch expression's env snapshot; splice it into the
+                // scope chain so name lookups inside the guard/result see the
+                // CURRENT arm's binding
+                if (bs >= 0) { locPrev[bs] = locHead; locHead = bs; }
+                LdrU(0, 31, 16);
+                if (bs >= 0) { StoreLocal(bs, 0); }
+            }
+            if (arm.c != null) {
+                int savedHead = locHead;
+                int bs2 = DeclSlotNg(arm);
+                if (bs2 >= 0) { locHead = bs2; }
+                GenExpr(arm.c);
+                locHead = savedHead;
+                CbzReg(0, skip);
+            }
+            GenExpr(arm.b);
+            if (slot >= 0) { StoreLocal(slot, 0); }
+            EmitB(endL);
+            Mark(skip);
+            i = i + 1;
+        }
+        Mark(endL);
+        E4(0xF84107E0);                                  // pop discriminant
+        if (slot >= 0) { LoadLocal(slot, 0); }
+        else { LoadImm(0, 0); }
     }
 
     void GenExpr(Node e) {
@@ -2071,13 +2480,37 @@ partial class Ngen {
                     }
                 } else if (op == TK.Plus()) {
                     E4(0x8B000020);                      // add x0, x1, x0
-                    if (Int32Kind(e.a) == 1 && Int32Kind(e.b) == 1) { Wrap32(1); }
+                    if (Int32Kind(e.a) == 1 && Int32Kind(e.b) == 1) {
+                        if (e.ival == 1) { EmitCheckedRange(); }
+                        else { Wrap32(1); }
+                    }
                 } else if (op == TK.Minus()) {
                     E4(0xCB000020);                      // sub x0, x1, x0
-                    if (Int32Kind(e.a) == 1 && Int32Kind(e.b) == 1) { Wrap32(1); }
+                    if (Int32Kind(e.a) == 1 && Int32Kind(e.b) == 1) {
+                        if (e.ival == 1) { EmitCheckedRange(); }
+                        else { Wrap32(1); }
+                    }
                 } else if (op == TK.Star()) {
-                    E4(0x9B007C20);                      // mul x0, x1, x0
-                    if (Int32Kind(e.a) == 1 && Int32Kind(e.b) == 1) { Wrap32(1); }
+                    if (e.ival == 1 && Int32Kind(e.a) == 1 && Int32Kind(e.b) == 1) {
+                        // checked multiply: overflow iff the high half is not
+                        // the sign extension of the low half
+                        int trap = NL();
+                        int done4 = NL();
+                        E4(0x9B407C22);                  // smulh x2, x1, x0
+                        E4(0x9340FC03);                  // asr x3, x0, #63
+                        E4(0xEB03005F);                  // cmp x2, x3
+                        EmitBcond(1, trap);              // b.ne -> overflow
+                        E4(0x9B007C20);                  // mul x0, x1, x0
+                        EmitB(done4);
+                        Mark(trap);
+                        EmitOvfReport();
+                        E4(0x9B007C20);                  // mul x0, x1, x0 (wrapped)
+                        Mark(done4);
+                        Wrap32(1);
+                    } else {
+                        E4(0x9B007C20);                      // mul x0, x1, x0
+                        if (Int32Kind(e.a) == 1 && Int32Kind(e.b) == 1) { Wrap32(1); }
+                    }
                 } else if (op == TK.Slash() || op == TK.Percent()) {
                     // divide/modulo: x1 = dividend, x0 = divisor. A zero
                     // divisor reports through zan_rt_guard_fail3 -- the same
@@ -2560,6 +2993,24 @@ partial class Ngen {
             }
         } else if (k == AK.NewExpr()) {
             GenNew(e);
+        } else if (k == AK.TupleExpr()) {
+            // tuple literal: a NewExpr of the synthesized __Tuple_ class
+            // (op==1 marks an initializer pair, consumed by GenNew, never here)
+            if (e.op == 1) {
+                diags.Error("ngen: unexpected initializer pair", e.line, e.col);
+                LoadImm(0, 0);
+                return;
+            }
+            string ttn = TupleExprTy(e);
+            Node nw = new Node(AK.NewExpr());
+            nw.type = new Node(AK.TypeRef());
+            nw.type.sval = ttn != null ? ttn : "__Tuple_object";
+            nw.line = e.line; nw.col = e.col;
+            int ti = 0;
+            while (ti < e.kids.Count) { nw.Add(e.kids[ti]); ti = ti + 1; }
+            GenExprInEnvNg(nw);
+        } else if (k == AK.SwitchExpr()) {
+            GenSwitchExprNg(e);
         } else if (k == AK.IsExpr()) {
             GenIs(e);
         } else if (k == AK.AsExpr()) {
@@ -2697,7 +3148,10 @@ partial class Ngen {
         int pushed;
         if (cix >= 0) {
             pushed = PushCallArgs(methNodes[cix], callN);
-        } else if (CtorCountNg(cls) > 0) {
+        } else if (CtorCountNg(cls) > 0 && e.ival != 2) {
+            // an object initializer without a matching ctor is allowed:
+            // allocate uninitialized and let the member assignments run
+            // (init-only properties make `new Point { X = 5, Y = 6 }` valid)
             diags.Error("ngen: no constructor of '" + cls + "' takes "
                 + callN.kids.Count + " argument(s)", e.line, e.col);
             return;
@@ -2716,10 +3170,27 @@ partial class Ngen {
             int bi = e.op;
             while (bi < e.kids.Count) {
                 Node it = e.kids[bi];
-                if (it.kind == AK.Assignment() && it.a != null && it.a.kind == AK.Ident()) {
+                if (it.kind == AK.Assignment() && it.a != null && it.a.kind == AK.Ident()
+                        && it.b != null && it.b.kind == AK.NewExpr() && it.b.ival == 2
+                        && it.b.type == null) {
+                    // member collection initializer:  names = { a, b } /
+                    // ages = { "k", v, ... } / Tags = { ... } (getter-only)
+                    GenMemberCollInit(cls, it);
+                } else if (it.kind == AK.Assignment() && it.a != null && it.a.kind == AK.Ident()) {
                     Fld initFld = FindField(FindClass(cls), it.a.sval);
-                    if (initFld == null) {
+                    Node setAcc = initFld == null
+                        ? AccessorInChain(cls, "set_" + it.a.sval) : null;
+                    if (initFld == null && setAcc == null) {
                         diags.Error("ngen: unknown field '" + it.a.sval + "' in initializer", it.line, it.col);
+                    } else if (setAcc != null) {
+                        // init/set-only property: call the desugared set_X
+                        // accessor with the object as receiver
+                        GenExpr(it.b);                   // x0 = value
+                        E4(0xF81F0FE0);                  // push value
+                        E4(0xF84107E1);                  // x1 = value
+                        E4(0xF84107E0);                  // x0 = obj (receiver)
+                        E4(0xF81F0FE0);                  // keep obj for next item
+                        BLInternal(MethSymNg(accOwnerCls, setAcc));
                     } else {
                         GenExpr(it.b);
                         if (IsDblTy(initFld.ty) && !IsDblExpr(it.b)) { ConvI2D(); }
@@ -2736,6 +3207,85 @@ partial class Ngen {
             }
         }
         E4(0xF84107E0);                                  // ldr x0, [sp], #16 (obj)
+    }
+
+    // `member = { i0, i1, ... }` inside an object initializer: the member's
+    // existing collection is kept and each item is Added (C# semantics).
+    // A `{ k, v }` pair item carries two arguments (dictionary Add).
+    void GenMemberCollInit(string cls, Node it) {
+        // the object under construction sits at [sp] (GenNew keeps it across
+        // the item loop); park it in the bundle's hidden slot and reach the
+        // member through that slot, so `member.Add(item)` resolves against
+        // the member's declared type exactly like `x.member.Add(item)`
+        int oi = LocalIdx(it.b.sval);
+        if (oi < 0) {
+            // the bundle slot was added while the reserve walk recursed into
+            // the new-expression's kids, so the env snapshot this gen runs
+            // under may predate it: fall back to a full table scan (the name
+            // is unique) and splice the slot into the scope chain
+            int scan = nloc - 1;
+            while (scan >= 0) {
+                if (locName[scan] == it.b.sval) { oi = scan; break; }
+                scan = scan - 1;
+            }
+        }
+        if (oi < 0) {
+            diags.Error("ngen: member initializer receiver slot missing", it.line, it.col);
+            return;
+        }
+        locTy[oi] = cls;                                 // receiver types as the class
+        locPrev[oi] = locHead; locHead = oi;             // activate for name lookups
+        LdrU(9, 31, 0);                                  // x9 = obj under construction
+        StoreLocal(oi, 9);
+        Node recv = new Node(AK.Ident());
+        recv.sval = it.b.sval;
+        recv.line = it.line; recv.col = it.col;
+        // field members read directly; property members go through their
+        // desugared get_X accessor so the declared element type resolves
+        Node mem;
+        Fld mf = FindField(FindClass(cls), it.a.sval);
+        if (mf != null) {
+            Node fm = new Node(AK.MemberAccess());
+            fm.a = recv;
+            fm.sval = it.a.sval;
+            fm.line = it.line; fm.col = it.col;
+            mem = fm;
+        } else {
+            Node gc = new Node(AK.Call());
+            Node gm = new Node(AK.MemberAccess());
+            gm.a = recv;
+            gm.sval = "get_" + it.a.sval;
+            gm.line = it.line; gm.col = it.col;
+            gc.a = gm;
+            gc.line = it.line; gc.col = it.col;
+            mem = gc;
+        }
+        bool isDict = ExprCls(mem) == "Dict";            // dict bundles pair items
+        int ii = 0;
+        while (ii < it.b.kids.Count) {
+            Node item = it.b.kids[ii];
+            Node call = new Node(AK.Call());
+            Node add = new Node(AK.MemberAccess());
+            add.a = mem;
+            add.sval = "Add";
+            add.line = it.line; add.col = it.col;
+            call.a = add;
+            call.line = it.line; call.col = it.col;
+            if (item.kind == AK.TupleExpr() && item.op == 1) {
+                int pi = 0;
+                while (pi < item.kids.Count) { call.Add(item.kids[pi]); pi = pi + 1; }
+            } else if (isDict && ii + 1 < it.b.kids.Count) {
+                // `{ k, v, k2, v2 }`: consecutive flat items pair into
+                // two-argument Add calls
+                call.Add(item);
+                call.Add(it.b.kids[ii + 1]);
+                ii = ii + 1;
+            } else {
+                call.Add(item);
+            }
+            GenExpr(call);
+            ii = ii + 1;
+        }
     }
 
     // `new T[] { a, b, c }`: allocate with the element count, then store each
@@ -2819,11 +3369,19 @@ partial class Ngen {
         if (e.kind == AK.Ident()) {
             return ClassTyOf(NamedSlotTy(e.sval));
         }
+        if (e.kind == AK.TupleExpr() && e.op != 1) {
+            // a tuple literal names its synthesized class once inferred
+            return TupleExprTy(e);
+        }
         if (e.kind == AK.MemberAccess()) {
             // field chains resolve to the field's declared class
             // (`x.next.n` needs ExprCls of `x.next`)
             Fld mf = FieldOf(e);
-            return mf != null ? ClassTyOf(mf.ty) : null;
+            if (mf != null) { return ClassTyOf(mf.ty); }
+            // property reads resolve through the accessor's return type
+            string gcp2 = e.a != null ? ExprCls(e.a) : null;
+            Node gp2 = gcp2 != null ? AccessorInChain(gcp2, "get_" + e.sval) : null;
+            return gp2 != null ? ClassTyOf(TypeFullName(gp2.type)) : null;
         }
         return null;
     }
@@ -2872,6 +3430,8 @@ partial class Ngen {
                 || t == "ulong") { return null; }
         if (t.Length > 5 && t.Substring(0, 5) == "List<") { return "List"; }
         if (t.Length > 11 && t.Substring(0, 11) == "Dictionary<") { return "Dict"; }
+        // the `Dict` spelling is the same builtin as `Dictionary`
+        if (t.Length > 5 && t.Substring(0, 5) == "Dict<") { return "Dict"; }
         if (IsArrTy(t) && (t == "int[]" || t == "long[]" || t == "ulong[]"
                 || t == "double[]" || t == "string[]" || t == "bool[]"
                 || t == "char[]")) { return null; }
@@ -2907,29 +3467,55 @@ partial class Ngen {
     // class has to be consulted via the site stamped by 'new'; unrelated
     // static types answer false, like gen0.
     void GenIs(Node e) {
-        if (e.type == null) {                            // `x is null`
+        if (e.type == null) {                            // `x is [not] null`
             GenExpr(e.a);
             E4(0xEB1F001F);                              // cmp x0, xzr
-            E4(0x9A9F17E0);                              // cset x0, eq
+            if (e.op == 1) { E4(0x9A9F07E0); }           // cset x0, ne
+            else { E4(0x9A9F17E0); }                     // cset x0, eq
             return;
         }
         string tt = e.type.sval;
         string st = StaticTyOf(e.a);
+        bool hasB = e.sval != null && e.sval != "";
+        if (hasB) {
+            // `x is T y`: evaluate once, test, store the cast into y
+            GenExpr(e.a);
+            E4(0xF81F0FE0);                              // push value
+            GenIsPred(tt, st);                           // x0 = 0/1
+            MovRR(9, 0);                                 // x9 = predicate
+            E4(0xF84107E0);                              // pop value -> x0
+            int bs = LocalIdx(e.sval);
+            if (bs >= 0) { StoreLocal(bs, 0); }
+            MovRR(0, 9);
+            return;
+        }
         Cls tc = FindClass(tt);
         if (tc == null) {
             // non-class target: strings and value types are decided by the
-            // static types alone
+            // static types alone (an object-typed string is decided by its
+            // runtime tag)
             if (tt == "string" && st == "string") {
                 GenExpr(e.a);
                 E4(0xEB1F001F);                          // cmp x0, xzr
                 E4(0x9A9F07E0);                          // cset x0, ne
+            } else if (st == "object" && tt == "string") {
+                GenExpr(e.a);
+                GenStrTagTest();
             } else if (st != null && st == tt) {
+                GenExpr(e.a);
                 LoadImm(0, 1);                           // same value type: always
             } else {
                 LoadImm(0, 0);
             }
             return;
         }
+        GenExpr(e.a);                                    // x0 = receiver
+        GenIsPredTail(tt, st, tc);
+    }
+
+    // `is T` predicate with the value already in x0 (assumes a class target):
+    // shared by GenIs and the switch pattern dispatch
+    void GenIsPredTail(string tt, string st, Cls tc) {
         string sc = ClassTyOf(st);
         if (sc == null) {
             // a string can never hold a class instance; anything else with
@@ -2937,7 +3523,6 @@ partial class Ngen {
             LoadImm(0, 0);
             return;
         }
-        GenExpr(e.a);                                    // x0 = receiver
         if (st == "object") {
             // object-typed source: identity is unknown statically, always
             // consult the runtime site (gen0 rule)
@@ -2954,6 +3539,49 @@ partial class Ngen {
             return;
         }
         LoadImm(0, 0);
+    }
+
+    // full `is T` predicate with the value already in x0 (any target shape):
+    // used by the pattern dispatch, which cannot re-evaluate the discriminant
+    void GenIsPred(string tt, string st) {
+        Cls tc = FindClass(tt);
+        if (tc == null) {
+            if (tt == "string" && st == "string") {
+                E4(0xEB1F001F);                          // cmp x0, xzr
+                E4(0x9A9F07E0);                          // cset x0, ne
+            } else if (st == "object" && tt == "string") {
+                GenStrTagTest();
+            } else if (st != null && st == tt) {
+                LoadImm(0, 1);                           // same value type: always
+            } else {
+                LoadImm(0, 0);
+            }
+            return;
+        }
+        GenIsPredTail(tt, st, tc);
+    }
+
+    // x0 = value: is it a managed string? The header word at obj-8 carries
+    // the string tag in its high half (ZAN_STRING_TAG), class sites live
+    // there for objects.
+    void GenStrTagTest() {
+        int zeroL = NL();
+        int yesL = NL();
+        int endL = NL();
+        CbzReg(0, zeroL);                                // null -> false
+        RtLdur(1, 0, -8);                                // ldur x1, [x0, #-8]
+        E4(0xD360FC21);                                  // lsr x1, x1, #32 (tag)
+        LoadImm(2, 1514229331);                          // 0x5A414E53 ("ZANS")
+        E4(0xEB02003F);                                  // cmp x1, x2
+        EmitBcond(0, yesL);                              // b.eq -> string
+        LoadImm(0, 0);
+        EmitB(endL);
+        Mark(yesL);
+        LoadImm(0, 1);
+        EmitB(endL);
+        Mark(zeroL);
+        LoadImm(0, 0);
+        Mark(endL);
     }
 
     // x as T -- like gen0: upcasts/identity, unrelated static types and
@@ -3033,6 +3661,7 @@ partial class Ngen {
         if (e.kind == AK.AsExpr() && e.type != null) { return e.type.sval; }
         if (e.kind == AK.AwaitExpr()) { return AsyncAwaitElemTyNg(e.a); }
         if (e.kind == AK.Ident()) { return NamedSlotTy(e.sval); }
+        if (e.kind == AK.TupleExpr() && e.op != 1) { return TupleExprTy(e); }
         if (e.kind == AK.Call()) { return CallRetTy(e); }
         if (e.kind == AK.MemberAccess()) {
             if ((e.sval == "Keys" || e.sval == "Values") && ExprCls(e.a) == "Dict") {
@@ -3041,7 +3670,11 @@ partial class Ngen {
             // EnumType.Member constants carry their enum identity
             if (e.a != null && e.a.kind == AK.Ident() && FindEnum(e.a.sval) >= 0) { return e.a.sval; }
             Fld f = FieldOf(e);
-            return f != null ? f.ty : null;
+            if (f != null) { return f.ty; }
+            // property read: the desugared get_X accessor's return type
+            string gcp = e.a != null ? ExprCls(e.a) : null;
+            Node gp = gcp != null ? AccessorInChain(gcp, "get_" + e.sval) : null;
+            return gp != null ? TypeFullName(gp.type) : null;
         }
         if (e.kind == AK.Index()) { return ElemTyOf(e); }
         return null;
@@ -3746,6 +4379,9 @@ partial class Ngen {
 
     string TypeFullName(Node t) {
         if (t == null) { return ""; }
+        // tuple type ref: sval already carries the mangled __Tuple_... name;
+        // kids hold the element types and must not render as generic args
+        if (t.op == 2) { return t.sval; }
         string n = t.sval;
         if (t.kids != null && t.kids.Count > 0) {
             n = n + "<";
@@ -3988,6 +4624,9 @@ partial class Ngen {
         }
         // both arms strings: the conditional yields a heap string either way
         if (e.kind == AK.Conditional()) { return IsStrExpr(e.b) && IsStrExpr(e.c); }
+        // a switch/tuple expression is a string when its result type is
+        if (e.kind == AK.SwitchExpr()) { return InferExprTyNg(e) == "string"; }
+        if (e.kind == AK.TupleExpr() && e.op != 1) { return TupleExprTy(e) != null && TupleExprTy(e).StartsWith("__Tuple_"); }
         if (e.kind == AK.MemberAccess()) {
             Fld f = FieldOf(e);
             if (f != null && f.ty == "string") { return true; }
@@ -4266,6 +4905,39 @@ partial class Ngen {
     void Wrap32(int kind) {
         if (kind == 1) { E4(0x93407C00); }           // sbfm x0, x0, #0, #31
         else if (kind == 2) { E4(0xD3407C00); }      // ubfm x0, x0, #0, #31
+    }
+
+    // checked add/sub: x0 holds the 64-bit result; a result outside the int
+    // range reports through the soft guard (stderr line, execution continues
+    // with the wrapped value, matching the reference's soft mode) and wraps
+    void EmitCheckedRange() {
+        int trap = NL();
+        int done = NL();
+        LoadImm(2, 2147483647);
+        E4(0xEB02001F);                              // cmp x0, x2
+        EmitBcond(12, trap);                         // b.gt -> overflow
+        LoadImm(2, -2147483648);
+        E4(0xEB02001F);                              // cmp x0, x2
+        EmitBcond(11, trap);                         // b.lt -> overflow
+        EmitB(done);
+        Mark(trap);
+        EmitOvfReport();
+        Mark(done);
+        Wrap32(1);
+    }
+
+    // overflow report through the shared soft guard; x0/x1 are preserved
+    // (the wrap-into-int semantics continue on the value in x0)
+    void EmitOvfReport() {
+        E4(0xF81F0FE0);                              // push x0
+        E4(0xF81F0FE1);                              // push x1
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardOvfIdx, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        E4(0xF84107E1);                              // pop x1
+        E4(0xF84107E0);                              // pop x0
     }
 
     // does this expression evaluate to a bool? (comparisons / bool locals,
