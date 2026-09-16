@@ -1,0 +1,252 @@
+using System;
+
+namespace Gui;
+
+/// <summary>3D 数学：行主序 4x4 矩阵（float[16]，下标 row*4+col）、
+/// 右手坐标系（+y 上、+z 朝向观察者、-z 为视线方向）、列向量约定
+/// （v' = M * v）。组合顺序与约定一致：Mvp = P * V * M。
+///
+/// 这个层是纯 Zan：矩阵只在 CPU 上组合一次再交给运行时的 3D 管线
+/// （Canvas.DrawMesh3D），不参与逐顶点运算——后者是后端（GPU 或
+/// 未来的 CPU 软光栅）的事。</summary>
+class Mat4 {
+    public float[] m;   // row-major, m[row*4+col]
+
+    public Mat4() { this.m = new float[16]; }
+
+    /// <summary>单位矩阵。</summary>
+    public static Mat4 Identity() {
+        Mat4 r = new Mat4();
+        r.m[0] = 1; r.m[5] = 1; r.m[10] = 1; r.m[15] = 1;
+        return r;
+    }
+
+    public static Mat4 Translate(float x, float y, float z) {
+        Mat4 r = Mat4.Identity();
+        r.m[3] = x; r.m[7] = y; r.m[11] = z;
+        return r;
+    }
+
+    public static Mat4 Scale(float x, float y, float z) {
+        Mat4 r = new Mat4();
+        r.m[0] = x; r.m[5] = y; r.m[10] = z; r.m[15] = 1;
+        return r;
+    }
+
+    /// <summary>绕任意单位轴的旋转（Rodrigues 公式展开），角度弧度。</summary>
+    public static Mat4 RotateAxis(float ax, float ay, float az, float rad) {
+        float len = (float)Math.Sqrt(ax * ax + ay * ay + az * az);
+        if (len < 1e-8f) { return Mat4.Identity(); }
+        ax = ax / len; ay = ay / len; az = az / len;
+        float c = (float)Math.Cos(rad);
+        float s = (float)Math.Sin(rad);
+        float t = 1.0f - c;
+        Mat4 r = new Mat4();
+        r.m[0] = t * ax * ax + c;
+        r.m[1] = t * ax * ay - s * az;
+        r.m[2] = t * ax * az + s * ay;
+        r.m[4] = t * ax * ay + s * az;
+        r.m[5] = t * ay * ay + c;
+        r.m[6] = t * ay * az - s * ax;
+        r.m[8] = t * ax * az - s * ay;
+        r.m[9] = t * ay * az + s * ax;
+        r.m[10] = t * az * az + c;
+        r.m[15] = 1;
+        return r;
+    }
+
+    /// <summary>矩阵乘 this * b（先施 b 再施 this，与 v' = M*v 一致）。</summary>
+    public static Mat4 Mul(Mat4 a, Mat4 b) {
+        Mat4 r = new Mat4();
+        for (int row = 0; row < 4; row = row + 1) {
+            for (int col = 0; col < 4; col = col + 1) {
+                float v = 0;
+                for (int k = 0; k < 4; k = k + 1) {
+                    v = v + a.m[row * 4 + k] * b.m[k * 4 + col];
+                }
+                r.m[row * 4 + col] = v;
+            }
+        }
+        return r;
+    }
+
+    public Mat4 Mul(Mat4 b) { return Mat4.Mul(this, b); }
+
+    /// <summary>透视投影（D3D 风格深度 0..1），fovY 弧度，近远必须为正。</summary>
+    public static Mat4 Perspective(float fovYRad, float aspect, float nearZ, float farZ) {
+        Mat4 r = new Mat4();
+        float f = 1.0f / (float)Math.Tan(fovYRad / 2.0f);
+        r.m[0] = f / aspect;
+        r.m[5] = f;
+        r.m[10] = farZ / (nearZ - farZ);
+        r.m[11] = (nearZ * farZ) / (nearZ - farZ);
+        r.m[14] = -1;
+        return r;
+    }
+
+    /// <summary>正交投影（D3D 风格深度 0..1），窗口 3D 视图与 HUD 场景用。</summary>
+    public static Mat4 Ortho(float left, float right, float bottom, float top,
+                             float nearZ, float farZ) {
+        Mat4 r = Mat4.Identity();
+        r.m[0] = 2.0f / (right - left);
+        r.m[5] = 2.0f / (top - bottom);
+        r.m[10] = 1.0f / (nearZ - farZ);
+        r.m[11] = nearZ / (nearZ - farZ);
+        r.m[3] = (left + right) / (left - right);
+        r.m[7] = (top + bottom) / (bottom - top);
+        return r;
+    }
+
+    /// <summary>lookAt 视图矩阵（右手系，eye 望向 target，up 任意非零）。</summary>
+    public static Mat4 LookAt(float ex, float ey, float ez,
+                              float tx, float ty, float tz,
+                              float ux, float uy, float uz) {
+        // forward = normalize(eye - target)（右手系：相机看向 -z）
+        float fx = ex - tx, fy = ey - ty, fz = ez - tz;
+        float fl = (float)Math.Sqrt(fx * fx + fy * fy + fz * fz);
+        if (fl < 1e-8f) { fx = 0; fy = 0; fz = -1; } else { fx /= fl; fy /= fl; fz /= fl; }
+        // right = normalize(up × forward)
+        float rx = uy * fz - uz * fy;
+        float ry = uz * fx - ux * fz;
+        float rz = ux * fy - uy * fx;
+        float rl = (float)Math.Sqrt(rx * rx + ry * ry + rz * rz);
+        if (rl < 1e-8f) { rx = 1; ry = 0; rz = 0; } else { rx /= rl; ry /= rl; rz /= rl; }
+        // up' = forward × right
+        float nx = fy * rz - fz * ry;
+        float ny = fz * rx - fx * rz;
+        float nz = fx * ry - fy * rx;
+        Mat4 r = new Mat4();
+        r.m[0] = rx; r.m[1] = ry; r.m[2] = rz;
+        r.m[4] = nx; r.m[5] = ny; r.m[6] = nz;
+        r.m[8] = fx; r.m[9] = fy; r.m[10] = fz;
+        r.m[3] = -(rx * ex + ry * ey + rz * ez);
+        r.m[7] = -(nx * ex + ny * ey + nz * ez);
+        r.m[11] = -(fx * ex + fy * ey + fz * ez);
+        r.m[15] = 1;
+        return r;
+    }
+
+    /// <summary>转列主序 float[16]（GPU 侧 uniformMatrix4fv 的约定）。</summary>
+    public float[] ToColumnMajor() {
+        float[] outM = new float[16];
+        for (int row = 0; row < 4; row = row + 1) {
+            for (int col = 0; col < 4; col = col + 1) {
+                outM[col * 4 + row] = this.m[row * 4 + col];
+            }
+        }
+        return outM;
+    }
+}
+
+/// <summary>网格构建器：交错顶点（px,py,pz, nx,ny,nz, u,v，每顶点 8 个 float）
+/// + ushort 索引，与运行时 3D 管线的顶点布局逐字节对应。Build 之后可复用
+/// Upload 到不同表面。</summary>
+class Mesh3D {
+    List<float> v;
+    List<ushort> idx;
+
+    public Mesh3D() {
+        this.v = new List<float>();
+        this.idx = new List<ushort>();
+    }
+
+    /// <summary>追加一个顶点，返回其索引。</summary>
+    public int Vertex(float px, float py, float pz,
+                      float nx, float ny, float nz,
+                      float u, float vv) {
+        this.v.Add(px); this.v.Add(py); this.v.Add(pz);
+        this.v.Add(nx); this.v.Add(ny); this.v.Add(nz);
+        this.v.Add(u); this.v.Add(vv);
+        return this.v.Count / 8 - 1;
+    }
+
+    /// <summary>按逆时针（从观察方向看）追加一个三角形，保证正面朝外。</summary>
+    public void Triangle(int a, int b, int c) {
+        this.idx.Add((ushort)a);
+        this.idx.Add((ushort)b);
+        this.idx.Add((ushort)c);
+    }
+
+    /// <summary>两个三角形组成一个四边形（a,b,c,d 逆时针）。</summary>
+    public void Quad(int a, int b, int c, int d) {
+        this.Triangle(a, b, c);
+        this.Triangle(a, c, d);
+    }
+
+    public int VertexCount() { return this.v.Count / 8; }
+    public int IndexCount() { return this.idx.Count; }
+
+    /// <summary>交错顶点缓冲（Canvas.MeshUpload 封送用）。</summary>
+    public float[] VertexArray() {
+        int n = this.v.Count;
+        float[] outv = new float[n];
+        for (int i = 0; i < n; i = i + 1) { outv[i] = this.v[i]; }
+        return outv;
+    }
+
+    /// <summary>三角索引缓冲（Canvas.MeshUpload 封送用）。</summary>
+    public ushort[] IndexArray() {
+        int n = this.idx.Count;
+        ushort[] outi = new ushort[n];
+        for (int i = 0; i < n; i = i + 1) { outi[i] = this.idx[i]; }
+        return outi;
+    }
+
+    /// <summary>以单位立方体（边长 2，中心原点）填充此网格，六面 UV 全贴。</summary>
+    public void AddCube() {
+        // +z front
+        int a = this.Vertex(-1, -1, 1, 0, 0, 1, 0, 1);
+        int b = this.Vertex(1, -1, 1, 0, 0, 1, 1, 1);
+        int c = this.Vertex(1, 1, 1, 0, 0, 1, 1, 0);
+        int d = this.Vertex(-1, 1, 1, 0, 0, 1, 0, 0);
+        this.Quad(a, b, c, d);
+        // -z back
+        a = this.Vertex(1, -1, -1, 0, 0, -1, 0, 1);
+        b = this.Vertex(-1, -1, -1, 0, 0, -1, 1, 1);
+        c = this.Vertex(-1, 1, -1, 0, 0, -1, 1, 0);
+        d = this.Vertex(1, 1, -1, 0, 0, -1, 0, 0);
+        this.Quad(a, b, c, d);
+        // +x right
+        a = this.Vertex(1, -1, 1, 1, 0, 0, 0, 1);
+        b = this.Vertex(1, -1, -1, 1, 0, 0, 1, 1);
+        c = this.Vertex(1, 1, -1, 1, 0, 0, 1, 0);
+        d = this.Vertex(1, 1, 1, 1, 0, 0, 0, 0);
+        this.Quad(a, b, c, d);
+        // -x left
+        a = this.Vertex(-1, -1, -1, -1, 0, 0, 0, 1);
+        b = this.Vertex(-1, -1, 1, -1, 0, 0, 1, 1);
+        c = this.Vertex(-1, 1, 1, -1, 0, 0, 1, 0);
+        d = this.Vertex(-1, 1, -1, -1, 0, 0, 0, 0);
+        this.Quad(a, b, c, d);
+        // +y top
+        a = this.Vertex(-1, 1, 1, 0, 1, 0, 0, 1);
+        b = this.Vertex(1, 1, 1, 0, 1, 0, 1, 1);
+        c = this.Vertex(1, 1, -1, 0, 1, 0, 1, 0);
+        d = this.Vertex(-1, 1, -1, 0, 1, 0, 0, 0);
+        this.Quad(a, b, c, d);
+        // -y bottom
+        a = this.Vertex(-1, -1, -1, 0, -1, 0, 0, 1);
+        b = this.Vertex(1, -1, -1, 0, -1, 0, 1, 1);
+        c = this.Vertex(1, -1, 1, 0, -1, 0, 1, 0);
+        d = this.Vertex(-1, -1, 1, 0, -1, 0, 0, 0);
+        this.Quad(a, b, c, d);
+    }
+
+    /// <summary>以 XZ 平面圆盘（n 边形，法线 +y）填充，UV 极坐标展开。</summary>
+    public void AddGroundDisc(int n, float radius) {
+        int center = this.Vertex(0, 0, 0, 0, 1, 0, 0.5f, 0.5f);
+        int first = this.Vertex(radius, 0, 0, 0, 1, 0, 1, 0.5f);
+        int prev = first;
+        for (int i = 1; i <= n; i = i + 1) {
+            float ang = (float)(2.0 * Math.PI * i / n);
+            float x = (float)Math.Cos(ang) * radius;
+            float z = (float)Math.Sin(ang) * radius;
+            int cur = this.Vertex(x, 0, z, 0, 1, 0,
+                                  0.5f + 0.5f * (float)Math.Cos(ang),
+                                  0.5f + 0.5f * (float)Math.Sin(ang));
+            if (i < n) { this.Triangle(center, prev, cur); }
+            prev = cur;
+        }
+        this.Triangle(center, prev, first);
+    }
+}

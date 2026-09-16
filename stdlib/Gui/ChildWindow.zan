@@ -1,0 +1,766 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+namespace Gui;
+
+/// 独立泵的停止条件（返回 true 即结束 PumpStandaloneUntil 循环）。
+delegate bool ChildWindowStop();
+
+/// Base class for every secondary top-level window (dialogs, settings,
+/// pickers that need their own OS window).
+///
+/// A child window is a top-level OS window of its own, so it needs more than a
+/// shared look: it has to be woken, animated, event-routed, pumped and closed
+/// by the main window's loop. Doing that per window meant wiring each new
+/// window into six places in the host loop, and every miss showed up as a
+/// window that stopped repainting. Here the plumbing lives once, and
+/// `ChildWindows` keeps parent-owned windows in the registry `Form.Run()`
+/// iterates. A caller running before its main window exists can instead use
+/// `OpenStandalone` and `PumpStandaloneUntil`; that path owns its event
+/// loop and is deliberately not registered in `ChildWindows`.
+///
+/// A subclass supplies the title/size/widget-id baseline, builds `root` (a
+/// retained Control tree), wires handlers, and may override `Pending()`
+/// (extra repaint reasons) and `AfterFrame()` (work to do once the frame is
+/// on screen). Windows rendered by an immediate-mode widget (the Wizard) set
+/// a render callback instead of building a tree.
+///
+/// Binding channel: controls declaring a `bind` path (a design-time
+/// declaration owned by the designer, Serialize and GenForm — see
+/// `Control.bindPath`) are synced against this window's JsonValue model
+/// every frame: model -> UI before the frame (`SyncFromModel`), user
+/// edits -> model after it (`SyncChangedNode`). The per-control snapshot
+/// that detects user edits lives HERE, not on Control — it is a runtime
+/// cache of this render loop, not a declaration. This is the dialog
+/// "state entity" string channel; in-code realtime binding goes through
+/// `Binding<T>` (System/Binding.zan, stdlib standards §6.1).
+class ChildWindow {
+    App host;
+    Control root;
+    HandlerRegistry handlers;
+    JsonValue model;
+    bool open;
+    bool destroyed;
+    int idBase;
+    Action renderCb;
+    /// 绑定快照旁表（`Control.bindSnapshot` 已拆除）：SyncFromNode
+    /// 记录"模型侧确认的控件值"，SyncChangedNode 据此判断用户是否
+    /// 编辑过。按控件引用线性查找——对话框的绑定控件是个位数到
+    /// 几十个，每帧的引用比较是纳秒级。树上移除的控件残留条目
+    /// 永不命中（键是引用），随窗口生命周期一并释放。
+    List<Control> boundKeys;
+    List<string> boundSnaps;
+
+    /// 构造：全部字段置空/默认（idBase 基线 900000）。
+    ChildWindow() {
+        host = null;
+        root = null;
+        handlers = null;
+        model = null;
+        open = false;
+        destroyed = false;
+        idBase = 900000;
+        renderCb = null;
+        boundKeys = null;
+        boundSnaps = null;
+    }
+
+    /// OS window caption.
+    virtual string Title() { return "Zan"; }
+
+    /// Initial client size, in unscaled pixels.
+    virtual int Width() { return 560; }
+    /// 初始客户区高度（未缩放像素）。
+    virtual int Height() { return 560; }
+
+    /// Caption buttons a secondary window keeps (skin and pin never appear;
+    /// a dialog that is not resizable can also drop maximize).
+    virtual bool ShowMinimize() { return true; }
+    /// 是否保留最大化按钮。
+    virtual bool ShowMaximize() { return true; }
+
+    /// Fixed WidgetId baseline for this window's frames. The main window never
+    /// rewinds the process-wide counter, so a child that did not pin its own
+    /// baseline would get different ids every frame and its buttons would
+    /// never see the hover/press resolved on the previous frame.
+    virtual int IdBase() { return 900000; }
+
+    /// The underlying App, for hosts that render immediate-mode widgets
+    /// (BeginFrame/PresentFrame) from a render callback.
+    App Host() { return host; }
+
+    /// Immediate-mode render mode: when set, the pump calls `a` instead of
+    /// rendering the Control tree. The callback owns BeginFrame/PresentFrame
+    /// and dispatches whatever action its widget reported.
+    void SetRender(Action a) {
+        renderCb = a;
+    }
+
+    /// Mounts the window's control tree and the JSON model the `bind` paths
+    /// of its controls read from / write to. Subclasses call this at the end
+    /// of their BuildUi, then register handler names with Handle() and finish
+    /// with Wire().
+    void SetRoot(Control tree, JsonValue m) {
+        root = tree;
+        model = m;
+        handlers = new HandlerRegistry();
+    }
+
+    /// Registers (or replaces) the Action bound to a design handler name;
+    /// Wire() resolves each control's `on<Event>` names through this table.
+    void Handle(string name, Action a) {
+        if (handlers == null) { handlers = new HandlerRegistry(); }
+        handlers.Set(name, a);
+    }
+
+    /// Resolves every recorded `on<Event>` handler name to its Action and
+    /// pushes the model into the bound controls (state -> UI). Call once
+    /// after all Handle() registrations.
+    void Wire() {
+        if (root == null) { return; }
+        WireNode(root);
+        SyncFromModel();
+    }
+
+    /// 递归解析控件树上的 `on<Event>` 处理器名并绑定到已注册的 Action。
+    void WireNode(Control c) {
+        for (int i = 0; i < c.events.Count; i = i + 1) {
+            string evt = c.events[i].key;
+            string hname = c.events[i].val;
+            if (hname != "" && handlers != null && handlers.Has(hname)) {
+                Action a = handlers.Get(hname);
+                c.BindEvent(evt, a);
+            }
+        }
+        for (int j = 0; j < c.children.Count; j = j + 1) {
+            WireNode(c.children[j]);
+        }
+    }
+
+    // ---- model binding (state <-> UI) -----------------------------------
+    // The same traversal the old UiDoc document ran: controls that declared a
+    // bind path get their bound property pushed from the model before each
+    // frame, and any change the user made is written back to the model after
+    // the frame.
+
+    /// 把绑定的状态实体值推入每个声明了 `bind` 路径的控件
+    /// （state -> UI）。不通过 SetProp 暴露 “value”/“text” 的控件
+    /// 会忽略写入，因此对所有控件类型都安全。
+    void SyncFromModel() {
+        if (model == null || root == null) { return; }
+        SyncFromNode(root);
+    }
+
+    /// 递归把模型值推入声明了 bind 路径的控件（值变化才写），
+    /// 并记录绑定快照。
+    void SyncFromNode(Control c) {
+        if (c.bindPath != "") {
+            JsonValue v = model.PathGet(c.bindPath);
+            if (v != null) {
+                string s = v.AsString("");
+                // 只在值真的变了才写：文本框收到一次写入就把光标收到末尾
+                // （SetText 的语义），而这段每帧都跑——无条件写下去的话，
+                // 方向键刚把光标挪开，下一帧就被同一个值弹回行尾。
+                string prop = c.bindProp;
+                if (prop == "") { prop = "value"; }
+                if (c.GetProp(prop) != s) { c.SetProp(prop, s); }
+            }
+            RecordSnapshot(c, BoundValue(c));
+        }
+        for (int j = 0; j < c.children.Count; j = j + 1) {
+            SyncFromNode(c.children[j]);
+        }
+    }
+
+    /// 把每个绑定控件的当前值读回状态实体（UI -> state）。
+    void SyncChangedNode(Control c) {
+        if (c.bindPath != "") {
+            string s = BoundValue(c);
+            if (s != SnapshotOf(c)) { WriteBoundValue(c, s); }
+        }
+        for (int i = 0; i < c.children.Count; i = i + 1) {
+            SyncChangedNode(c.children[i]);
+        }
+    }
+
+    /// 记录（或更新）控件绑定属性的模型侧确认值——上次由模型
+    /// 写入/确认时 `BoundValue` 的读数，作为"用户是否编辑过"的基准。
+    void RecordSnapshot(Control c, string v) {
+        if (boundKeys == null) {
+            boundKeys = new List<Control>();
+            boundSnaps = new List<string>();
+        }
+        for (int i = 0; i < boundKeys.Count; i = i + 1) {
+            if (boundKeys[i] == c) { boundSnaps[i] = v; return; }
+        }
+        boundKeys.Add(c);
+        boundSnaps.Add(v);
+    }
+
+    /// 控件的上一次模型侧确认值；从未记录（新绑定控件首次回写
+    /// 前的防御路径）按被拆字段的原初始值语义返回 ""。
+    string SnapshotOf(Control c) {
+        if (boundKeys == null) { return ""; }
+        for (int i = 0; i < boundKeys.Count; i = i + 1) {
+            if (boundKeys[i] == c) { return boundSnaps[i]; }
+        }
+        return "";
+    }
+
+    /// 控件绑定属性的当前值：显式 bindProp 优先，否则取 value、
+    /// 再取 text。
+    string BoundValue(Control c) {
+        if (c.bindProp != "") { return c.GetProp(c.bindProp); }
+        string s = c.GetProp("value");
+        if (s == "") { s = c.GetProp("text"); }
+        return s;
+    }
+
+    /// 把字符串值写回模型节点：按现有节点的类型转换为
+    /// bool / 数值 / 字符串，保持模型原有的形状。
+    void WriteBoundValue(Control c, string s) {
+        JsonValue cur = model.PathGet(c.bindPath);
+        if (cur != null && cur.IsBool()) {
+            model.PathSetValue(c.bindPath, JsonValue.NewBool(s == "true"));
+        } else if (cur != null && cur.IsNumber()) {
+            model.PathSetValue(c.bindPath, JsonValue.NewNum(s));
+        } else {
+            model.PathSet(c.bindPath, s);
+        }
+    }
+
+    /// Extra reasons to repaint: actions raised by handlers between
+    /// frames, background work still running, ...
+    virtual bool Pending() { return false; }
+
+    /// Runs right after the frame is presented (model sync, deferred work).
+    virtual void AfterFrame() { }
+
+    /// 语言切换广播：宿主把 UI 语言切到 `lang`（"zh" / "en" 语言码）后，
+    /// 对每个开着的子窗口调用一次。子类在这里重填 zform 的设计期
+    /// 文案（ApplyTexts 模式）并刷新依赖语言的静态扇出字段；窗口
+    /// 标题由基类重取 Title() 处理，子类无需关心。
+    virtual void OnLanguageChanged(string lang) { }
+
+    /// Creates and shows the window with the parent's look, then registers it
+    /// with the pump. Subclasses call this at the end of their `Open`.
+    void OpenHost(App parent) {
+        open = true;
+        idBase = this.IdBase();
+        host = App.CreateDark(this.Title(), this.Width(), this.Height());
+        host.ApplySkin(parent.ThemeMenuIndex());
+        // A secondary window follows its parent: switching the skin or
+        // pinning belongs to the main window's caption, not to every dialog
+        // (their captions were showing a palette and a pin that only ever
+        // acted on the dialog itself).
+        host.SetChromeButtons(false, false, this.ShowMinimize(),
+                              this.ShowMaximize());
+        host.FollowCaptionTips(parent);
+        host.Show();
+        host.SetWindowOpacity(parent.WindowOpacity());
+        host.SetUserWallpaper(parent.UserWallpaperPath(),
+                              parent.UserWallpaperOpacity());
+        host.RequestRedraw();
+        ChildWindows.Register(this);
+    }
+
+    /// Creates a standalone top-level host for callers that run before the
+    /// application's main window exists. It deliberately does not inherit
+    /// parent styling or enter the shared ChildWindows registry, so it opens
+    /// on the product default skin (see `StandaloneSkin`) instead of the dark
+    /// baseline every host window is constructed with.
+    void OpenStandalone() {
+        open = true;
+        idBase = this.IdBase();
+        host = App.CreateDark(this.Title(), this.Width(), this.Height());
+        host.ApplySkinName(this.StandaloneSkin());
+        host.SetChromeButtons(false, false, this.ShowMinimize(),
+                              this.ShowMaximize());
+        host.Show();
+        host.RequestRedraw();
+    }
+
+    /// Skin pack a standalone window opens with. There is no parent window to
+    /// follow, so the default is the light skin the plain `App` constructor
+    /// preselects; an unknown name leaves the look untouched.
+    virtual string StandaloneSkin() { return "light"; }
+
+    /// Drives this window without a parent application's loop. ProcessEvent
+    /// supplies the blocking event wait when there is no redraw or animation,
+    /// so a background job can be observed without a busy loop.
+    void PumpStandaloneUntil(ChildWindowStop stop) {
+        this.PumpStandaloneUntilMode(stop, true);
+    }
+
+    /// Drives the standalone window without closing it when the stop condition
+    /// becomes true. The caller owns the final Close().
+    void PumpStandaloneUntilKeepOpen(ChildWindowStop stop) {
+        this.PumpStandaloneUntilMode(stop, false);
+    }
+
+    /// 独立事件泵的公共实现：泵宿主事件并逐帧渲染，直到窗口关闭
+    /// 或 stop() 为真；closeWhenDone 决定结束时是否顺带 Close()。
+    void PumpStandaloneUntilMode(ChildWindowStop stop, bool closeWhenDone) {
+        while (this.IsOpen() && (stop == null || !stop())) {
+            if (!host.PumpSafe()) {
+                this.Close();
+                break;
+            }
+            if (this.IsOpen()) { this.Render(); }
+        }
+        if (closeWhenDone && this.IsOpen()) { this.Close(); }
+    }
+
+    /// Renders one frame, with this window's widget ids pinned: the render
+    /// callback when one was set, otherwise the retained Control tree.
+    void Render() {
+        if (!this.NeedsRedraw()) { return; }
+        int saved = WidgetId.SeqValue();
+        WidgetId.SetSeq(idBase);
+        if (renderCb != null) {
+            renderCb();
+        } else {
+            host.BeginFrame();
+            int top = host.ContentTop();
+            if (root != null) {
+                SyncFromModel();
+                root.MeasureTree(host);
+                // 阴影带外扩的异形宿主把内容轮廓推离画布原点
+                // (ShapeOffX, ShapeOffY)：保留树从内容原点起摆，绘制、
+                // 命中区与画布坐标三方才对齐（普通宿主两值恒 0，无感）。
+                root.Arrange(host.ShapeOffX(), top + host.ShapeOffY(),
+                             host.ClientWidth(),
+                             host.ClientHeight() - top);
+                root.RenderTree(host);
+            }
+            host.RenderChrome(this.Title());
+            host.PresentFrame();
+            // 回写在弹层之后：下拉/弹出层的选择是在 PresentFrame 里的
+            // RunOverlays 阶段才发生的，在它之前读回控件值只会读到旧值，
+            // 而下一帧的 SyncFromModel 又把旧值写回控件——绑定了状态实体
+            // 的下拉框因此永远切不动（不带 bind、由代码读 Value() 的下拉
+            // 不受影响，这就是「有的能切有的不能」）。
+            if (root != null) { SyncChangedNode(root); }
+        }
+        WidgetId.SetSeq(saved);
+        this.AfterFrame();
+    }
+
+    /// 窗口开着且有帧要出（宿主标脏或 Pending()）时为 true。
+    bool NeedsRedraw() {
+        return open && (host.needsRedraw || this.Pending());
+    }
+
+    /// 窗口是否仍开着。
+    bool IsOpen() { return open; }
+
+    /// 该 OS 窗口句柄是否归本窗口所有。
+    bool OwnsWindow(nint hwnd) {
+        return open && hwnd == host.WindowHandle();
+    }
+
+    /// Applies one OS event addressed to this window; a close event just marks
+    /// it closed (the main loop drops it on the next pump).
+    void ApplyEvent(nint hwnd) {
+        if (!this.OwnsWindow(hwnd)) { return; }
+        if (host.EventKind() == 8) {
+            this.OnCloseRequested();
+            open = false;
+            this.Teardown();
+            return;
+        }
+        host.ApplyEvent(hwnd);
+    }
+
+    /// Called when the user clicks the window's close button. Subclasses can
+    /// mirror the behaviour of their internal "done"/"cancel" handlers here.
+    virtual void OnCloseRequested() { }
+
+    /// 关闭窗口：向 OS 发送关闭请求、标记关闭并立即 Teardown
+    /// （幂等，见 Teardown）。
+    void Close() {
+        if (open) { host.window.Close(); }
+        open = false;
+        this.Teardown();
+    }
+
+    /// Destroys the OS window for good. `Window.Close()` only *requests* a
+    /// close (it posts the close event to the window's own loop); a child the
+    /// host has already let go of never reads that event, so without this the
+    /// window lingers on screen, unpainted and dead to clicks. Idempotent.
+    void Teardown() {
+        if (destroyed) { return; }
+        destroyed = true;
+        if (host != null) {
+            host.window.Destroy();
+            // 光栅 surface 与 OS 窗口是两份资源：销毁窗口只释放
+            // X11/Win32 侧，surface 槽位（及其模糊/快照缓存）要
+            // 显式归还，否则每开关一个副窗口就漏一块帧缓冲。
+            host.canvas.Destroy();
+        }
+    }
+
+    /// 请求宿主重绘（窗口开着时）。
+    void RequestRedraw() {
+        if (open) { host.RequestRedraw(); }
+    }
+
+    // ---- forwarding: the few App operations the host loop still needs ----
+
+    /// 转发给宿主换肤（窗口开着时）。
+    void ApplySkin(int i) {
+        if (open) { host.ApplySkin(i); }
+    }
+
+    /// 转发给宿主设置窗口不透明度（0-100，窗口开着时）。
+    void SetWindowOpacity(int percent) {
+        if (open) { host.SetWindowOpacity(percent); }
+    }
+
+    /// 转发给宿主设置用户壁纸与不透明度（窗口开着时）。
+    void SetUserWallpaper(string path, int opacity) {
+        if (open) { host.SetUserWallpaper(path, opacity); }
+    }
+
+    /// 宿主窗口的 OS 句柄。
+    nint WindowHandle() { return host.WindowHandle(); }
+
+    /// 主窗口换肤后同步本副窗口并重绘。
+    void FollowSkin(int i) {
+        if (!open) { return; }
+        host.ApplySkin(i);
+        host.RequestRedraw();
+    }
+
+    /// 主窗口换了界面语言：已经开着的副窗口的标题提示也得跟上。
+    void FollowCaptionTips(App src) {
+        if (!open) { return; }
+        host.FollowCaptionTips(src);
+        host.RequestRedraw();
+    }
+
+    /// 主窗口调不透明度后同步本副窗口。
+    void FollowOpacity(int percent) {
+        if (!open) { return; }
+        host.SetWindowOpacity(percent);
+    }
+
+    /// 主窗口换壁纸后同步本副窗口。
+    void FollowWallpaper(string path, int opacity) {
+        if (!open) { return; }
+        host.SetUserWallpaper(path, opacity);
+    }
+
+    /// 宿主的下一次动画截止时刻（毫秒时钟；窗口关闭返回 -1）。
+    int AnimNextMs() {
+        if (!open) { return 0 - 1; }
+        return host.animNextMs;
+    }
+
+    /// 宿主的下一次特效截止时刻（毫秒时钟；窗口关闭返回 -1）。
+    int FxNextMs() {
+        if (!open) { return 0 - 1; }
+        return host.fxNextMs;
+    }
+}
+
+/// The registry of open child windows the main window's loop drives.
+///
+/// `Form.Run()` asks it, once per iteration, whether anything needs a
+/// repaint, folds in the animation deadlines, routes the OS event to whoever
+/// owns it, and pumps a frame for each open window. Nothing in the loop names
+/// an individual window, so a window opened from a child window is driven the
+/// same way as one opened from the ribbon.
+class ChildWindows {
+    static List<ChildWindow> wins;
+    static FilePicker picker;
+    /// 最近一次已路由的事件序号与结果（`Route` 幂等）。标准循环
+    /// `Form.Run` 与自带帧钩子的宿主（ZanIDE 外壳）都会按 hwnd 路由，
+    /// 同一事件经两处必然把一次按压/释放重放一遍——双击计数、长按
+    /// 计时、拖拽起点都会被算两遍。事件序号是"每投递一个新事件 +1"，
+    /// 正好是那件事件的身份证；它同时挡住动画帧里 `EventKind()` 的
+    /// 陈旧回读（没有新事件时序号不变）。
+    static long routedSeq;
+    static bool routedHandled;
+    /// 组件自建的附加选择器（Upload 内建选文件弹窗等）。单一 `picker`
+    /// 槽归应用 shell 注册的共享选择器所有（IDE 的 pathPicker）；这批
+    /// 由组件按需登记，数量不限。PumpAll/Route/Wants 统一照顾两处。
+    static List<FilePicker> pickers;
+
+    /// 注册表（惰性创建）。
+    static List<ChildWindow> All() {
+        if (ChildWindows.wins == null) {
+            ChildWindows.wins = new List<ChildWindow>();
+        }
+        return ChildWindows.wins;
+    }
+
+    /// 把窗口加入主循环驱动队列（OpenHost 自动调用）。
+    static void Register(ChildWindow w) {
+        ChildWindows.All().Add(w);
+    }
+
+    /// 语言切换广播：对每个开着的子窗口调用 OnLanguageChanged，并把
+    /// 自绘标题栏的文字按新语言的 Title() 重设。宿主（IDE 外壳）在
+    /// 设置窗回报语言变更时调用一次（lang 为 "zh"/"en" 语言码）；
+    /// 之后开的新窗口自然用新语言。
+    static void ApplyLanguage(string lang) {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            if (!w.IsOpen()) { continue; }
+            w.OnLanguageChanged(lang);
+            if (w.host != null) { w.host.SetWindowTitle(w.Title()); }
+        }
+    }
+
+    /// Registers the shared file picker so the pump renders it while open;
+    /// the picker dispatches its result through its own UiEvents.
+    static void RegisterPicker(FilePicker p) {
+        ChildWindows.picker = p;
+    }
+
+    /// 登记一个组件自建的选择器（Upload 内建弹窗）。同一实例重复登记
+    /// 是无操作；`PrunePickers` 在它关闭后移出，因此宿主应在每次打开
+    /// 时重新登记（组件复用同一 picker 实例）。返回 true = 首次登记。
+    static bool RegisterComponentPicker(FilePicker p) {
+        if (ChildWindows.pickers == null) {
+            ChildWindows.pickers = new List<FilePicker>();
+        }
+        if (ChildWindows.pickers.Contains(p)) { return false; }
+        ChildWindows.pickers.Add(p);
+        return true;
+    }
+
+    /// Forgets windows that have closed.
+    static void Prune() {
+        List<ChildWindow> all = ChildWindows.All();
+        List<ChildWindow> keep = new List<ChildWindow>();
+        foreach (ChildWindow w in all) {
+            if (w.IsOpen()) { keep.Add(w); }
+            else { w.Teardown(); }
+        }
+        ChildWindows.wins = keep;
+    }
+
+    /// 是否还有开着的子窗口。
+    static bool AnyOpen() {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            if (w.IsOpen()) { return true; }
+        }
+        return false;
+    }
+
+    /// True when any open window has a frame to draw (so the loop polls
+    /// instead of blocking).
+    static bool Wants() {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            if (w.NeedsRedraw()) { return true; }
+        }
+        if (ChildWindows.AnyPickerWants()) { return true; }
+        return false;
+    }
+
+    /// 任一组件选择器开着且要求重绘（轮询判据；FilePicker 文档约定：
+    /// 弹窗开着时主循环不得阻塞在 WaitEvent 上）。
+    static bool AnyPickerWants() {
+        if (ChildWindows.pickers == null) { return false; }
+        for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
+            FilePicker p = ChildWindows.pickers[i];
+            if (p.IsOpen() && p.NeedsRedraw()) { return true; }
+        }
+        return false;
+    }
+
+    /// 任一组件选择器开着（主循环用它收紧阻塞等待）。
+    static bool AnyPickerOpen() {
+        if (ChildWindows.pickers == null) { return false; }
+        for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
+            if (ChildWindows.pickers[i].IsOpen()) { return true; }
+        }
+        return false;
+    }
+
+    /// Folds every open window's animation / effect deadline into `deadline`
+    /// (-1 means "no deadline"), so idle waits wake up for child animations.
+    static int Deadline(int deadline) {
+        int d = deadline;
+        foreach (ChildWindow w in ChildWindows.All()) {
+            int a = w.AnimNextMs();
+            if (a >= 0 && (d < 0 || a < d)) { d = a; }
+            int f = w.FxNextMs();
+            if (f >= 0 && (d < 0 || f < d)) { d = f; }
+        }
+        return d;
+    }
+
+    /// 组件选择器开着时把它的重绘需求折叠进主应用：轮询判据（开着时
+    /// 不得阻塞在 WaitEvent 上）+ 弹窗要出帧时唤醒主循环。
+    static bool PumpPickers(App main) {
+        if (ChildWindows.pickers == null) { return false; }
+        bool woken = false;
+        for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
+            FilePicker p = ChildWindows.pickers[i];
+            if (!p.IsOpen()) { continue; }
+            if (p.NeedsRedraw() && !woken) {
+                main.RequestRedraw();
+                woken = true;
+            }
+        }
+        return woken;
+    }
+
+    /// Prunes component pickers that have closed (each Upload keeps its own
+    /// picker instance alive for the next open; only the registry entry goes).
+    static void PrunePickers() {
+        if (ChildWindows.pickers == null) { return; }
+        List<FilePicker> keep = new List<FilePicker>();
+        for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
+            FilePicker p = ChildWindows.pickers[i];
+            if (p.IsOpen()) { keep.Add(p); }
+        }
+        ChildWindows.pickers = keep;
+    }
+
+    /// Requests a repaint on every window whose deadline has passed; true when
+    /// at least one was due.
+    static bool TickDue(int now) {
+        bool due = false;
+        foreach (ChildWindow w in ChildWindows.All()) {
+            int a = w.AnimNextMs();
+            int f = w.FxNextMs();
+            if (a >= 0 && now >= a) { due = true; w.RequestRedraw(); }
+            if (f >= 0 && now >= f) { due = true; w.RequestRedraw(); }
+        }
+        return due;
+    }
+
+    /// 把事件交给它所属的那扇顶层窗口（子窗口 / 共享选择器 / 组件
+    /// 选择器）；都不属于时返回 false（那是主窗口自己的事件）。
+    /// 由事件泵 `App.ProcessEvent` 对每一件非本窗口事件调用一次，
+    /// 宿主循环因此不必知道 hwnd 路由这回事。幂等（按事件序号）：
+    /// 自带循环/帧钩子的宿主若再调一次，同一件事件不会被送第二遍。
+    static bool Route(nint hwnd) {
+        // 幂等：同一件事件（序号相同）只交付一次，重复调用返回上次结果。
+        long seq = Window.EventSeqGlobal();
+        if (seq == ChildWindows.routedSeq) { return ChildWindows.routedHandled; }
+        ChildWindows.routedSeq = seq;
+        ChildWindows.routedHandled = false;
+        foreach (ChildWindow w in ChildWindows.All()) {
+            if (w.OwnsWindow(hwnd)) {
+                w.ApplyEvent(hwnd);
+                ChildWindows.routedHandled = true;
+                return true;
+            }
+        }
+        // 共享文件选择器（应用外壳注册的 pathPicker）：它的弹窗也是
+        // 独立顶层窗口，路由由这里一并负责，外壳不必自己再判断一遍。
+        if (ChildWindows.picker != null
+            && ChildWindows.picker.OwnsWindow(hwnd)) {
+            ChildWindows.picker.ApplyEvent(hwnd);
+            ChildWindows.routedHandled = true;
+            return true;
+        }
+        if (ChildWindows.pickers != null) {
+            for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
+                FilePicker p = ChildWindows.pickers[i];
+                if (p.OwnsWindow(hwnd)) {
+                    p.ApplyEvent(hwnd);
+                    ChildWindows.routedHandled = true;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Paints one frame for the child window that owns `hwnd` (called from the
+    /// window procedure during WM_SIZE in the modal resize loop). Returns true
+    /// when a matching child was found and painted; false means the hwnd belongs
+    /// to the main window or an unknown source.
+    static bool PaintForResize(nint hwnd) {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            if (w.OwnsWindow(hwnd)) {
+                w.host.SyncSurface();
+                w.Render();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// One frame of every open window and of the shared file picker, then
+    /// drops (and destroys) the closed ones. Called by `Form.Run()` every
+    /// iteration; safe to call again from a frame hook: a window opened from
+    /// another window's action handler is rendered by the second call instead
+    /// of staying blank until the next OS event.
+    static void PumpAll() {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            if (w.IsOpen()) { w.Render(); }
+        }
+        if (ChildWindows.picker != null) {
+            if (ChildWindows.picker.IsOpen() && ChildWindows.picker.NeedsRedraw()) {
+                ChildWindows.picker.RenderWindow();
+            }
+        }
+        // 组件自建的选择器（Upload 内建弹窗）：开着就出一帧。RenderWindow
+        // 内部自会跳过不需要重绘的帧。
+        if (ChildWindows.pickers != null) {
+            for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
+                FilePicker p = ChildWindows.pickers[i];
+                if (p.IsOpen()) { p.RenderWindow(); }
+            }
+        }
+        ChildWindows.Prune();
+        ChildWindows.PrunePickers();
+    }
+
+    /// Folds the child deadlines into the main app's idle wait and wakes the
+    /// main window when a child animation comes due. Call once per loop
+    /// iteration from the frame hook (Form.Run already sleeps on the folded
+    /// deadline).
+    static void FoldDeadlines(App main) {
+        int dl = ChildWindows.Deadline(-1);
+        if (dl >= 0) { main.RequestWakeAt(dl); }
+        int now = Window.GetTickMs();
+        if (ChildWindows.TickDue(now)) { main.RequestRedraw(); }
+        // 组件选择器开着时保持主循环轮询（needsRedraw 常挂），否则
+        // Form.Run 会阻塞在 WaitEvent 上，弹窗永远出不了帧。
+        if (ChildWindows.AnyPickerOpen()) {
+            main.RequestRedraw();
+        }
+    }
+
+    /// 主窗口换肤时同步每个开着的子窗口。
+    static void FollowSkin(int i) {
+        foreach (ChildWindow w in ChildWindows.All()) { w.FollowSkin(i); }
+    }
+
+    /// 主窗口调整不透明度时同步每个开着的子窗口。
+    static void FollowOpacity(int percent) {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            w.FollowOpacity(percent);
+        }
+    }
+
+    /// 把主窗口当前的标题提示文案推给每个开着的副窗口。
+    static void FollowCaptionTips(App main) {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            w.FollowCaptionTips(main);
+        }
+    }
+
+    /// 主窗口更换用户壁纸时同步每个开着的子窗口。
+    static void FollowWallpaper(string path, int opacity) {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            w.FollowWallpaper(path, opacity);
+        }
+    }
+
+    /// Repaints every open window (used after the shared file picker returns:
+    /// whoever asked for it must show the result).
+    static void RequestRedrawAll() {
+        foreach (ChildWindow w in ChildWindows.All()) { w.RequestRedraw(); }
+    }
+}

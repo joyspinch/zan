@@ -1,0 +1,369 @@
+using System.Text;
+using System;
+
+namespace System.Web;
+
+/// <summary>
+/// Rich per-request controller base. The attribute-driven router creates ONE
+/// instance per request, binds the <see cref="HttpContext"/>, runs the
+/// controller-level hook, invokes the matched action, then runs the after hook.
+/// Actions are instance methods that read/write through <c>this</c>:
+///
+///   [HttpPost]
+///   [Description("登录")]
+///   void Login() {
+///       string user = this.In("user");
+///       ...
+///       this.Ok("{\"token\":\"" + token + "\"}");
+///   }
+///
+/// Cross-cutting auth (login / permission / rank) is declared with attributes
+/// ([Custom(Authorization = ...)]) and enforced centrally by the dispatcher
+/// before the action runs. Override <see cref="OnBefore"/> / <see cref="OnAfter"/>
+/// for controller-scoped setup / teardown (the equivalent of the reference
+/// project's per-controller hooks).
+/// </summary>
+class Controller {
+    HttpContext ctx;     // the live request/response context for this instance
+    /// 已解析的登录主体 id（匿名时为 ""）。
+    string uid;          // resolved principal id ("" when anonymous)
+    string __viewKey;    // "<Module>.<Controller>.<Action>" -- injected by the router each request
+
+    /// <summary>Bind the request context (called by the generated trampoline).</summary>
+    void __Bind(HttpContext c) {
+        this.ctx = c;
+        this.uid = c.uid;
+    }
+
+    /// <summary>Runs before the action; return false to short-circuit.
+    /// Delegates to the overridable <see cref="OnBefore"/>.</summary>
+    bool __Before() { return this.OnBefore(); }
+
+    /// <summary>Setup on the request coroutine, so it can await: a controller
+    /// that hands out table accessors leases this request's connection here,
+    /// before the action runs, because an accessor is a plain property and
+    /// cannot await. The generated trampoline awaits this one; it defaults to
+    /// the synchronous <see cref="OnBefore"/> hook so existing controllers keep
+    /// working.</summary>
+    async bool __BeforeAsync() { return await this.OnBeforeAsync(); }
+
+    /// <summary>Awaitable controller setup. Override this (instead of
+    /// <see cref="OnBefore"/>) when the preparation performs I/O.</summary>
+    virtual async bool OnBeforeAsync() { return this.OnBefore(); }
+
+    /// <summary>Runs after the action (only when __Before returned true).</summary>
+    void __After() { this.OnAfter(); }
+
+    /// <summary>Teardown on the request coroutine, so it can await: releasing a
+    /// pooled connection may have to roll back a transaction first, and on a
+    /// non-blocking driver that rollback is itself an awaited round trip. The
+    /// generated trampoline awaits this one; it defaults to the synchronous
+    /// <see cref="OnAfter"/> hook so existing controllers keep working.</summary>
+    async void __AfterAsync() { await this.OnAfterAsync(); }
+
+    /// <summary>Awaitable controller teardown. Override this (instead of
+    /// <see cref="OnAfter"/>) when cleanup performs I/O.</summary>
+    virtual async void OnAfterAsync() { this.OnAfter(); }
+
+    /// <summary>[Tx] trampoline hook: open the request-scoped transaction.
+    /// Return false when the store is unavailable, so the request is answered
+    /// 503 rather than pretending the write happened. The default is a no-op
+    /// success so plain controllers compile unchanged; a DB-backed base class
+    /// (the templates' AppController) overrides it with its lease.</summary>
+    virtual async bool __TxBegin() { return true; }
+
+    /// <summary>[Tx] trampoline hook: commit after the action succeeded.
+    /// No-op by default.</summary>
+    virtual async void __TxCommit() { }
+
+    /// <summary>[Tx] trampoline hook: roll back on the failure paths. Must be
+    /// safe to call twice and safe to call after commit; no-op by default.</summary>
+    virtual async void __TxRollback() { }
+
+    /// <summary>Controller-level hook; override to guard/prepare every action
+    /// in this controller. Return false to stop the request.</summary>
+    virtual bool OnBefore() { return true; }
+
+    /// <summary>Controller-level teardown hook; override as needed.</summary>
+    virtual void OnAfter() { }
+
+    // ---- request context accessors ----
+    /// 本实例绑定的请求上下文。
+    HttpContext Ctx() { return this.ctx; }
+    /// 本次请求是否已解析出登录用户。
+    bool IsLogin() { return this.uid.Length > 0; }
+
+    // ---- input (all values go through the central Filter) ----
+    /// 过滤后的参数（trim + 去控制符；route → query → form 合并）。
+    string In(string name) { return this.ctx.In(name); }
+    /* 原始未过滤值（Bug#8）：多行语义字段专用——Filter.Clean 会剥净 \r\n。
+       调用方须自行保证渲染侧转义（escape-first 管线首步 HtmlEscape）。 */
+    /// 原始未过滤值：多行语义字段专用，渲染转义由调用方负责。
+    string InRaw(string name) { return this.ctx.InRaw(name); }
+    /// 过滤并 HTML 转义的参数（可直接渲染进页面）。
+    string InText(string name) { return this.ctx.InText(name); }
+    /// 过滤后的整型；缺失/非法取 def（严格整串解析）。
+    int InInt(string name, int def) { return this.ctx.InInt(name, def); }
+    /// 过滤后的 64 位整型；规则同 InInt。
+    long InLong(string name, long def) { return this.ctx.InLong(name, def); }
+    /// 过滤后的数值；缺失/非法取 def。
+    double InDouble(string name, double def) { return this.ctx.InDouble(name, def); }
+    /// 布尔参数："1/true/on/yes" 真，"0/false/off/no" 假，其余 def。
+    bool InBool(string name, bool def) { return this.ctx.InBool(name, def); }
+    /// 参数是否在 form/query/route 任一处出现。
+    bool HasIn(string name) { return this.ctx.HasIn(name); }
+    /// 路由参数（{param} 段）。
+    string Param(string name) { return this.ctx.Param(name); }
+    /// 原始请求正文。
+    string Body() { return this.ctx.Body(); }
+
+    // ---- required input -----------------------------------------------------
+    // `Need` is `In` for a parameter the action cannot proceed without: it reads
+    // as one expression in the middle of the action (no `if (x.Length == 0)`
+    // ladder repeating the same 400 in every handler) and aborts with the
+    // uniform {"code":"0003"} answer when the value is missing. `label` is the
+    // human name used both in that message and in the generated API docs.
+
+    /// <summary>Required text parameter; aborts with 400/0003 when empty.</summary>
+    string Need(string name, string label) {
+        string v = this.ctx.In(name);
+        if (v.Length == 0) { throw new ApiError(400, "0003", label + "不能为空"); }
+        return v;
+    }
+
+    /// <summary>Required HTML-escaped text parameter.</summary>
+    string NeedText(string name, string label) {
+        string v = this.ctx.InText(name);
+        if (v.Length == 0) { throw new ApiError(400, "0003", label + "不能为空"); }
+        return v;
+    }
+
+    /// <summary>Required integer parameter. A missing value and a non-numeric one
+    /// are the same client mistake, so both answer the same way.</summary>
+    int NeedInt(string name, string label) {
+        string raw = this.ctx.In(name);
+        if (raw.Length == 0) { throw new ApiError(400, "0003", label + "不能为空"); }
+        int sentinel = 0 - 2147483647 - 1;
+        int v = Filter.ToInt(raw, sentinel);
+        if (v == sentinel) { throw new ApiError(400, "0003", label + "必须是整数"); }
+        return v;
+    }
+
+    /// <summary>Required long parameter (ids and timestamps outgrow int).</summary>
+    long NeedLong(string name, string label) {
+        string raw = this.ctx.In(name);
+        if (raw.Length == 0) { throw new ApiError(400, "0003", label + "不能为空"); }
+        long sentinel = -9223372036854775807;
+        long v = Filter.ToLong(raw, sentinel);
+        if (v == sentinel) { throw new ApiError(400, "0003", label + "必须是整数"); }
+        return v;
+    }
+
+    /// <summary>Required number parameter (aborts with 400/0003 when missing
+    /// or not numeric).</summary>
+    double NeedDouble(string name, string label) {
+        string raw = this.ctx.In(name);
+        if (raw.Length == 0) { throw new ApiError(400, "0003", label + "不能为空"); }
+        double sentinel = -1.7976931348623157e308;
+        double v = Filter.ToDouble(raw, sentinel);
+        if (v == sentinel) { throw new ApiError(400, "0003", label + "必须是数字"); }
+        return v;
+    }
+
+    /// <summary>Required flag parameter (aborts only when missing; the value
+    /// words are the same ones <c>InBool</c> accepts).</summary>
+    bool NeedBool(string name, string label) {
+        string raw = this.ctx.In(name);
+        if (raw.Length == 0) { throw new ApiError(400, "0003", label + "不能为空"); }
+        return Filter.ToBool(raw, false);
+    }
+
+    /// <summary>True when this request came from script rather than from a
+    /// navigation -- htmx sends `HX-Request`, fetch/XHR ask for JSON. It matters
+    /// for "you are not signed in": a navigation should land on the sign-in
+    /// form, but redirecting a background request hands the caller the form's
+    /// HTML with a 200, which reads like the write succeeded.</summary>
+    bool WantsJson() {
+        if (this.ctx.Header("HX-Request").Length > 0) { return true; }
+        if (this.ctx.Header("X-Requested-With").Length > 0) { return true; }
+        string accept = this.ctx.Header("Accept");
+        return accept.Contains("application/json");
+    }
+
+    // ---- list screens -------------------------------------------------------
+
+    /// <summary>The list parameters of this request -- page, limit, order, dir,
+    /// kw -- with the page size clamped to `defLimit`..200. One call replaces the
+    /// five reads every list action would otherwise repeat, and the compiler
+    /// documents all five in /api/docs from this one call site.</summary>
+    ListQuery Paged(string defOrder, int defLimit) {
+        return ListQuery.From(this.ctx, defOrder, defLimit, 200);
+    }
+
+    // ---- uniform responses ----
+    /// <summary>{"code":"0000","msg":"ok","data": &lt;data&gt;} -- data must
+    /// already be a JSON value.</summary>
+    void Ok(string data) { this.ctx.Api("0000", "ok", data); }
+
+    /// <summary>Ends the action with {"code":..,"msg":..,"data":null} and the
+    /// matching status. It throws: the generated trampoline (and WebApp for a
+    /// hand-mapped route) turns the exception into that response, so a guard is
+    /// one line and no action carries `...; return;` error tails. The status
+    /// line keeps the standard ASCII reason phrase; the localized message goes
+    /// in the body, where it belongs.</summary>
+    void Fail(int status, string code, string msg) {
+        throw new ApiError(status, code, msg);
+    }
+
+    /// 以 application/json 应答。
+    void Json(string json) { this.ctx.Json(json); }
+    /// 以 text/plain 应答。
+    void Text(string text) { this.ctx.Text(text); }
+    /// 以 text/html 应答。
+    void Html(string html) { this.ctx.Html(html); }
+
+    // ---- views: the template follows the controller ----
+    /// The router injects this action's view id ("<Module>.<Controller>.<Action>") via
+    /// __SetView before the action runs, so View(data) renders the .html that
+    /// sits next to this controller (<Module>/View/<Controller>.<Action>.html)
+    /// with zero wiring -- no per-action template name to pass.
+    void __SetView(string key) { this.__viewKey = key; }
+
+    /// <summary>Render this action's co-located template.</summary>
+    void View(ViewData data) {
+        this.ctx.Html(WebHost.Current().RenderPage(this.__viewKey, data));
+    }
+
+    /// <summary>Render this action's template WITHOUT the layout: the answer to
+    /// an in-page request, where the browser already has the shell and only the
+    /// panel is being replaced.</summary>
+    void Fragment(ViewData data) {
+        this.ctx.Html(WebHost.Current().RenderFragment(this.__viewKey, data));
+    }
+
+    /// <summary>Render an explicitly named template, layout and all.</summary>
+    void FragmentOf(string name, ViewData data) {
+        this.ctx.Html(WebHost.Current().RenderFragment(name, data));
+    }
+
+    /// <summary>Render an explicitly named template instead of the convention one.</summary>
+    void ViewOf(string name, ViewData data) {
+        this.ctx.Html(WebHost.Current().RenderPage(name, data));
+    }
+}
+
+/// <summary>
+/// The read half of a list screen, taken straight from the request: page, limit,
+/// order, dir, kw. Every list in an application answers the same five parameters
+/// with the same names, so this is one class rather than a convention each
+/// controller re-implements slightly differently.
+///
+/// The bounds are the server's, not the client's: `page` is at least 1 and
+/// `limit` is clamped to [1, max], so `?limit=1000000` cannot turn a list into a
+/// table scan. `order` is a bare sort key the caller chooses from -- the query
+/// itself is still typed, because the controller maps the key to an
+/// OrderBy(a => a.column) that the compiler checks.
+/// </summary>
+class ListQuery {
+    int page;
+    int limit;
+    /// Sort key as asked for, already defaulted; the controller decides which
+    /// keys exist.
+    string order;
+    /// True for descending -- `?dir=asc` is the only way to get ascending.
+    bool desc;
+    /// Search text, trimmed; "" when the caller did not search.
+    string kw;
+
+    ListQuery() {
+        this.page = 1;
+        this.limit = 20;
+        this.order = "";
+        this.desc = true;
+        this.kw = "";
+    }
+
+    /// 页码（从 1 起）。
+    int Page() { return this.page; }
+    /// 每页行数（钳制在 [1, max]）。
+    int Limit() { return this.limit; }
+    /// 排序键（由控制器映射到具体列）。
+    string Order() { return this.order; }
+    /// 是否降序（仅 `?dir=asc` 得到升序）。
+    bool Desc() { return this.desc; }
+    /// 搜索文本（未搜索时为 ""）。
+    string Kw() { return this.kw; }
+
+    /// <summary>Rows to skip for this page, for Skip(q.Skip()).</summary>
+    int Skip() { return (this.page - 1) * this.limit; }
+
+    /// <summary>Number of pages `total` rows make at this limit (at least 1, so
+    /// an empty list still reads as "第 1 / 1 页").</summary>
+    int Pages(int total) {
+        if (total <= 0) { return 1; }
+        return (total + this.limit - 1) / this.limit;
+    }
+
+    /// <summary>The query string that reproduces this listing minus the page, so
+    /// a pager only has to append `&amp;page=N`.</summary>
+    string QueryString() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("limit=");
+        sb.Append(Convert.ToString(this.limit));
+        if (this.order.Length > 0) {
+            sb.Append("&order=");
+            sb.Append(Encoding.UrlEncode(this.order));
+            if (this.desc) { sb.Append("&dir=desc"); } else { sb.Append("&dir=asc"); }
+        }
+        if (this.kw.Length > 0) {
+            sb.Append("&kw=");
+            sb.Append(Encoding.UrlEncode(this.kw));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Reads the five parameters off the request. `defOrder` is the sort
+    /// key used when the caller names none, `defLimit` the page size, `maxLimit`
+    /// the largest page size this endpoint will serve.</summary>
+    static ListQuery From(HttpContext ctx, string defOrder, int defLimit,
+                          int maxLimit) {
+        ListQuery q = new ListQuery();
+        q.page = ctx.InInt("page", 1);
+        if (q.page < 1) { q.page = 1; }
+        q.limit = ctx.InInt("limit", defLimit);
+        if (q.limit < 1) { q.limit = defLimit; }
+        if (q.limit > maxLimit) { q.limit = maxLimit; }
+        q.order = ctx.In("order");
+        if (q.order.Length == 0) { q.order = defOrder; }
+        q.desc = ctx.In("dir") != "asc";
+        q.kw = ctx.InText("kw").Trim();
+        return q;
+    }
+}
+
+/// <summary>
+/// The write half: the response shape every list endpoint returns, so a client
+/// (or the CRUD pages) can render any list without knowing which one it is:
+/// {"items":[...],"total":N,"page":P,"limit":L,"pages":K}. `items` is already
+/// serialized JSON -- the rows are typed models, and serializing them is the
+/// caller's business.
+/// </summary>
+class Listing {
+    /// 列表响应 JSON（{"items","total","page","limit","pages"}）；
+    /// items 是已序列化的行 JSON，空时输出 []。
+    static string Json(string itemsJson, int total, ListQuery q) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"items\":");
+        if (itemsJson.Length == 0) { sb.Append("[]"); } else { sb.Append(itemsJson); }
+        sb.Append(",\"total\":");
+        sb.Append(Convert.ToString(total));
+        sb.Append(",\"page\":");
+        sb.Append(Convert.ToString(q.Page()));
+        sb.Append(",\"limit\":");
+        sb.Append(Convert.ToString(q.Limit()));
+        sb.Append(",\"pages\":");
+        sb.Append(Convert.ToString(q.Pages(total)));
+        sb.Append("}");
+        return sb.ToString();
+    }
+}

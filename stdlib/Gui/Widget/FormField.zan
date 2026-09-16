@@ -1,0 +1,1123 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// 数据录入表单的一行（FormCreate / 表单构建器风格）。
+///
+/// FormField 是可设计控件，描述收集“什么”，而非
+/// 如何绘制交互控件：字段类型（`ftype`）、旁边显示的标签、
+/// 模型键（`fname`）、占位符、必填标记，以及——选择型
+/// 字段的——选项列表。可视化设计器渲染该行预览，
+/// 并通过标准 Kind()/Props()/GetProp/SetProp 模型编辑，因此
+/// 整个表单可无特判地往返 Serialize。
+///
+/// 字段类型（ftype）：
+///   0 input      1 textarea  2 password 3 number  4 radio
+///   5 checkbox   6 select    7 switch   8 rate    9 slider
+///   10 date      11 time     12 upload  13 color   14 richtext
+///
+/// 显示/布局组件（ftype >= 15）渲染静态内容而非
+/// 接收输入；占满整行宽度，不带标签列。
+/// 在设计器面板中按类别分组：
+///   Layout:     15 title     16 text        17 divider
+///   Display:    18 card       19 tag         20 badge     21 avatar
+///               22 statistic  23 table       24 timeline  25 tree
+///               26 collapse   27 empty
+///   Feedback:   28 alert      29 progress     30 result    31 skeleton
+///               32 spin       33 tooltip
+///   Navigation: 34 steps      35 breadcrumb   36 tabs      37 pagination
+///               38 menu       39 pageheader
+class FormField : Control {
+    /// Canonical serialized component class. The legacy ftype is retained only
+    /// for reading old designer documents and palette metadata.
+    string kind;
+    int ftype;
+    /// 字段旁显示的标签文字。
+    string label;
+    /// 模型键：运行时绑定与提交数据用的字段名。
+    string fname;
+    /// 占位文本（ftype 72 时为起始 URL）。
+    string placeholder;
+    /// Project component class name. A non-empty value marks a custom kind
+    /// and is serialized directly so JSON round-trips preserve the class.
+    string customKind;
+    /// 该字段是一个「已保存用户组件」的引用节点（而非项目源码
+    /// 类）：.zform 里写成 {"kind":名,"ref":名,...}，组件设计
+    /// 的每次进化自动跟随所有实例；GenForm 编译期按 ref 展开
+    /// 组件文档，画布上按组件文档做真控件预览。
+    bool compRef;
+    /// 引用节点的画布真控件预览开关（false = 显示占位块，
+    /// 序列化为 "pvOff": true）。
+    bool pvPreview;
+    /// 是否必填（提交校验标记）。
+    bool required;
+    /// switch 字段的默认开启状态（ftype 7）。
+    bool defOn;      // switch 字段的默认开启状态
+    /// 显示文本（ftype 15/16）的自动换行：渲染的 Label 换行适应
+    /// 字段宽度而非省略截断。序列化以便自由布局携带
+    /// 较长的提示段落。
+    bool wrap;
+    /// 24 分栏中的列跨度（24 = 整行，12 = 半行，……）。
+    int span;        // 24 分栏中的列跨度（24 = 整行，12 = 半行，……）
+    /// 自由画布布局（designer layoutMode == 1）：设计空间中的绝对
+    /// 位置和尺寸（窗口像素）。容器子元素的坐标
+    /// 相对于容器的内容框（对应运行时的 DockManual + Place
+    /// ）。流式模式下忽略，此时宽度由 span 决定。
+    int fx;
+    int fy;
+    int fw;
+    int fh;
+    /// Runtime layout result. Dock/flow resolution updates these fields for
+    /// the canvas only; the author rectangle above remains serializable.
+    int layoutX;
+    int layoutY;
+    int layoutW;
+    int layoutH;
+    bool layoutReady;
+    /// 按设计尺寸存储的备用自由画布矩形（LVGL 风格断点
+    /// 布局）："WxH:x,y,w,h;WxH:x,y,w,h"。fx/fy/fw/fh 始终保存
+    /// 当前设计尺寸的矩形；设计器中切换尺寸时把
+    /// 旧矩形存到这里，存在新矩形时再加载。
+    string altRects;
+    /// 设计器锁定：锁住的组件仍可选中和改属性，
+    /// 但画布上拖不动、拉不大（和场景设计器的 Locked() 一致）。
+    bool locked;
+    /// 停靠边（Dock.Manual/Top/Bottom/Left/Right/Fill 的数字）。
+    /// 自由画布默认 0（给定的 fx/fy/fw/fh 绝对定位）；在
+    /// Dock Panel 里改成某一边，就能做出“上工具条 + 左侧栏 +
+    /// 下状态栏 + 中间填充”这种应用外壳，且能随窗口缩放。
+    int dockSide;
+    /// 选项列表：选择型字段的候选项，也复用作表格列、标签页
+    /// 标题、步骤/菜单/树条目等（见 UsesOptionsOf）。
+    List<string> options;
+
+    /// 容器支持。容器（Card / Tabs）在 `kids` 中持有嵌套
+    /// 子组件；每个子元素在 `childTab` 中记录所属标签页
+    /// （如 Card 这类单内容体容器恒为 0）。`uiState`
+    /// 是组合控件绑定的响应式索引——Tabs 的当前标签页、
+    /// Steps 的当前步骤、Collapse 的展开面板、
+    /// Pagination 的页码、Menu / Tree 的选中项——让预览实时生效。
+    List<FormField> kids;
+    int childTab;
+    SignalInt uiState;
+    /// Tabs 容器的标签条方向（0 = 顶部横向，1 = 左侧纵向，
+    /// 对应运行时 Tabs 的 orient 属性）。序列化为
+    /// "orient": "horizontal"/"vertical"，纵向时画布与生成
+    /// 代码都让子级让出左侧轨道。
+    int tabOrient;
+
+    /// 字段内联 CSS 声明文本（与元素 style 属性同一语义与优先级：
+    /// "color:#c00; padding:8px"）。设计文档存 "style" 键（.html
+    /// 设计稿里就是元素的 style 属性），画布预览与生成代码经
+    /// SetProp("style") 走 StyleSheet.ApplyInline 通道落地。
+    /// 名字不叫 Style：与 Gui.Style 类名撞，方法体里裸写 Style.Part
+    /// 会被这个字段抢走解析。
+    string styleText;
+
+    /// 设计器未建模的字段键原样保留(DataGrid 的 "of"/"columns"、
+    /// 控件的 "props" 直通表等):加载时收集,保存时原样写回,
+    /// 手写设计稿经设计器往返不丢声明。为 null 表示没有。
+    JsonValue extra;
+
+    /// 公共初始化：按字段类型填默认标签 / 占位 / 选项与 24 栅格跨度。
+    void InitField(int ft) {
+        this.InitControl("field", 0);
+        ftype = ft;
+        kind = FormField.KindForType(ft);
+        label = FormField.DefaultLabel(ft);
+        fname = "field";
+        placeholder = FormField.DefaultPlaceholder(ft);
+        required = false;
+        defOn = false;
+        wrap = false;
+        span = 24;
+        fx = 0;
+        fy = 0;
+        fw = 200;
+        fh = 32;
+        layoutX = 0;
+        layoutY = 0;
+        layoutW = 0;
+        layoutH = 0;
+        layoutReady = false;
+        altRects = "";
+        locked = false;
+        dockSide = 0;
+        styleText = "";
+        customKind = "";
+        compRef = false;
+        pvPreview = true;
+        options = new List<string>();
+        kids = new List<FormField>();
+        childTab = 0;
+        tabOrient = 0;
+        uiState = new SignalInt(0);
+        extra = null;
+        SeedOptions(ft);
+    }
+
+    /// 容器类型拥有嵌套子组件：Card (18) 有单一
+    /// 内容体；Panel (45) 是独立的容器面板；Tabs (36) 把子元素
+    /// 分配到各个标签页；Split (60) 分成两个窗格（childTab 0/1
+    /// 即窗格序号）；Dock Panel (61) 按各子元素自己的 `dock` 边停靠。
+    static bool IsContainerOf(int ft) {
+        return ft == 18 || ft == 36 || ft == 45 || ft == 60 || ft == 61;
+    }
+
+    /// 外壳条通常占哪一边：工具条贴顶、状态栏贴底、停靠面板
+    /// 吃掉剩下的空间。只是给「停靠」属性的建议值，组件建出来
+    /// 一律是自由定位（0），不会自己跑去贴边。
+    static int SuggestDockOf(int ft) {
+        if (ft == 58) { return 1; }
+        if (ft == 59) { return 2; }
+        if (ft == 61) { return 5; }
+        return 0;
+    }
+
+    /// 应用外壳类容器 / 条（工具条、状态栏、分栏、停靠面板）。
+    /// 它们自带表面并在窗口边缘成条，因此设计器不给它们
+    /// 加标签列。
+    static bool IsShellOf(int ft) {
+        return ft == 58 || ft == 59 || ft == 60 || ft == 61;
+    }
+
+    /// 本字段是否为容器类型（拥有嵌套子组件）。
+    bool IsContainer() {
+        return FormField.IsContainerOf(ftype);
+    }
+
+    /// 嵌套子组件数 / 第 i 个子组件。
+    int KidCount() { return kids.Count; }
+    /// 返回第 i 个子组件。
+    FormField KidAt(int i) { return kids[i]; }
+
+    // ---- 自由画布定位（designer layoutMode == 1）----
+
+    /// 设置设计空间中的绝对位置（容器子元素相对于父内容
+    /// 框）。
+    FormField PlaceAt(int x, int y) { fx = x; fy = y; return this; }
+    /// 设置设计空间中的尺寸（自由画布）。
+    FormField FreeSize(int w, int h) { fw = w; fh = h; return this; }
+    /// 设计空间绝对坐标 / 尺寸（自由画布；未放置时为默认值）。
+    int FreeX() { return fx; }
+    /// 设计空间 Y 坐标。
+    int FreeY() { return fy; }
+    /// 设计空间宽度。
+    int FreeW() { return fw; }
+    /// 设计空间高度。
+    int FreeH() { return fh; }
+
+    /// Runtime rectangle used by the designer canvas. It is deliberately
+    /// separate from fx/fy/fw/fh so automatic layout cannot alter the source.
+    void SetLayoutRect(int x, int y, int w, int h) {
+        layoutX = x;
+        layoutY = y;
+        layoutW = w;
+        layoutH = h;
+        layoutReady = true;
+    }
+    /// 清除运行时布局结果（含全部子组件），取值回退到设计矩形。
+    void ResetLayout() {
+        layoutReady = false;
+        for (int i = 0; i < kids.Count; i = i + 1) {
+            kids[i].ResetLayout();
+        }
+    }
+    /// 运行时布局矩形（未结算 layoutReady=false 时回退设计矩形）。
+    int LayoutX() { return layoutReady ? layoutX : fx; }
+    /// 运行时布局 Y（未结算时回退设计 fy）。
+    int LayoutY() { return layoutReady ? layoutY : fy; }
+    /// 运行时布局宽（未结算时回退设计 fw）。
+    int LayoutW() { return layoutReady ? layoutW : fw; }
+    /// 运行时布局高（未结算时回退设计 fh）。
+    int LayoutH() { return layoutReady ? layoutH : fh; }
+
+    /// 把当前 fx/fy/fw/fh 写入备用矩形表，键为
+    /// "WxH"（覆盖该尺寸之前的条目）。
+    void StashRect(string key) {
+        string entry = key + ":" + Convert.ToString(fx) + "," + Convert.ToString(fy)
+            + "," + Convert.ToString(fw) + "," + Convert.ToString(fh);
+        string outp = "";
+        List<string> parts = altRects.Split(";");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string pt = parts[i];
+            if (pt.Length > 0 && !FormField.AltKeyIs(pt, key)) {
+                if (outp != "") { outp = outp + ";"; }
+                outp = outp + pt;
+            }
+        }
+        if (outp != "") { outp = outp + ";"; }
+        altRects = outp + entry;
+    }
+
+    /// 把 "WxH" 键下保存的备用矩形加载到 fx/fy/fw/fh。
+    /// 该尺寸无条目时返回 false（矩形保持不变）。
+    bool LoadRect(string key) {
+        List<string> parts = altRects.Split(";");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string pt = parts[i];
+            if (pt.Length > 0 && FormField.AltKeyIs(pt, key)) {
+                List<string> kv = pt.Split(":");
+                if (kv.Count == 2) {
+                    List<string> nums = kv[1].Split(",");
+                    if (nums.Count == 4) {
+                        fx = Convert.ToInt32(nums[0]);
+                        fy = Convert.ToInt32(nums[1]);
+                        fw = Convert.ToInt32(nums[2]);
+                        fh = Convert.ToInt32(nums[3]);
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /// 备用矩形条目是否为给定 "WxH" 键。
+    static bool AltKeyIs(string entry, string key) {
+        return entry.Length > key.Length + 1
+            && entry.Substring(0, key.Length + 1) == key + ":";
+    }
+
+    /// 为组件填充默认选项列表——选项值、表格列、
+    /// 标签页标题、步骤/菜单/树条目——使新添加的组件
+    /// 在预览中不至于空白。
+    void SeedOptions(int ft) {
+        if (ft == 23) { options.Add("Name:name"); options.Add("Email:email"); options.Add("Status:status"); return; }
+        if (ft == 24) { options.Add("Created"); options.Add("Approved"); options.Add("Shipped"); return; }
+        if (ft == 25) { options.Add("Root"); options.Add("Child A"); options.Add("Child B"); return; }
+        if (ft == 26) { options.Add("Section 1"); options.Add("Section 2"); return; }
+        if (ft == 34) { options.Add("Step 1"); options.Add("Step 2"); options.Add("Step 3"); return; }
+        if (ft == 35) { options.Add("Home"); options.Add("Library"); options.Add("Data"); return; }
+        if (ft == 36) { options.Add("Tab 1"); options.Add("Tab 2"); options.Add("Tab 3"); return; }
+        if (ft == 38) { options.Add("Dashboard"); options.Add("Settings"); options.Add("Profile"); return; }
+        if (ft == 40) { options.Add("List item one"); options.Add("List item two"); options.Add("List item three"); return; }
+        if (ft == 41) { options.Add("Name:name"); options.Add("Email:email"); options.Add("Status:status"); return; }
+        if (ft == 42) { options.Add("Slide 1"); options.Add("Slide 2"); options.Add("Slide 3"); return; }
+        if (ft == 58) { options.Add("New:plus"); options.Add("Open:folder"); options.Add("Save:save"); options.Add("-"); options.Add(">Help:info"); return; }
+        if (ft == 59) { options.Add("Ready"); options.Add(">UTF-8"); options.Add(">Ln 1, Col 1"); return; }
+        // 分栏容器把方向和第一个窗格的尺寸存在通用选项表里，
+        // 无需为它单独加 .zform 键：options[0]=方向，options[1]=尺寸。
+        if (ft == 60) { options.Add("vertical"); options.Add("240"); return; }
+        if (FormField.UsesOptionsOf(ft)) {
+            options.Add("Option 1");
+            options.Add("Option 2");
+            options.Add("Option 3");
+        }
+    }
+
+    /// 构造指定类型的字段（默认标签 / 占位 / 选项已种子化）。
+    FormField(int ft) {
+        InitField(ft);
+    }
+
+    /// 构建 `ftype` 字段并生成唯一的默认模型键。
+    static FormField New(int ft, int seq) {
+        FormField f = new FormField(ft);
+        f.kind = FormField.KindForType(ft);
+        f.fname = FormField.TypeKey(ft) + Convert.ToString(seq);
+        f.name = f.fname;
+        return f;
+    }
+
+    /// 深拷贝（子元素一并复制）：设计器的「复制」用它，
+    /// 副本除了模型名之外和原件完全一致。
+    FormField Clone() {
+        FormField f = new FormField(ftype);
+        f.kind = kind;
+        f.label = label;
+        f.fname = fname;
+        f.name = fname;
+        f.placeholder = placeholder;
+        f.customKind = customKind;
+        f.compRef = compRef;
+        f.pvPreview = pvPreview;
+        f.required = required;
+        f.defOn = defOn;
+        f.wrap = wrap;
+        f.span = span;
+        f.fx = fx;
+        f.fy = fy;
+        f.fw = fw;
+        f.fh = fh;
+        f.altRects = altRects;
+        f.locked = locked;
+        f.dockSide = dockSide;
+        f.childTab = childTab;
+        f.tabOrient = tabOrient;
+        f.options = new List<string>();
+        for (int i = 0; i < options.Count; i = i + 1) { f.options.Add(options[i]); }
+        f.kids = new List<FormField>();
+        for (int k = 0; k < kids.Count; k = k + 1) { f.kids.Add(kids[k].Clone()); }
+        return f;
+    }
+
+    /// Legacy palette value retained only while reading old designer state.
+    static int Custom() { return 100; }
+
+    /// 是否为自定义组件字段（customKind 非空）。
+    bool IsCustom() { return customKind != ""; }
+
+    /// 构建携带发现的 `kind` 标签的自定义组件字段。
+    static FormField NewCustom(string kind, int seq) {
+        FormField f = new FormField(100);
+        f.kind = kind;
+        f.customKind = kind;
+        f.label = kind;
+        f.fname = kind + Convert.ToString(seq);
+        f.name = f.fname;
+        return f;
+    }
+
+    // ---- 类型元数据 ----
+
+    /// 用于默认模型名称的短类型键，如 "input"、"select"。
+    static string TypeKey(int ft) {
+        if (ft == 1) { return "textarea"; }
+        if (ft == 2) { return "password"; }
+        if (ft == 3) { return "number"; }
+        if (ft == 4) { return "radio"; }
+        if (ft == 5) { return "checkbox"; }
+        if (ft == 6) { return "select"; }
+        if (ft == 7) { return "switch"; }
+        if (ft == 8) { return "rate"; }
+        if (ft == 9) { return "slider"; }
+        if (ft == 10) { return "date"; }
+        if (ft == 11) { return "time"; }
+        if (ft == 12) { return "upload"; }
+        if (ft == 13) { return "color"; }
+        if (ft == 14) { return "richtext"; }
+        if (ft == 15) { return "title"; }
+        if (ft == 16) { return "text"; }
+        if (ft == 17) { return "divider"; }
+        if (ft == 18) { return "card"; }
+        if (ft == 19) { return "tag"; }
+        if (ft == 20) { return "badge"; }
+        if (ft == 21) { return "avatar"; }
+        if (ft == 22) { return "statistic"; }
+        if (ft == 23) { return "table"; }
+        if (ft == 24) { return "timeline"; }
+        if (ft == 25) { return "tree"; }
+        if (ft == 26) { return "collapse"; }
+        if (ft == 27) { return "empty"; }
+        if (ft == 28) { return "alert"; }
+        if (ft == 29) { return "progress"; }
+        if (ft == 30) { return "result"; }
+        if (ft == 31) { return "skeleton"; }
+        if (ft == 32) { return "spin"; }
+        if (ft == 33) { return "tooltip"; }
+        if (ft == 34) { return "steps"; }
+        if (ft == 35) { return "breadcrumb"; }
+        if (ft == 36) { return "tabs"; }
+        if (ft == 37) { return "pagination"; }
+        if (ft == 38) { return "menu"; }
+        if (ft == 39) { return "pageheader"; }
+        if (ft == 40) { return "listview"; }
+        if (ft == 41) { return "datatable"; }
+        if (ft == 42) { return "carousel"; }
+        if (ft == 43) { return "chart"; }
+        if (ft == 44) { return "ellipsis"; }
+        if (ft == 45) { return "panel"; }
+        if (ft == 46) { return "scrollbar"; }
+        if (ft == 47) { return "loading"; }
+        if (ft == 48) { return "dropdown"; }
+        if (ft == 49) { return "floatbutton"; }
+        if (ft == 50) { return "popover"; }
+        if (ft == 51) { return "popconfirm"; }
+        if (ft == 52) { return "notification"; }
+        if (ft == 53) { return "ribbon"; }
+        if (ft == 54) { return "icon"; }
+        if (ft == 55) { return "contextmenu"; }
+        if (ft == 56) { return "layer"; }
+        if (ft == 57) { return "timer"; }
+        if (ft == 58) { return "toolbar"; }
+        if (ft == 59) { return "statusbar"; }
+        if (ft == 60) { return "split"; }
+        if (ft == 61) { return "dockpanel"; }
+        if (ft == 62) { return "led"; }
+        if (ft == 63) { return "digital"; }
+        if (ft == 64) { return "gauge"; }
+        if (ft == 65) { return "bargraph"; }
+        if (ft == 66) { return "trend"; }
+        if (ft == 67) { return "alarmbanner"; }
+        if (ft == 68) { return "alarmlist"; }
+        if (ft == 69) { return "numpad"; }
+        if (ft == 70) { return "devicecard"; }
+        if (ft == 71) { return "equippanel"; }
+        if (ft == 72) { return "webview"; }
+        return "input";
+    }
+
+    /// TypeKey 的逆运算：由规范字符串类型（即 .zform 的
+    /// `kind` 字段中所写）求 ftype。"custom" -> 100；未知 -> 0（input）。
+    static int TypeForKey(string key) {
+        if (key == "custom") { return 100; }
+        // A Panel is the standalone container type, not the card it shares a
+        // widget with.
+        if (key == "Panel") { return 45; }
+        // 23 and 41 both resolve to the shared DataGrid<T> widget; the
+        // canonical grid field is 41, so "DataGrid" (and the legacy
+        // "DataTable") kind reads back as 41 instead of whichever type the
+        // scan hits first.
+        if (key == "DataGrid" || key == "DataTable") { return 41; }
+        // Canvas-drawn types keep their display kind in documents; the
+        // generator substitutes a placeable stand-in, but loading must
+        // restore the original designer type.
+        if (key == "Chart") { return 43; }
+        if (key == "Ellipsis") { return 44; }
+        if (key == "Scrollbar") { return 46; }
+        if (key == "Ribbon") { return 53; }
+        if (key == "Layer") { return 56; }
+        // The inverse of KindForType, so a document written by the designer
+        // reads back as the same field type. Several types share a widget
+        // (a date and a colour entry are both an Input); the first match wins,
+        // which is the plain entry the generator would have produced anyway.
+        for (int ft = 0; ft <= FormField.MaxType(); ft = ft + 1) {
+            if (FormField.KindForType(ft) == key) { return ft; }
+        }
+        // Older documents stored the lowercase palette key.
+        for (int ft2 = 0; ft2 <= FormField.MaxType(); ft2 = ft2 + 1) {
+            if (FormField.TypeKey(ft2) == key) { return ft2; }
+        }
+        return 0;
+    }
+
+    /// 最大的内置字段类型（自定义组件为哨兵 100）。面板范围、
+    /// 序列化和编译期投影都以它为界。
+    static int MaxType() { return 85; }
+
+    /// 供面板/检查器使用的可读类型名称。
+    static string TypeName(int ft) {
+        if (ft == 1) { return "Textarea"; }
+        if (ft == 2) { return "Password"; }
+        if (ft == 3) { return "Number"; }
+        if (ft == 4) { return "Radio"; }
+        if (ft == 5) { return "Checkbox"; }
+        if (ft == 6) { return "Select"; }
+        if (ft == 7) { return "Switch"; }
+        if (ft == 8) { return "Rate"; }
+        if (ft == 9) { return "Slider"; }
+        if (ft == 10) { return "Date"; }
+        if (ft == 11) { return "Time"; }
+        if (ft == 12) { return "Upload"; }
+        if (ft == 13) { return "Color"; }
+        if (ft == 14) { return "Rich Text"; }
+        if (ft == 15) { return "Title"; }
+        if (ft == 16) { return "Text"; }
+        if (ft == 17) { return "Divider"; }
+        if (ft == 18) { return "Card"; }
+        if (ft == 19) { return "Tag"; }
+        if (ft == 20) { return "Badge"; }
+        if (ft == 21) { return "Avatar"; }
+        if (ft == 22) { return "Statistic"; }
+        if (ft == 23 || ft == 41) { return "DataGrid"; }
+        if (ft == 24) { return "Timeline"; }
+        if (ft == 25) { return "Tree"; }
+        if (ft == 26) { return "Collapse"; }
+        if (ft == 27) { return "Empty"; }
+        if (ft == 28) { return "Alert"; }
+        if (ft == 29) { return "Progress"; }
+        if (ft == 30) { return "Result"; }
+        if (ft == 31) { return "Skeleton"; }
+        if (ft == 32) { return "Spin"; }
+        if (ft == 33) { return "Tooltip"; }
+        if (ft == 34) { return "Steps"; }
+        if (ft == 35) { return "Breadcrumb"; }
+        if (ft == 36) { return "Tabs"; }
+        if (ft == 37) { return "Pagination"; }
+        if (ft == 38) { return "Menu"; }
+        if (ft == 39) { return "Page Header"; }
+        if (ft == 40) { return "List View"; }
+        if (ft == 41) { return "Data Table"; }
+        if (ft == 42) { return "Carousel"; }
+        if (ft == 45) { return "Panel"; }
+        if (ft == 47) { return "Loading"; }
+        // 48 dropdown is the popup a control opens; the placeable form of
+        // it is the select box.
+        if (ft == 48) { return "SelectBox"; }
+        if (ft == 49) { return "Float Button"; }
+        if (ft == 50) { return "Popover"; }
+        if (ft == 51) { return "Popconfirm"; }
+        if (ft == 52) { return "Notification"; }
+        if (ft == 53) { return "ToolStrip"; }
+        if (ft == 54) { return "Icon"; }
+        if (ft == 55) { return "Context Menu"; }
+        if (ft == 57) { return "Timer"; }
+        if (ft == 58) { return "Tool Strip"; }
+        if (ft == 59) { return "Status Bar"; }
+        if (ft == 60) { return "Split"; }
+        if (ft == 61) { return "Dock Panel"; }
+        if (ft == 62) { return "LED"; }
+        if (ft == 63) { return "Digital Readout"; }
+        if (ft == 64) { return "Gauge"; }
+        if (ft == 65) { return "Bargraph"; }
+        if (ft == 66) { return "Trend"; }
+        if (ft == 67) { return "Alarm Banner"; }
+        if (ft == 68) { return "Alarm List"; }
+        if (ft == 69) { return "Numeric Keypad"; }
+        if (ft == 70) { return "Device Card"; }
+        if (ft == 71) { return "Equipment Panel"; }
+        if (ft == 72) { return "Web View"; }
+        if (ft == 73) { return "Flex"; }
+        if (ft == 74) { return "Grid"; }
+        if (ft == 75) { return "Image"; }
+        if (ft == 76) { return "Calendar"; }
+        if (ft == 77) { return "Countdown"; }
+        if (ft == 78) { return "QR Code"; }
+        if (ft == 79) { return "Watermark"; }
+        if (ft == 80) { return "Marquee"; }
+        if (ft == 81) { return "Dynamic Tags"; }
+        if (ft == 82) { return "Number Anim"; }
+        if (ft == 83) { return "OTP Input"; }
+        if (ft == 84) { return "Transfer"; }
+        if (ft == 85) { return "Virtual List"; }
+        return "Input";
+    }
+
+    /// 某字段类型特有的语义事件（除每个 Control 都继承的通用
+    /// 指针/焦点/键盘/生命周期事件集之外）。驱动
+    /// 设计器的事件检查器和 JSON `on*` 处理器约定。
+    static List<string> SemanticEventsOf(int ft) {
+        List<string> e = new List<string>();
+        // --- 表单输入 ---
+        if (ft == 0 || ft == 1 || ft == 2 || ft == 3) {
+            e.Add("Change"); e.Add("Submit");            // Input/Textarea/Password/Number
+        } else if (ft == 14) {
+            e.Add("Change");                              // Rich Text
+        } else if (ft == 4) {
+            e.Add("Change");                              // Radio
+        } else if (ft == 5) {
+            e.Add("Change"); e.Add("Toggle");             // Checkbox
+        } else if (ft == 6) {
+            e.Add("Change"); e.Add("SelectionChanged");   // Select
+        } else if (ft == 7) {
+            e.Add("Change"); e.Add("Toggle");             // Switch
+        } else if (ft == 8) {
+            e.Add("Change");                              // Rate
+        } else if (ft == 9) {
+            e.Add("Change"); e.Add("DragEnd");            // Slider
+        } else if (ft == 10 || ft == 11) {
+            e.Add("Change"); e.Add("Open"); e.Add("Close"); // Date / Time picker
+        } else if (ft == 12) {
+            e.Add("Change"); e.Add("Upload"); e.Add("Remove"); // Upload
+        } else if (ft == 13) {
+            e.Add("Change");                              // Color
+        // --- 显示 ---
+        } else if (ft == 19) {
+            e.Add("Click"); e.Add("Close");               // Tag（可关闭）
+        } else if (ft == 21) {
+            e.Add("Click");                               // Avatar
+        } else if (ft == 22) {
+            e.Add("Click");                               // Statistic
+        } else if (ft == 23 || ft == 41) {
+            e.Add("HeaderClick"); e.Add("Sort"); e.Add("RowClick");
+            e.Add("RowDoubleClick"); e.Add("CellClick"); e.Add("CellEdit");
+            e.Add("SelectionChanged"); e.Add("ColumnResize"); e.Add("ScrollChanged");
+        } else if (ft == 24) {
+            e.Add("ItemClick");                           // Timeline
+        } else if (ft == 25) {
+            e.Add("Expand"); e.Add("Collapse"); e.Add("Select"); // Tree
+        } else if (ft == 26) {
+            e.Add("Toggle"); e.Add("Change");             // Collapse
+        // --- 反馈 ---
+        } else if (ft == 28) {
+            e.Add("Close");                               // Alert
+        } else if (ft == 30) {
+            e.Add("Action");                              // Result
+        } else if (ft == 33) {
+            e.Add("Show"); e.Add("Hide");                 // Tooltip
+        } else if (ft == 34) {
+            e.Add("Change");                              // Steps
+        // --- 导航 ---
+        } else if (ft == 35) {
+            e.Add("ItemClick");                           // Breadcrumb
+        } else if (ft == 36) {
+            e.Add("TabChanged"); e.Add("TabClosed");      // Tabs
+        } else if (ft == 37) {
+            e.Add("Change");                              // Pagination
+        } else if (ft == 38 || ft == 40 || ft == 48) {
+            e.Add("ItemClick"); e.Add("SelectionChanged"); // Menu / List / Dropdown
+        } else if (ft == 55) {
+            e.Add("ItemClick"); e.Add("Opening");         // Context Menu
+        } else if (ft == 56) {
+            e.Add("Open"); e.Add("Close");                // Layer
+        } else if (ft == 57) {
+            e.Add("Tick");                                // Timer
+        } else if (ft == 39) {
+            e.Add("Back");                                // Page Header
+        // --- 显示/反馈扩展 ---
+        } else if (ft == 42) {
+            e.Add("Change");                              // Carousel
+        } else if (ft == 43) {
+            e.Add("PointClick"); e.Add("LegendClick");    // Chart
+        } else if (ft == 49) {
+            e.Add("Click");                               // Float Button
+        } else if (ft == 50) {
+            e.Add("Show"); e.Add("Hide");                 // Popover
+        } else if (ft == 51) {
+            e.Add("Confirm"); e.Add("Cancel");            // Popconfirm
+        } else if (ft == 52) {
+            e.Add("Click"); e.Add("Close");               // Notification
+        } else if (ft == 54) {
+            e.Add("Click");                               // Icon
+        } else if (ft == 67) {
+            e.Add("Ack");
+        } else if (ft == 68) {
+            e.Add("RowClick");
+        } else if (ft == 69) {
+            e.Add("Enter");
+            e.Add("Cancel");
+        } else if (ft == 58) {
+            e.Add("ItemClick");                           // Tool Strip
+        } else if (ft == 60) {
+            e.Add("Change");                              // Split（分栏尺寸）
+        } else if (ft == 72) {
+            e.Add("NavStart"); e.Add("NavComplete");      // Web View
+            e.Add("TitleChanged"); e.Add("LoadingChanged");
+        }
+        return e;
+    }
+
+    /// 覆写：公共事件之外并入字段类型（ftype）对应的语义事件集。
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        List<string> sem = FormField.SemanticEventsOf(ftype);
+        for (int i = 0; i < sem.Count; i = i + 1) {
+            if (!e.Contains(sem[i])) { e.Add(sem[i]); }
+        }
+        return e;
+    }
+
+    /// 字段类型的默认标签文案（中文）。
+    static string DefaultLabel(int ft) {
+        if (ft == 1) { return "描述"; }
+        if (ft == 2) { return "密码"; }
+        if (ft == 3) { return "金额"; }
+        if (ft == 4) { return "选择"; }
+        if (ft == 5) { return "标签"; }
+        if (ft == 6) { return "分类"; }
+        if (ft == 7) { return "启用"; }
+        if (ft == 8) { return "评分"; }
+        if (ft == 9) { return "等级"; }
+        if (ft == 10) { return "日期"; }
+        if (ft == 11) { return "时间"; }
+        if (ft == 12) { return "附件"; }
+        if (ft == 13) { return "颜色"; }
+        if (ft == 14) { return "内容"; }
+        if (ft == 15) { return "区块标题"; }
+        if (ft == 16) { return "这里是辅助说明文字。"; }
+        if (ft == 17) { return "分组"; }
+        if (ft == 18) { return "卡片标题"; }
+        if (ft == 19) { return "标签"; }
+        if (ft == 20) { return "消息"; }
+        if (ft == 21) { return "AB"; }
+        if (ft == 22) { return "营收"; }
+        if (ft == 23) { return "表格"; }
+        if (ft == 24) { return "时间线"; }
+        if (ft == 25) { return "树"; }
+        if (ft == 26) { return "面板"; }
+        if (ft == 27) { return "暂无数据"; }
+        if (ft == 28) { return "这是一条警告信息。"; }
+        if (ft == 29) { return "进度"; }
+        if (ft == 30) { return "成功"; }
+        if (ft == 31) { return "加载中"; }
+        if (ft == 32) { return "加载中"; }
+        if (ft == 33) { return "悬停查看"; }
+        if (ft == 34) { return "步骤"; }
+        if (ft == 35) { return "首页"; }
+        if (ft == 36) { return "标签页"; }
+        if (ft == 37) { return "分页"; }
+        if (ft == 38) { return "菜单"; }
+        if (ft == 39) { return "页面标题"; }
+        if (ft == 40) { return "列表视图"; }
+        if (ft == 41) { return "数据表格"; }
+        if (ft == 42) { return "轮播"; }
+        if (ft == 43) { return "本周访问"; }
+        if (ft == 44) { return "一行较长的文本，超出宽度时会自动截断并显示省略号。"; }
+        if (ft == 45) { return "面板标题"; }
+        if (ft == 46) { return "滚动条"; }
+        if (ft == 47) { return "加载中"; }
+        if (ft == 48) { return "选择操作"; }
+        if (ft == 49) { return "浮动按钮"; }
+        if (ft == 50) { return "气泡卡片"; }
+        if (ft == 51) { return "删除此项？"; }
+        if (ft == 52) { return "通知消息"; }
+        if (ft == 53) { return "功能区"; }
+        if (ft == 54) { return "图标"; }
+        if (ft == 58) { return "工具条"; }
+        if (ft == 59) { return "就绪"; }
+        if (ft == 60) { return "分栏"; }
+        if (ft == 61) { return "停靠面板"; }
+        if (ft == 62) { return "RUN"; }
+        if (ft == 63) { return "PV"; }
+        if (ft == 64) { return "PV"; }
+        if (ft == 65) { return "液位"; }
+        if (ft == 66) { return "趋势"; }
+        if (ft == 67) { return "报警"; }
+        if (ft == 68) { return "报警列表"; }
+        if (ft == 69) { return "键盘"; }
+        if (ft == 70) { return "设备"; }
+        if (ft == 71) { return "装备"; }
+        if (ft == 72) { return "网页视图"; }
+        return "文本字段";
+    }
+
+    /// 字段类型的默认占位文本。
+    static string DefaultPlaceholder(int ft) {
+        if (ft == 6) { return "请选择"; }
+        if (ft == 10) { return "选择日期"; }
+        if (ft == 11) { return "选择时间"; }
+        if (ft == 12) { return "点击上传"; }
+        if (ft == 2) { return "请输入密码"; }
+        // 网页视图的文本属性是起始地址（见 WebViewBox 的 `url`）。
+        if (ft == 72) { return "https://www.example.com"; }
+        return "请输入";
+    }
+
+    /// 字段类型是否带用户可编辑的选项列表。除
+    /// 选择型字段外，一些显示/导航组件也复用该选项
+    /// 这些组件的条目使用列表：表格列(23)、时间线事件(24)、树
+    /// 节点(25)、折叠区(26)、步骤(34)、面包屑(35)、
+    /// 标签页标题(36)和菜单项(38)。
+    static bool UsesOptionsOf(int ft) {
+        return ft == 4 || ft == 5 || ft == 6
+            || ft == 23 || ft == 24 || ft == 25 || ft == 26
+            || ft == 34 || ft == 35 || ft == 36 || ft == 38
+            || ft == 40 || ft == 41 || ft == 42 || ft == 55
+            || ft == 58 || ft == 59 || ft == 60
+            || ft == 81;
+    }
+
+    /// 非可视化（行为）组件，WinForms 组件托盘风格：它们
+    /// 不在设计窗口本身中占空间——设计器把它们显示在
+    /// 画布下方的托盘条里。Tooltip(33)、
+    /// Loading(47)、Dropdown(48)、Float Button(49)、Popover(50)、
+    /// Popconfirm(51)、Notification(52)、Context Menu(55)、Layer(56)、
+    /// Timer(57)。
+    static bool IsNonVisualOf(int ft) {
+        return ft == 33 || ft == 47 || ft == 48 || ft == 49 || ft == 50
+            || ft == 51 || ft == 52 || ft == 55 || ft == 56 || ft == 57;
+    }
+
+    /// 本字段是否为非可视（行为）组件（设计器托盘条显示）。
+    bool IsNonVisual() {
+        return FormField.IsNonVisualOf(ftype);
+    }
+
+    /// 本字段类型是否带用户可编辑的选项列表。
+    bool UsesOptions() {
+        return FormField.UsesOptionsOf(ftype);
+    }
+
+    /// 显示 / 布局 / 反馈 / 导航组件（ftype >= 15）渲染
+    /// 静态内容：它们横跨整行，跳过标签列。
+    static bool IsDisplayOf(int ft) {
+        return ft >= 15;
+    }
+
+    /// 本字段是否为显示/布局组件（ftype >= 15，渲染静态内容）。
+    bool IsDisplay() {
+        return FormField.IsDisplayOf(ftype);
+    }
+
+    /// 行高（未缩放），让较高的输入框（textarea/upload/richtext）和
+    /// 多选项字段在画布上获得所需空间。
+    int RowUnits() {
+        // 73-85: 新增组件的画布行高——日历/图片/水印/网格/穿梭框/
+        // 虚拟列表要高度，流式件（Flex/Tags/OTP/动效数字）矮行即可。
+        if (ftype == 73) { return 48; }
+        if (ftype == 74) { return 96; }
+        if (ftype == 75) { return 96; }
+        if (ftype == 76) { return 200; }
+        if (ftype == 77) { return 36; }
+        if (ftype == 78) { return 110; }
+        if (ftype == 79) { return 96; }
+        if (ftype == 80) { return 34; }
+        if (ftype == 81) { return 34; }
+        if (ftype == 82) { return 42; }
+        if (ftype == 83) { return 40; }
+        if (ftype == 84) { return 150; }
+        if (ftype == 85) { return 150; }
+        if (ftype == 1) { return 62; }
+        if (ftype == 12) { return 78; }
+        if (ftype == 14) { return 84; }
+        if (ftype == 4 || ftype == 5) { return 34; }
+        if (ftype == 15) { return 30; }
+        if (ftype == 16) { return 26; }
+        if (ftype == 17) { return 24; }
+        if (ftype == 18) { return 96; }
+        if (ftype == 19) { return 30; }
+        if (ftype == 20) { return 34; }
+        if (ftype == 21) { return 44; }
+        if (ftype == 22) { return 60; }
+        if (ftype == 23) { return 104; }
+        if (ftype == 24) { return 92; }
+        if (ftype == 25) { return 92; }
+        if (ftype == 26) { return 72; }
+        if (ftype == 27) { return 84; }
+        if (ftype == 28) { return 40; }
+        if (ftype == 29) { return 40; }
+        if (ftype == 30) { return 96; }
+        if (ftype == 31) { return 70; }
+        if (ftype == 32) { return 44; }
+        if (ftype == 33) { return 34; }
+        if (ftype == 34) { return 56; }
+        if (ftype == 35) { return 30; }
+        if (ftype == 36) { return 70; }
+        if (ftype == 37) { return 34; }
+        if (ftype == 38) { return 92; }
+        if (ftype == 39) { return 56; }
+        if (ftype == 40) { return 96; }
+        if (ftype == 41) { return 104; }
+        if (ftype == 42) { return 104; }
+        if (ftype == 43) { return 140; }
+        if (ftype == 44) { return 26; }
+        if (ftype == 45) { return 96; }
+        if (ftype == 46) { return 96; }
+        if (ftype == 47) { return 44; }
+        if (ftype == 48) { return 40; }
+        if (ftype == 49) { return 56; }
+        if (ftype == 50) { return 88; }
+        if (ftype == 51) { return 104; }
+        if (ftype == 52) { return 52; }
+        if (ftype == 53) { return 88; }
+        if (ftype == 54) { return 40; }
+        if (ftype == 58) { return 34; }
+        if (ftype == 59) { return 24; }
+        if (ftype == 62) { return 26; }
+        if (ftype == 63) { return 72; }
+        if (ftype == 64) { return 160; }
+        if (ftype == 65) { return 180; }
+        if (ftype == 66) { return 200; }
+        if (ftype == 67) { return 32; }
+        if (ftype == 68) { return 200; }
+        if (ftype == 69) { return 260; }
+        if (ftype == 70) { return 140; }
+        if (ftype == 71) { return 300; }
+        if (ftype == 72) { return 300; }
+        if (ftype == 60) { return 160; }
+        if (ftype == 61) { return 160; }
+        return 34;
+    }
+
+    // ---- 选项列表 ----
+
+    /// 选项数 / 第 i 个选项 / 追加一个选项。
+    int OptionCount() { return options.Count; }
+    /// 返回第 i 个选项。
+    string OptionAt(int i) { return options[i]; }
+    /// 追加一个选项。
+    void AddOption(string s) { options.Add(s); }
+    /// 通过重建列表来移除一个选项（运行时的列表中段
+    /// RemoveAt 与列表中段 Insert 一样可能破坏堆）。
+    void RemoveOptionAt(int i) {
+        if (i < 0 || i >= options.Count) { return; }
+        List<string> nl = new List<string>();
+        for (int k = 0; k < options.Count; k = k + 1) {
+            if (k != i) { nl.Add(options[k]); }
+        }
+        options = nl;
+    }
+
+    /// 选项列表 → "a|b|c" 文本（GetExtra 序列化用）。
+    string JoinOptions() {
+        string r = "";
+        for (int i = 0; i < options.Count; i = i + 1) {
+            if (i > 0) { r = r + "|"; }
+            r = r + options[i];
+        }
+        return r;
+    }
+
+    /// "a|b|c" 文本 → 选项列表（SetExtra 反序列化用）。
+    void SetOptionsFrom(string joined) {
+        options = new List<string>();
+        string cur = "";
+        for (int i = 0; i < joined.Length; i = i + 1) {
+            string ch = joined.Substring(i, 1);
+            if (ch == "|") { options.Add(cur); cur = ""; }
+            else { cur = cur + ch; }
+        }
+        if (cur.Length > 0) { options.Add(cur); }
+    }
+
+    // ---- 设计器 / 序列化模型 ----
+
+    /// Canonical .zform kind for this field. Custom fields retain the
+    /// discovered class name directly; built-ins use their real widget kind.
+    string KindName() {
+        if (this.kind != "") { return this.kind; }
+        if (this.IsCustom()) { return this.customKind; }
+        return FormField.KindForType(this.ftype);
+    }
+
+    /// The single source of truth for "which widget class does this field
+    /// become": the designer writes it into `kind`, the .zform generator
+    /// declares it as the field's type, and TypeForKey reads it back. Every
+    /// built-in type maps to a real Control with a parameterless constructor,
+    /// so a design can never generate code that names a type that does not
+    /// exist. Field types that have no widget of their own (a date or colour
+    /// entry, an upload row) resolve to the control that actually collects
+    /// them.
+    static string KindForType(int ft) {
+        if (ft == 100) { return ""; }
+        if (ft == 1) { return "TextArea"; }
+        if (ft == 4) { return "Radio"; }
+        if (ft == 5) { return "Checkbox"; }
+        if (ft == 6) { return "SelectBox"; }
+        if (ft == 7) { return "Switch"; }
+        if (ft == 8) { return "Rate"; }
+        if (ft == 9) { return "Slider"; }
+        if (ft == 14) { return "TextArea"; }
+        if (ft == 15 || ft == 16) { return "Label"; }
+        if (ft == 17) { return "Divider"; }
+        if (ft == 18 || ft == 45) { return "Panel"; }
+        if (ft == 19) { return "Tag"; }
+        if (ft == 20) { return "Badge"; }
+        if (ft == 21) { return "Avatar"; }
+        if (ft == 22) { return "Statistic"; }
+        // 23 表格与 41 数据表格共用泛型 DataGrid<T>（Table 只是
+        // 画布预览的静态表头渲染器，不是 Control）：kind 必须是
+        // 可实例化的控件类，否则设计稿生成的 `new Table()` 编不过、
+        // kind "DataGrid" 也无法经 TypeForKey 往返回 23/41。
+        if (ft == 23 || ft == 41) { return "DataGrid"; }
+        if (ft == 24) { return "Timeline"; }
+        if (ft == 25) { return "TreeView"; }
+        if (ft == 26) { return "Collapse"; }
+        if (ft == 27) { return "Empty"; }
+        if (ft == 29) { return "Progress"; }
+        if (ft == 30) { return "Result"; }
+        if (ft == 31) { return "Skeleton"; }
+        if (ft == 32 || ft == 47) { return "Spin"; }
+        if (ft == 34) { return "Steps"; }
+        if (ft == 35) { return "Breadcrumb"; }
+        if (ft == 36) { return "Tabs"; }
+        if (ft == 37) { return "Pagination"; }
+        if (ft == 39) { return "PageHeader"; }
+        if (ft == 40) { return "ListView"; }
+        if (ft == 48) { return "Dropdown"; }
+        if (ft == 42) { return "Carousel"; }
+        // 43/44/46/53/56 keep their display kind for round-trip identity
+        // (Chart, Ellipsis, Scrollbar, Ribbon, Layer). None is a Control —
+        // the canvas draws them itself — so GenForm.TypeOf falls back to a
+        // placeable stand-in (Panel/Label/ToolStrip) when generating code.
+        if (ft == 43) { return "Chart"; }
+        if (ft == 44) { return "Ellipsis"; }
+        if (ft == 46) { return "Scrollbar"; }
+        if (ft == 49) { return "FloatButton"; }
+        if (ft == 53) { return "Ribbon"; }
+        if (ft == 56) { return "Layer"; }
+        if (ft == 58) { return "ToolStrip"; }
+        if (ft == 59) { return "StatusBar"; }
+        if (ft == 60) { return "SplitPanel"; }
+        // 61 dockpanel is a DockHost tab, not a placeable widget, so a
+        // design that carries one generates the plain container.
+        if (ft == 61) { return "Panel"; }
+        if (ft == 62) { return "Led"; }
+        if (ft == 63) { return "Digital"; }
+        if (ft == 64) { return "Gauge"; }
+        if (ft == 65) { return "Bargraph"; }
+        if (ft == 66) { return "Trend"; }
+        if (ft == 67) { return "AlarmBanner"; }
+        if (ft == 68) { return "AlarmList"; }
+        if (ft == 69) { return "NumPad"; }
+        if (ft == 70) { return "DeviceCard"; }
+        if (ft == 71) { return "EquipPanel"; }
+        if (ft == 72) { return "WebViewBox"; }
+        // 73-85: 补齐后续新增的控件——布局容器（Flex/Grid）、媒体展示
+        // （Image/Watermark/Marquee）、数据件（Transfer/VirtualList/
+        // DynamicTags）、动效件（Countdown/NumberAnimation）与
+        // OTP 输入、月历。全部是 ControlFactory 可实例化的真控件。
+        if (ft == 73) { return "Flex"; }
+        if (ft == 74) { return "Grid"; }
+        if (ft == 75) { return "Image"; }
+        if (ft == 76) { return "Calendar"; }
+        if (ft == 77) { return "Countdown"; }
+        if (ft == 78) { return "QrCode"; }
+        if (ft == 79) { return "Watermark"; }
+        if (ft == 80) { return "Marquee"; }
+        if (ft == 81) { return "DynamicTags"; }
+        if (ft == 82) { return "NumberAnimation"; }
+        if (ft == 83) { return "InputOtp"; }
+        if (ft == 84) { return "Transfer"; }
+        if (ft == 85) { return "VirtualList"; }
+        // 2 password, 3 number, 10 date, 11 time, 12 upload, 13 color are all
+        // single-line entries, and the remaining types (alert, tooltip, menu,
+        // popover, popconfirm, notification, contextmenu, icon, ellipsis,
+        // timer) are transient surfaces or plain text rather than placeable
+        // widgets, so a design that carries one still generates a control that
+        // exists.
+        if (ft == 28 || ft == 33 || ft == 38 || ft == 44 || ft == 50
+            || ft == 51 || ft == 52 || ft == 54 || ft == 55 || ft == 57) {
+            return "Label";
+        }
+        // A chart, a scrollbar, a layer and a dock tab are drawn by hosts
+        // rather than placed on their own, so they generate the container.
+        if (ft == 43 || ft == 46 || ft == 56) { return "Panel"; }
+        return "Input";
+    }
+
+    /// 控件类型标识（序列化/设计器用）。
+    override string Kind() { return "Field"; }
+
+    /// 覆写：返回设计器属性清单（label/fname/placeholder/required/
+    /// wrap/defOn/span/dock/customKind/options，部分按类型给）。
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec lbl = PropSpec.Text("label", "Label");
+        lbl.str = label;
+        ps.Add(lbl);
+        PropSpec fld = PropSpec.Text("fname", "Name");
+        fld.str = fname;
+        fld.AsName();
+        ps.Add(fld);
+        // 网页视图用这一行存起始地址（它没有占位文本），因此换一个
+        // 名字，属性面板不再把地址当成「占位符」。
+        string phLabel = "Placeholder";
+        if (ftype == 72) { phLabel = "Start URL"; }
+        PropSpec ph = PropSpec.Text("placeholder", phLabel);
+        ph.str = placeholder;
+        ps.Add(ph);
+        PropSpec req = PropSpec.Bool("required", "Required");
+        req.flag = required;
+        ps.Add(req);
+        if (ftype == 15 || ftype == 16) {
+            PropSpec wr = PropSpec.Bool("wrap", "Wrap");
+            wr.flag = wrap;
+            ps.Add(wr);
+        }
+        PropSpec on = PropSpec.Bool("defOn", "Default on");
+        on.flag = defOn;
+        ps.Add(on);
+        PropSpec sp = PropSpec.Int("span", "Span");
+        sp.num = span;
+        ps.Add(sp);
+        PropSpec dk = PropSpec.Enum("dock", "Dock", new List<string>());
+        dk.Option("manual"); dk.Option("top"); dk.Option("bottom");
+        dk.Option("left"); dk.Option("right"); dk.Option("fill");
+        dk.num = dockSide;
+        ps.Add(dk);
+        if (this.IsCustom()) {
+            PropSpec kind = PropSpec.Text("customKind", "Component");
+            kind.str = customKind;
+            ps.Add(kind);
+        }
+        ps.Add(PropSpec.Text("options", "Options"));
+        return ps;
+    }
+
+    /// 选项列表存为文本，逗号分隔的每项即一个选项。
+    override string GetExtra(string key) {
+        if (key == "options") { return this.JoinOptions(); }
+        return "";
+    }
+
+    /// 设计器写入 `options`（逗号分隔选项文本）；其他键返回 false
+    /// 交给基类。
+    override bool SetExtra(string key, string val) {
+        if (key != "options") { return false; }
+        this.SetOptionsFrom(val);
+        return true;
+    }
+}

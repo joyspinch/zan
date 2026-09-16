@@ -1,0 +1,439 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.DataTable;
+
+/// DataTable 布局持久化：用户手工调整出的视图状态——
+/// 列宽、顺序、可见性、冻结、排序键、分组、逐列
+/// 聚合、完整筛选栈、稳定键选区与展开的详情行——
+/// 序列化为 JSON 并读回。
+///
+///   string s = DataTable.SaveLayout(st, cols);   // 例如存入设置文件
+///   DataTable.LoadLayout(st, cols, s);           // 下次启动时
+///
+/// 列以 `DataColumn.Field` 名称为键，绝不按位置，
+/// 插入、移动或重命名列后布局依然有效。
+/// 布局未提到的列保持声明默认值；布局中
+/// 不存在的名称被跳过。这让 `LoadLayout` 面对过期文件也安全——
+/// 退化为部分恢复，而非丢弃布局或
+/// 把某列宽度错赋给另一列。
+///
+/// 未命名列（`field == ""`）无法寻址，保存和加载
+/// 都会被跳过：用 `DataColumn.Field` 命名即表示参与。
+partial class DataTable {
+    /// 布局格式版本，写入 `ver`。结构变化时递增，
+    /// 使未来读取方能迁移而非误解析；`LoadLayout` 拒绝
+    /// 不认识的版本。
+    static int LayoutVersion() { return 1; }
+
+    // ---------- 保存 ----------
+
+    /// 把 `st` 的视图状态序列化为 JSON 字符串。只写入*用户*修改的状态：
+    /// 滚动偏移、选区、进行中的编辑和拖拽状态
+    /// 刻意排除，恢复它们会与下次会话冲突。
+    static string SaveLayout(DataTableState st, List<DataColumn> cols) {
+        JsonValue root = JsonValue.NewObject();
+        root.Put("ver", JsonValue.NewNum(Convert.ToString(DataTable.LayoutVersion())));
+
+        // ---- 逐列状态，按字段名作键 ----
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            string f = cols[i].field;
+            // 未命名列加载时无法匹配，写入只会
+            // 增加读取方不得不跳过的噪音。
+            if (f.Length > 0) {
+                JsonValue c = JsonValue.NewObject();
+                c.Put("field", JsonValue.NewStr(f));
+                if (i < st.colWidths.Count) {
+                    c.Put("w", JsonValue.NewNum(Convert.ToString(st.colWidths[i])));
+                }
+                if (i < st.colHidden.Count && st.colHidden[i]) {
+                    c.Put("hidden", JsonValue.NewBool(true));
+                }
+                if (i < st.colFreeze.Count && st.colFreeze[i] != 0) {
+                    c.Put("freeze", JsonValue.NewNum(Convert.ToString(st.colFreeze[i])));
+                }
+                if (i < st.aggMode.Count && st.aggMode[i] != 0) {
+                    c.Put("agg", JsonValue.NewNum(Convert.ToString(st.aggMode[i])));
+                }
+                if (i < st.filterRowText.Count && st.filterRowText[i].Length > 0) {
+                    c.Put("frow", JsonValue.NewStr(st.filterRowText[i]));
+                }
+                if (i < st.filters.Count) {
+                    JsonValue fj = DataTable.FilterToJson(st.filters[i]);
+                    if (fj != null) { c.Put("filter", fj); }
+                }
+                arr.Append(c);
+            }
+        }
+        root.Put("cols", arr);
+
+        // ---- 列顺序，按显示序列的字段名 ----
+        JsonValue ord = JsonValue.NewArray();
+        for (int o = 0; o < st.colOrder.Count; o = o + 1) {
+            int ci = st.colOrder[o];
+            if (ci >= 0 && ci < cols.Count && cols[ci].field.Length > 0) {
+                ord.Append(JsonValue.NewStr(cols[ci].field));
+            }
+        }
+        root.Put("order", ord);
+
+        // ---- 排序键，由外层到内层 ----
+        JsonValue sk = JsonValue.NewArray();
+        for (int s = 0; s < st.sortKeys.Count; s = s + 1) {
+            int sc = st.sortKeys[s].col;
+            if (sc >= 0 && sc < cols.Count && cols[sc].field.Length > 0) {
+                JsonValue e = JsonValue.NewObject();
+                e.Put("field", JsonValue.NewStr(cols[sc].field));
+                e.Put("dir", JsonValue.NewNum(Convert.ToString(st.sortKeys[s].dir)));
+                sk.Append(e);
+            }
+        }
+        root.Put("sort", sk);
+
+        // ---- 分组列，由外层到内层 ----
+        JsonValue gr = JsonValue.NewArray();
+        for (int g = 0; g < st.groupCols.Count; g = g + 1) {
+            int gc = st.groupCols[g];
+            if (gc >= 0 && gc < cols.Count && cols[gc].field.Length > 0) {
+                gr.Append(JsonValue.NewStr(cols[gc].field));
+            }
+        }
+        root.Put("group", gr);
+
+        // ---- 折叠的表头 band（已按其路径作键）----
+        JsonValue bc = JsonValue.NewArray();
+        for (int b = 0; b < st.bandCollapsed.Count; b = b + 1) {
+            bc.Append(JsonValue.NewStr(st.bandCollapsed[b]));
+        }
+        root.Put("bands", bc);
+
+        // ---- 展开的主从详情行，按稳定 RowKey ----
+        // 源行索引只对相同数据有意义，行一旦重排/插删
+        // 就指到别的业务行。稳定键源写 canonical key，
+        // 恢复时无论行移动到哪里都展开同一行；没有
+        // 键提供器的旧源回退写 `legacy:` 前缀的索引，
+        // 语义与旧行为一致。
+        JsonValue ex = JsonValue.NewArray();
+        for (int e2 = 0; e2 < st.expandedKeys.Count; e2 = e2 + 1) {
+            RowKey ek = st.expandedKeys[e2];
+            if (ek != null && ek.Canonical().Length > 0) {
+                ex.Append(JsonValue.NewStr(ek.Canonical()));
+            }
+        }
+        if (ex.Count() == 0 && !st.expandedByKey) {
+            for (int e3 = 0; e3 < st.expandedRows.Count; e3 = e3 + 1) {
+                ex.Append(JsonValue.NewStr("legacy:" + Convert.ToString(st.expandedRows[e3])));
+            }
+        }
+        root.Put("expanded", ex);
+
+        // ---- 选区快照，由 SelectionModel 序列化 ----
+        // 键集合 / 全选+排除都不物化 bool[N]；临时 key 由
+        // 模型维护方过滤，这里只写业务键。没有键提供器的
+        // 旧源不写选区：legacy 索引不是持久身份，恢复它会
+        // 在数据变化后选错行。
+        if (st.selectionModel != null && st.expandedByKey) {
+            root.Put("selection", JsonValue.ParseLenient(st.selectionModel.ToJson()));
+        }
+
+        // ---- 表级开关 ----
+        JsonValue v = JsonValue.NewObject();
+        v.Put("rowNum", JsonValue.NewBool(st.showRowNum));
+        v.Put("select", JsonValue.NewBool(st.showSelect));
+        v.Put("striped", JsonValue.NewBool(st.striped));
+        v.Put("summary", JsonValue.NewBool(st.showSummary));
+        v.Put("filterRow", JsonValue.NewBool(st.showFilterRow));
+        v.Put("statusBar", JsonValue.NewBool(st.showStatusBar));
+        v.Put("paged", JsonValue.NewBool(st.paged));
+        root.Put("view", v);
+
+        return root.ToJson();
+    }
+
+    /// 序列化某列的筛选器；没有活动阶段时返回 null——
+    /// 未筛选的列不向布局贡献内容。
+    static JsonValue FilterToJson(ColFilter f) {
+        if (!f.Active()) { return null; }
+        JsonValue o = JsonValue.NewObject();
+        if (f.hidden.Count > 0) {
+            JsonValue h = JsonValue.NewArray();
+            for (int i = 0; i < f.hidden.Count; i = i + 1) {
+                h.Append(JsonValue.NewStr(f.hidden[i]));
+            }
+            o.Put("hidden", h);
+        }
+        if (f.textQuery.Length > 0) {
+            o.Put("tq", JsonValue.NewStr(f.textQuery));
+            o.Put("tm", JsonValue.NewNum(Convert.ToString(f.textMode)));
+        }
+        if (f.batchTerms.Count > 0) {
+            JsonValue b = JsonValue.NewArray();
+            for (int i = 0; i < f.batchTerms.Count; i = i + 1) {
+                b.Append(JsonValue.NewStr(f.batchTerms[i]));
+            }
+            o.Put("batch", b);
+            o.Put("bExact", JsonValue.NewBool(f.batchExact));
+            o.Put("bKeep", JsonValue.NewBool(f.batchKeep));
+        }
+        if (f.cmpMode != 0) {
+            o.Put("cmp", JsonValue.NewNum(Convert.ToString(f.cmpMode)));
+            o.Put("cmpA", JsonValue.NewStr(f.cmpA));
+            o.Put("cmpB", JsonValue.NewStr(f.cmpB));
+        }
+        if (f.datePreset != 0) {
+            o.Put("dpre", JsonValue.NewNum(Convert.ToString(f.datePreset)));
+        }
+        if (f.topMode != 0) {
+            o.Put("top", JsonValue.NewNum(Convert.ToString(f.topMode)));
+            o.Put("topN", JsonValue.NewNum(Convert.ToString(f.topN)));
+        }
+        return o;
+    }
+
+    // ---------- 加载 ----------
+
+    /// 恢复 `SaveLayout` 写入的布局。文本不是已知版本的可用布局时
+    /// 返回 false 且不动 `st`，
+    /// 防止损坏或外来的设置文件被部分应用。
+    ///
+    /// 可在网格首帧前安全调用：与索引对齐的逐列
+    /// 列表会先扩展以匹配 `cols`。
+    static bool LoadLayout(DataTableState st, List<DataColumn> cols, string text) {
+        if (text.Length == 0) { return false; }
+        JsonValue root = JsonValue.ParseLenient(text);
+        if (root == null) { return false; }
+        if (!root.IsObject()) { return false; }
+        int ver = root.Int("ver", 0);
+        // 拒绝本版本不认识的版本号，而不是猜测
+        // 可能已移动字段的结构。
+        if (ver != DataTable.LayoutVersion()) { return false; }
+
+        // 逐列列表与 `cols` 索引对齐；先确保它们
+        // 足够长再按下标写入，使首帧前加载的布局
+        // 不会越界。
+        DataTable.EnsureLayoutSlots(st, cols);
+
+        DataTable.LoadColumnState(st, cols, root);
+        DataTable.LoadColumnOrder(st, cols, root);
+        DataTable.LoadSortKeys(st, cols, root);
+        DataTable.LoadGrouping(st, cols, root);
+        DataTable.LoadCollapsedBands(st, root);
+        DataTable.LoadExpandedRows(st, root);
+        DataTable.LoadSelection(st, root);
+        DataTable.LoadViewToggles(st, root);
+
+        // 布局同时携带查询（筛选、排序、分组、聚合）和
+        // 视图（宽度、隐藏、冻结、顺序）状态；查询失效
+        // 已包含其依赖的显示结果失效。
+        DataTable.InvalidateQuery(st);
+        return true;
+    }
+
+    /// 逐列状态：宽度 / 隐藏 / 冻结 / 聚合 / 筛选行 / 筛选器。
+    static void LoadColumnState(DataTableState st, List<DataColumn> cols, JsonValue root) {
+        JsonValue arr = root.Get("cols");
+        if (arr != null && arr.IsArray()) {
+            for (int i = 0; i < arr.Count(); i = i + 1) {
+                JsonValue c = arr.At(i);
+                if (c.IsObject()) {
+                    int ci = DataTable.Col(cols, c.Str("field", ""));
+                    // 布局中提到但当前表没有的列
+                    // （已重命名或在新版本中移除）会被跳过。
+                    if (ci >= 0) {
+                        int w = c.Int("w", 0);
+                        // 防止手工编辑的文件中出现
+                        // 零或负宽度把列压没。
+                        if (w > 0) { st.colWidths[ci] = w; }
+                        st.colHidden[ci] = c.Bool("hidden", false);
+                        int fz = c.Int("freeze", 0);
+                        if (fz >= 0 && fz <= 2) { st.colFreeze[ci] = fz; }
+                        int ag = c.Int("agg", 0);
+                        if (ag >= 0 && ag <= 6) { st.aggMode[ci] = ag; }
+                        st.filterRowText[ci] = c.Str("frow", "");
+                        st.filters[ci].Reset();
+                        JsonValue fj = c.Get("filter");
+                        if (fj != null && fj.IsObject()) {
+                            DataTable.FilterFromJson(st.filters[ci], fj);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 列顺序：布局列出的列按保存序列在前，
+    /// 布局未提到的列（写入后新增的）按声明位置
+    /// 在后，确保不丢列。
+    static void LoadColumnOrder(DataTableState st, List<DataColumn> cols, JsonValue root) {
+        JsonValue ord = root.Get("order");
+        if (ord != null && ord.IsArray() && ord.Count() > 0) {
+            List<int> next = new List<int>();
+            for (int o = 0; o < ord.Count(); o = o + 1) {
+                int ci = DataTable.Col(cols, ord.At(o).AsString(""));
+                if (ci >= 0 && next.IndexOf(ci) < 0) { next.Add(ci); }
+            }
+            for (int c2 = 0; c2 < cols.Count; c2 = c2 + 1) {
+                if (next.IndexOf(c2) < 0) { next.Add(c2); }
+            }
+            st.colOrder = next;
+        }
+    }
+
+    /// 排序键，sortCol/sortDir 镜像主键以兼容旧版。
+    static void LoadSortKeys(DataTableState st, List<DataColumn> cols, JsonValue root) {
+        st.sortKeys.Clear();
+        st.sortCol = -1;
+        st.sortDir = 1;
+        JsonValue sk = root.Get("sort");
+        if (sk != null && sk.IsArray()) {
+            for (int s = 0; s < sk.Count(); s = s + 1) {
+                JsonValue e = sk.At(s);
+                if (e.IsObject()) {
+                    int ci = DataTable.Col(cols, e.Str("field", ""));
+                    int dir = e.Int("dir", 1);
+                    if (ci >= 0 && (dir == 1 || dir == 2)) {
+                        st.sortKeys.Add(new SortKey(ci, dir));
+                    }
+                }
+            }
+        }
+        // sortCol/sortDir 镜像主键以兼容旧版（见
+        // DataTableState），因此要与刚构建的列表保持一致。
+        if (st.sortKeys.Count > 0) {
+            st.sortCol = st.sortKeys[0].col;
+            st.sortDir = st.sortKeys[0].dir;
+        }
+    }
+
+    /// 分组列；折叠状态从零开始（键基于组值）。
+    static void LoadGrouping(DataTableState st, List<DataColumn> cols, JsonValue root) {
+        st.groupCols.Clear();
+        // 折叠状态以组*值*为键，而组值在
+        // 重建前没有意义，因此从零开始：所有组展开。
+        st.collapsedKeys.Clear();
+        JsonValue gr = root.Get("group");
+        if (gr != null && gr.IsArray()) {
+            for (int g = 0; g < gr.Count(); g = g + 1) {
+                int ci = DataTable.Col(cols, gr.At(g).AsString(""));
+                if (ci >= 0 && st.groupCols.IndexOf(ci) < 0) { st.groupCols.Add(ci); }
+            }
+        }
+    }
+
+    /// 折叠的表头 band；隐藏列在下一帧重新推导。
+    static void LoadCollapsedBands(DataTableState st, JsonValue root) {
+        st.bandCollapsed.Clear();
+        // 折叠 band 隐藏了哪些列在下一帧重新推导。
+        st.bandAutoHidden.Clear();
+        JsonValue bc = root.Get("bands");
+        if (bc != null && bc.IsArray()) {
+            for (int b = 0; b < bc.Count(); b = b + 1) {
+                string p = bc.At(b).AsString("");
+                if (p.Length > 0) { st.bandCollapsed.Add(p); }
+            }
+        }
+    }
+
+    /// 展开的主从详情行。布局带 `expanded` 键数组：
+    /// 稳定键源写业务 canonical key（`legacy:` 前缀为旧索引
+    /// 格式），恢复时经 RowIndexOfKey 定位——行重排/插删后
+    /// 仍展开同一行。找不到的键被跳过；扁平化时仍逐个
+    /// 经 CanExpand 审核，无法强行展开 provider 拒绝的行。
+    static void LoadExpandedRows(DataTableState st, JsonValue root) {
+        st.expandedRows.Clear();
+        st.expandedKeys.Clear();
+        JsonValue ex = root.Get("expanded");
+        if (ex != null && ex.IsArray()) {
+            for (int e2 = 0; e2 < ex.Count(); e2 = e2 + 1) {
+                string k = ex.At(e2).AsString("");
+                if (k.Length == 0) { continue; }
+                if (k.Length > 7 && k.Substring(0, 7) == "legacy:") {
+                    int rw = DataTable.ParseInt(k.Substring(7, k.Length - 7));
+                    if (rw >= 0 && st.expandedRows.IndexOf(rw) < 0) {
+                        st.expandedRows.Add(rw);
+                    }
+                } else if (!DataTable.ExpandedKeySeen(st, k)) {
+                    st.expandedKeys.Add(RowKey.Of(k));
+                    st.expandedByKey = true;
+                }
+            }
+        }
+    }
+
+    /// `k` 是否已在展开键集合里（内容相等；List.IndexOf 是引用
+    /// 比较，对 RowKey 不可用）。
+    static bool ExpandedKeySeen(DataTableState st, string k) {
+        for (int i = 0; i < st.expandedKeys.Count; i = i + 1) {
+            if (st.expandedKeys[i].Canonical() == k) { return true; }
+        }
+        return false;
+    }
+
+    /// 选区快照：从 `selection` 对象重建 SelectionModel。
+    /// 模型缺失或解析失败时保持当前模型不动（和布局中
+    /// 未提到的列一样退化为"无此状态"而非错误）。加载的
+    /// 模型此后权威：首次 SyncSelectionModel 不再把空的
+    /// 旧 bool 数组误导入成"没有选择"。
+    static void LoadSelection(DataTableState st, JsonValue root) {
+        JsonValue sel = root.Get("selection");
+        if (sel == null || !sel.IsObject()) { return; }
+        SelectionModel model = SelectionModel.FromJson(sel.ToJson());
+        if (model == null) { return; }
+        DataTable.SetSelectionModel(st, model);
+    }
+
+    /// 表级显示开关。
+    static void LoadViewToggles(DataTableState st, JsonValue root) {
+        JsonValue v = root.Get("view");
+        if (v != null && v.IsObject()) {
+            st.showRowNum = v.Bool("rowNum", st.showRowNum);
+            st.showSelect = v.Bool("select", st.showSelect);
+            st.striped = v.Bool("striped", st.striped);
+            st.showSummary = v.Bool("summary", st.showSummary);
+            st.showFilterRow = v.Bool("filterRow", st.showFilterRow);
+            st.showStatusBar = v.Bool("statusBar", st.showStatusBar);
+            st.paged = v.Bool("paged", st.paged);
+        }
+    }
+
+    /// 从保存的对象恢复某列的筛选器。调用方先重置
+    /// 筛选器，因此只设置布局携带的阶段。
+    static void FilterFromJson(ColFilter f, JsonValue o) {
+        JsonValue h = o.Get("hidden");
+        if (h != null && h.IsArray()) {
+            for (int i = 0; i < h.Count(); i = i + 1) {
+                f.hidden.Add(h.At(i).AsString(""));
+            }
+        }
+        f.textQuery = o.Str("tq", "");
+        f.textMode = o.Int("tm", 1);
+        JsonValue b = o.Get("batch");
+        if (b != null && b.IsArray()) {
+            for (int i = 0; i < b.Count(); i = i + 1) {
+                f.batchTerms.Add(b.At(i).AsString(""));
+            }
+        }
+        f.batchExact = o.Bool("bExact", false);
+        f.batchKeep = o.Bool("bKeep", true);
+        int cm = o.Int("cmp", 0);
+        if (cm >= 0 && cm <= 10) { f.cmpMode = cm; }
+        f.cmpA = o.Str("cmpA", "");
+        f.cmpB = o.Str("cmpB", "");
+        int dp = o.Int("dpre", 0);
+        if (dp >= 0 && dp <= 11) { f.datePreset = dp; }
+        int tm2 = o.Int("top", 0);
+        if (tm2 >= 0 && tm2 <= 6) { f.topMode = tm2; }
+        f.topN = o.Int("topN", 10);
+    }
+
+    /// 扩展与索引对齐的逐列列表以覆盖所有列，
+    /// 使 LoadLayout 即使在网格自身首帧初始化之前
+    /// 也能按下标写入。与 EnsureInit 的尾部一致。
+    static void EnsureLayoutSlots(DataTableState st, List<DataColumn> cols) {
+        // Layout 恢复与首帧/动态列初始化必须使用同一套
+        // 槽位扩展逻辑，避免新增列只补一部分并行列表。
+        DataTable.EnsureColumnSlots(st, cols);
+    }
+}

@@ -1,0 +1,199 @@
+using System;
+
+namespace System.Net;
+
+/// <summary>Ping 返回的强类型结果状态。</summary>
+enum PingStatus {
+    /// <summary>收到应答。</summary>
+    Success,
+    /// <summary>超时内未收到应答。</summary>
+    TimedOut,
+    /// <summary>目标不可达（网络或主机）。</summary>
+    DestinationUnreachable,
+    /// <summary>报文过大无法传送。</summary>
+    PacketTooBig,
+    /// <summary>请求参数被拒（Windows IP_STATUS 11006-11008/11015）。</summary>
+    BadRequest,
+    /// <summary>其他错误（句柄/内存/API 失败等）。</summary>
+    Error
+}
+
+/// <summary>一条 ICMP echo 结果。</summary>
+class PingReply {
+    /// <summary>应答状态。</summary>
+    public PingStatus status;
+    /// <summary>应答方地址（Windows 取自应答，可能异于请求串）。</summary>
+    public string address;
+    /// <summary>往返时间（毫秒）。</summary>
+    public int roundtripTime;
+    /// <summary>应答携带的数据字节数。</summary>
+    public int dataSize;
+
+    /// <summary>是否成功收到应答。</summary>
+    public bool IsSuccess() { return status == PingStatus.Success; }
+
+    /// <summary>主动释放 reply 持有的文本。</summary>
+    public void Dispose() { address = null; }
+}
+
+/// <summary>
+/// ICMP echo 客户端，不经过命令行 shell 或外部 ping 可执行程序。
+/// Windows 上直接调 iphlpapi；Linux/macOS 上走运行时的 ICMP socket
+/// （Linux 优先用无需提权的 SOCK_DGRAM/IPPROTO_ICMP “ping socket”，
+/// 内核不开放时回退到需 root/CAP_NET_RAW 的 SOCK_RAW）。
+/// </summary>
+class Ping {
+    /// <summary>发送 IPv4 echo 请求，超时 4 秒。</summary>
+    static PingReply Send(string address) {
+        return Ping.Send(address, 4000);
+    }
+
+    /// <summary>发送 IPv4 echo 请求并返回类型化回复。</summary>
+    /// <summary>发送 IPv4 echo 请求并等待应答，最多
+    /// <paramref name="timeoutMs"/> 毫秒（负值按 0 处理）。地址不是
+    /// 合法 IPv4 时抛 ArgumentException（Windows 侧对广播地址
+    /// "255.255.255.255" 网开一面）；非 Windows 下 socket/权限错误
+    /// 映射为 <see cref="PingStatus.Error"/>。</summary>
+    static PingReply Send(string address, int timeoutMs) {
+        #if WINDOWS
+        if (timeoutMs < 0) { timeoutMs = 0; }
+        int destination = Ping.ParseIPv4(address);
+        if (destination == -1 && address != "255.255.255.255") {
+            throw new ArgumentException("Ping address must be an IPv4 address");
+        }
+
+        PingReply result = new PingReply();
+        result.status = PingStatus.Error;
+        result.address = address;
+        result.roundtripTime = 0;
+        result.dataSize = 0;
+
+        nint handle = Ping.IcmpCreateFile();
+        if (handle == (nint)-1 || handle == 0) { return result; }
+
+        string payload = "zan-ping";
+        nint request = NativeMemory.Alloc(payload.Length);
+        NativeMemory.PutString(request, 0, payload, payload.Length);
+        // x64 下 ICMP_ECHO_REPLY 为 40 字节，为返回的数据留出空间
+        // 以及 API 文档所述的额外 8 字节错误负载。
+        int replySize = 40 + payload.Length + 8;
+        nint reply = NativeMemory.Alloc(replySize);
+        int count = Ping.IcmpSendEcho(handle, destination, request,
+            (ushort)payload.Length, 0, reply, replySize, timeoutMs);
+        if (count > 0) {
+            int nativeStatus = new Span<int>(reply + 4, 1)[0];
+            result.status = Ping.MapStatus(nativeStatus);
+            result.roundtripTime = new Span<int>(reply + 8, 1)[0];
+            result.dataSize = (int)new Span<ushort>(reply + 12, 1)[0];
+            result.address = Ping.FormatIPv4(new Span<int>(reply, 1)[0]);
+        }
+        NativeMemory.Free(reply);
+        NativeMemory.Free(request);
+        Ping.IcmpCloseHandle(handle);
+        return result;
+        #else
+        if (timeoutMs < 0) { timeoutMs = 0; }
+        PingReply result = new PingReply();
+        result.address = address;
+        result.roundtripTime = 0;
+        result.dataSize = 0;
+        int rc = Ping.NativeIcmpPing(address, timeoutMs);
+        if (rc >= 0) {
+            result.status = PingStatus.Success;
+            result.roundtripTime = rc;
+            result.dataSize = 8;
+            return result;
+        }
+        if (rc == -1) { result.status = PingStatus.TimedOut; return result; }
+        if (rc == -2) {
+            result.status = PingStatus.DestinationUnreachable;
+            return result;
+        }
+        if (rc == -4) {
+            throw new ArgumentException("Ping address must be an IPv4 address");
+        }
+        result.status = PingStatus.Error;
+        return result;
+        #endif
+    }
+
+    #if !WINDOWS
+    /// <summary>平台 ICMP 实现：返回往返毫秒（&gt;= 0），或
+    /// -1 超时 / -2 不可达 / -3 socket 或权限错误 / -4 地址无法解析。</summary>
+    [DllImport("crt", EntryPoint = "zan_plat_icmp_ping")]
+    static extern int NativeIcmpPing(string address, int timeoutMs);
+    #endif
+
+    #if WINDOWS
+    [DllImport("iphlpapi", EntryPoint = "IcmpCreateFile")]
+    static extern nint IcmpCreateFile();
+
+    [DllImport("iphlpapi", EntryPoint = "IcmpSendEcho")]
+    static extern int IcmpSendEcho(nint handle, int destination, nint request,
+                                   ushort requestSize, nint options, nint reply,
+                                   int replySize, int timeoutMs);
+
+    [DllImport("iphlpapi", EntryPoint = "IcmpCloseHandle")]
+    static extern int IcmpCloseHandle(nint handle);
+
+    /// <summary>把 Windows IP_STATUS 码映射为 <see cref="PingStatus"/>。</summary>
+    static PingStatus MapStatus(int status) {
+        if (status == 0) { return PingStatus.Success; }
+        if (status == 11010) { return PingStatus.TimedOut; }
+        if (status == 11009) { return PingStatus.PacketTooBig; }
+        if (status == 11004 || status == 11005 || status == 11002
+            || status == 11003) { return PingStatus.DestinationUnreachable; }
+        if (status == 11006 || status == 11007 || status == 11008
+            || status == 11015) { return PingStatus.BadRequest; }
+        return PingStatus.Error;
+    }
+
+    /// <summary>点分 IPv4 解析为 Windows IPAddr——网络序字节按小端
+    /// 解释的 DWORD（因此 127.0.0.1 变成 0x0100007f）。非法格式返回 -1。</summary>
+    static int ParseIPv4(string text) {
+        int packed = 0;
+        int part = 0;
+        int digits = 0;
+        int octet = 0;
+        for (int i = 0; i <= text.Length; i = i + 1) {
+            bool atEnd = i == text.Length;
+            string ch = atEnd ? "." : text.Substring(i, 1);
+            if (ch == ".") {
+                if (digits == 0 || octet > 255 || part > 3) { return -1; }
+                packed = packed | (octet << (part * 8));
+                part = part + 1;
+                octet = 0;
+                digits = 0;
+            } else {
+                if (ch < "0" || ch > "9" || digits >= 3) { return -1; }
+                octet = octet * 10 + Ping.Digit(ch);
+                digits = digits + 1;
+            }
+        }
+        if (part != 4) { return -1; }
+        return packed;
+    }
+
+    /// <summary>单字符十进制数字；"0" 与非 1-9 字符都返回 0。</summary>
+    static int Digit(string ch) {
+        if (ch == "1") { return 1; }
+        if (ch == "2") { return 2; }
+        if (ch == "3") { return 3; }
+        if (ch == "4") { return 4; }
+        if (ch == "5") { return 5; }
+        if (ch == "6") { return 6; }
+        if (ch == "7") { return 7; }
+        if (ch == "8") { return 8; }
+        if (ch == "9") { return 9; }
+        return 0;
+    }
+
+    /// <summary>IPAddr DWORD 还原为点分十进制。</summary>
+    static string FormatIPv4(int packed) {
+        return Convert.ToString(packed & 255) + "."
+            + Convert.ToString((packed >> 8) & 255) + "."
+            + Convert.ToString((packed >> 16) & 255) + "."
+            + Convert.ToString((packed >> 24) & 255);
+    }
+    #endif
+}

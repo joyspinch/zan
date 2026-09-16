@@ -1,0 +1,574 @@
+using System;
+using System.Diagnostics;
+
+namespace Gui.Component.WebView;
+
+/// <summary>
+/// WebView 控件驱动的扁平句柄 API，映射到平台
+/// 所拥有的任何引擎上。
+///
+/// Windows 上的引擎是 Edge WebView2，在 Zan（WebView2.zan）中
+/// 直接针对其 COM 接口实现——无需原生垫片。macOS 上由 zan_gui
+/// 运行时提供 WKWebView；Android 上同一组 zan_gui_webview_*
+/// 入口由 libzan_gui.so 提供，落在系统 android.webkit.WebView
+/// 上（gui_runtime_android.c + APK shell 里的 ZanWeb Java 桥）。
+/// 没有可嵌入引擎的平台走
+/// 下面的回退路径：Create 返回 0，控件绘制自己的
+/// 占位符，因此完全不引用任何原生符号。
+/// </summary>
+class WebViewBackend {
+    #if MACOS || ANDROID
+    [DllImport("zan_gui")]
+    static extern int zan_gui_webview_create(nint hwnd, string profileId);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_destroy(int h);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_set_frame(int h, int x, int y, int w, int hh);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_set_visible(int h, int visible);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_navigate(int h, string url);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_load_html(int h, string html, string baseUrl);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_back(int h);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_forward(int h);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_reload(int h);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_stop(int h);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_webview_can_go_back(int h);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_webview_can_go_forward(int h);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_webview_is_loading(int h);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_webview_nav_seq(int h);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_webview_last_status(int h);
+    [DllImport("zan_gui")]
+    static extern string zan_gui_webview_get_url(int h);
+    [DllImport("zan_gui")]
+    static extern string zan_gui_webview_get_title(int h);
+    [DllImport("zan_gui")]
+    static extern string zan_gui_webview_last_request(int h);
+    [DllImport("zan_gui")]
+    static extern string zan_gui_webview_eval(int h, string js);
+    [DllImport("zan_gui")]
+    static extern string zan_gui_webview_get_cookies(int h, string url);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_set_cookie(int h, string url,
+                                                  string cookieName,
+                                                  string cookieValue);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_clear_cookies(int h);
+    #endif
+
+    /// <summary>创建以窗口句柄为父的视图，返回句柄。profileId 隔离
+    /// Cookie/缓存（""=默认配置）。平台没有可嵌入引擎时返回 0，
+    /// 后续所有调用均为安全空操作；无效句柄同样被忽略。</summary>
+    static int Create(nint hwnd, string profileId) {
+        #if WINDOWS
+        return WebView2.Create(hwnd, profileId);
+        #elif MACOS || ANDROID
+        return WebViewBackend.zan_gui_webview_create(hwnd, profileId);
+        #else
+        return 0;
+        #endif
+    }
+
+    /// 销毁视图并释放原生资源；无效句柄被忽略。
+    static void Destroy(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null) { w.Dispose(); }
+        #elif MACOS || ANDROID
+        WebViewBackend.zan_gui_webview_destroy(h);
+        #endif
+    }
+
+    /// 把原生视图摆到客户区坐标 (x,y,w,hh)（逻辑像素，平台自行按 DPI
+    /// 折算）；无效句柄被忽略。
+    static void SetFrame(int h, int x, int y, int w, int hh) {
+        #if WINDOWS
+        WebView2 v = WebView2.Get(h);
+        if (v != null) { v.SetFrame(x, y, w, hh); }
+        #elif MACOS || ANDROID
+        WebViewBackend.zan_gui_webview_set_frame(h, x, y, w, hh);
+        #endif
+    }
+
+    /// 显示或隐藏原生视图；无效句柄被忽略。
+    static void SetVisible(int h, bool visible) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null) { w.SetVisible(visible); }
+        #elif MACOS || ANDROID
+        int v = 0;
+        if (visible) { v = 1; }
+        WebViewBackend.zan_gui_webview_set_visible(h, v);
+        #endif
+    }
+
+    /// 把本帧未被遮挡的区域下发给原生视图。`spec` 是
+    /// "x,y,w,h;..." 的矩形并集（客户区坐标），"" = 完全被盖住，
+    /// 应该隐藏。签名匹配 Gui.NativeClipFn，由 WebView.Render 登记给
+    /// App，帧末统一回调（委托是纯函数指针，所以这里是静态方法）。
+    static void ApplyClip(int h, string spec) {
+        #if WINDOWS
+        WebView2 v = WebView2.Get(h);
+        if (v != null) { v.SetClip(spec); }
+        #elif MACOS || ANDROID
+        // 原生视图是 OS 兄弟层，分区裁剪由 zan_gui 提供完
+        // 备实现（macOS: gui_runtime_mac.m；Android:
+        // gui_runtime_android.c）。但交叉链接只能解析仓库里
+        // 已提交的 libzan_gui（由对应平台构建）的导出表，直接
+        // DllImport 会让还没重建库的 --publish 链接失败。所以
+        // 和下面那批桥接入口一样在运行时探测：有就真裁，没有就退回
+        // set_visible 的“全遮住才隐藏”。
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_setClip != 0) {
+            WvNameVoidFn f = (WvNameVoidFn)WebViewBackend.addr_setClip;
+            f(h, spec);
+            return;
+        }
+        WebViewBackend.zan_gui_webview_set_visible(h, spec == "" ? 0 : 1);
+        #endif
+    }
+
+    /// 导航到 URL；无效句柄被忽略。
+    static void Navigate(int h, string url) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null) { w.Navigate(url); }
+        #elif MACOS || ANDROID
+        WebViewBackend.zan_gui_webview_navigate(h, url);
+        #endif
+    }
+
+    /// 以 `baseUrl` 解析相对地址加载一段 HTML；无效句柄被忽略。
+    static void LoadHtml(int h, string html, string baseUrl) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null) { w.LoadHtml(html, baseUrl); }
+        #elif MACOS || ANDROID
+        WebViewBackend.zan_gui_webview_load_html(h, html, baseUrl);
+        #endif
+    }
+
+    /// 后退一页；无效句柄被忽略。
+    static void Back(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null) { w.Back(); }
+        #elif MACOS || ANDROID
+        WebViewBackend.zan_gui_webview_back(h);
+        #endif
+    }
+
+    /// 前进一页；无效句柄被忽略。
+    static void Forward(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null) { w.Forward(); }
+        #elif MACOS || ANDROID
+        WebViewBackend.zan_gui_webview_forward(h);
+        #endif
+    }
+
+    /// 重新加载当前页；无效句柄被忽略。
+    static void Reload(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null) { w.Reload(); }
+        #elif MACOS || ANDROID
+        WebViewBackend.zan_gui_webview_reload(h);
+        #endif
+    }
+
+    /// 停止当前加载；无效句柄被忽略。
+    static void Stop(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null) { w.StopLoading(); }
+        #elif MACOS || ANDROID
+        WebViewBackend.zan_gui_webview_stop(h);
+        #endif
+    }
+
+    /// 能否后退（无历史/无效句柄/无引擎为 false）。
+    static bool CanGoBack(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w == null) { return false; }
+        return w.CanGoBack();
+        #elif MACOS || ANDROID
+        return WebViewBackend.zan_gui_webview_can_go_back(h) != 0;
+        #else
+        return false;
+        #endif
+    }
+
+    /// 能否前进（无历史/无效句柄/无引擎为 false）。
+    static bool CanGoForward(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w == null) { return false; }
+        return w.CanGoForward();
+        #elif MACOS || ANDROID
+        return WebViewBackend.zan_gui_webview_can_go_forward(h) != 0;
+        #else
+        return false;
+        #endif
+    }
+
+    /// 是否正在加载（无效句柄/无引擎为 false）。
+    static bool IsLoading(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w == null) { return false; }
+        return w.IsLoading();
+        #elif MACOS || ANDROID
+        return WebViewBackend.zan_gui_webview_is_loading(h) != 0;
+        #else
+        return false;
+        #endif
+    }
+
+    /// <summary>每次导航/源变化时递增的计数器；控件轮询它
+    /// 以判断 URL 和标题何时可能已变化。无引擎平台恒为 0。</summary>
+    static int NavSeq(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w == null) { return 0; }
+        return w.NavSeq();
+        #elif MACOS || ANDROID
+        return WebViewBackend.zan_gui_webview_nav_seq(h);
+        #else
+        return 0;
+        #endif
+    }
+
+    /// <summary>最近一次导航完成的 HTTP 状态码；无导航或无引擎时为 0。</summary>
+    static int LastStatus(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w == null) { return 0; }
+        return w.LastStatus();
+        #elif MACOS || ANDROID
+        return WebViewBackend.zan_gui_webview_last_status(h);
+        #else
+        return 0;
+        #endif
+    }
+
+    /// 当前 URL（无页面/无效句柄/无引擎为 ""）。
+    static string GetUrl(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w == null) { return ""; }
+        return w.GetUrl();
+        #elif MACOS || ANDROID
+        return WebViewBackend.zan_gui_webview_get_url(h);
+        #else
+        return "";
+        #endif
+    }
+
+    /// 当前页面标题（无页面/无效句柄/无引擎为 ""）。
+    static string GetTitle(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w == null) { return ""; }
+        return w.GetTitle();
+        #elif MACOS || ANDROID
+        return WebViewBackend.zan_gui_webview_get_title(h);
+        #else
+        return "";
+        #endif
+    }
+
+    /// 最近一次导航请求的 URL（导航开始时记录；无/无效句柄为 ""）。
+    static string LastRequest(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w == null) { return ""; }
+        return w.LastRequest();
+        #elif MACOS || ANDROID
+        return WebViewBackend.zan_gui_webview_last_request(h);
+        #else
+        return "";
+        #endif
+    }
+
+    /// <summary>同步执行 JS 并取返回值（macOS 上会自旋 runloop 等待；
+    /// 不需要返回值时优先用 EvalAsync）。失败或无引擎返回 ""。</summary>
+    static string Eval(int h, string js) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w == null) { return ""; }
+        return w.Eval(js);
+        #elif MACOS || ANDROID
+        return WebViewBackend.zan_gui_webview_eval(h, js);
+        #else
+        return "";
+        #endif
+    }
+
+    /// 取 `url` 匹配域名的 Cookie（"name=value; ..." 形式；无/失败为 ""）。
+    static string GetCookies(int h, string url) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w == null) { return ""; }
+        return w.GetCookies(url);
+        #elif MACOS || ANDROID
+        return WebViewBackend.zan_gui_webview_get_cookies(h, url);
+        #else
+        return "";
+        #endif
+    }
+
+    /// 为 `url` 所在域写一枚 Cookie；无效句柄被忽略。
+    static void SetCookie(int h, string url, string cookieName,
+                          string cookieValue) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null) { w.SetCookie(url, cookieName, cookieValue); }
+        #elif MACOS || ANDROID
+        WebViewBackend.zan_gui_webview_set_cookie(h, url, cookieName,
+                                                  cookieValue);
+        #endif
+    }
+
+    /// 清掉该视图数据仓的全部 Cookie；无效句柄被忽略。
+    static void ClearCookies(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null) { w.ClearCookies(); }
+        #elif MACOS || ANDROID
+        WebViewBackend.zan_gui_webview_clear_cookies(h);
+        #endif
+    }
+
+    // ------------------------------------------------ JS ↔ 原生（可选能力）
+    //
+    // 这些入口是后加的：交叉链接只能解析仓库里那份已提交的
+    // libzan_gui.dylib（由 Mac 上的 CI 构建）的导出表，直接 DllImport
+    // 新符号会让 --publish macos-* 链接失败。所以按 Interop.Symbol 的
+    // 既有用法在运行时探测——旧运行时上表现为「不支持」，而不是启动即崩。
+
+    #if MACOS || ANDROID
+    static nint guiMod = 0;
+    static bool guiTried = false;
+    static nint addr_addHandler = 0;
+    static nint addr_removeHandler = 0;
+    static nint addr_takeMessage = 0;
+    static nint addr_msgPending = 0;
+    static nint addr_msgDropped = 0;
+    static nint addr_addScript = 0;
+    static nint addr_addStyle = 0;
+    static nint addr_removeScripts = 0;
+    static nint addr_evalAsync = 0;
+    static nint addr_clearData = 0;
+    static nint addr_setClip = 0;
+
+    /// 解析 zan_gui 里可选的 WKWebView 桥接入口。zan_gui 已被主程序加载，
+    /// dlopen 只是拿到同一个镜像的句柄：先按可执行文件同目录找（发布包把
+    /// dylib 放在 exe 旁边），再交给加载器按名字找。Android 上同一组入口
+    /// 由 libzan_gui.so 提供（系统 WebView 后端，gui_runtime_android.c）。
+    static void ResolveBridge() {
+        if (WebViewBackend.guiTried) { return; }
+        WebViewBackend.guiTried = true;
+        string dir = ProcessHost.AppDir();
+        #if ANDROID
+        string libName = "/libzan_gui.so";
+        #else
+        string libName = "/libzan_gui.dylib";
+        #endif
+        if (dir != "") {
+            WebViewBackend.guiMod = Interop.Load(dir + libName);
+        }
+        #if ANDROID
+        if (WebViewBackend.guiMod == 0) {
+            WebViewBackend.guiMod = Interop.Load("libzan_gui.so");
+        }
+        #else
+        if (WebViewBackend.guiMod == 0) {
+            WebViewBackend.guiMod = Interop.Load("libzan_gui.dylib");
+        }
+        #endif
+        nint m = WebViewBackend.guiMod;
+        if (m == 0) { return; }
+        WebViewBackend.addr_addHandler =
+            Interop.Symbol(m, "zan_gui_webview_add_handler");
+        WebViewBackend.addr_removeHandler =
+            Interop.Symbol(m, "zan_gui_webview_remove_handler");
+        WebViewBackend.addr_takeMessage =
+            Interop.Symbol(m, "zan_gui_webview_take_message");
+        WebViewBackend.addr_msgPending =
+            Interop.Symbol(m, "zan_gui_webview_msg_pending");
+        WebViewBackend.addr_msgDropped =
+            Interop.Symbol(m, "zan_gui_webview_msg_dropped");
+        WebViewBackend.addr_addScript =
+            Interop.Symbol(m, "zan_gui_webview_add_script");
+        WebViewBackend.addr_addStyle =
+            Interop.Symbol(m, "zan_gui_webview_add_style");
+        WebViewBackend.addr_removeScripts =
+            Interop.Symbol(m, "zan_gui_webview_remove_scripts");
+        WebViewBackend.addr_evalAsync =
+            Interop.Symbol(m, "zan_gui_webview_eval_async");
+        WebViewBackend.addr_clearData =
+            Interop.Symbol(m, "zan_gui_webview_clear_data");
+        WebViewBackend.addr_setClip =
+            Interop.Symbol(m, "zan_gui_webview_set_clip");
+    }
+    #endif
+
+    /// <summary>当前平台/运行时是否支持 JS→原生 的消息桥。仅 macOS
+    /// 运行时带桥接入口时为 true；Windows 走 WebView2 自身通道。</summary>
+    static bool HasBridge() {
+        #if MACOS || ANDROID
+        WebViewBackend.ResolveBridge();
+        return WebViewBackend.addr_addHandler != 0
+            && WebViewBackend.addr_takeMessage != 0;
+        #else
+        return false;
+        #endif
+    }
+
+    /// <summary>注册 window.webkit.messageHandlers.<name> 消息通道；
+    /// 页面 postMessage 的内容随后用 TakeMessage 逐条取。运行时不
+    /// 支持时返回 false。</summary>
+    static bool AddHandler(int h, string handlerName) {
+        #if MACOS || ANDROID
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_addHandler == 0) { return false; }
+        WvNameFn f = (WvNameFn)WebViewBackend.addr_addHandler;
+        return f(h, handlerName) != 0;
+        #else
+        return false;
+        #endif
+    }
+
+    /// 撤掉 AddHandler 注册的消息通道；不支持时为空操作。
+    static void RemoveHandler(int h, string handlerName) {
+        #if MACOS || ANDROID
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_removeHandler == 0) { return; }
+        WvNameVoidFn f = (WvNameVoidFn)WebViewBackend.addr_removeHandler;
+        f(h, handlerName);
+        #endif
+    }
+
+    /// 队列里最早的一条消息，格式 "<handler>\t<body>"；空队列为 ""。
+    static string TakeMessage(int h) {
+        #if MACOS || ANDROID
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_takeMessage == 0) { return ""; }
+        WvStrIntFn f = (WvStrIntFn)WebViewBackend.addr_takeMessage;
+        return f(h);
+        #else
+        return "";
+        #endif
+    }
+
+    /// 消息队列里还没取走的条数（不支持为 0）。
+    static int PendingMessages(int h) {
+        #if MACOS || ANDROID
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_msgPending == 0) { return 0; }
+        WvIntIntFn f = (WvIntIntFn)WebViewBackend.addr_msgPending;
+        return f(h);
+        #else
+        return 0;
+        #endif
+    }
+
+    /// 因队列满而被丢掉的消息数（宿主没及时取走）。
+    static int DroppedMessages(int h) {
+        #if MACOS || ANDROID
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_msgDropped == 0) { return 0; }
+        WvIntIntFn f = (WvIntIntFn)WebViewBackend.addr_msgDropped;
+        return f(h);
+        #else
+        return 0;
+        #endif
+    }
+
+    /// <summary>每页可注入脚本：每次导航都重新执行；atEnd=true 在
+    /// 文档解析完后跑（DOM 就绪），false 在文档开始前跑。注册失败
+    /// （含运行时不支持）返回 false。</summary>
+    static bool AddScript(int h, string js, bool atEnd) {
+        #if MACOS || ANDROID
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_addScript == 0) { return false; }
+        WvScriptFn f = (WvScriptFn)WebViewBackend.addr_addScript;
+        int at = 0;
+        if (atEnd) { at = 1; }
+        return f(h, js, at) != 0;
+        #else
+        return false;
+        #endif
+    }
+
+    /// 为当前页注入一段 CSS（每次导航后仍生效）；注册失败（含运行时
+    /// 不支持）返回 false。
+    static bool AddStyle(int h, string css) {
+        #if MACOS || ANDROID
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_addStyle == 0) { return false; }
+        WvNameFn f = (WvNameFn)WebViewBackend.addr_addStyle;
+        return f(h, css) != 0;
+        #else
+        return false;
+        #endif
+    }
+
+    /// 撤掉全部注入脚本与样式；不支持时为空操作。
+    static void RemoveScripts(int h) {
+        #if MACOS || ANDROID
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_removeScripts == 0) { return; }
+        WvVoidIntFn f = (WvVoidIntFn)WebViewBackend.addr_removeScripts;
+        f(h);
+        #endif
+    }
+
+    /// <summary>不等待结果的 Native→JS 调用（Eval 会自旋 runloop 等
+    /// 返回值）；运行时没有这个入口时退回同步 Eval。</summary>
+    static void EvalAsync(int h, string js) {
+        #if MACOS || ANDROID
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_evalAsync != 0) {
+            WvNameVoidFn f = (WvNameVoidFn)WebViewBackend.addr_evalAsync;
+            f(h, js);
+            return;
+        }
+        #endif
+        string ignored = WebViewBackend.Eval(h, js);
+    }
+
+    /// <summary>清掉该视图数据仓的全部网站数据（Cookie、缓存、
+    /// localStorage…）；运行时不支持时退化为只清 Cookie。</summary>
+    static void ClearData(int h) {
+        #if MACOS || ANDROID
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_clearData != 0) {
+            WvVoidIntFn f = (WvVoidIntFn)WebViewBackend.addr_clearData;
+            f(h);
+            return;
+        }
+        #endif
+        WebViewBackend.ClearCookies(h);
+    }
+}
+
+delegate int WvNameFn(int h, string name);
+delegate void WvNameVoidFn(int h, string name);
+delegate string WvStrIntFn(int h);
+delegate int WvIntIntFn(int h);
+delegate void WvVoidIntFn(int h);
+delegate int WvScriptFn(int h, string js, int atEnd);

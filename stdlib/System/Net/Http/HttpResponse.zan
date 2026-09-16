@@ -1,0 +1,354 @@
+using System;
+
+namespace System.Net.Http;
+
+/// <summary>
+/// HTTP 响应的构建器与解析器。
+/// </summary>
+class HttpResponse {
+    int statusCode;
+    string statusText;
+    string body;
+    /// 二进制正文（与 body 二选一）。Zan 字符串以 NUL 结尾，
+    /// 无法携带任意字节，因此图片/可执行文件等正文走 byte[]。
+    byte[] bodyBytes;
+    int bodyBytesLen;
+    string contentType;
+    List<string> headers;
+    bool keepAlive;
+
+    /// <summary>私有构造：200 / keep-alive 的默认状态，由各静态工厂使用。</summary>
+    HttpResponse() {
+        this.statusCode = 200;
+        this.statusText = "OK";
+        this.body = "";
+        this.bodyBytes = null;
+        this.bodyBytesLen = 0;
+        this.contentType = "text/html";
+        this.headers = new List<string>();
+        this.keepAlive = true;
+    }
+
+    /// <summary>用给定正文创建 200 OK 响应。</summary>
+    static HttpResponse Ok(string body) {
+        HttpResponse resp = new HttpResponse();
+        resp.body = body;
+        return resp;
+    }
+
+    /// <summary>创建 JSON 响应。</summary>
+    static HttpResponse Json(string jsonBody) {
+        HttpResponse resp = new HttpResponse();
+        resp.body = jsonBody;
+        resp.contentType = "application/json";
+        return resp;
+    }
+
+    /// <summary>创建纯文本响应。</summary>
+    static HttpResponse Text(string text) {
+        HttpResponse resp = new HttpResponse();
+        resp.body = text;
+        resp.contentType = "text/plain";
+        return resp;
+    }
+
+    /// <summary>
+    /// 用二进制正文创建响应。正文按 <paramref name="len"/> 字节
+    /// 原样发送，内嵌 NUL 不会截断报文。
+    /// </summary>
+    static HttpResponse Bytes(byte[] data, int len, string ct) {
+        HttpResponse resp = new HttpResponse();
+        resp.bodyBytes = data;
+        resp.bodyBytesLen = len;
+        resp.contentType = ct;
+        return resp;
+    }
+
+    /// <summary>正文字节数（文本或二进制）。</summary>
+    int BodyLength() {
+        if (this.bodyBytes != null) { return this.bodyBytesLen; }
+        return this.body.Length;
+    }
+
+    /// <summary>正文是否为二进制缓冲区。</summary>
+    bool IsBinary() { return this.bodyBytes != null; }
+
+    /// <summary>字符串是否含 CR/LF（头部注入检查用）。</summary>
+    static bool HasCrlf(string s) {
+        return s.IndexOf("\r") >= 0 || s.IndexOf("\n") >= 0;
+    }
+
+    /// <summary>头部名/值是否不含会破坏报文分帧的字符：NUL、CR、LF、
+    /// DEL。名字另禁冒号——否则可夹带出第二个头字段（头注入）。
+    /// <paramref name="isName"/> 为 true 时按名字判定。</summary>
+    static bool HeaderFramingSafe(bool isName, string s) {
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int ch = s[i] & 255;
+            if (ch == 0 || ch == 10 || ch == 13 || ch == 127) { return false; }
+            if (isName && ch == 58) { return false; }
+        }
+        return true;
+    }
+
+    /// <summary>头部名与值是否可安全写入：名字非空且无冒号，两者都
+    /// 不含分帧字符。请求侧（HttpClient）与响应侧共用同一防线。</summary>
+    static bool IsValidHeader(string name, string value) {
+        return name.Length > 0 && HttpResponse.HeaderFramingSafe(true, name)
+            && HttpResponse.HeaderFramingSafe(false, value);
+    }
+
+    /// <summary>创建重定向响应。Location 不允许注入折行；非法值
+    /// 被保守拒绝，不产生一个可被下游解释的重定向头。</summary>
+    static HttpResponse Redirect(string url) {
+        HttpResponse resp = new HttpResponse();
+        if (HttpResponse.HasCrlf(url)) {
+            resp.statusCode = 400;
+            resp.statusText = "Bad Request";
+            resp.body = "";
+            return resp;
+        }
+        resp.statusCode = 302;
+        resp.statusText = "Found";
+        resp.headers.Add("Location: " + url);
+        return resp;
+    }
+
+    /// <summary>创建 404 Not Found 响应。</summary>
+    static HttpResponse NotFound() {
+        HttpResponse resp = new HttpResponse();
+        resp.statusCode = 404;
+        resp.statusText = "Not Found";
+        resp.body = "<h1>404 Not Found</h1>";
+        return resp;
+    }
+
+    /// <summary>创建 500 Internal Server Error 响应。message 原样进入
+    /// HTML 正文，先做 HTML 转义：消息里常含异常文本、URL 或用户
+    /// 输入片段，未转义就是把反射型 XSS 内置在错误页里。</summary>
+    static HttpResponse ServerError(string message) {
+        HttpResponse resp = new HttpResponse();
+        resp.statusCode = 500;
+        resp.statusText = "Internal Server Error";
+        resp.body = "<h1>500 Internal Server Error</h1><p>"
+            + HttpResponse.EscapeHtmlText(message) + "</p>";
+        return resp;
+    }
+
+    /// 最小 HTML 实体转义（& < > " '），供内嵌消息进正文用。
+    static string EscapeHtmlText(string text) {
+        StringBuilder html = new StringBuilder();
+        for (int i = 0; i < text.Length; i = i + 1) {
+            string ch = text.Substring(i, 1);
+            if (ch == "&") { html.Append("&amp;"); }
+            else if (ch == "<") { html.Append("&lt;"); }
+            else if (ch == ">") { html.Append("&gt;"); }
+            else if (ch == "\"") { html.Append("&quot;"); }
+            else if (ch == "'") { html.Append("&#39;"); }
+            else { html.Append(ch); }
+        }
+        return html.ToString();
+    }
+
+    /// <summary>用自定义状态码创建响应。</summary>
+    static HttpResponse WithStatus(int code, string text, string body) {
+        HttpResponse resp = new HttpResponse();
+        resp.statusCode = code;
+        if (!HttpResponse.HasCrlf(text)) { resp.statusText = text; }
+        resp.body = body;
+        return resp;
+    }
+
+    /// <summary>主动释放响应持有的头部存储。</summary>
+    void Dispose() {
+        if (this.headers != null) {
+            this.headers.Clear();
+            this.headers = null;
+        }
+        this.bodyBytes = null;
+        this.bodyBytesLen = 0;
+    }
+
+    /// <summary>设置响应头。名称和值均禁止 CR/LF，避免注入
+    /// 额外字段或响应体；非法输入保持响应可序列化但不添加该头。</summary>
+    HttpResponse SetHeader(string name, string headerValue) {
+        if (!HttpResponse.IsValidHeader(name, headerValue)) {
+            return this;
+        }
+        this.headers.Add(name + ": " + headerValue);
+        return this;
+    }
+
+    /// <summary>Returns one response header by name. Header names are
+    /// case-insensitive as required by HTTP; an absent header returns "".</summary>
+    string GetHeader(string name) {
+        if (name.Length == 0 || this.headers == null) { return ""; }
+        string want = name.ToLower();
+        for (int i = 0; i < this.headers.Count; i = i + 1) {
+            string line = this.headers[i];
+            int colon = line.IndexOf(":");
+            if (colon <= 0) { continue; }
+            string got = line.Substring(0, colon).Trim().ToLower();
+            if (got == want) { return line.Substring(colon + 1).Trim(); }
+        }
+        return "";
+    }
+
+    /// <summary>设置 content type。</summary>
+    HttpResponse SetContentType(string ct) {
+        if (!HttpResponse.HasCrlf(ct)) { this.contentType = ct; }
+        return this;
+    }
+
+    /// <summary>设置连接模式。</summary>
+    HttpResponse SetKeepAlive(bool keep) {
+        this.keepAlive = keep;
+        return this;
+    }
+
+    /// <summary>
+    /// 只序列化状态行与头部（含结尾空行）。二进制正文时
+    /// 调用方先发这个字符串，再按字节发 <c>bodyBytes</c>。
+    /// </summary>
+    string BuildHeaders() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("HTTP/1.1 ");
+        sb.Append(Convert.ToString(this.statusCode));
+        sb.Append(" ");
+        sb.Append(this.statusText);
+        sb.Append("\r\n");
+
+        sb.Append("Content-Type: ");
+        sb.Append(this.contentType);
+        sb.Append("\r\n");
+
+        sb.Append("Content-Length: ");
+        sb.Append(Convert.ToString(this.BodyLength()));
+        sb.Append("\r\n");
+
+        if (this.keepAlive) {
+            sb.Append("Connection: keep-alive\r\n");
+        } else {
+            sb.Append("Connection: close\r\n");
+        }
+
+        sb.Append("Server: Zan/1.0\r\n");
+
+        for (int i = 0; i < this.headers.Count; i = i + 1) {
+            sb.Append(this.headers[i]);
+            sb.Append("\r\n");
+        }
+
+        sb.Append("\r\n");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 将响应序列化为原始 HTTP 响应字符串。仅适用于文本正文；
+    /// 二进制正文请用 <see cref="BuildHeaders"/> + <c>bodyBytes</c>。
+    /// </summary>
+    string Build() {
+        return this.BuildHeaders() + this.body;
+    }
+
+    /// <summary>是否为可选空白（SP / HTAB，RFC 7230 OWS）。</summary>
+    static bool IsOws(int c) {
+        return c == 32 || c == 9;
+    }
+
+    /// <summary>[start, stop) 起点跳过 OWS，返回首个非 OWS 字节下标。</summary>
+    static int TrimOwsStart(string s, int start, int stop) {
+        while (start < stop && HttpResponse.IsOws(s[start] & 255)) {
+            start = start + 1;
+        }
+        return start;
+    }
+
+    /// <summary>[start, stop) 终点回退 OWS，返回尾后第一个非 OWS 下标。</summary>
+    static int TrimOwsStop(string s, int start, int stop) {
+        while (stop > start && HttpResponse.IsOws(s[stop - 1] & 255)) {
+            stop = stop - 1;
+        }
+        return stop;
+    }
+
+    /// <summary>解析原始 HTTP 响应（客户端用法）。</summary>
+    static HttpResponse Parse(string raw) {
+        HttpResponse resp = new HttpResponse();
+        int len = raw.Length;
+        if (len == 0) { return resp; }
+
+        // 状态行：HTTP/1.1 200 OK
+        int lineEnd = 0;
+        for (; lineEnd < len && raw.Substring(lineEnd, 1) != "\n"; lineEnd = lineEnd + 1) {
+        }
+        string statusLine = raw.Substring(0, lineEnd);
+        if (statusLine.Length > 0 && statusLine.Substring(statusLine.Length - 1, 1) == "\r") {
+            statusLine = statusLine.Substring(0, statusLine.Length - 1);
+        }
+
+        // 解析状态码：HTTP-version 后必须至少一个 SP/HTAB；
+        // reason-phrase 前的 OWS 同样允许 HTAB。
+        int sp1 = 0;
+        while (sp1 < statusLine.Length
+                && !HttpResponse.IsOws(statusLine[sp1] & 255)) {
+            sp1 = sp1 + 1;
+        }
+        int codeStart = HttpResponse.TrimOwsStart(statusLine, sp1,
+            statusLine.Length);
+        int sp2 = codeStart;
+        while (sp2 < statusLine.Length
+                && !HttpResponse.IsOws(statusLine[sp2] & 255)) {
+            sp2 = sp2 + 1;
+        }
+        if (sp2 > codeStart) {
+            resp.statusCode = Convert.ToInt(statusLine.Substring(codeStart,
+                sp2 - codeStart));
+        }
+        int reasonStart = HttpResponse.TrimOwsStart(statusLine, sp2,
+            statusLine.Length);
+        int reasonStop = HttpResponse.TrimOwsStop(statusLine, reasonStart,
+            statusLine.Length);
+        if (reasonStart < reasonStop) {
+            resp.statusText = statusLine.Substring(reasonStart,
+                reasonStop - reasonStart);
+        }
+
+        // 解析头部直到空行
+        int pos = lineEnd + 1;
+        int bodyStart = pos;
+        while (pos < len) {
+            int hEnd = pos;
+            while (hEnd < len && raw.Substring(hEnd, 1) != "\n") {
+                hEnd = hEnd + 1;
+            }
+            string headerLine = raw.Substring(pos, hEnd - pos);
+            if (headerLine.Length > 0 && headerLine.Substring(headerLine.Length - 1, 1) == "\r") {
+                headerLine = headerLine.Substring(0, headerLine.Length - 1);
+            }
+            if (headerLine.Length == 0) {
+                bodyStart = hEnd + 1;
+                break;
+            }
+            int colon = headerLine.IndexOf(":");
+            if (colon > 0) {
+                resp.headers.Add(headerLine);
+                string name = headerLine.Substring(0, colon).ToLower();
+                if (name == "content-type") {
+                    int valueStart = HttpResponse.TrimOwsStart(headerLine,
+                        colon + 1, headerLine.Length);
+                    int valueStop = HttpResponse.TrimOwsStop(headerLine,
+                        valueStart, headerLine.Length);
+                    resp.contentType = headerLine.Substring(valueStart,
+                        valueStop - valueStart);
+                }
+            }
+            pos = hEnd + 1;
+        }
+
+        if (bodyStart < len) {
+            resp.body = raw.Substring(bodyStart);
+        }
+
+        return resp;
+    }
+}

@@ -1,0 +1,557 @@
+using System;
+using Gui;
+using Gui.Hmi;
+
+namespace Gui.Widget;
+
+/// 统一的 .zform -> 真控件树构建器。设计器预览与运行时窗口
+/// 共用这一套：把设计文档（Designer.SaveJson / formgen 消费的同一 JSON）
+/// 实例化为真正的 Control 树，按 24 列流式或自由画布布局排布。
+///
+/// 设计器把它渲染在编辑外框内并叠加选中/handle 覆盖层；运行时把
+/// 同一棵树放进 Form。因此“所见即所得”天然成立，自定义组件也走
+/// 同一条实例化路径（ProjectComponents / 注入工厂）。
+///
+    /// Canonical kind, layout metadata, and property setup are shared with
+    /// formgen through the Control contract. Every setup is applied to the
+    /// concrete local Control variable, avoiding downcasts.
+class FormBuilder {
+    /// 把设计文档根对象构建为内容根 Control（不含窗口外框）。
+    static Control Build(JsonValue root) {
+        Panel host = new Panel("root");
+        host.style = 3;
+        bool free = false;
+        if (root != null) { free = root.Int("layoutMode", 0) == 1; }
+        host.Dock(Dock.Fill());
+        if (free) {
+            host.Pad(0);
+            host.gap = 0;
+        } else {
+            host.Pad(16);
+            host.gap = 10;
+        }
+        if (root == null) { return host; }
+        JsonValue arr = root.Get("fields");
+        if (arr == null || !arr.IsArray()) { return host; }
+        if (free) {
+            for (int i = 0; i < arr.Count(); i = i + 1) {
+                FormBuilder.BuildFree(host, arr.At(i));
+            }
+        } else {
+            FormBuilder.BuildFlow(host, arr);
+        }
+        return host;
+    }
+
+    // ---- canonical kind and layout metadata ------------------------
+
+    /// 字段的规范 kind：设计文档 `kind` 键优先，旧文档回退 LegacyKind(type)。
+    static string Kind(JsonValue o) {
+        string k = o.Str("kind", "");
+        if (k != "") { return k; }
+        return FormBuilder.LegacyKind(o.Int("type", -1));
+    }
+
+    /// One-time read compatibility for old designer documents. New writers
+    /// never emit this key.
+    static string LegacyKind(int t) {
+        if (t == 0) { return "Input"; }
+        if (t == 1) { return "TextArea"; }
+        if (t == 4) { return "Radio"; }
+        if (t == 5) { return "Checkbox"; }
+        if (t == 6) { return "SelectBox"; }
+        if (t == 7) { return "Switch"; }
+        if (t == 8) { return "Rate"; }
+        if (t == 9) { return "Slider"; }
+        if (t == 18 || t == 45) { return "Panel"; }
+        if (t == 29) { return "Progress"; }
+        if (t == 36) { return "Tabs"; }
+        if (t == 37) { return "Pagination"; }
+        if (t == 49) { return "FloatButton"; }
+        if (t == 58) { return "ToolStrip"; }
+        if (t == 59) { return "StatusBar"; }
+        if (t == 60) { return "SplitPanel"; }
+        return "";
+    }
+
+    /// 设计对象是否带 kids 数组（即容器）。
+    static bool IsContainer(JsonValue o) {
+        JsonValue kids = o.Get("kids");
+        return kids != null && kids.IsArray();
+    }
+
+    /// 控件是否自带 `label` 属性（Checkbox / Radio 那样把标题画在框
+    /// 旁边）。自带的交给控件，不自带的由表单在它上面补一行标题。
+    static bool OwnsLabel(Control ctl) {
+        if (ctl == null) { return false; }
+        List<PropSpec> ps = ctl.Props();
+        if (ps == null) { return false; }
+        for (int i = 0; i < ps.Count; i = i + 1) {
+            if (ps[i].key == "label") { return true; }
+        }
+        return false;
+    }
+
+    /// 字段需不需要表单替它画标题。以前这里是一张写死的白名单
+    /// （Input / TextArea / SelectBox），于是 Switch、Slider、Rate 这些
+    /// 字段的 label 既没进控件、也没画成标题，直接丢了；Checkbox 和
+    /// Radio 明明自带 label 属性也拿不到值。改成问控件自己有没有
+    /// label：没有就由表单补标题，两边都不会再漏。
+    static bool NeedsCaption(JsonValue o, Control ctl) {
+        // 只有设计文档真的写了 `label` 才由表单补标题行。`Caption` 在没有
+        // label 时会回退到 `name`，那是给自带 label 的控件兜底用的——若这里
+        // 也认那个回退，任何只写了 `name` 的字段都会被套一层
+        // `FbStack{Label, 控件}`，控件树凭空深一层：`.zform` 里
+        // `host.children[0].children[0]` 拿到的就不再是字段控件本身
+        // （CheckboxGroup 的聚合 API 因此全部落到 FbStack 上）。
+        if (o.Str("label", "") == "") { return false; }
+        return !FormBuilder.OwnsLabel(ctl);
+    }
+
+    /// 字段高度（设计文档 fh；缺省 / 非法 32）。
+    static int PrefH(JsonValue o) {
+        int h = o.Int("fh", 32);
+        return h > 0 ? h : 32;
+    }
+
+    /// 工具条 / 状态栏的默认停靠边（Top / Bottom），其余 Manual。
+    static int DefaultDock(JsonValue o) {
+        string k = FormBuilder.Kind(o);
+        if (k == "ToolStrip") { return 1; }
+        if (k == "StatusBar") { return 2; }
+        return 0;
+    }
+
+    /// span 钳制到 [1,24]。
+    static int ClampSpan(int s) {
+        if (s < 1) { return 1; }
+        if (s > 24) { return 24; }
+        return s;
+    }
+
+    /// 标题文案：label 优先，为空回退 name。
+    static string Caption(JsonValue o) {
+        string label = o.Str("label", "");
+        if (label != "") { return label; }
+        return o.Str("name", "");
+    }
+
+    /// kids 数组长度（非容器 0）。
+    static int ChildCount(JsonValue o) {
+        JsonValue kids = o.Get("kids");
+        if (kids != null && kids.IsArray()) { return kids.Count(); }
+        return 0;
+    }
+
+    /// 第 i 个选项文本（缺失 / 非字符串回退 def）。
+    static string OptAt(JsonValue o, int i, string def) {
+        JsonValue opts = o.Get("options");
+        if (opts == null || !opts.IsArray() || i >= opts.Count()) { return def; }
+        JsonValue it = opts.At(i);
+        if (it == null || !it.IsString()) { return def; }
+        return it.AsString(def);
+    }
+
+    /// 第 i 个选项解析为整数（缺失 / 非数字回退 def）。
+    static int OptInt(JsonValue o, int i, int def) {
+        string s = FormBuilder.OptAt(o, i, "");
+        if (s == "" || !FormBuilder.IsNumber(s)) { return def; }
+        return Convert.ToInt32(s);
+    }
+
+    /// 是否为（可选负号前缀的）纯整数字符串。
+    static bool IsNumber(string s) {
+        if (s == "") { return false; }
+        int i = 0;
+        if (s.StartsWith("-")) { i = 1; }
+        if (i >= s.Length) { return false; }
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch < "0" || ch > "9") { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// options 数组 → "a|b|c" 文本（空数组返回 ""）。
+    static string JoinOpts(JsonValue o) {
+        JsonValue opts = o.Get("options");
+        if (opts == null || !opts.IsArray() || opts.Count() == 0) { return ""; }
+        string s = "";
+        for (int i = 0; i < opts.Count(); i = i + 1) {
+            if (i > 0) { s = s + "|"; }
+            s = s + opts.At(i).AsString("");
+        }
+        return s;
+    }
+
+    // ---- construction through the shared string-kind registry --------
+
+    /// 按 kind 经共享注册表实例化真控件，并套用设计文档的
+    /// name / label / class / options / placeholder / defOn / columns 等属性。
+    static Control MakeControl(JsonValue o, bool free) {
+        string kind = FormBuilder.Kind(o);
+        if (kind == "") { return null; }
+        Control ctl = ControlFactory.Create(kind);
+        if (ctl == null) { return null; }
+        ctl.name = o.Str("name", "");
+        // 自带 label 的控件（Checkbox / Radio）自己画标题，把值交给它；
+        // 其余控件的标题由 BuildCell 在上方补一行。
+        string cap = FormBuilder.Caption(o);
+        if (cap != "" && FormBuilder.OwnsLabel(ctl)) {
+            ctl.SetProp("label", cap);
+        }
+        // 样式类（皮肤规则 / `grid-cols-3 gap-y-2` 这类原子类）。
+        string cls = o.Str("class", "");
+        if (cls != "") { ctl.Class = cls; }
+        // 内联 CSS 声明（style 属性语义，优先于类规则）。
+        string isty = o.Str("style", "");
+        if (isty != "") { ctl.SetProp("style", isty); }
+        string opts = FormBuilder.JoinOpts(o);
+        if (opts != "") { ctl.SetProp("options", opts); }
+        string placeholder = o.Str("placeholder", "");
+        if (placeholder != "") { ctl.SetProp("placeholder", placeholder); }
+        if (o.Bool("defOn", false)) { ctl.SetProp("defOn", "true"); }
+        int cols = o.Int("columns", 0);
+        if (cols > 0) { ctl.SetProp("columns", Convert.ToString(cols)); }
+        if (kind == "DataGrid") {
+            string spec = FormBuilder.GridColumnsSpec(o);
+            if (spec != "") { ctl.SetProp("previewColumns", spec); }
+        }
+        return ctl;
+    }
+
+    /// DataGrid 的 columns 对象数组压成列头预览串（"宽,标题|…"）。
+    /// 运行时建树拿不到 "of" 的实体类型，预览只铺列头；类型化取值
+    /// 由编译期 GenForm 生成。
+    static string GridColumnsSpec(JsonValue o) {
+        JsonValue cols = o.Get("columns");
+        if (cols == null || !cols.IsArray()) { return ""; }
+        string spec = "";
+        for (int i = 0; i < cols.Count(); i = i + 1) {
+            JsonValue c = cols.At(i);
+            if (c == null || !c.IsObject()) { continue; }
+            string title = c.Str("title", "");
+            if (title == "") { title = c.Str("field", ""); }
+            if (title == "") { continue; }
+            if (spec != "") { spec = spec + "|"; }
+            spec = spec + Convert.ToString(c.Int("width", 100)) + "," + title;
+        }
+        return spec;
+    }
+
+    /// 把 Panel 型容器（card/tabs/dockpanel）的 kids 填入。
+    static void FillKids(Control p, JsonValue o, bool free) {
+        JsonValue kids = o.Get("kids");
+        if (kids == null || !kids.IsArray()) { return; }
+        if (free) {
+            for (int i = 0; i < kids.Count(); i = i + 1) {
+                FormBuilder.BuildFree(p, kids.At(i));
+            }
+        } else {
+            FormBuilder.BuildFlow(p, kids);
+        }
+    }
+
+    // ---- flow (24-col) ----
+
+    /// 24 列流式布局：逐字段 BuildCell 后按 span（容器恒 24）加入 FbFlow。
+    static void BuildFlow(Control parent, JsonValue arr) {
+        FbFlow flow = new FbFlow();
+        flow.Dock(Dock.Top());
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            JsonValue o = arr.At(i);
+            int sp = FormBuilder.ClampSpan(o.Int("span", 24));
+            if (FormBuilder.IsContainer(o)) { sp = 24; }
+            Control cell = FormBuilder.BuildCell(o);
+            if (cell != null) { flow.AddCell(cell, sp); }
+        }
+        parent.Add(flow);
+    }
+
+    /// 单个流式字段 → 控件：需要标题时包 FbStack（标签在上），
+    /// 选项组单独设行高，其余按 fh 钉高。
+    static Control BuildCell(JsonValue o) {
+        Control ctl = FormBuilder.MakeControl(o, false);
+        if (ctl == null) { return null; }
+        if (FormBuilder.IsContainer(o)) {
+            ctl.logPad = 10;
+            // 容器的 kids 在流式路径同样要建（与 GenForm.EmitField 递归
+            // kids、BuildFree 的 FillKids 对齐）——此前漏调，流式容器
+            // 的子树在运行时/出口页里整棵丢失。
+            FormBuilder.FillKids(ctl, o, false);
+            return ctl;
+        }
+        if (FormBuilder.NeedsCaption(o, ctl)) {
+            FbStack cell = new FbStack();
+            Label capL = new Label(FormBuilder.Caption(o));
+            capL.Dock(Dock.Top());
+            // logH 而不是 Prefer：设计文档里的高度是 100% 下的逻辑
+            // 像素，按物理像素用的话，150% 缩放下文字长大了、格子却
+            // 没有，标题就压到控件上、行也压到下一行。
+            capL.logH = 18;
+            cell.Add(capL);
+            ctl.Dock(Dock.Fill());
+            ctl.logH = FormBuilder.PrefH(o);
+            cell.Add(ctl);
+            return cell;
+        }
+        // 选项组自己算高度（行数 x 行高）：字段高度在这里是“行高”，
+        // 不能当成整体高度钉死，否则换行的第二行会被裁掉。
+        if (ctl is ChoiceGroup) {
+            ((ChoiceGroup)ctl).SetRowHeight(FormBuilder.PrefH(o));
+            return ctl;
+        }
+        ctl.logH = FormBuilder.PrefH(o);
+        return ctl;
+    }
+
+    /// 把单个字段（分栏面板某个 pane 的直接子节点）按流式加入。
+    static void BuildFlowOne(Control pane, JsonValue kid) {
+        JsonValue arr = JsonValue.NewArray();
+        arr.Append(kid);
+        FormBuilder.BuildFlow(pane, arr);
+    }
+
+    // ---- free canvas ----
+
+    /// 自由画布：按 dock 边停靠，否则 Place 绝对定位 + Prefer 尺寸；
+    /// 容器递归 FillKids。
+    static void BuildFree(Control parent, JsonValue o) {
+        Control ctl = FormBuilder.MakeControl(o, true);
+        if (ctl == null) { return; }
+        int fx = o.Int("fx", 0);
+        int fy = o.Int("fy", 0);
+        int fw = o.Int("fw", 200);
+        int fh = o.Int("fh", 32);
+        int dk = o.Int("dock", FormBuilder.DefaultDock(o));
+        if (dk == 1 || dk == 2) {
+            ctl.Dock(dk == 1 ? Dock.Top() : Dock.Bottom());
+            ctl.Prefer(0, fh);
+        } else if (dk == 3 || dk == 4) {
+            ctl.Dock(dk == 3 ? Dock.Left() : Dock.Right());
+            ctl.Prefer(fw, 0);
+        } else if (dk == 5) {
+            ctl.Dock(Dock.Fill());
+        } else {
+            ctl.Dock(Dock.Manual());
+            ctl.Place(fx, fy);
+            ctl.Prefer(fw, fh);
+        }
+        if (FormBuilder.IsContainer(o)) {
+            ctl.Pad(0);
+            FormBuilder.FillKids(ctl, o, true);
+        }
+        parent.Add(ctl);
+    }
+
+    /// 从设计器的 FormField 构建单个叶子控件（不含标题标签——标题由
+    /// 设计器/表单布局单独绘制）。设计器预览用它渲染真控件，与运行时的
+    /// MakeControl 走同一条构造路径，从根上消除“所见非所得”。
+    static Control FromField(FormField f) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("label", JsonValue.NewStr(f.label));
+        o.Put("name", JsonValue.NewStr(f.fname));
+        o.Put("placeholder", JsonValue.NewStr(f.placeholder));
+        o.Put("kind", JsonValue.NewStr(f.KindName()));
+        o.Put("class", JsonValue.NewStr(f.Class));
+        o.Put("style", JsonValue.NewStr(f.styleText));
+        if (f.defOn) { o.Put("defOn", JsonValue.NewBool(true)); }
+        if (f.wrap) { o.Put("wrap", JsonValue.NewBool(true)); }
+        if (f.OptionCount() > 0) {
+            JsonValue arr = JsonValue.NewArray();
+            for (int i = 0; i < f.OptionCount(); i = i + 1) {
+                arr.Append(JsonValue.NewStr(f.OptionAt(i)));
+            }
+            o.Put("options", arr);
+        }
+        Control ctl = FormBuilder.MakeControl(o, false);
+        if (ctl == null) { return null; }
+        ctl.name = f.fname;
+        return ctl;
+    }
+}
+
+/// 24 列流式容器（设计器/运行时/FormBuilder 共用的唯一布局原语）。
+/// 把子节点按各自 span（1..24）贪心打包成多行：一行累计 span 超过 24
+/// 就换行；每个单元宽度按 span/24 比例分配（与设计器 LayoutFlowList
+/// 完全一致：按 24 列而非行内总和分配，列间留 colGap，行间留 rowGap），
+/// 行高取该行子节点 prefH 的最大值。无表面。
+class FbFlow : Panel {
+    /// 与 children 平行的列宽表（span 1..24）。
+    List<int> spans;
+    /// 逻辑像素（100% 下的样子）。
+    int colGap;
+    int rowGap;
+    /// 单元最小宽度（逻辑像素，过窄时兜底）。
+    int minCell;
+    /// OnMeasure 按当前缩放解析出的实际间距，供拿不到 App 的
+    /// Arrange 复用 —— 直接用逻辑值排布，150% 下列间距会偏窄、
+    /// 行距不足，字段互相贴住。
+    int mColGap;
+    int mRowGap;
+    int mMinCell;
+
+    /// 构造：列距 12 / 行距 6 / 最小单元 24（逻辑像素）。
+    FbFlow() {
+        this.InitPanel("fbflow", 3);
+        this.spans = new List<int>();
+        this.colGap = 12;
+        this.rowGap = 6;
+        this.minCell = 24;
+        this.mColGap = 12;
+        this.mRowGap = 6;
+        this.mMinCell = 24;
+    }
+
+    /// 追加一个单元及其列宽（span，1..24）。
+    void AddCell(Control c, int span) {
+        this.spans.Add(span);
+        this.Add(c);
+    }
+
+    /// 第 i 单元的列宽（钳制 1..24；越界按 24）。
+    int SpanAt(int i) {
+        if (i < this.spans.Count) {
+            int s = this.spans[i];
+            if (s < 1) { return 1; }
+            if (s > 24) { return 24; }
+            return s;
+        }
+        return 24;
+    }
+
+    /// 行结束下标（不含）：从 start 起贪心累计到超过 24 列。
+    int RowEnd(int start) {
+        int n = this.children.Count;
+        int end = start;
+        int cols = 0;
+        while (end < n) {
+            int sp = this.SpanAt(end);
+            if (end > start && cols + sp > 24) { break; }
+            cols = cols + sp;
+            end = end + 1;
+            if (cols >= 24) { break; }
+        }
+        return end;
+    }
+
+    /// [start,end) 行高 = 行内子节点 prefH 的最大值。
+    int RowHeight(int start, int end) {
+        int rowH = 0;
+        for (int k = start; k < end; k = k + 1) {
+            int hk = this.children[k].prefH;
+            if (hk > rowH) { rowH = hk; }
+        }
+        return rowH;
+    }
+
+    /// 覆写：不画任何表面（画布容器，视觉全由子控件承担）。
+    override void OnPaint(App app) {
+    }
+
+    /// 覆写：按 24 栅格分行的行高累计出首选高（宽随宿主）。
+    override void OnMeasure(App app) {
+        this.mColGap = app.Scale(this.colGap);
+        this.mRowGap = app.Scale(this.rowGap);
+        this.mMinCell = app.Scale(this.minCell);
+        int n = this.children.Count;
+        int i = 0;
+        int total = 0;
+        int rows = 0;
+        while (i < n) {
+            int end = this.RowEnd(i);
+            total = total + this.RowHeight(i, end);
+            rows = rows + 1;
+            i = end;
+        }
+        if (rows > 1) { total = total + this.mRowGap * (rows - 1); }
+        this.prefH = total;
+        this.prefW = 0;
+    }
+
+    /// 覆写：按每项 span 把 24 栅格宽折算成单元格矩形逐行摆放。
+    override void Arrange(int px, int py, int pw, int ph) {
+        if (pw < 0) { pw = 0; }
+        if (ph < 0) { ph = 0; }
+        this.bx = px;
+        this.by = py;
+        this.bw = pw;
+        this.bh = ph;
+        int cx = px + this.StylePadL();
+        int cy = py + this.StylePadT();
+        int cw = pw - this.StylePadL() - this.StylePadR();
+        if (cw < 0) { cw = 0; }
+        int n = this.children.Count;
+        int i = 0;
+        int rowY = cy;
+        while (i < n) {
+            int end = this.RowEnd(i);
+            int rowH = this.RowHeight(i, end);
+            int acc = 0;
+            for (int k = i; k < end; k = k + 1) {
+                int xa = cx + cw * acc / 24;
+                acc = acc + this.SpanAt(k);
+                int xb = cx + cw * acc / 24;
+                int wCell = xb - xa;
+                if (k < end - 1) { wCell = wCell - this.mColGap; }
+                if (wCell < this.mMinCell) { wCell = this.mMinCell; }
+                this.children[k].Arrange(xa, rowY, wCell, rowH);
+            }
+            rowY = rowY + rowH + this.mRowGap;
+            i = end;
+        }
+    }
+}
+
+/// 竖直单元：标签在上、控件填充其余。用于带 caption 的流式字段，
+/// 无表面。
+class FbStack : Panel {
+    /// 构造：以 "fbstack" 注册为透明布局面板（标签在上、控件填充）。
+    FbStack() {
+        this.InitPanel("fbstack", 3);
+    }
+
+    /// 覆写：不画任何表面（无表面竖直单元）。
+    override void OnPaint(App app) {
+    }
+
+    /// 覆写：子项测量高累计、宽取最宽者（宽随宿主）。
+    override void OnMeasure(App app) {
+        int h = 0;
+        int w = 0;
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            h = h + this.children[i].prefH;
+            if (this.children[i].prefW > w) { w = this.children[i].prefW; }
+        }
+        this.prefH = h;
+        this.prefW = 0;
+    }
+
+    /// 覆写：子项自上而下按测量高堆叠，dock-fill（dock==5）的
+    /// 子项吃掉剩余高度。
+    override void Arrange(int px, int py, int pw, int ph) {
+        if (pw < 0) { pw = 0; }
+        if (ph < 0) { ph = 0; }
+        this.bx = px;
+        this.by = py;
+        this.bw = pw;
+        this.bh = ph;
+        int cy = py;
+        int rest = ph;
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            Control c = this.children[i];
+            if (c.dock == 5) {
+                c.Arrange(px, cy, pw, rest);
+            } else {
+                int hh = c.prefH;
+                if (hh > rest) { hh = rest; }
+                if (hh < 0) { hh = 0; }
+                c.Arrange(px, cy, pw, hh);
+                cy = cy + hh;
+                rest = rest - hh;
+            }
+        }
+    }
+}
+

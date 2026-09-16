@@ -1,0 +1,601 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.CodeEditor;
+
+/// 一份源文件的扫描预处理：抹除了字面量/注释的行、每行所在
+/// 类型体的 owner，以及每行声明的成员名（未声明为 ""）。
+/// 引用统计对每个成员都要走一遍全文，这三份数据与成员无关，
+/// 因此按文件算一次就够：CodeLens 统计一屏声明的代价原本
+/// 与「声明数 × 项目字节数」相乘，就出在这里。
+class CeFileIndex {
+    /// 抹除了字面量与注释的行（与源文件行号一一对应）。
+    List<string> stripped;
+    /// 每行所属的类型体名（不在任何类型内为 ""）。
+    List<string> owners;
+    /// 每行声明的成员名（无声明为 ""）。
+    List<string> decls;
+
+    /// 为整份源码建文件索引：抹除字面量/注释、划分每行的
+    /// owner 类型、摘出每行声明的成员名，三份结果一次算齐。
+    static CeFileIndex Of(List<string> ls) {
+        CeFileIndex idx = new CeFileIndex();
+        idx.stripped = new List<string>();
+        CodeEditor.StripCodeInto(ls, idx.stripped);
+        idx.owners = new List<string>();
+        CodeEditor.OwnerPerLinePre(idx.stripped, idx.owners);
+        idx.decls = new List<string>();
+        for (int i = 0; i < idx.stripped.Count; i = i + 1) {
+            idx.decls.Add(CodeEditor.DeclNameAt(idx.stripped[i]));
+        }
+        return idx;
+    }
+
+    /// 源文本的索引（宿主给的项目源码是整篇文本）。
+    static CeFileIndex OfText(string body) {
+        return CeFileIndex.Of(CodeEditor.SplitLines(body));
+    }
+}
+
+/// CodeEditor 分部：由 `zanc --emit-symbols` 生成的符号索引。
+///
+/// 补全此前用 CodeEditor.Completion.zan 中手写的表回答成员查询，
+/// 而该表已与编译器脱节：它提供了
+/// File.OpenRead()、Math.Clamp() 和 Convert.ToDecimal()（均不存在），
+/// 却隐藏了 File.GetSize()。编译器写入索引的内容
+/// 优先于这些表；它们保留为尚未
+/// 建立索引的工作区的回退。
+partial class CodeEditor {
+    static List<string> symOwners;   // 每个成员记录所属的类型
+    static List<string> symNames;    // 成员名称
+    static List<string> symKinds;    // M 方法、P 属性、F 字段、C 构造函数、E 事件
+    static List<string> symSigs;     // 显示签名
+    static List<string> symStatics;  // 成员为静态时是 "1"
+    static List<string> symTypes;    // 索引中的每个类型名
+    static List<string> symBases;    // symTypes[i] 的基类列表，逗号分隔
+
+    /// 索引成功加载后返回 true。
+    static bool SymbolIndexLoaded() {
+        return symTypes != null && symTypes.Count > 0;
+    }
+
+    /// 丢弃已加载的索引（构建后重新加载前使用）。
+    static void ClearSymbolIndex() {
+        symOwners = new List<string>();
+        symNames = new List<string>();
+        symKinds = new List<string>();
+        symSigs = new List<string>();
+        symStatics = new List<string>();
+        symTypes = new List<string>();
+        symBases = new List<string>();
+    }
+
+    /// 加载 `zanc --emit-symbols <path>` 写入的索引：制表符分隔的
+    /// `T kind namespace name bases` 和 `M owner name kind static signature`
+    /// 记录。文件缺失或没有记录时返回 false，
+    /// 此时补全继续使用内置表。
+    static bool LoadSymbolIndex(string path) {
+        CodeEditor.ClearSymbolIndex();
+        if (path.Length == 0 || !File.Exists(path)) { return false; }
+        string text = File.ReadAllText(path);
+        if (text.Length == 0) { return false; }
+        List<string> ls = text.Split("\n");
+        int i = 0;
+        while (i < ls.Count) {
+            string line = ls[i];
+            i = i + 1;
+            if (line.Length == 0) { continue; }
+            if (line.EndsWith("\r")) { line = line.Substring(0, line.Length - 1); }
+            if (line.StartsWith("#")) { continue; }
+            List<string> f = line.Split("\t");
+            if (f.Count < 4) { continue; }
+            if (f[0] == "T") {
+                string tn = f[3];
+                if (tn.Length > 0 && !CodeEditor.Has(symTypes, tn)) {
+                    symTypes.Add(tn);
+                    if (f.Count > 4) { symBases.Add(f[4]); } else { symBases.Add(""); }
+                }
+            } else if (f[0] == "M" && f.Count >= 6) {
+                // extern（DllImport）声明是 FFI 绑定而非 API，
+                // 不应提供：WebApp 的 crt `time`/`fopen`/`fwrite`/`fclose`
+                // 是该类型的成员，看起来像 WebApp 自己的方法。
+                if (f.Count > 6 && CodeEditor.Find(f[6], "x") >= 0) { continue; }
+                symOwners.Add(f[1]);
+                symNames.Add(f[2]);
+                symKinds.Add(f[3]);
+                symSigs.Add(f[5]);
+                symStatics.Add(f[4]);
+            }
+        }
+        return symTypes.Count > 0;
+    }
+
+    /// 索引描述了 `typeName` 时返回 true。
+    static bool HasSymbolType(string typeName) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return false; }
+        return CodeEditor.Has(symTypes, typeName);
+    }
+
+    // ---- 按类型限定的源码搜索 -----------------------------------------
+    // 转到定义和查找引用此前仅按名称搜索，
+    // `WebApp.Create` 曾落在项目中第一个 `Create(` 上，
+    // 其引用列表也包含所有无关的 `Create` 调用。这些函数以
+    // 成员所属的类型这一关键信息遍历文本，
+    // 以区分同名成员。它们接受普通行，编辑器可用于
+    // 自己的缓冲区，IDE 可用于未打开的文件。
+
+    /// `line` 上声明的类型名（`class`、`struct`、`interface`、
+    /// `enum`，前面可带任意修饰符），无则 ""。
+    static string TypeNameOn(string line) {
+        List<string> kws = new List<string>{
+            "class", "struct", "interface", "enum" };
+        for (int k = 0; k < kws.Count; k = k + 1) {
+            string kw = kws[k];
+            int p = CodeEditor.FindWordFrom(line, kw, 0);
+            if (p >= 0) {
+                int q = p + kw.Length;
+                while (q < line.Length && line.Substring(q, 1) == " ") { q = q + 1; }
+                string name = "";
+                while (q < line.Length && CodeEditor.IsIdentChar(line.Substring(q, 1))) {
+                    name = name + line.Substring(q, 1);
+                    q = q + 1;
+                }
+                if (name.Length > 0) { return name; }
+            }
+        }
+        return "";
+    }
+
+    /// `s` 中从 `from` 起 `word` 第一次整词出现的偏移，
+    /// 无则 -1。
+    static int FindWordFrom(string s, string word, int from) {
+        int at = from;
+        while (true) {
+            int p = CodeEditor.FindFrom(s, word, at);
+            if (p < 0) { return 0 - 1; }
+            at = p + word.Length;
+            bool okL = p == 0 || !CodeEditor.IsIdentByte(s[p - 1]);
+            bool okR = at >= s.Length || !CodeEditor.IsIdentByte(s[at]);
+            if (okL && okR) { return p; }
+        }
+    }
+
+    /// `line` 贡献的净花括号嵌套量，忽略字面量和注释。
+    static int BraceDelta(string line) {
+        return CodeEditor.BraceDeltaPre(CodeEditor.StripCode(line));
+    }
+
+    /// 已抹除字面量/注释的行的净花括号嵌套量。谁持有
+    /// 抹除结果就由谁传入，同一行不必为了数花括号再抹一遍。
+    static int BraceDeltaPre(string s) {
+        int d = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int b = s[i];
+            if (b == 123) { d = d + 1; }
+            else if (b == 125) { d = d - 1; }
+        }
+        return d;
+    }
+
+    /// 对 `ls` 的每一行，给出包含该行的类型体的类型名
+    /// （类型外为 ""），按行序追加到 `outOwners`。
+    static void OwnerPerLine(List<string> ls, List<string> outOwners) {
+        List<string> stripped = new List<string>();
+        CodeEditor.StripCodeInto(ls, stripped);
+        CodeEditor.OwnerPerLinePre(stripped, outOwners);
+    }
+
+    /// 按行抹除字面量/注释，结果追加到 `outStripped`。一份
+    /// 抹除结果可供 owner 划分、变量收集和引用统计共用。
+    static void StripCodeInto(List<string> ls, List<string> outStripped) {
+        for (int i = 0; i < ls.Count; i = i + 1) {
+            outStripped.Add(CodeEditor.StripCode(ls[i]));
+        }
+    }
+
+    /// OwnerPerLine，但行已经抹除过。
+    static void OwnerPerLinePre(List<string> stripped, List<string> outOwners) {
+        List<string> stack = new List<string>();
+        List<int> depths = new List<int>();
+        int depth = 0;
+        for (int i = 0; i < stripped.Count; i = i + 1) {
+            string s = stripped[i];
+            string tn = CodeEditor.TypeNameOn(s);
+            if (tn.Length > 0) { stack.Add(tn); depths.Add(depth); }
+            if (stack.Count > 0) { outOwners.Add(stack[stack.Count - 1]); }
+            else { outOwners.Add(""); }
+            depth = depth + CodeEditor.BraceDeltaPre(s);
+            while (stack.Count > 0 && depth <= depths[depths.Count - 1]) {
+                stack.RemoveAt(stack.Count - 1);
+                depths.RemoveAt(depths.Count - 1);
+            }
+        }
+    }
+
+    /// `ls` 第 `at` 行所在类型体的类型名，无则 ""。
+    static string EnclosingTypeAt(List<string> ls, int at) {
+        if (at < 0 || at >= ls.Count) { return ""; }
+        List<string> owners = new List<string>();
+        CodeEditor.OwnerPerLine(ls, owners);
+        if (at >= owners.Count) { return ""; }
+        return owners[at];
+    }
+
+    /// `s` 中恰在偏移 `end` 之前结束的标识符
+    /// （该处字符不属于标识符时返回 ""）。
+    static string IdentBefore(string s, int end) {
+        int a = end;
+        while (a > 0 && CodeEditor.IsIdentByte(s[a - 1])) { a = a - 1; }
+        if (a >= end) { return ""; }
+        return s.Substring(a, end - a);
+    }
+
+    /// `ls` 中持有 `typeName` 类型值的名称：`Type name`
+    /// 声明，或 `name = Type.` / `name = new Type(` 赋值。这些
+    /// 就是本文件中访问该类型成员的接收者，
+    /// `app.MaxBody` 正是借此被识别为 WebApp 的 MaxBody。
+    static void CollectTypedVars(List<string> ls, string typeName,
+            List<string> outNames) {
+        List<string> stripped = new List<string>();
+        CodeEditor.StripCodeInto(ls, stripped);
+        CodeEditor.CollectTypedVarsPre(stripped, typeName, outNames);
+    }
+
+    /// CollectTypedVars，但行已经抹除过。
+    static void CollectTypedVarsPre(List<string> stripped, string typeName,
+            List<string> outNames) {
+        for (int i = 0; i < stripped.Count; i = i + 1) {
+            string s = stripped[i];
+            int at = 0;
+            while (true) {
+                int p = CodeEditor.FindWordFrom(s, typeName, at);
+                if (p < 0) { break; }
+                at = p + typeName.Length;
+                int q = at;
+                // 带泛型实参列表仍算声明该类型。
+                if (q < s.Length && s.Substring(q, 1) == "<") {
+                    int d = 1;
+                    q = q + 1;
+                    while (q < s.Length && d > 0) {
+                        string c = s.Substring(q, 1);
+                        if (c == "<") { d = d + 1; }
+                        else if (c == ">") { d = d - 1; }
+                        q = q + 1;
+                    }
+                }
+                if (q < s.Length && s.Substring(q, 1) == " ") {
+                    while (q < s.Length && s.Substring(q, 1) == " ") { q = q + 1; }
+                    string nm = "";
+                    while (q < s.Length && CodeEditor.IsIdentChar(s.Substring(q, 1))) {
+                        nm = nm + s.Substring(q, 1);
+                        q = q + 1;
+                    }
+                    while (q < s.Length && s.Substring(q, 1) == " ") { q = q + 1; }
+                    string after = "";
+                    if (q < s.Length) { after = s.Substring(q, 1); }
+                    bool decl = after == "=" || after == ";" || after == ","
+                        || after == ")";
+                    if (nm.Length > 0 && decl && !CodeEditor.Has(outNames, nm)) {
+                        outNames.Add(nm);
+                    }
+                }
+                // `name = Type.Something(...)` / `name = new Type(...)`。
+                int eq = p;
+                while (eq > 0 && s.Substring(eq - 1, 1) == " ") { eq = eq - 1; }
+                if (CodeEditor.IdentBefore(s, eq) == "new") { eq = eq - 3; }
+                while (eq > 0 && s.Substring(eq - 1, 1) == " ") { eq = eq - 1; }
+                if (eq > 0 && s.Substring(eq - 1, 1) == "=") {
+                    int lhs = eq - 1;
+                    while (lhs > 0 && s.Substring(lhs - 1, 1) == " ") { lhs = lhs - 1; }
+                    string nm2 = CodeEditor.IdentBefore(s, lhs);
+                    if (nm2.Length > 0 && !CodeEditor.Has(outNames, nm2)) {
+                        outNames.Add(nm2);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `ls` 中属于类型 `owner` 的 `member` 出现：通过
+    /// 类型名、`this`/`base`、该类型的变量，
+    /// 或在 owner 自身函数体内不带限定地书写。
+    /// 同名声明会被跳过。给定 `outLines` 时行号追加到其中。
+    static int CountMemberRefsIn(List<string> ls, string member, string owner,
+            List<int> outLines) {
+        return CodeEditor.CountMemberRefsPre(CeFileIndex.Of(ls), member, owner,
+            outLines);
+    }
+
+    /// CountMemberRefsIn，但行索引已由调用方备好。统计一个
+    /// 文件里的多个成员时预处理只做一次；每个成员都重做
+    /// 一遍曾让 CodeLens 的跳转代价与声明数相乘。
+    static int CountMemberRefsPre(CeFileIndex idx, string member, string owner,
+            List<int> outLines) {
+        List<string> family = new List<string>();
+        List<string> recvs = new List<string>();
+        CodeEditor.MemberRecvsPre(idx.stripped, owner, family, recvs);
+        return CodeEditor.CountMemberRefsWith(idx, family, recvs, member,
+            outLines);
+    }
+
+    /// `owner` 成员在这些行上的可能接收者（及类型家族）。
+    /// 成员属于 `owner`，但可通过任何继承它的类型*到达*：
+    /// 写在派生类型名上，或声明为该派生类型的变量上，
+    /// 都是对同一成员的引用。
+    static void MemberRecvsPre(List<string> stripped, string owner,
+            List<string> outFamily, List<string> outRecvs) {
+        outRecvs.Add("this");
+        outRecvs.Add("base");
+        outFamily.Add(owner);
+        CodeEditor.SymbolSubtypesOf(owner, outFamily);
+        for (int fi = 0; fi < outFamily.Count; fi = fi + 1) {
+            if (!CodeEditor.Has(outRecvs, outFamily[fi])) {
+                outRecvs.Add(outFamily[fi]);
+            }
+            CodeEditor.CollectTypedVarsPre(stripped, outFamily[fi], outRecvs);
+        }
+    }
+
+    /// 成员引用统计的内层：抹除行、逐行 owner、类型家族与
+    /// 接收者均已备好。
+    static int CountMemberRefsWith(CeFileIndex idx, List<string> family,
+            List<string> recvs, string member, List<int> outLines) {
+        List<string> stripped = idx.stripped;
+        List<string> owners = idx.owners;
+        int total = 0;
+        for (int li = 0; li < stripped.Count; li = li + 1) {
+            string s = stripped[li];
+            if (idx.decls[li] != member) {
+                int from = 0;
+                while (true) {
+                    int p = CodeEditor.FindWordFrom(s, member, from);
+                    if (p < 0) { break; }
+                    from = p + member.Length;
+                    bool ok = false;
+                    if (p > 0 && s[p - 1] == 46) {
+                        ok = CodeEditor.Has(recvs, CodeEditor.IdentBefore(s, p - 1));
+                    } else if (li < owners.Count) {
+                        ok = CodeEditor.Has(family, owners[li]);
+                    }
+                    if (ok) {
+                        total = total + 1;
+                        if (outLines != null) { outLines.Add(li); }
+                    }
+                }
+            }
+        }
+        return total;
+    }
+
+    /// `ls` 中类型 `owner` 声明 `member` 的行索引，无则 -1。只搜索
+    /// owner 自身函数体，同文件中其他类型的同名成员
+    /// 绝不是答案。
+    static int FindMemberDeclLineIn(List<string> ls, string owner, string member) {
+        List<string> owners = new List<string>();
+        CodeEditor.OwnerPerLine(ls, owners);
+        for (int i = 0; i < ls.Count && i < owners.Count; i = i + 1) {
+            if (owners[i] == owner && CodeEditor.TypeNameOn(CodeEditor.StripCode(ls[i])).Length == 0) {
+                if (CodeEditor.IsMemberDeclOf(ls[i], member)) { return i; }
+            }
+        }
+        return 0 - 1;
+    }
+
+    /// `line` 声明 `member` 时返回 true：方法头（`... member(`）或
+    /// 字段/属性（`Type member;` / `Type member =` / `Type member {`），
+    /// 而非对它的使用。
+    static bool IsMemberDeclOf(string line, string member) {
+        string s = CodeEditor.TrimStr(CodeEditor.StripCode(line));
+        if (s.Length == 0) { return false; }
+        if (CodeEditor.TypeNameOn(s).Length > 0) { return false; }
+        int p = CodeEditor.FindWordFrom(s, member, 0);
+        if (p <= 0) { return false; }
+        if (s.Substring(p - 1, 1) != " ") { return false; }
+        string before = CodeEditor.TrimStr(s.Substring(0, p - 1));
+        // 声明前只有其类型（和修饰符）：使用之前
+        // 是运算符、点号或控制关键字。
+        if (before.Length == 0) { return false; }
+        string lastCh = before.Substring(before.Length - 1, 1);
+        if (!CodeEditor.IsIdentChar(lastCh) && lastCh != ">" && lastCh != "]"
+            && lastCh != "?") { return false; }
+        if (CodeEditor.Find(before, "=") >= 0) { return false; }
+        if (CodeEditor.Find(before, "(") >= 0) { return false; }
+        if (CodeEditor.Find(before, ".") >= 0) { return false; }
+        string first = CodeEditor.IdentAt(before, 0);
+        if (CodeEditor.IsControlWord(first)) { return false; }
+        int q = p + member.Length;
+        while (q < s.Length && s.Substring(q, 1) == " ") { q = q + 1; }
+        string after = "";
+        if (q < s.Length) { after = s.Substring(q, 1); }
+        return after == "(" || after == ";" || after == "=" || after == "{"
+            || after == "<";
+    }
+
+    /// `s` 中从 `at` 开始的标识符（无则 ""）。
+    static string IdentAt(string s, int at) {
+        string o = "";
+        int i = at;
+        while (i < s.Length && CodeEditor.IsIdentChar(s.Substring(i, 1))) {
+            o = o + s.Substring(i, 1);
+            i = i + 1;
+        }
+        return o;
+    }
+
+    /// `typeName` 基类链中实际声明 `member` 的类型，
+    /// 索引不知晓该成员时返回 ""。继承它的类型上的 `app.ToString()`
+    /// 必须指向声明它的基类，而非
+    /// 调用它的派生类型。
+    static string SymbolDeclaringType(string typeName, string member) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
+        string cur = typeName;
+        for (int depth = 0; cur.Length > 0 && depth < 8; depth = depth + 1) {
+            for (int i = 0; i < symOwners.Count; i = i + 1) {
+                if (symOwners[i] == cur && symNames[i] == member) { return cur; }
+            }
+            cur = CodeEditor.SymbolFirstBase(cur);
+        }
+        return "";
+    }
+
+    /// 追加编译器真正拥有的 `typeName` 成员，沿
+    /// 基类链展开，继承成员也会出现。
+    static void SymbolMembers(string typeName, List<string> out2) {
+        CodeEditor.SymbolMembersIn(typeName, out2, 0 - 1);
+    }
+
+    /// 单一访问上下文下的 `typeName` 成员：`wantStatic` 为 1 只列
+    /// 静态成员（接收者为类型本身：`WebApp.`），0 只列
+    /// 实例成员（接收者为值：`app.`），-1 两者都列。混用两者
+    /// 正是此前把类型全部实例状态塞进 `TypeName.` 的原因。
+    static void SymbolMembersIn(string typeName, List<string> out2,
+            int wantStatic) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return; }
+        string cur = typeName;
+        for (int depth = 0; cur.Length > 0 && depth < 8; depth = depth + 1) {
+            for (int i = 0; i < symOwners.Count; i = i + 1) {
+                if (symOwners[i] == cur && symKinds[i] != "C") {
+                    bool want = wantStatic < 0;
+                    if (!want && i < symStatics.Count) {
+                        bool st = symStatics[i] == "1";
+                        want = st == (wantStatic == 1);
+                    }
+                    if (want && !CodeEditor.Has(out2, symNames[i])) {
+                        out2.Add(symNames[i]);
+                    }
+                }
+            }
+            cur = CodeEditor.SymbolFirstBase(cur);
+        }
+    }
+
+    /// 索引描述了 `typeName` 且未把 `member` 归于
+    /// 它或它的任何基类时返回 true —— 这是唯一能确定
+    /// 无关类型同名成员绝对是错误答案的情况。
+    static bool SymbolTypeLacksMember(string typeName, string member) {
+        if (!CodeEditor.HasSymbolType(typeName)) { return false; }
+        return CodeEditor.SymbolDeclaringType(typeName, member).Length == 0;
+    }
+
+    /// 追加所有基类链可达 `typeName` 的已索引类型 ——
+    /// 即其成员也能到达的类型。
+    static void SymbolSubtypesOf(string typeName, List<string> out2) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return; }
+        for (int i = 0; i < symTypes.Count; i = i + 1) {
+            string cur = CodeEditor.SymbolFirstBase(symTypes[i]);
+            for (int depth = 0; cur.Length > 0 && depth < 8; depth = depth + 1) {
+                if (cur == typeName) {
+                    if (!CodeEditor.Has(out2, symTypes[i])) { out2.Add(symTypes[i]); }
+                    break;
+                }
+                cur = CodeEditor.SymbolFirstBase(cur);
+            }
+        }
+    }
+
+    /// `typeName` 在索引中的第一个基类（无则 ""）。
+    static string SymbolFirstBase(string typeName) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
+        for (int i = 0; i < symTypes.Count; i = i + 1) {
+            if (symTypes[i] == typeName) {
+                string b = symBases[i];
+                if (b.Length == 0) { return ""; }
+                int c = b.IndexOf(",");
+                if (c >= 0) { b = b.Substring(0, c); }
+                int lt = b.IndexOf("<");
+                if (lt >= 0) { b = b.Substring(0, lt); }
+                return b;
+            }
+        }
+        return "";
+    }
+
+    /// `typeName.member` 的声明签名（索引无
+    /// 此成员时返回 ""）。有重载时取第一个声明。
+    static string SymbolSignature(string typeName, string member) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
+        string cur = typeName;
+        for (int depth = 0; cur.Length > 0 && depth < 8; depth = depth + 1) {
+            for (int i = 0; i < symOwners.Count; i = i + 1) {
+                if (symOwners[i] == cur && symNames[i] == member) { return symSigs[i]; }
+            }
+            cur = CodeEditor.SymbolFirstBase(cur);
+        }
+        // 扩展方法声明在另一个类型上（"static string
+        // PadLeft(this string s, ...)"），因此还要查找 `this <typeName>`
+        // 接收者。
+        string want = "(this " + typeName;
+        for (int k = 0; k < symOwners.Count; k = k + 1) {
+            if (symNames[k] == member) {
+                int at = symSigs[k].IndexOf(want);
+                if (at >= 0) { return symSigs[k]; }
+            }
+        }
+        return "";
+    }
+
+    /// 索引对任意类型成员的第一个签名，用于
+    /// 接收者类型未知的悬停/签名条。
+    static string SymbolSignatureAny(string member) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
+        for (int i = 0; i < symNames.Count; i = i + 1) {
+            if (symNames[i] == member) { return symSigs[i]; }
+        }
+        return "";
+    }
+
+    /// 为 `typeName.member` 声明的所有签名，即重载集。
+    static void SymbolOverloads(string typeName, string member, List<string> out2) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return; }
+        string want = "(this " + typeName;
+        for (int i = 0; i < symOwners.Count; i = i + 1) {
+            bool mine = symOwners[i] == typeName && symNames[i] == member;
+            bool ext = symNames[i] == member && symSigs[i].IndexOf(want) >= 0;
+            if (mine || ext) {
+                if (!CodeEditor.Has(out2, symSigs[i])) { out2.Add(symSigs[i]); }
+            }
+        }
+    }
+
+    /// 补全为 `typeName.member` 显示的种类字母，
+    /// 索引未描述时返回 ""。
+    static string SymbolKind(string typeName, string member) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
+        for (int i = 0; i < symOwners.Count; i = i + 1) {
+            if (symOwners[i] == typeName && symNames[i] == member) { return symKinds[i]; }
+        }
+        return "";
+    }
+
+    /// 所有拼写以 `prefix` 开头的已索引类型名
+    /// （不区分大小写），用于类型名补全。
+    static void SymbolTypesStartingWith(string prefix, List<string> out2) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return; }
+        for (int i = 0; i < symTypes.Count; i = i + 1) {
+            if (CodeEditor.StartsWithI(symTypes[i], prefix)) {
+                if (!CodeEditor.Has(out2, symTypes[i])) { out2.Add(symTypes[i]); }
+            }
+        }
+    }
+
+    /// 索引中适用于 `typeName` 的扩展方法：第一个参数
+    /// 声明为 `this <typeName>` 的静态方法。
+    static void SymbolExtensionsFor(string typeName, List<string> out2) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return; }
+        string want = "(this " + typeName;
+        for (int i = 0; i < symOwners.Count; i = i + 1) {
+            string sig = symSigs[i];
+            int at = sig.IndexOf(want);
+            if (at >= 0) {
+                int after = at + want.Length;
+                string next = "";
+                if (after < sig.Length) { next = sig.Substring(after, 1); }
+                if (next == " " || next == "<") {
+                    if (!CodeEditor.Has(out2, symNames[i])) { out2.Add(symNames[i]); }
+                }
+            }
+        }
+    }
+}

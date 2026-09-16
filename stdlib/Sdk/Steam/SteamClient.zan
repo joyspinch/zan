@@ -1,0 +1,319 @@
+using System;
+using System.Text;
+using System.Json;
+using System.Net;
+using System.Net.Http;
+
+namespace Sdk.Steam;
+
+/// <summary>
+/// Steam Web API 客户端（steamworks Web API，api.steampowered.com 的
+/// HTTP/JSON 门面），用于游戏对接 Steam 的服务端与工具链场景：
+///
+///   - 服务器校验客户端票据（AuthenticateUserTicket，接
+///     steam_api.GetAuthTicketForWebApi 拿到的 hex 票据）；
+///   - 查玩家资料 / 在线状态 / 拥有游戏；
+///   - 查在线人数、成就 Schema；
+///   - 上报成就与统计（SetUserStatsForGame，成就即 1/0 的 int 统计）。
+///
+/// 用法（一行可用）：
+/// <code>
+/// SteamClient client = new SteamClient("your-webapi-key", 480);
+/// SteamResponse r = await client.GetNumberOfCurrentPlayersAsync();
+/// int count = r.Int("response.player_count", 0);
+/// </code>
+///
+/// 可选配置一律链式，均有合理默认值：
+/// <code>client.Timeout(15000).Server("api.steampowered.com", 443);</code>
+///
+/// 接口版本与封装范围（方法名 = Steam 接口名，与官方文档一一对应）：
+///   ISteamUser/GetPlayerSummaries/v0002
+///   ISteamUserAuth/AuthenticateUserTicket/v1（须发行商 key，仅服务端调用）
+///   ISteamUserStats/GetNumberOfCurrentPlayers/v1
+///   ISteamUserStats/GetSchemaForGame/v2
+///   ISteamUserStats/SetUserStatsForGame/v1
+///   IPlayerService/GetOwnedGames/v0001
+///
+/// 失败一律抛 <see cref="SteamException"/>；key 无效时 Steam 返回 HTTP 403。
+/// Web API key 在 https://steamcommunity.com/dev/apikey 申请；
+/// AuthenticateUserTicket 需要在 Steamworks 后台另外生成发行商 Web API key。
+///
+/// 线程/协程安全：单个实例的配置在构造后只读，可被多个协程并发调用；
+/// Server/Timeout 等 setter 应在并发调用前完成。
+/// </summary>
+class SteamClient {
+    static string DEFAULT_HOST = "api.steampowered.com";
+    static int DEFAULT_PORT = 443;
+
+    string key;
+    int appId;
+    string host;
+    int port;
+    int timeoutMs;
+    bool plainHttp;
+    ExternalCallPolicy callPolicy;
+
+    /// <summary>用 Web API key 与自家游戏 AppId 创建客户端，指向正式网关。</summary>
+    public SteamClient(string key, int appId) {
+        this.key = key;
+        this.appId = appId;
+        this.host = SteamClient.DEFAULT_HOST;
+        this.port = SteamClient.DEFAULT_PORT;
+        this.timeoutMs = 30000;
+        this.plainHttp = false;
+        this.callPolicy = ExternalCallPolicy.Default();
+    }
+
+    /// <summary>
+    /// 明文 HTTP 模式：不再对目标发 TLS。正式网关 api.steampowered.com
+    /// 永远是 HTTPS，默认关闭；给指向自建代理 / 本地假网关（如测试里的
+    /// HttpServer 回放）的场景用。它只是关掉 TLS，目标仍要过
+    /// ExternalCallPolicy 的地址策略——访问 loopback 必须配
+    /// <c>ExternalCallPolicy.Default().AllowLocalHttp()</c>。
+    /// </summary>
+    SteamClient PlainHttpMode() {
+        this.plainHttp = true;
+        return this;
+    }
+
+    /// <summary>指向另一个网关（自建代理 / 抓包调试 / 本地假网关测试）。</summary>
+    SteamClient Server(string host, int port) {
+        this.host = host;
+        this.port = port;
+        return this;
+    }
+
+    /// <summary>请求超时（毫秒），默认 30000。</summary>
+    SteamClient Timeout(int ms) {
+        this.timeoutMs = ms;
+        return this;
+    }
+
+    /// <summary>替换统一外部调用预算（测试里用它放行本地 HTTP）。</summary>
+    SteamClient WithCallPolicy(ExternalCallPolicy policy) {
+        this.callPolicy = policy == null ? ExternalCallPolicy.Default() : policy;
+        return this;
+    }
+
+    ExternalCallPolicy CallPolicy() {
+        return this.callPolicy;
+    }
+
+    // ---- ISteamUserStats ------------------------------------------------------
+
+    /// <summary>
+    /// 查询当前在线人数：ISteamUserStats/GetNumberOfCurrentPlayers/v1。
+    /// 结果读 <c>response.player_count</c>（response.result == 1 表示成功）。
+    /// 此接口无需 key。
+    /// </summary>
+    async SteamResponse GetNumberOfCurrentPlayersAsync() {
+        string path = "/ISteamUserStats/GetNumberOfCurrentPlayers/v1"
+            + "?appid=" + Convert.ToString(this.appId);
+        return await this.GetAsync(path);
+    }
+
+    /// <summary>
+    /// 查游戏的成就与统计 Schema：ISteamUserStats/GetSchemaForGame/v2。
+    /// 成就数组在 <c>game.availableGameStats.achievements</c>，统计在
+    /// <c>...stats</c>；language 传语言（english 等），空串表示默认。
+    /// </summary>
+    async SteamResponse GetSchemaForGameAsync(string language) {
+        string path = "/ISteamUserStats/GetSchemaForGame/v2"
+            + "?key=" + Encoding.UrlEncode(this.key)
+            + "&appid=" + Convert.ToString(this.appId);
+        if (language.Length > 0) {
+            path = path + "&l=" + Encoding.UrlEncode(language);
+        }
+        return await this.GetAsync(path);
+    }
+
+    /// <summary>
+    /// 上报一批成就 / 统计：ISteamUserStats/SetUserStatsForGame/v1。
+    /// stats 形如 <c>{"achieved":1,"kills":42}</c>——成就按 1/0 的 int
+    /// 统计上报，键为成就的 API name；count 为该对象键数，超出部分忽略。
+    /// Steam 只接受表单参数（stats[name]=value），此调用固定 POST。
+    /// </summary>
+    async SteamResponse SetUserStatsForGameAsync(JsonValue stats, int count) {
+        if (stats == null || !stats.IsObject()) {
+            throw new SteamException("client.paramError",
+                "stats 必须是 JSON 对象，如 {\"achieved\":1}", "");
+        }
+        if (count <= 0) {
+            throw new SteamException("client.paramError", "count 必须 > 0", "");
+        }
+        string body = "key=" + Encoding.UrlEncode(this.key)
+            + "&appid=" + Convert.ToString(this.appId);
+        int added = 0;
+        for (int i = 0; i < stats.Count() && added < count; i = i + 1) {
+            string name = stats.KeyAt(i);
+            int value = stats.ValAt(i) != null ? stats.ValAt(i).AsInt(0) : 0;
+            if (name.Length == 0) { continue; }
+            body = body + "&stats[" + Encoding.UrlEncode(name)
+                + "]=" + Convert.ToString(value);
+            added = added + 1;
+        }
+        return await this.PostFormAsync("/ISteamUserStats/SetUserStatsForGame/v1",
+            body);
+    }
+
+    // ---- ISteamUser -----------------------------------------------------------
+
+    /// <summary>
+    /// 批量查玩家资料：ISteamUser/GetPlayerSummaries/v0002。
+    /// steamIds 为 64 位 SteamID（字符串形式即可），Steam 上限一次 100 个，
+    /// 超出会抛 SteamException("client.paramError")。
+    /// </summary>
+    async SteamResponse GetPlayerSummariesAsync(List<string> steamIds) {
+        if (steamIds == null || steamIds.Count == 0) {
+            throw new SteamException("client.paramError", "steamIds 不能为空", "");
+        }
+        if (steamIds.Count > 100) {
+            throw new SteamException("client.paramError",
+                "steamIds 一次最多 100 个（Steam 限制）", "");
+        }
+        StringBuilder ids = new StringBuilder();
+        for (int i = 0; i < steamIds.Count; i = i + 1) {
+            if (i > 0) { ids.Append(","); }
+            ids.Append(steamIds[i]);
+        }
+        string path = "/ISteamUser/GetPlayerSummaries/v0002"
+            + "?key=" + Encoding.UrlEncode(this.key)
+            + "&steamids=" + Encoding.UrlEncode(ids.ToString());
+        return await this.GetAsync(path);
+    }
+
+    // ---- ISteamUserAuth -------------------------------------------------------
+
+    /// <summary>
+    /// 服务端校验客户端票据：ISteamUserAuth/AuthenticateUserTicket/v1。
+    ///
+    /// ticket 是客户端 steam_api 的 GetAuthTicketForWebApi(identity) 拿到的
+    /// 票据字节的 hex 字符串；identity 必须与客户端生成时用的一致。
+    /// 需要 <b>发行商</b> Web API key（普通 key 会 403），且只能从安全的服务端
+    /// 调用。结果用 <see cref="SteamTicketResult"/> 承载；
+    /// result（EResult）非 1 时抛 SteamException("auth.&lt;EResult&gt;")。
+    /// </summary>
+    async SteamTicketResult AuthenticateUserTicketAsync(string ticket,
+                                                        string identity) {
+        if (ticket.Length == 0) {
+            throw new SteamException("client.paramError", "ticket 不能为空", "");
+        }
+        string body = "key=" + Encoding.UrlEncode(this.key)
+            + "&appid=" + Convert.ToString(this.appId)
+            + "&ticket=" + Encoding.UrlEncode(ticket);
+        if (identity.Length > 0) {
+            body = body + "&identity=" + Encoding.UrlEncode(identity);
+        }
+        SteamResponse resp = await this.PostFormAsync(
+            "/ISteamUserAuth/AuthenticateUserTicket/v1", body);
+        return SteamTicketResult.Parse(resp.Value);
+    }
+
+    // ---- IPlayerService -------------------------------------------------------
+
+    /// <summary>
+    /// 查玩家拥有的游戏：IPlayerService/GetOwnedGames/v0001。
+    /// includeAppInfo=true 时返回游戏名与图片；includeFreeGames=true 时
+    /// 包含免费游玩的游戏。appIds 非空时只查这些 AppId
+    /// （Steam 以 appids_filter[0]=..&amp;appids_filter[1]=.. 形式接收）。
+    /// 注意：玩家资料隐私为"私密"时 Steam 返回 game_count=0 的空集。
+    /// </summary>
+    async SteamResponse GetOwnedGamesAsync(string steamId, bool includeAppInfo,
+                                           bool includeFreeGames,
+                                           List<int> appIds) {
+        if (steamId.Length == 0) {
+            throw new SteamException("client.paramError", "steamId 不能为空", "");
+        }
+        string path = "/IPlayerService/GetOwnedGames/v0001"
+            + "?key=" + Encoding.UrlEncode(this.key)
+            + "&steamid=" + Encoding.UrlEncode(steamId)
+            + "&include_appinfo=" + (includeAppInfo ? "1" : "0")
+            + "&include_played_free_games=" + (includeFreeGames ? "1" : "0");
+        if (appIds != null) {
+            for (int i = 0; i < appIds.Count; i = i + 1) {
+                path = path + "&appids_filter[" + Convert.ToString(i) + "]="
+                    + Convert.ToString(appIds[i]);
+            }
+        }
+        return await this.GetAsync(path);
+    }
+
+    // ---- 便捷结果类 ------------------------------------------------------------
+
+    /// <summary>GetPlayerSummaries 的结果直接解成列表（response.players[]）。</summary>
+    async List<SteamPlayerSummary> GetPlayersAsync(List<string> steamIds) {
+        SteamResponse resp = await this.GetPlayerSummariesAsync(steamIds);
+        List<SteamPlayerSummary> players = new List<SteamPlayerSummary>();
+        JsonValue arr = resp.Value.PathGet("response.players");
+        if (arr == null || !arr.IsArray()) { return players; }
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            players.Add(SteamPlayerSummary.From(arr.At(i)));
+        }
+        return players;
+    }
+
+    /// <summary>GetSchemaForGame 的成就定义直接解成列表（缺失时为空表）。</summary>
+    async List<SteamAchievement> GetAchievementsSchemaAsync(string language) {
+        SteamResponse resp = await this.GetSchemaForGameAsync(language);
+        List<SteamAchievement> items = new List<SteamAchievement>();
+        JsonValue arr = resp.Value.PathGet("game.availableGameStats.achievements");
+        if (arr == null || !arr.IsArray()) { return items; }
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            items.Add(SteamAchievement.From(arr.At(i)));
+        }
+        return items;
+    }
+
+    /// <summary>GetOwnedGames 的游戏列表直接解成列表（response.games[]）。</summary>
+    async List<SteamOwnedGame> GetOwnedGameListAsync(string steamId,
+                                                     bool includeAppInfo,
+                                                     bool includeFreeGames) {
+        SteamResponse resp = await this.GetOwnedGamesAsync(steamId,
+            includeAppInfo, includeFreeGames, null);
+        List<SteamOwnedGame> games = new List<SteamOwnedGame>();
+        JsonValue arr = resp.Value.PathGet("response.games");
+        if (arr == null || !arr.IsArray()) { return games; }
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            games.Add(SteamOwnedGame.From(arr.At(i)));
+        }
+        return games;
+    }
+
+    // ---- 传输 ------------------------------------------------------------------
+
+    async SteamResponse GetAsync(string path) {
+        HttpClient http = this.NewHttp();
+        try {
+            // SendAsync 一次带回状态码与正文；动词辅助方法（GetAsync）
+            // 只返回正文，拿不到 HTTP 状态码就无法把 403（key 无效）、
+            // 429（限流）映射成 SteamException("http.<状态>")。
+            HttpResponse parsed = await http.SendAsync("GET", path, "");
+            return SteamResponse.Parse(parsed.statusCode, parsed.body);
+        } catch (SteamException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new SteamException("client.networkError", e.Message, "");
+        }
+    }
+
+    async SteamResponse PostFormAsync(string path, string formBody) {
+        HttpClient http = this.NewHttp();
+        http.SetHeader("Content-Type", "application/x-www-form-urlencoded");
+        try {
+            HttpResponse parsed = await http.SendAsync("POST", path, formBody);
+            return SteamResponse.Parse(parsed.statusCode, parsed.body);
+        } catch (SteamException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new SteamException("client.networkError", e.Message, "");
+        }
+    }
+
+    HttpClient NewHttp() {
+        HttpClient http = new HttpClient(this.host, this.port);
+        if (!this.plainHttp) { http.UseTls(); }
+        http.SetTimeout(this.timeoutMs);
+        http.SetCallPolicy(this.callPolicy);
+        return http;
+    }
+}

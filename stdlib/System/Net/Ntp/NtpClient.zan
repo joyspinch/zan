@@ -1,0 +1,52 @@
+using System;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace System.Net.Ntp;
+
+/// <summary>
+/// SNTP 客户端（RFC 4330）——通过 UDP 123 端口获取墙上时钟时间，
+/// 这是没有电池供电 RTC 的设备获知日期的常见方式。
+///
+/// 用法：
+///   long unix = await NtpClient.QueryAsync("pool.ntp.org", 123, 3000);
+///   if (unix > 0) { /* seconds since 1970-01-01 UTC */ }
+/// </summary>
+class NtpClient {
+    // NTP 纪元（1900）与 Unix 纪元（1970）之间的秒数。
+    static const long EPOCH_DELTA = 2208988800;
+
+    /// <summary>发送一次 SNTP 请求并返回 Unix 秒（UTC），
+    /// 超时或应答格式错误时返回 -1。<paramref name="timeoutMs"/> 限定
+    /// 等待应答数据报的时间。</summary>
+    static async long QueryAsync(string host, int port, int timeoutMs) {
+        UdpClient udp = new UdpClient();
+        byte[] pkt = new byte[48];
+        pkt[0] = (byte)((0 << 6) + (4 << 3) + 3);   // LI=0，VN=4，mode=3（客户端）
+        string wire = pkt.ToStr(0, 48);
+        int _s = await udp.SendBytesToAsync(wire, 48, host, port);
+
+        long start = Stopwatch.GetMilliseconds();
+        byte[] d = new byte[64];
+        int n = 0;
+        while (n == 0
+               && Stopwatch.GetMilliseconds() - start < timeoutMs) {
+            if (Socket.IsReadable(udp.GetSocket())) {
+                n = udp.RecvBytesFrom(d, 64);
+            } else {
+                await Task.Delay(20);
+            }
+        }
+        udp.Close();
+        if (n < 44) { return -1; }
+        // 发送时间戳：偏移量 40 处的 32 位秒数。
+        long secs = 0;
+        int i = 40;
+        while (i < 44) {
+            secs = (secs << 8) + (d[i] & 255);
+            i = i + 1;
+        }
+        if (secs == 0) { return -1; }
+        return secs - NtpClient.EPOCH_DELTA;
+    }
+}

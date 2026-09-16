@@ -1,0 +1,220 @@
+using System;
+using System.IO;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+/// <summary>
+/// ZanDB 存储引擎使用的随机访问、页粒度的文件。
+///
+/// 所有读写都是定位式的（POSIX 上为 pread/pwrite，Windows 上为
+/// 文件描述符上的 seek+read）：它们不依赖共享的文件
+/// 位置，因此多个数据库句柄——以及多个进程——可以在同一文件上
+/// 工作而不互相踩踏偏移量。stdio
+/// FILE* 仅用于可移植地创建/打开文件；从不发出缓冲的 stdio
+/// 读写，因此 fd 级别的 IO 和 fsync 能看到一切。
+///
+///   PageFile f = PageFile.Open("data.zdb");
+///   ByteBuffer page = ByteBuffer.Alloc(4096);
+///   f.ReadAt(0, page, 4096);
+///   f.WriteAt(4096, page.Raw(), page.Length());
+///   f.Sync();
+///   f.Close();
+/// </summary>
+class PageFile {
+    /// <summary><see cref="LockExclusive"/> 在报告失败前等待当前持有者
+    /// 多久。</summary>
+    static int LOCK_TIMEOUT_MS = 60000;
+
+    nint fp;
+    int fd;
+    string path;
+    string lastError;
+
+    [DllImport("crt")]
+    static extern nint fopen(string path, string mode);
+
+    [DllImport("crt")]
+    static extern int fclose(nint fp);
+
+    #if WINDOWS
+    [DllImport("crt", EntryPoint = "_fileno")]
+    static extern int FileNo(nint fp);
+
+    [DllImport("crt", EntryPoint = "_commit")]
+    static extern int SyncFd(int fd);
+
+    [DllImport("crt", EntryPoint = "_lseeki64")]
+    static extern long SeekFd(int fd, long offset, int origin);
+
+    [DllImport("crt", EntryPoint = "_read")]
+    static extern int ReadFd(int fd, nint buf, int count);
+
+    [DllImport("crt", EntryPoint = "_write")]
+    static extern int WriteFd(int fd, nint buf, int count);
+
+    // _locking() 从当前文件位置开始锁定一个字节范围；
+    // 模式 1（_LK_LOCK）阻塞（约重试 10 秒），2（_LK_NBLCK）快速失败，
+    // 0（_LK_UNLCK）释放锁。
+    [DllImport("crt", EntryPoint = "_locking")]
+    static extern int LockFd(int fd, int mode, int length);
+    #else
+    [DllImport("crt", EntryPoint = "fileno")]
+    static extern int FileNo(nint fp);
+
+    [DllImport("crt", EntryPoint = "fsync")]
+    static extern int SyncFd(int fd);
+
+    [DllImport("crt", EntryPoint = "lseek")]
+    static extern long SeekFd(int fd, long offset, int origin);
+
+    [DllImport("crt", EntryPoint = "pread")]
+    static extern int PReadFd(int fd, nint buf, int count, long offset);
+
+    [DllImport("crt", EntryPoint = "pwrite")]
+    static extern int PWriteFd(int fd, nint buf, int count, long offset);
+
+    // flock(): 2 = LOCK_EX, 8 = LOCK_UN, 4 = LOCK_NB
+    [DllImport("crt", EntryPoint = "flock")]
+    static extern int FlockFd(int fd, int op);
+    #endif
+
+    /// 私有构造；统一经 <see cref="Open"/> 创建。
+    PageFile() {
+        this.fp = 0;
+        this.fd = -1;
+        this.path = "";
+        this.lastError = "";
+    }
+
+    /// <summary>为随机读写打开（或创建）一个文件。</summary>
+    static PageFile Open(string path) {
+        PageFile f = new PageFile();
+        f.path = path;
+        f.fp = fopen(path, "r+b");
+        if (f.fp == 0) {
+            f.fp = fopen(path, "w+b");
+        }
+        if (f.fp == 0) {
+            f.lastError = "cannot open " + path;
+            return f;
+        }
+        f.fd = FileNo(f.fp);
+        return f;
+    }
+
+    /// 文件是否成功打开。
+    bool IsOpen() { return this.fp != 0; }
+
+    /// 最近一次操作的错误描述（无错为空串）。
+    string GetError() { return this.lastError; }
+
+    /// <summary>从 offset 处读取 count 字节到 buf（先清空 buf）。
+    /// 返回实际读取的字节数。</summary>
+    int ReadAt(long offset, ByteBuffer buf, int count) {
+        if (this.fp == 0) { return -1; }
+        buf.Clear();
+        buf.EnsureCapacity(count);
+        int n = ReadRaw(offset, buf.Raw(), count);
+        if (n < 0) { n = 0; }
+        buf.SetLength(n);
+        return n;
+    }
+
+    /// <summary>定位读取到原始块中。</summary>
+    int ReadRaw(long offset, nint raw, int count) {
+        if (this.fp == 0) { return -1; }
+        #if WINDOWS
+        if (SeekFd(this.fd, offset, 0) < 0) {
+            this.lastError = "seek failed";
+            return -1;
+        }
+        return ReadFd(this.fd, raw, count);
+        #else
+        return PReadFd(this.fd, raw, count, offset);
+        #endif
+    }
+
+    /// <summary>从原始块向 offset 处写入 count 字节。
+    /// 返回写入的字节数。</summary>
+    int WriteAt(long offset, nint raw, int count) {
+        if (this.fp == 0) { return -1; }
+        #if WINDOWS
+        if (SeekFd(this.fd, offset, 0) < 0) {
+            this.lastError = "seek failed";
+            return -1;
+        }
+        return WriteFd(this.fd, raw, count);
+        #else
+        return PWriteFd(this.fd, raw, count, offset);
+        #endif
+    }
+
+    /// <summary>在文件末尾追加 count 字节；返回数据落盘的偏移量，
+    /// 出错时返回 -1。</summary>
+    long Append(nint raw, int count) {
+        if (this.fp == 0) { return -1; }
+        long end = Size();
+        if (end < 0) { return -1; }
+        if (WriteAt(end, raw, count) != count) { return -1; }
+        return end;
+    }
+
+    /// <summary>当前文件大小（字节）。</summary>
+    long Size() {
+        if (this.fp == 0) { return -1; }
+        return SeekFd(this.fd, 0, 2);
+    }
+
+    /// <summary>缓冲写入的 flush；定位 IO 无缓冲，因此该方法
+    /// 仅为 API 兼容而保留。</summary>
+    void Flush() { }
+
+    /// <summary>将写入的数据强制落盘到稳定存储。成功时返回 true
+    /// 成功。</summary>
+    bool Sync() {
+        if (this.fp == 0) { return false; }
+        return SyncFd(this.fd) == 0;
+    }
+
+    /// <summary>获取整个文件的独占锁，等待当前
+    /// 持有者释放。若进程
+    /// 退出，锁由操作系统释放，因此崩溃的写入者不会卡死数据库。</summary>
+    bool LockExclusive() {
+        if (this.fp == 0) { return false; }
+        #if WINDOWS
+        if (SeekFd(this.fd, 0, 0) < 0) { return false; }
+        // 用 _LK_NBLCK 自旋而非 _LK_LOCK：_LK_LOCK 会在
+        // 每次重试之间睡一整秒，因此毫秒级提交的写入者
+        // 每秒只能把锁交给等待者一次。
+        for (int waited = 0; waited < PageFile.LOCK_TIMEOUT_MS; waited = waited + 1) {
+            if (LockFd(this.fd, 2, 1) == 0) { return true; }
+            Thread.Sleep(1);
+        }
+        return false;
+        #else
+        return FlockFd(this.fd, 2) == 0;
+        #endif
+    }
+
+    /// 释放 LockExclusive 取得的锁；成功返回 true。
+    bool Unlock() {
+        if (this.fp == 0) { return false; }
+        #if WINDOWS
+        if (SeekFd(this.fd, 0, 0) < 0) { return false; }
+        return LockFd(this.fd, 0, 1) == 0;                     // _LK_UNLCK
+        #else
+        return FlockFd(this.fd, 8) == 0;
+        #endif
+    }
+
+    /// 关闭文件。进程退出时操作系统会兜底释放，但显式关闭
+    /// 能及时让出锁与句柄。
+    void Close() {
+        if (this.fp != 0) {
+            fclose(this.fp);
+            this.fp = 0;
+            this.fd = -1;
+        }
+    }
+}

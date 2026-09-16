@@ -1,0 +1,177 @@
+using System;
+using System.Web;
+
+namespace Gui;
+
+/// WEB_GUI_ROADMAP P5：HTML 声明层的 Gui 侧——把 System.Web.HtmlParser
+/// 的声明记录构建成控件树。解析/空白/实体/记录全在纯层（生成器
+/// GenHtml 也吃同一份记录，运行时与编译期同构）；本文件只负责
+/// tag→控件映射与属性协议（事件接线、绑定路径、样式类）。
+///
+/// tag 映射：容器 tag → Element（UA 样式表给 web 缺省语义），
+/// button → Button、input → Input/Checkbox、textarea → TextArea、
+/// img → Image；select 等未映射 tag 落 Element 占位。
+///
+/// 属性协议：id → 选择器名（nodeName），class → AddClass，
+/// style → 合成 .zgen-N 规则（复用整套级联与 !important 机制），
+/// data-on-<evt>="名" 经 HtmlHandlers 注册表接 BindEvent，
+/// data-bind → bindPath。其余属性（href/title/disabled/...）忽略。
+
+/// 解析产物：body 根 + 收集的样式。root 恒为 body 元素——片段没有
+/// body 标签时包一层隐式 body（对齐 Chrome 的文档语义）。
+class HtmlDoc {
+    Control root;
+    string css;
+    int gen;        // style 属性合成类的计数器（zgen-N）
+}
+
+/// data-on-* 的处理器注册表：`handlers.Add("submit", () => ...)`，
+/// HTML 里 `data-on-click="submit"` 命中同名条目即接线。
+class HtmlHandlers {
+    Dict<string, Action> map;
+
+    void Add(string name, Action a) {
+        if (this.map == null) { this.map = new Dict<string, Action>(); }
+        this.map.Add(name, a);
+    }
+
+    /// 未注册的名字返回 null（静默不接线——HTML 是声明，事件在
+    /// 宿主语言里，名字打错表现为按钮没反应而非崩溃）。
+    Action Find(string name) {
+        if (this.map == null) { return null; }
+        Action a = null;
+        if (this.map.TryGetValue(name, out a)) { return a; }
+        return null;
+    }
+}
+
+class Html {
+    /// 解析 `html`（整文档或片段）并建树。`baseDir` 是 `<link>`
+    /// 相对路径的基目录（空 = 不解析 link）。`handlers` 可为 null。
+    static HtmlDoc Parse(string html, string baseDir, HtmlHandlers handlers) {
+        WDoc wd = HtmlParser.Parse(html, baseDir);
+        HtmlDoc doc = new HtmlDoc();
+        doc.css = wd.css;
+        doc.gen = 0;
+        List<Control> built = new List<Control>();
+        for (int i = 0; i < wd.nodes.Count; i = i + 1) {
+            built.Add(Html.Build(wd.nodes[i], doc, handlers));
+        }
+        // 装配：逐父按 items 文档序走一遍——AddText 与 AddChild 的
+        // 交错顺序就是 HTML 的行内内容顺序（混排行盒依赖）。
+        for (int i = 0; i < wd.nodes.Count; i = i + 1) {
+            WNode n = wd.nodes[i];
+            Control c = built[i];
+            for (int k = 0; k < n.items.Count; k = k + 1) {
+                WItem it = n.items[k];
+                if (it.kid < 0) {
+                    // 真控件下的游离文本无处安放（映射控件的文本走
+                    // 自己的协议——button 吃捕获文本）
+                    if (c is Element) { ((Element)c).AddText(it.text); }
+                } else {
+                    Html.AddChild(c, built[it.kid]);
+                }
+            }
+        }
+        doc.root = built.Count > 0 ? built[0] : null;
+        return doc;
+    }
+
+    /// 一条记录 → 一个控件（构造 + 属性协议）。容器自己的文本不在这
+    /// 里加——装配阶段按 items 文档序与子控件交错加入。
+    static Control Build(WNode n, HtmlDoc doc, HtmlHandlers handlers) {
+        string tag = n.tag;
+        string id = HtmlText.Attr(n.attrNames, n.attrVals, "id");
+        string type = HtmlText.Attr(n.attrNames, n.attrVals,
+                                    "type").ToLower();
+        Control c = null;
+        if (tag == "button") {
+            Button b = new Button();
+            b.InitButton(n.text);
+            c = b;
+        } else if (tag == "textarea") {
+            TextArea ta = new TextArea();
+            ta.InitTextArea(new SignalString(n.text), "");
+            c = ta;
+        } else if (tag == "input" && type == "checkbox") {
+            Checkbox cb = new Checkbox();
+            cb.InitCheckbox("", new SignalBool(false));
+            c = cb;
+        } else if (tag == "input") {
+            Input inp = new Input();
+            inp.InitInput(
+                new SignalString(HtmlText.Attr(n.attrNames, n.attrVals,
+                                               "value")),
+                HtmlText.Attr(n.attrNames, n.attrVals, "placeholder"));
+            c = inp;
+        } else if (tag == "img") {
+            Image img = new Image();
+            img.InitImage(HtmlText.Attr(n.attrNames, n.attrVals, "src"),
+                          HtmlText.Attr(n.attrNames, n.attrVals, "alt"),
+                          "cover");
+            c = img;
+        } else {
+            Element el = new Element();
+            el.InitElement(tag, id);
+            c = el;
+        }
+        // 真控件的 id 不进 nodeName（那是 Element 的），走选择器名
+        if (id != "" && !(c is Element)) { c.SetProp("name", id); }
+        // 属性协议（与 GenHtml 生成的建树代码同一套语义）
+        for (int i = 0; i < n.attrNames.Count; i = i + 1) {
+            string k = n.attrNames[i];
+            string v = n.attrVals[i];
+            if (k == "id" || k == "type" || k == "value"
+                || k == "placeholder" || k == "src" || k == "alt") {
+                continue;   // 构造时已用
+            }
+            if (k == "class") {
+                List<string> cs = HtmlText.SplitClass(v);
+                for (int j = 0; j < cs.Count; j = j + 1) {
+                    c.AddClass(cs[j]);
+                }
+                continue;
+            }
+            if (k == "style") {
+                // 行内样式合成专属类规则，复用整套级联/!important 机制
+                string gen = "zgen-" + Convert.ToString(doc.gen);
+                doc.gen = doc.gen + 1;
+                c.AddClass(gen);
+                doc.css = doc.css + "." + gen + " { " + v + " }\n";
+                continue;
+            }
+            if (k == "data-bind") {
+                c.bindPath = v;
+                continue;
+            }
+            if (k.Length > 8 && HtmlText.StartsWith(k, "data-on-")) {
+                string suffix = k.Substring(8, k.Length - 8);
+                string evt = HtmlText.EventKind(suffix);
+                if (evt != "") { Html.Wire(handlers, c, evt, v); }
+                continue;
+            }
+            // 其余属性（href/title/disabled/...）忽略（台账）
+        }
+        return c;
+    }
+
+    /// 挂子节点：Element 父走 AddKid（与 AddText 的文档序交错，
+    /// 行盒混排依赖），控件父走普通 Add。
+    static void AddChild(Control parent, Control c) {
+        if (parent is Element) {
+            ((Element)parent).AddKid(c);
+            return;
+        }
+        parent.Add(c);
+    }
+
+    /// data-on-* 接线的公开钩子：生成的/手写的建树代码统一走这里，
+    /// 由它消化"名字 → 注册表 Action → BindEvent"与 Button 等控件
+    /// 把事件路由到专属槽位的差异（BindEvent 多态分派）。
+    static void Wire(HtmlHandlers handlers, Control c, string evt,
+                     string name) {
+        if (handlers == null || evt == "") { return; }
+        Action a = handlers.Find(name);
+        if (a != null) { c.BindEvent(evt, a); }
+    }
+}

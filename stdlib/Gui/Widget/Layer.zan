@@ -1,0 +1,2021 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+/// 浮动层的保留状态，支撑两种形态：
+///   kind 0 —— 可拖动的“页面”窗口（layui `layer` 的 page/iframe 风格）：
+///             持有几何信息、拖动状态及最小化/最大化/还原。
+///   kind 1 —— 居中的模态对话框（alert / confirm），变暗的背景遮罩，
+///             图标 + 标题 + 正文 + 操作行。
+///   kind 2 —— 居中的提示对话框：类似 confirm 再加一个文本输入框。
+/// state：0 正常，1 最大化，2 最小化（仅窗口）。
+class LayerState {
+    string title;
+    string body;
+    int x;
+    int y;
+    int w;
+    int h;
+    // 保存的正常几何信息，从最大化/最小化还原时回到这里。
+    int sx;
+    int sy;
+    int sw;
+    int sh;
+    int state;
+    bool open;
+    bool dragging;
+    int grabDx;
+    int grabDy;
+    int barId;
+    int closeId;
+    int maxId;
+    int minId;
+    // 是否绘制底部操作行（OK / Cancel）。
+    bool footer;
+    // 最近一次底部操作：0 无，1 确定，2 取消，3 关闭(X)。
+    int action;
+    // --- 统一 layer 扩展 ---
+    int kind;            // 0 窗口，1 对话框，2 提示框
+    bool modal;          // 绘制变暗的背景遮罩并让层居中
+    int dtype;           // 对话框图标：0 信息，1 成功，2 警告，3 错误
+    bool twoButtons;     // confirm/prompt（OK+Cancel）对比 alert（仅 OK）
+    string okText;
+    string cancelText;
+    // 可选的第三种退路（“Don't save”），绘制在 Cancel 左侧，
+    // 报告为 action 4。常规双按钮对话框传 ""。
+    string altText;
+    // 保留的操作按钮 + 关闭图标 id。Layer 每帧渲染这些按钮，
+    // 但绝不能重建：重建的 Button 每帧都会拿到全新的 WidgetId，
+    // 因此对照上一帧命中区解析出的点击目标
+    // 永远不会匹配新 id，按钮看起来就像失效了（保留式宿主如
+    // IDE 不会调用 WidgetId.ResetFrame）。在 Create() 中只创建一次。
+    Button okBtn;
+    Button cancelBtn;
+    Button altBtn;
+    Input promptInput;   // kind 2 的文本输入框（其他情况为 null）
+    int openMs;          // layer 打开时的墙钟毫秒数（入场动画用）
+    // 最小化任务条槽位（左下角横排第几个），由 RenderStack 每帧
+    // 按堆叠顺序指派；单独 Render 的窗口保持 0。
+    int minSlot;
+    // page 层的嵌入式正文控件树（layui page 层放任意 HTML 的等价物）：
+    // 宿主构造一棵保留的组件树（表单/面板等）挂进来，每帧渲染在
+    // 正文区。构造必须包在 Layer.BeginBody()/EndBody() 里领保留段 id。
+    Control view;
+    // 点遮罩关闭（模态对话框）：按下与抬起都落在遮罩、且不在对话框
+    // 矩形内时报告 action 2，由调用方关闭。
+    bool shadeClose;
+    // prompt 形态：0 文本，1 密码（Input.password），2 多行（TextArea）。
+    int promptFormType;
+    // >0 时输入的 UTF-8 字节上限（Input 内部按字节计游标）。
+    int promptMaxLen;
+    TextArea promptArea; // formType 2 的多行输入框（此时 promptInput 为 null）
+    // ---- 窗口缩放（左/右/下缘 + 左下/右下角） ----
+    bool sizing;
+    int rDir;            // 1 左缘，2 右缘，3 下缘，4 右下角，5 左下角
+    int rStartX;
+    int rStartY;
+    int rStartW;
+    int rStartH;
+    int rsLId;
+    int rsRId;
+    int rsBId;
+    int rsSEId;
+    int rsSWId;
+    // ---- 生命周期回调（layui success/end 的等价物） ----
+    // Opened：入场动画走完（或无动画时首帧渲染）触发一次。
+    // Closed：层关闭后的第一次渲染沿（或 Layer.Close 立即）触发
+    // 一次——直接置 open=false 的宿主只要照常渲染该层就会收到。
+    UiEvent Opened;
+    UiEvent Closed;
+    // 渲染沿检测用：Open 时置位，Closed 触发时清掉（重开重新武装）。
+    bool wasOpen;
+    bool openedRaised;
+    // >0 时打开这么多毫秒后自动关闭（layui 的 time），经 Layer.Close
+    // 走统一路径（同样触发 Closed）。
+    int AutoCloseMs;
+    // ---- 出场动画（layui isOutAnim:true 的等价物） ----
+    // Close 时层不立即消失：open 立即为 false（宿主状态机、Esc 往返
+    // 立刻稳定，Closed 也在关闭沿照旧触发），但层进入 closing 态在
+    // 屏幕上再停留出场时长，由渲染沿推 exitP 淡出并加速上滑，走完
+    // 自动摘除。
+    bool closing;
+    int closeMs;
+    // 关闭沿是否已触发 Closed（Layer.Close 就地触发；宿主直接翻
+    // open=false 的由渲染沿的关闭沿补触发——只触发一次）。
+    bool closedRaised;
+    // SizeToContent 打开的窗口保持画布居中（layui offset:'auto'）：
+    // 深链/点击回调可能在画布定型前创建窗口，出生时算好的居中会随
+    // 画布尺寸变化失效；渲染沿按当前画布重新居中，用户拖动/缩放/
+    // 最大化一次后让位（此后是用户自己的摆放）。
+    bool autoCenter;
+    // SizeToContent 的原始参数（逻辑 px，渲染沿按当前 DPI 现算设备
+    // 值）：深链在画布/DPI 定型前就可能建窗（此时 dpiScale 还是
+    // 100），出生时量出的几何是错的，真正的定宽高在渲染沿重算。
+    int sizeMinW;
+    int sizeMaxH;
+    // 超高时包住 view 的滚动列（SizeToContent 现算时才可能建立）；
+    // 渲染与命中都走 wrap，view 始终是宿主 SetBody 的原树。
+    Control wrap;
+
+    // Layer 专用保留 id 段的游标（seq 域，id = 1000000 + 段内序号）。
+    static int winSeq;
+
+    LayerState(string title, int x, int y, int w, int h) {
+        // 窗口在点击回调里中途创建，而即时模式宿主每帧 ResetFrame
+        // 会把计数器回卷重发：从这里直接领号，领走的正是宿主随后
+        // 每帧控件的本命 id（gallery 里 barId 恰好等于下一帧 Photos
+        // 按钮的 id——点窗口标题栏会触发 Photos，点关闭触发别的
+        // 演示控件，即“信号污染”）。与 ChildWindow / FilePicker /
+        // Designer 一样改钉专属高位段，与宿主计数器互不相扰。
+        // 930000 与 Designer(840000/860000)、FilePicker/ChildWindow
+        // (900000) 错开；步长 16 远超本构造器 + 子控件的一次用量。
+        int outer = WidgetId.SeqValue();
+        WidgetId.SetSeq(930000 + LayerState.winSeq);
+        LayerState.winSeq = LayerState.winSeq + 16;
+        this.title = title;
+        this.body = "";
+        this.x = x;
+        this.y = y;
+        this.w = w;
+        this.h = h;
+        this.sx = x;
+        this.sy = y;
+        this.sw = w;
+        this.sh = h;
+        this.state = 0;
+        this.open = false;
+        this.dragging = false;
+        this.grabDx = 0;
+        this.grabDy = 0;
+        this.barId = WidgetId.Next();
+        this.closeId = WidgetId.Next();
+        this.maxId = WidgetId.Next();
+        this.minId = WidgetId.Next();
+        this.footer = true;
+        this.action = 0;
+        this.kind = 0;
+        this.modal = false;
+        this.dtype = 0;
+        this.twoButtons = true;
+        this.okText = "OK";
+        this.cancelText = "Cancel";
+        this.altText = "";
+        this.okBtn = new Button { Class = "primary" };
+        this.cancelBtn = new Button { };
+        this.altBtn = new Button { };
+        this.promptInput = null;
+        this.promptArea = null;
+        this.view = null;
+        this.shadeClose = false;
+        this.promptFormType = 0;
+        this.promptMaxLen = 0;
+        this.sizing = false;
+        this.rDir = 0;
+        this.rStartX = 0;
+        this.rStartY = 0;
+        this.rStartW = 0;
+        this.rStartH = 0;
+        // 缩放把手也领保留段 id（渲染时每帧注册，id 必须跨帧稳定）。
+        this.rsLId = WidgetId.Next();
+        this.rsRId = WidgetId.Next();
+        this.rsBId = WidgetId.Next();
+        this.rsSEId = WidgetId.Next();
+        this.rsSWId = WidgetId.Next();
+        this.Opened = new UiEvent();
+        this.Closed = new UiEvent();
+        this.wasOpen = false;
+        this.openedRaised = false;
+        this.AutoCloseMs = 0;
+        this.closing = false;
+        this.closeMs = 0;
+        this.closedRaised = false;
+        this.autoCenter = false;
+        this.sizeMinW = 0;
+        this.sizeMaxH = 0;
+        this.wrap = null;
+        WidgetId.SetSeq(outer);
+    }
+
+    /// 居中的模态确认对话框（OK + Cancel）。dtype 决定图标。
+    static LayerState Confirm(string title, string body, int dtype) {
+        LayerState s = new LayerState(title, 0, 0, 420, 200);
+        s.body = body;
+        s.kind = 1;
+        s.modal = true;
+        s.dtype = dtype;
+        s.twoButtons = true;
+        return s;
+    }
+
+    /// 居中的模态对话框，提供三种出路——“保存它，
+    /// 丢弃它，还是保持原状”，这是关闭编辑器时必须问的问题。
+    /// 主操作报告 1，取消（及 X）报告 2 / 3，备选操作报告 4。
+    static LayerState Choose(string title, string body, int dtype, string okText,
+                             string altText, string cancelText) {
+        LayerState s = LayerState.Confirm(title, body, dtype);
+        s.okText = okText;
+        s.altText = altText;
+        s.cancelText = cancelText;
+        return s;
+    }
+
+    /// 居中的模态 alert 对话框（仅一个 OK 按钮）。
+    static LayerState Alert(string title, string body, int dtype) {
+        LayerState s = LayerState.Confirm(title, body, dtype);
+        s.twoButtons = false;
+        return s;
+    }
+
+    /// 带文本输入框的居中模态 prompt 对话框（OK + Cancel）。
+    static LayerState Prompt(string title, string hint) {
+        return LayerState.PromptWith(title, hint, 0, "", 0);
+    }
+
+    /// 强化版 prompt：formType 0 文本 / 1 密码 / 2 多行，value 为
+    /// 初值（"" 表示空），maxLen > 0 时限制输入的 UTF-8 字节长度。
+    static LayerState PromptWith(string title, string hint, int formType,
+                                 string value, int maxLen) {
+        LayerState s = new LayerState(title, 0, 0, 420,
+                                      formType == 2 ? 340 : 220);
+        s.kind = 2;
+        s.modal = true;
+        s.dtype = 0;
+        s.twoButtons = true;
+        s.promptFormType = formType;
+        s.promptMaxLen = maxLen;
+        // promptInput 在构造器之外创建，同样领保留段 id（理由见构造器）。
+        int outer = WidgetId.SeqValue();
+        WidgetId.SetSeq(930000 + LayerState.winSeq);
+        LayerState.winSeq = LayerState.winSeq + 16;
+        if (formType == 2) {
+            s.promptArea = new TextArea(hint);
+            if (value != "") { s.promptArea.SetText(value); }
+        } else {
+            s.promptInput = new Input(hint);
+            if (value != "") { s.promptInput.SetText(value); }
+            if (formType == 1) { s.promptInput.password = true; }
+            if (maxLen > 0) { s.promptInput.MaxLen = maxLen; }
+        }
+        WidgetId.SetSeq(outer);
+        return s;
+    }
+
+    /// page 层宿主控件：把一棵保留的组件树挂进窗口正文
+    /// （layui page 层放任意 HTML 的等价物——表单、面板等组合）。
+    /// 构造这棵树时必须包在 Layer.BeginBody()/EndBody() 里，否则
+    /// 控件在点击回调里中途领宿主计数器的 id，会重演“信号污染”。
+    void SetBody(Control v) {
+        view = v;
+    }
+
+    /// layui `area:'auto'` + `offset:'auto'` 的组件层等价物：按正文
+    /// 控件树的自然测量尺寸定窗宽高（minW 兜底窄表单），在画布上
+    /// 居中；正文自然高度超过可用正文高度时自动包一层 ScrollColumn，
+    /// 超出部分交给滚动条。SetBody 之后、Open 之前调用一次；
+    /// maxH > 0 时额外压低正文高度上限（弹窗不顶满视口）。
+    ///
+    /// 参数是逻辑 px（内部按 DPI 换算）。深链可能在画布/DPI 定型前
+    /// 建窗，这里只记参数；真正的量测与定几何在渲染沿
+    /// ApplySizeToContent 现算（此时画布、DPI、主题都已是真值）。
+    void SizeToContent(App app, int minW, int maxH) {
+        sizeMinW = minW;
+        sizeMaxH = maxH;
+        this.ApplySizeToContent(app);
+    }
+
+    /// SizeToContent 的现算体（LayerState 成员）：量正文树 → 定窗
+    /// 宽高 → 居中。窗口渲染沿也会调用它（画布定型/重算窗口尺寸），
+    /// 保证深链建窗与 DPI 切换后几何都正确。
+    void ApplySizeToContent(App app) {
+        if (view == null) { return; }
+        view.MeasureTree(app);
+        int contentW = view.prefW;
+        int contentH = view.prefH;
+        int aw = app.canvas.Width();
+        int ah = app.canvas.Height();
+        int bar = Layer.BarH(app);
+        int footH = 0;
+        if (footer) { footH = Layer.FooterH(app); }
+        // 与 RenderLayerBody 的正文几何同一套衬距：左右 20、顶 16、
+        // 底 8；正文文本占一行时控件树整体下移 28。
+        int padT = app.Scale(16);
+        int padB = app.Scale(8);
+        int padX = app.Scale(40);
+        int textH = 0;
+        if (body != "") { textH = app.Scale(28); }
+        int availBody = ah - app.titlebarH - app.Scale(32)
+            - bar - padT - padB - textH - footH;
+        if (availBody < app.Scale(60)) { availBody = app.Scale(60); }
+        int maxH = sizeMaxH;
+        if (maxH > 0) { maxH = app.Scale(maxH); }
+        if (maxH > 0 && availBody > maxH) { availBody = maxH; }
+        bool scrolling = contentH > availBody
+            && view.Kind() != "ScrollColumn";
+        if (scrolling) {
+            ScrollColumn sc = new ScrollColumn();
+            sc.With(view);
+            wrap = sc;
+        } else {
+            wrap = null;
+        }
+        int w = contentW + padX;
+        int minW = sizeMinW;
+        if (minW > 0) { minW = app.Scale(minW); }
+        if (w < minW) { w = minW; }
+        if (w > aw - app.Scale(32)) { w = aw - app.Scale(32); }
+        int bodyH = contentH;
+        if (scrolling) { bodyH = availBody; }
+        int h = bar + padT + textH + bodyH + padB + footH;
+        if (h > ah - app.titlebarH - app.Scale(16)) {
+            h = ah - app.titlebarH - app.Scale(16);
+        }
+        int wx = (aw - w) / 2;
+        int wy = (ah - h) / 2;
+        if (wy < app.titlebarH) { wy = app.titlebarH; }
+        if (wy + h > ah) { wy = ah - h; }
+        this.w = w;
+        this.h = h;
+        this.x = wx;
+        this.y = wy;
+        // 居中后的几何同时作为最大化/最小化还原的基准。
+        sx = x;
+        sy = y;
+        sw = w;
+        sh = h;
+        // 打开期间跟随画布重新居中，画布定型后窗口不偏在角落。
+        autoCenter = true;
+    }
+
+    void Open() {
+        open = true;
+        action = 0;
+        openMs = Window.GetTickMs();
+        // 重新武装生命周期回调：Opened 等入场走完再触发一次，
+        // Closed 在下一次关闭沿触发。打断未走完的出场动画。
+        wasOpen = true;
+        openedRaised = false;
+        closedRaised = false;
+        closing = false;
+        closeMs = 0;
+        if (state == 2) { state = 0; }
+        // 进打开注册表（按打开顺序，末尾最上）——键盘语义
+        // （Esc/Enter）与 CloseLast/CloseAll 依赖这份次序。
+        Layer.EnsureZorder();
+        Layer.zorder.Remove(this);
+        Layer.zorder.Add(this);
+    }
+
+    /// 用户在 prompt layer 中键入的文字（未输入时为空）。
+    string PromptText() {
+        if (promptArea != null) { return promptArea.GetText(); }
+        if (promptInput == null) { return ""; }
+        return promptInput.GetText();
+    }
+}
+
+/// 一个短暂的队列项（toast / notification）。队列掌管其诞生
+/// 时刻，以便淡入、存活 `lifeMs` 后淡出；`curY`/`curX`
+/// 携带缓动后的屏幕位置，使更早的项被移除时
+/// 堆栈能平滑收拢。
+class ToastItem {
+    string text;
+    int type;
+    int bornMs;
+    int lifeMs;
+    bool closing;
+    int closeMs;
+    int curY;
+    int curX;
+
+    ToastItem(string text, int type, int lifeMs) {
+        this.text = text;
+        this.type = type;
+        this.bornMs = Window.GetTickMs();
+        this.lifeMs = lifeMs;
+        this.closing = false;
+        this.closeMs = 0;
+        this.curY = 0 - 99999;
+        this.curX = 0 - 99999;
+    }
+}
+
+/// 统一的 overlay 层——单个组件满足所有弹层需求
+/// （layui `layer` 风格）：可拖动的页面窗口、模态 alert/confirm/prompt
+/// 对话框、顶部居中的消息 toast 队列、角落通知、加载
+/// 遮罩、锚定提示和全屏图片轮播。打开/关闭时均有动画，
+/// 并在延迟的 overlay 绘制阶段渲染，因此浮在
+/// 页面内容之上。
+class Layer {
+    // ---- 临时队列（惰性创建） ----
+    static List<ToastItem> toasts;
+    static List<ToastItem> notifs;
+    // 上一帧这两条队列各自占过的像素 [x, y, w, h]（w/h 为 0 表示上一帧
+    // 什么也没画）。
+    static List<int> toastPrev;
+    static List<int> notifPrev;
+    // ---- 打开注册表（键盘语义与 CloseLast/CloseAll 的次序依据） ----
+    // Open() 时按打开顺序入表（末尾最上），关闭后惰性剔除。
+    static List<LayerState> zorder;
+    // CloseLast/CloseAll 翻开 open 标志后置位：下一次渲染沿结束后由
+    // 渲染路径兑现成 app.RequestRedraw()（CloseLast 没有 App 参数，
+    // 无法就地请求）。保证遮罩/窗口消失的那一帧真的被渲染上屏。
+    static bool requestRedraw;
+    // ---- photos 的键盘会话状态：RenderPhotos 每帧刷新， ----
+    // Key() 借此判断照片层是否仍在屏上（250ms 内算活着）。
+    static int photosTick;
+    static SignalInt photosIdx;
+    static int photoCount;
+    static bool photosCloseReq;
+    // ---- page 层正文控件树的保留 id 段游标（seq 域） ----
+    static int savedSeq;
+    static int bodySeq;
+
+    static void EnsureZorder() {
+        if (Layer.zorder == null) { Layer.zorder = new List<LayerState>(); }
+    }
+
+    /// 剔除已关闭的注册项（随渲染路径惰性调用）。出场动画没走完
+    /// （closing）与还没轮到启动出场（wasOpen——宿主刚翻 open=false、
+    /// 本帧渲染沿才会 BeginExit）的保留——RenderStack 的收场扫描要从
+    /// 这里找到它们补画淡出帧（宿主驱动的对话框 open=false 后不再被
+    /// Layer.Render 画到）；先剪后扫会把它们剪没，对话框就瞬间消失。
+    /// 5 秒兜底：宿主若从此不再渲染该层，注册表也不被永久占用。
+    static void PruneZorder() {
+        Layer.EnsureZorder();
+        int now = Window.GetTickMs();
+        for (int i = Layer.zorder.Count - 1; i >= 0; i = i - 1) {
+            LayerState s = Layer.zorder[i];
+            if (s.open) { continue; }
+            if (s.wasOpen && now - s.openMs <= 5000) { continue; }
+            if (s.closing && now - s.closeMs <= 2000) { continue; }
+            Layer.zorder.RemoveAt(i);
+        }
+    }
+
+    /// 最上层打开中的对话框（kind 1/2），无则 null。
+    static LayerState TopmostDialog() {
+        Layer.EnsureZorder();
+        int i = Layer.zorder.Count - 1;
+        while (i >= 0) {
+            LayerState s = Layer.zorder[i];
+            if (s.open && s.kind != 0) { return s; }
+            i = i - 1;
+        }
+        return null;
+    }
+
+    /// `s` 是否是当前最上层打开中的 layer（渲染路径里避免同一键
+    /// 事件被多个对话框重复消费）。
+    static bool IsTopmost(LayerState s) {
+        Layer.EnsureZorder();
+        int i = Layer.zorder.Count - 1;
+        while (i >= 0) {
+            if (Layer.zorder[i].open) { return Layer.zorder[i] == s; }
+            i = i - 1;
+        }
+        return false;
+    }
+
+    /// 规范关闭入口（layui isOutAnim:true 的等价物）：open 立即为
+    /// false（宿主状态机、Esc 往返立刻稳定），层进入 closing 态——
+    /// 渲染沿还会把它在屏幕上淡出+上滑收场。Closed 仍在关闭沿立即
+    /// 触发（回调时序与无出场动画时完全一致，出场纯粹是收场动画）。
+    /// 直接置 open=false 的宿主走同一条路（关闭沿在渲染时启动出场，
+    /// 并在那里补触发 Closed）。
+    static void Close(App app, LayerState s) {
+        if (!s.open) { return; }
+        s.open = false;
+        s.dragging = false;
+        s.sizing = false;
+        s.closing = true;
+        s.closeMs = Window.GetTickMs();
+        if (!s.closedRaised) {
+            s.closedRaised = true;
+            s.Closed.Raise();
+        }
+        Layer.requestRedraw = true;
+    }
+
+    /// 关闭沿（!open 且 wasOpen）的第一帧：启动出场动画。
+    static void BeginExit(LayerState s) {
+        s.wasOpen = false;
+        s.closing = true;
+        s.closeMs = Window.GetTickMs();
+        s.dragging = false;
+        s.sizing = false;
+    }
+
+    /// 弹出完成回调：入场进度到 1000（或无入场）的第一帧触发一次。
+    /// 渲染路径在算完 Entrance 后调用。
+    static void NotifyOpened(LayerState s) {
+        if (s.wasOpen && !s.openedRaised) {
+            s.openedRaised = true;
+            s.Opened.Raise();
+        }
+    }
+
+    /// Esc 的语义：最上层对话框报告取消（action 2，由调用方关闭；
+    /// 与 X 的 action 3、按钮的 1/2 一致）。photos 在屏时请求关闭。
+    static bool CloseTopmostDialog() {
+        LayerState top = Layer.TopmostDialog();
+        if (top != null) {
+            top.action = 2;
+            // action 由调用方在同一帧的渲染沿读走并置 open=false，但很多
+            // 宿主（gallery 的对话框 pass、IDE 的 RenderDocDialogs）只翻
+            // open 标志、不请求重绘。Esc 帧本身渲染时对话框还开着（键盘
+            // 消费在 RenderDialog 画遮罩之前，遮罩照画上屏），下一帧若没
+            // 人请求，事件循环就睡到 fx 拍——恢复的快照又把遮罩钉在屏上，
+            // 直到 500ms 后 HUD/动画拍才真正擦掉，正是「Esc 后蒙版滞留」。
+            // 这里同样没有 App，置位交 FlushCloseRedraw 兑现。
+            Layer.requestRedraw = true;
+            return true;
+        }
+        if (Window.GetTickMs() - Layer.photosTick < 250) {
+            Layer.photosCloseReq = true;
+            return true;
+        }
+        return false;
+    }
+
+    /// 关闭最上层打开中的 layer（直接置 open=false，不产生 action）。
+    /// kind 0 窗口 / 1 对话框 / 2 提示框，-1 不限。无则返回 false。
+    static bool CloseLast(int kind) {
+        Layer.PruneZorder();
+        int i = Layer.zorder.Count - 1;
+        while (i >= 0) {
+            LayerState s = Layer.zorder[i];
+            if (s.open && (kind < 0 || s.kind == kind)) {
+                s.open = false;
+                // 关闭沿必须有人重绘：遮罩/窗口的像素只会在下一帧的渲染
+                // 里消失，这里不请求的话事件循环睡到 fx 拍，快照把旧画面
+                // 钉在屏上（与 Close/CloseTopmostDialog 同因）。
+                Layer.requestRedraw = true;
+                return true;
+            }
+            i = i - 1;
+        }
+        if (kind < 0 && Window.GetTickMs() - Layer.photosTick < 250) {
+            Layer.photosCloseReq = true;
+            return true;
+        }
+        return false;
+    }
+
+    /// 关闭全部打开中的 layer（不产生 action）。photos 不经注册表，
+    /// 由 CloseLast(-1) 的兜底分支请求关闭。
+    static void CloseAll(int kind) {
+        Layer.PruneZorder();
+        bool any = false;
+        for (int i = 0; i < Layer.zorder.Count; i = i + 1) {
+            LayerState s = Layer.zorder[i];
+            if (s.open && (kind < 0 || s.kind == kind)) {
+                s.open = false;
+                any = true;
+            }
+        }
+        if (any) { Layer.requestRedraw = true; }
+    }
+
+    /// 键盘语义（宿主在 key-down 事件里调用；对话框与 photos 的渲染
+    /// 路径也经此消费）。Esc 关最上层（对话框优先、photos 次之），
+    /// Enter 确认最上层对话框（多行 prompt 除外——Enter 是换行），
+    /// ←/→ 在 photos 里翻页。有下拉/菜单等框架弹层打开时让位
+    /// （框架自己收 Esc）。返回 true 表示本次按键已被层消费。
+    static bool Key(App app, int code) {
+        if (app.HasOverlays()) { return false; }
+        if (code == 27) {
+            if (Layer.CloseTopmostDialog()) {
+                app.RequestRedraw();
+                return true;
+            }
+            return false;
+        }
+        if (code == 13) {
+            LayerState top = Layer.TopmostDialog();
+            if (top != null && top.promptFormType != 2) {
+                top.action = 1;
+                // 与 Esc 同理：Enter 确认沿宿主可能只翻 open 标志，
+                // 这里替它把下一帧的整窗重绘挂上，遮罩不当屏。
+                app.RequestRedraw();
+                return true;
+            }
+            return false;
+        }
+        if ((code == 37 || code == 39)
+            && Window.GetTickMs() - Layer.photosTick < 250) {
+            SignalInt idx = Layer.photosIdx;
+            if (idx != null && Layer.photoCount > 0) {
+                int v = idx.Get() + (code == 39 ? 1 : 0 - 1);
+                if (v < 0) { v = Layer.photoCount - 1; }
+                if (v >= Layer.photoCount) { v = 0; }
+                idx.Set(v);
+                app.RequestRedraw();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// page 层正文控件树的构造包裹（与 LayerState.SetBody 配对）：
+    /// BeginBody 把 WidgetId 计数器切到 Layer 专属的 body 保留段
+    /// （seq 980000 起，每棵树步长 1024），EndBody 构造完还原宿主
+    /// 计数器并前进游标。正文控件在点击回调里中途 new 出来，若直接
+    /// 从宿主计数领号，领走的正是随后每帧控件的本命 id（“信号污染”）。
+    static void BeginBody() {
+        if (Layer.bodySeq < 980000) { Layer.bodySeq = 980000; }
+        Layer.savedSeq = WidgetId.SeqValue();
+        WidgetId.SetSeq(Layer.bodySeq);
+    }
+
+    static void EndBody() {
+        Layer.bodySeq = Layer.bodySeq + 1024;
+        WidgetId.SetSeq(Layer.savedSeq);
+    }
+
+    static void EnsureQueues() {
+        if (Layer.toasts == null) { Layer.toasts = new List<ToastItem>(); }
+        if (Layer.notifs == null) { Layer.notifs = new List<ToastItem>(); }
+        if (Layer.toastPrev == null) { Layer.toastPrev = Layer.NewRect(); }
+        if (Layer.notifPrev == null) { Layer.notifPrev = Layer.NewRect(); }
+    }
+
+    static List<int> NewRect() {
+        List<int> r = new List<int>();
+        r.Add(0); r.Add(0); r.Add(0); r.Add(0);
+        return r;
+    }
+
+    /// 声明这条队列这一帧的脏区，并把上一帧的脏区一起交上去。
+    ///
+    /// 队列里的东西一直在动（滑入、淡出、幸存者上移收拢），只声明「它现在
+    /// 在哪」的话，上一帧它占过、这一帧已经离开的那几行像素没人重画，留在
+    /// 屏幕上就是残影；最后一条消失的那一帧更是连一次重绘都不会请求，于是
+    /// 那条 toast 会一直挂在屏幕上直到下一次整窗重绘。
+    static void MarkQueueDirty(App app, List<int> prev, bool any,
+            int rx, int ry, int rw, int rh) {
+        if (any) { app.RequestAnimationFrameIn(16, rx, ry, rw, rh); }
+        if (prev[2] > 0 && prev[3] > 0) {
+            app.RequestAnimationFrameIn(16, prev[0], prev[1], prev[2], prev[3]);
+        }
+        if (any) {
+            prev[0] = rx; prev[1] = ry; prev[2] = rw; prev[3] = rh;
+        } else {
+            prev[0] = 0; prev[1] = 0; prev[2] = 0; prev[3] = 0;
+        }
+    }
+
+    /// 对话框操作按钮宽度：取标签自然宽度，不低于
+    /// 标准对话框按钮宽度，使一排按钮保持齐整。
+    static int ActionWidth(App app, Button b, int minW) {
+        int w = b.AutoWidth(app);
+        if (w < minW) { w = minW; }
+        return w;
+    }
+
+    static int Clamp01(int v) {
+        if (v < 0) { return 0; }
+        if (v > 1000) { return 1000; }
+        return v;
+    }
+
+    /// toast/notification/dialog 类型到 CSS 角色类（1/默认无类）。
+    static string RoleClass(int mtype) {
+        if (mtype == 2) { return "info"; }
+        if (mtype == 3) { return "success"; }
+        if (mtype == 4) { return "warning"; }
+        if (mtype == 5) { return "error"; }
+        return "";
+    }
+
+    static string RoleIcon(int mtype) {
+        if (mtype == 3) { return "success"; }
+        if (mtype == 4) { return "warning"; }
+        if (mtype == 5) { return "error"; }
+        return "info";
+    }
+
+    // ================================================================
+    // 消息 toast 队列（顶部居中、自动消失、向上收拢）
+    // ================================================================
+
+    /// 入队一条短暂的顶部居中 toast。type：1 默认，2 信息，
+    /// 3 成功，4 警告，5 错误。
+    static void Msg(string text, int type) {
+        Layer.EnsureQueues();
+        int now = Window.GetTickMs();
+        for (int i = 0; i < Layer.toasts.Count; i = i + 1) {
+            ToastItem it = Layer.toasts[i];
+            if (it.text == text && it.type == type && !it.closing) {
+                it.lifeMs = now - it.bornMs + 3000;
+                return;
+            }
+        }
+        Layer.toasts.Add(new ToastItem(text, type, 3000));
+    }
+
+    /// 绘制并推进 toast 队列。在 overlay 阶段每帧调用一次。
+    /// 条目从槽位正上方淡入/滑入，短暂停留后
+    /// 淡出；幸存者缓动上移，填补空隙。
+    static void RenderToasts(App app) {
+        Layer.EnsureQueues();
+        Theme t = app.theme;
+        int now = Window.GetTickMs();
+
+        int i = 0;
+        while (i < Layer.toasts.Count) {
+            ToastItem it = Layer.toasts[i];
+            if (it.closing && now - it.closeMs >= 240) {
+                Layer.toasts.RemoveAt(i);
+            } else {
+                i = i + 1;
+            }
+        }
+
+        int h = t.heightMedium;
+        int gap = app.Scale(8);
+        int slotH = h + gap;
+        int topY = app.titlebarH + app.Scale(10);
+        int n = Layer.toasts.Count;
+        int rx = 0;
+        int ry = app.titlebarH;
+        int rw = app.canvas.Width();
+        int rh = app.canvas.Height() - app.titlebarH;
+        for (int j = 0; j < n; j = j + 1) {
+            ToastItem it = Layer.toasts[j];
+            if (!it.closing && now - it.bornMs >= it.lifeMs) {
+                it.closing = true;
+                it.closeMs = now;
+            }
+            int ty = topY + j * slotH;
+            if (it.curY < 0 - 9000) { it.curY = ty - app.Scale(14); }
+            else { it.curY = it.curY + (ty - it.curY) / 3; }
+
+            int enterP = App.Ease(Layer.Clamp01((now - it.bornMs) * 1000 / 220));
+            int exitP = 0;
+            if (it.closing) {
+                exitP = App.Ease(Layer.Clamp01((now - it.closeMs) * 1000 / 240));
+            }
+            int a = enterP * (1000 - exitP) / 1000;
+            Rect toastRect = Layer.DrawToast(
+                app, it.curY, a, it.text, it.type);
+            if (j == 0) {
+                rx = toastRect.x;
+                ry = toastRect.y;
+                rw = toastRect.width;
+                rh = toastRect.height;
+            } else {
+                if (toastRect.x < rx) {
+                    rw = rw + rx - toastRect.x;
+                    rx = toastRect.x;
+                }
+                if (toastRect.y < ry) {
+                    rh = rh + ry - toastRect.y;
+                    ry = toastRect.y;
+                }
+                if (toastRect.x + toastRect.width > rx + rw) {
+                    rw = toastRect.x + toastRect.width - rx;
+                }
+                if (toastRect.y + toastRect.height > ry + rh) {
+                    rh = toastRect.y + toastRect.height - ry;
+                }
+            }
+        }
+        Layer.MarkQueueDirty(app, Layer.toastPrev, n > 0, rx, ry, rw, rh);
+    }
+
+    static Rect DrawToast(App app, int y, int a, string text, int mtype) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        string cls = Layer.RoleClass(mtype);
+        StyleBox s = Style.Of(app, "toast", cls, Style.SNormal());
+        StyleBox icoStyle = Style.Part(app, "toast", "icon", "", cls, "",
+                                       Style.SNormal());
+        string iconName = Layer.RoleIcon(mtype);
+        int fontSize = s.FontOr(Style.FontFallback(app, "medium"));
+
+        int ico = t.iconSizeSmall;
+        int h = t.heightMedium;
+        int textW = Canvas.MeasureText(text, fontSize);
+        int w = t.paddingMedium * 2 + ico + t.gapSmall + textW;
+        int x = (c.Width() - w) / 2;
+
+        int sh = 34 * a / 1000;
+        c.FillRoundRect(x + 1, y + 2, w, h, t.borderRadiusMedium, sh * 16777216);
+        app.FillGlass(x, y, w, h, t.borderRadiusMedium, s.bg, a);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium,
+                        Style.Fade(s.borderColor, a), s.BorderWOr(1));
+        c.DrawGlyphIn(iconName, x + t.paddingMedium, y, ico, h, ico,
+                            Style.Fade(icoStyle.fg, a));
+        c.DrawText(x + t.paddingMedium + ico + t.gapSmall,
+                   Canvas.CenterTextY(y, h, fontSize),
+                   text, Style.Fade(s.fg, a), fontSize);
+        return new Rect(x, y, w + 1, h + 2);
+    }
+
+    // ================================================================
+    // 通知队列（右上角、自动消失、向上收拢）
+    // ================================================================
+
+    /// 入队一条角落通知。type：1 默认，2 信息，3 成功，
+    /// 4 警告，5 错误。
+    static void Notify(string title, int type) {
+        Layer.EnsureQueues();
+        Layer.notifs.Add(new ToastItem(title, type, 4000));
+    }
+
+    static void RenderNotifs(App app) {
+        Layer.EnsureQueues();
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int now = Window.GetTickMs();
+
+        int i = 0;
+        while (i < Layer.notifs.Count) {
+            ToastItem it = Layer.notifs[i];
+            if (it.closing && now - it.closeMs >= 260) {
+                Layer.notifs.RemoveAt(i);
+            } else {
+                i = i + 1;
+            }
+        }
+
+        int w = app.Scale(300);
+        int h = t.heightLarge + t.paddingSmall;
+        int gap = app.Scale(10);
+        int slotH = h + gap;
+        int margin = app.Scale(16);
+        int tx = c.Width() - w - margin;
+        int topY = app.titlebarH + app.Scale(12);
+        int n = Layer.notifs.Count;
+        int rx = tx;
+        int ry = topY;
+        int rw = w;
+        int rh = h;
+        for (int j = 0; j < n; j = j + 1) {
+            ToastItem it = Layer.notifs[j];
+            if (!it.closing && now - it.bornMs >= it.lifeMs) {
+                it.closing = true;
+                it.closeMs = now;
+            }
+            int ty = topY + j * slotH;
+            if (it.curY < 0 - 9000) { it.curY = ty; }
+            else { it.curY = it.curY + (ty - it.curY) / 3; }
+
+            int enterP = App.Ease(Layer.Clamp01((now - it.bornMs) * 1000 / 240));
+            int exitP = 0;
+            if (it.closing) {
+                exitP = App.Ease(Layer.Clamp01((now - it.closeMs) * 1000 / 260));
+            }
+            int a = enterP * (1000 - exitP) / 1000;
+            int cx = tx + (1000 - a) * app.Scale(24) / 1000;
+            Layer.DrawNotifyCard(app, cx, it.curY, w, a, it.text, it.type);
+            if (j == 0) {
+                rx = cx; ry = it.curY; rw = w; rh = h;
+            } else {
+                if (cx < rx) { rw = rw + rx - cx; rx = cx; }
+                if (it.curY < ry) { rh = rh + ry - it.curY; ry = it.curY; }
+                if (cx + w > rx + rw) { rw = cx + w - rx; }
+                if (it.curY + h > ry + rh) {
+                    rh = it.curY + h - ry;
+                }
+            }
+        }
+        Layer.MarkQueueDirty(app, Layer.notifPrev, n > 0, rx, ry, rw, rh);
+    }
+
+    /// 单条通知 / 内联横幅卡片的高度。
+    static int NotifyH(App app) {
+        return app.theme.heightLarge + app.theme.paddingSmall;
+    }
+
+    /// 绘制通知卡片（不透明）。也复用作静态预览渲染器。
+    static void DrawNotify(App app, int x, int y, int w, string message, int ntype) {
+        Layer.DrawNotifyCard(app, x, y, w, 1000, message, ntype);
+    }
+
+    static void DrawNotifyCard(App app, int x, int y, int w, int a,
+                               string message, int ntype) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int h = t.heightLarge + t.paddingSmall;
+
+        string cls = Layer.RoleClass(ntype);
+        StyleBox s = Style.Of(app, "notification", cls, Style.SNormal());
+        StyleBox barStyle = Style.Part(app, "notification", "bar", "", cls,
+                                       "", Style.SNormal());
+        string iconName = Layer.RoleIcon(ntype);
+        int fontSize = s.FontOr(Style.FontFallback(app, "medium"));
+
+        int sh = 34 * a / 1000;
+        c.FillRoundRect(x + 1, y + 2, w, h, t.borderRadiusMedium, sh * 16777216);
+        app.FillGlass(x, y, w, h, t.borderRadiusMedium, s.bg, a);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium,
+                        Style.Fade(s.borderColor, a), s.BorderWOr(1));
+
+        int barColor = barStyle.bg;
+        c.FillRect(x, y, barStyle.WidthOr(3), h, Style.Fade(barColor, a));
+
+        c.DrawGlyphIn(iconName, x + t.paddingMedium, y,
+                            t.iconSizeMedium, h, t.iconSizeMedium,
+                            Style.Fade(barColor, a));
+        c.DrawText(x + t.paddingMedium + t.iconSizeMedium + t.gapSmall,
+                   Canvas.CenterTextY(y, h, fontSize),
+                   message, Style.Fade(s.fg, a), fontSize);
+    }
+
+    // ================================================================
+    // 加载遮罩 + 锚定提示
+    // ================================================================
+
+    /// 覆盖某区域的加载遮罩：变暗的圆角面板，中央是
+    /// 旋转指示器和可选的说明文字。
+    static void RenderLoad(App app, int x, int y, int w, int h, string tip) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox mask = Style.Part(app, "layer", "mask", "", "", "",
+                                   Style.SNormal());
+        c.FillRoundRect(x, y, w, h, t.borderRadiusLarge, mask.bg);
+        app.BlockHitsRect(x, y, w, h);
+        int d = app.Scale(36);
+        int cy = y + h / 2 - app.Scale(10);
+        new Spin(36).RenderInside(app,
+            new Rect(x + (w - d) / 2, cy - d / 2, d, d));
+        if (tip == "") { return; }
+        StyleBox ls = Style.Part(app, "layer", "load-label", "", "", "",
+                                 Style.SNormal());
+        int fs = ls.FontOr(Style.FontFallback(app, "small"));
+        c.DrawTextCentered(x, cy + app.Scale(30), w, Canvas.FontHeight(fs), tip,
+                           ls.FgOr(0), fs);
+    }
+
+    /// 小型的锚定提示气泡（委托给共享的 Tooltip 视觉）。
+    static void Tips(App app, int anchorX, int anchorY, string text) {
+        Tooltip.Render(app, anchorX, anchorY, text);
+    }
+
+    // ================================================================
+    // 静态兼容辅助函数（替代已删除的包装函数）
+    // ================================================================
+
+    /// 居中的模态面板，带标题栏 + 关闭按钮。返回
+    /// 关闭按钮的命中 id。（替代原 Modal.Render。）
+    static int Modal(App app, int w, int h, string title) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        StyleBox ov = Style.Part(app, "dialog", "overlay", "", "", "",
+                                 Style.SNormal());
+        StyleBox surf = Style.Part(app, "dialog", "surface", "", "", "",
+                                   Style.SNormal());
+        c.FillRect(0, 0, c.Width(), c.Height(), ov.bg);
+        app.BlockHitsBelow();
+        NativeLayer.Occlude(app, 0, 0, c.Width(), c.Height());
+        // 同 RenderDialog：调用方给的桌面定宽在窄视口上钳到可视区内。
+        int mw = w;
+        int mh = h;
+        int mAvailW = c.Width() - app.Scale(16) * 2;
+        if (mw > mAvailW) { mw = mAvailW; }
+        int mAvailH = c.Height() - app.Scale(16) * 2;
+        if (mh > mAvailH) { mh = mAvailH; }
+        int x = (c.Width() - mw) / 2;
+        int y = (c.Height() - mh) / 2;
+
+        c.FillRoundRect(x + surf.shadowDx, y + surf.shadowDy, mw, mh,
+                        t.borderRadiusLarge, surf.shadow);
+        c.FillRoundRect(x, y, mw, mh, t.borderRadiusLarge, surf.bg);
+
+        if (title != "") {
+            StyleBox ts = Style.Part(app, "dialog", "title", "", "", "",
+                                     Style.SNormal());
+            StyleBox ds = Style.Part(app, "dialog", "divider", "", "", "",
+                                     Style.SNormal());
+            int titleFont = ts.FontOr(Style.FontFallback(app, "large"));
+            c.DrawText(x + t.paddingLarge, y + t.paddingLarge, title,
+                       ts.fg, titleFont);
+            c.FillRect(x + 1, y + t.paddingLarge + t.heightMedium, mw - 2, 1,
+                       ds.bg);
+        }
+
+        int closeId = app.focus.AllocId();
+        int closeX = x + mw - t.heightMedium;
+        int closeY = y;
+        int closeState = Style.SNormal();
+        if (app.focus.IsHovered(closeId)) { closeState = Style.SHover(); }
+        StyleBox cs = Style.Part(app, "dialog", "close", "", "", "",
+                                 closeState);
+        if (cs.bg != 0) {
+            c.FillRoundRect(closeX, closeY, t.heightMedium, t.heightMedium,
+                            t.borderRadiusLarge, cs.bg);
+        }
+        c.DrawGlyphIn("close", closeX, closeY, t.heightMedium,
+                            t.heightMedium, t.iconSizeSmall, cs.fg);
+        app.hitTester.RegisterRect(closeId, closeX, closeY, t.heightMedium, t.heightMedium, 0);
+        return closeId;
+    }
+
+    /// 锚定在触发器下方的小型确认弹出框。返回 0 无，
+    /// 1 确认，2 取消。（替代原 Popconfirm.Render。）
+    static int DrawPopconfirm(App app, int anchorX, int anchorY, string message,
+                              string okText, string cancelText) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int ico = t.iconSizeSmall;
+        StyleBox s = Style.Of(app, "popconfirm", "", Style.SNormal());
+        int fontSize = s.FontOr(Style.FontFallback(app, "medium"));
+        int msgW = Canvas.MeasureText(message, fontSize);
+        int pad = t.paddingMedium;
+        int w = pad * 2 + ico + t.gapSmall + msgW;
+        int bw = app.Scale(64);
+        int minW = pad * 2 + bw * 2 + t.gapSmall;
+        if (w < minW) { w = minW; }
+        int h = pad * 2 + Canvas.FontHeight(fontSize) + t.gapMedium + t.heightSmall;
+
+        int x = anchorX - w / 2;
+        int y = anchorY + app.Scale(8);
+        if (x < app.Scale(4)) { x = app.Scale(4); }
+
+        StyleBox icoStyle = Style.Part(app, "popconfirm", "icon", "", "", "",
+                                       Style.SNormal());
+        int notch = app.Scale(6);
+        c.FillRoundRect(x + s.shadowDx, y + s.shadowDy, w, h,
+                        t.borderRadiusMedium, s.shadow);
+        app.FillGlass(x, y, w, h, t.borderRadiusMedium, s.bg, 1000);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium, s.borderColor,
+                        s.BorderWOr(1));
+        Tooltip.TriUp(c, anchorX, y - notch, notch, notch, s.bg);
+        app.BlockHitsRect(x, y, w, h);
+
+        c.DrawGlyph("warning", x + pad, y + pad, ico, icoStyle.fg);
+        c.DrawText(x + pad + ico + t.gapSmall, y + pad, message, s.fg, fontSize);
+
+        int by = y + h - t.heightSmall - pad;
+        int okX = x + w - pad - bw;
+        int cancelX = okX - t.gapSmall - bw;
+
+        int result = 0;
+        int cancelId = new Button { Text = cancelText, Class = "primary outline" }.Render(app, cancelX, by, bw);
+        if (Ui.Clicked(app, cancelId)) { result = 2; }
+        int okId = new Button { Text = okText, Class = "primary" }.Render(app, okX, by, bw);
+        if (Ui.Clicked(app, okId)) { result = 1; }
+        return result;
+    }
+
+    // ================================================================
+    // 全屏图片轮播（layui `photos` layer）
+    // ================================================================
+
+    /// 全屏变暗的图片查看器，包装共享的 Carousel。每张 slide 是一个
+    /// 图片源（文件 / data URI / http(s) URL / SVG），由 Gui.Widget.Image
+    /// 以 cover 填满观看框——photos 层不自己画占位。
+    /// 关闭按钮被点击的那一帧返回 true。
+    static bool RenderPhotos(App app, List<string> slides, SignalInt idx,
+                             CarouselAnim anim) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int W = c.Width();
+        int H = c.Height();
+        int top = app.titlebarH;
+
+        // 键盘会话：记录当前索引/张数与活跃时刻（Key 判断照片层
+        // 是否顶屏），消费宿主或上帧转来的关闭请求。
+        Layer.photosTick = Window.GetTickMs();
+        Layer.photosIdx = idx;
+        Layer.photoCount = slides.Count;
+        bool wantClose = Layer.photosCloseReq;
+        Layer.photosCloseReq = false;
+        if (app.EventKind() == 4) {
+            Layer.Key(app, app.window.EventKeyCode());
+        }
+
+        StyleBox s = Style.Of(app, "photos", "", Style.SNormal());
+        int fontSize = s.FontOr(Style.FontFallback(app, "medium"));
+        c.FillRect(0, top, W, H - top, s.bg);
+        int scrimId = app.BlockHitsRect(0, top, W, H - top);
+
+        int pw = W * 7 / 10;
+        int ph = (H - top) * 7 / 10;
+        int px = (W - pw) / 2;
+        int py = top + ((H - top) - ph) / 2;
+
+        Carousel car = new Carousel(idx);
+        for (int i = 0; i < slides.Count; i = i + 1) {
+            car.AddSlideView(new Image(slides[i], "", "cover"));
+        }
+        car.Animate(anim)
+            .RenderInside(app, new Rect(px, py, pw, ph));
+
+        c.DrawText(px, py - app.Scale(28),
+                   "Photo " + Convert.ToString(idx.Get() + 1) + " / "
+                   + Convert.ToString(slides.Count), s.fg, fontSize);
+
+        int bw = app.Scale(36);
+        int bx = px + pw - bw;
+        int byy = py - app.Scale(42);
+        if (byy < top + app.Scale(6)) { byy = top + app.Scale(6); }
+        int closeId = app.focus.AllocId();
+        bool hover = Ui.Over(app, bx, byy, bw, bw);
+        int chipState = Style.SNormal();
+        if (hover) { chipState = Style.SHover(); }
+        StyleBox chip = Style.Part(app, "photos", "chip", "", "", "",
+                                   chipState);
+        c.FillRoundRect(bx, byy, bw, bw, bw / 2, chip.bg);
+        c.DrawGlyphIn("close", bx, byy, bw, bw, t.iconSizeSmall, chip.fg);
+        app.hitTester.RegisterRect(closeId, bx, byy, bw, bw, 0);
+        if (app.EventKind() == 3
+            && app.ClickTarget() == closeId) {
+            return true;
+        }
+        // 点观看框外的遮罩空白处关闭（naive UI 图片预览的惯例，全屏
+        // 看图不该逼用户瞄准右上角的小 X）。要求按下与释放都落在
+        // 遮罩上：从观看框里拖出去的翻页手势不得误判成关闭。
+        if (app.EventKind() == 3
+            && app.PressTarget() == scrimId
+            && app.ClickTarget() == scrimId) {
+            return true;
+        }
+        // Esc（Layer.Key 置的关闭请求）：下一帧在渲染开头兑现。
+        // 返回 true 前把重绘挂上：宿主收到 true 才会翻 photosOpen，
+        // 但它不一定自己请求重绘；photos 全屏像素的消失必须由下一帧
+        // 渲染兑现，否则 fx 快照把照片层钉在屏上直到某个无关动画拍。
+        if (wantClose) {
+            app.RequestRedraw();
+            return true;
+        }
+        return false;
+    }
+
+    // ================================================================
+    // 可拖动的页面窗口 + 模态对话框
+    // ================================================================
+
+    static int BarH(App app) {
+        return app.theme.heightLarge;
+    }
+
+    static int FooterH(App app) {
+        return app.theme.heightMedium + app.Scale(20);
+    }
+
+    static int BtnW(App app) {
+        return app.Scale(46);
+    }
+
+    /// 状态 `s` 下，调用方正文内容应开始的绝对 Y 坐标。
+    static int BodyTop(App app, LayerState s) {
+        int top = app.titlebarH;
+        if (s.state == 1) { return top + Layer.BarH(app) + app.Scale(16); }
+        return s.y + Layer.BarH(app) + app.Scale(16);
+    }
+
+    /// 正文内容应开始的绝对 X 坐标。
+    static int BodyLeft(App app, LayerState s) {
+        if (s.state == 1) { return app.Scale(20); }
+        return s.x + app.Scale(20);
+    }
+
+    static bool Inside(int mx, int my, int x, int y, int w, int h) {
+        return mx >= x && mx < x + w && my >= y && my < y + h;
+    }
+
+    /// 缩放拖拽的几何推导：从 rStart* 起始几何与当前鼠标位推出新的
+    /// x/y/w/h（含最小尺寸与客户区钳制）。dir 与 s.rDir 同义：
+    /// 1 左缘，2 右缘，3 下缘，4 右下角，5 左下角。渲染拖动与
+    /// 无窗口回归共用这一份推导。
+    static void ApplyResize(App app, LayerState s, int mx, int my) {
+        int W = app.canvas.Width();
+        int H = app.canvas.Height();
+        int minW = app.Scale(220);
+        int minH = app.Scale(120);
+        int dir = s.rDir;
+        int dx = mx - s.grabDx;
+        int dy = my - s.grabDy;
+        if (dir == 1 || dir == 5) {
+            // 左缘：x/w 联动，最小宽度时钉住左缘，钳到客户区左界。
+            int nx = s.rStartX + dx;
+            int nw = s.rStartW - dx;
+            if (nw < minW) {
+                nw = minW;
+                nx = s.rStartX + s.rStartW - minW;
+            }
+            if (nx < 0) {
+                nw = nw + nx;
+                nx = 0;
+            }
+            s.x = nx;
+            s.w = nw;
+        }
+        if (dir == 2 || dir == 4) {
+            // 右缘：只动宽度，最小宽度与客户区右界钳制。
+            int nw = s.rStartW + dx;
+            if (nw < minW) { nw = minW; }
+            if (s.rStartX + nw > W) { nw = W - s.rStartX; }
+            s.w = nw;
+        }
+        if (dir >= 3) {
+            // 下缘/两角：只动高度，最小高度与客户区底界钳制。
+            int nh = s.rStartH + dy;
+            if (nh < minH) { nh = minH; }
+            if (s.rStartY + nh > H) { nh = H - s.rStartY; }
+            s.h = nh;
+        }
+    }
+
+    /// 最小化窗口在左下角任务条上的位置（仅剩一条标题栏，宽 260）：
+    /// 槽位从左往右横排，一行放不下向上折行。命中区（Bounds）与
+    /// 绘制（RenderActive）都从这里取位，保证两者始终一致。
+    static void MinPos(App app, LayerState s, List<int> outv) {
+        int mw = app.Scale(260);
+        int gap = app.Scale(8);
+        int margin = app.Scale(8);
+        int bar = Layer.BarH(app);
+        int W = app.canvas.Width();
+        int H = app.canvas.Height();
+        int perRow = (W - margin * 2 + gap) / (mw + gap);
+        if (perRow < 1) { perRow = 1; }
+        int col = s.minSlot % perRow;
+        int row = s.minSlot / perRow;
+        outv.Add(margin + col * (mw + gap));
+        outv.Add(H - margin - bar - row * (bar + gap));
+    }
+
+    /// `s` 实际在屏幕上的边界（考虑最大化 / 最小化），
+    /// 写入 4 元素 int 列表 [x, y, w, h]。
+    static void Bounds(App app, LayerState s, List<int> outv) {
+        int top = app.titlebarH;
+        int bar = Layer.BarH(app);
+        int ex = s.x; int ey = s.y; int ew = s.w; int eh = s.h;
+        if (s.state == 1) {
+            ex = 0; ey = top; ew = app.canvas.Width(); eh = app.canvas.Height() - top;
+        } else if (s.state == 2) {
+            List<int> mp = new List<int>();
+            Layer.MinPos(app, s, mp);
+            ex = mp[0]; ey = mp[1];
+            ew = app.Scale(260); eh = bar;
+        }
+        outv.Add(ex); outv.Add(ey); outv.Add(ew); outv.Add(eh);
+    }
+
+    static bool Contains(App app, LayerState s, int mx, int my) {
+        List<int> b = new List<int>();
+        Layer.Bounds(app, s, b);
+        return Layer.Inside(mx, my, b[0], b[1], b[2], b[3]);
+    }
+
+    /// layer 打开以来的入场进度（千分比）；仍在缓入时
+    /// 会重新启动动画计时。
+    static int Entrance(App app, LayerState s) {
+        if (s.openMs <= 0) { return 1000; }
+        int el = Window.GetTickMs() - s.openMs;
+        int p = App.Ease(Layer.Clamp01(el * 1000 / 180));
+        if (p < 1000) {
+            List<int> b = new List<int>();
+            Layer.Bounds(app, s, b);
+            app.RequestAnimationFrameIn(16, b[0], b[1], b[2], b[3]);
+        }
+        return p;
+    }
+
+    /// 出场动画时长（layui isOutAnim ~300ms 的量级）。
+    static int ExitMs() { return 240; }
+
+    /// 出场进度（0..1000）：closing 层在关闭沿之后的淡出/位移进度，
+    /// 非 closing 层恒 1000。渲染路径用它衰减 shade 与表面。
+    static int ExitP(LayerState s) {
+        if (!s.closing || s.closeMs <= 0) { return 1000; }
+        return App.Ease(Layer.Clamp01((Window.GetTickMs() - s.closeMs)
+            * 1000 / Layer.ExitMs()));
+    }
+
+    /// 出场衰减：按 a‰ 乘法衰减颜色的既有 alpha（a=1000 原样返回）。
+    /// Style.Fade 是「设为 a‰」的绝对语义，对 0x22000000 阴影、遮罩
+    /// ov.bg 这类预透明色，a=1000 时会跳成全不透明——淡出必须用
+    /// 乘法衰减。
+    static int MulAlpha(int color, int a) {
+        if (a >= 1000) { return color; }
+        if (a <= 0) { return 0; }
+        int rgb = color % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+        int al = (color - rgb) / 16777216 + 256;
+        return (al * a / 1000) * 16777216 + rgb;
+    }
+
+    /// !open 层的关闭沿：第一帧启动出场并补触发 Closed（Layer.Close
+    /// 路径已在 Close 里触发过，closedRaised 拦住二次触发），其后画
+    /// 淡出/上滑收场帧（模态对话框走整屏遮罩+表面，页面窗口走窗口
+    /// 自身），走完请求整帧重绘擦净。返回 true 表示本帧处理了该层
+    /// （调用方不必再画它）。
+    static bool ClosingFrame(App app, LayerState s) {
+        if (s.wasOpen) {
+            Layer.BeginExit(s);
+            if (!s.closedRaised) {
+                s.closedRaised = true;
+                s.Closed.Raise();
+            }
+        }
+        if (!s.closing) { return false; }
+        int outP = Layer.ExitP(s);
+        if (outP < 1000) {
+            if (s.modal) { Layer.RenderDialogExit(app, s, outP); }
+            else { Layer.RenderClosing(app, s, outP); }
+            // 遮罩淡出覆盖整屏，动画损伤区按整画布申请（窗口矩形
+            // 不够——下一帧遮罩变浅的每一处像素都要重画）。
+            app.RequestAnimationFrameIn(16, 0, 0,
+                                        app.canvas.Width(), app.canvas.Height());
+            return true;
+        }
+        s.closing = false;
+        app.RequestRedraw();
+        return true;
+    }
+
+    /// 从后往前绘制页面窗口堆栈（最后一个 = 最顶层）。点击
+    /// 任一窗口都会将其置顶；只有指针下最顶层的窗口（或被拖动者）
+    /// 才消费鼠标事件。
+    static void RenderStack(App app, List<LayerState> list) {
+        Layer.PruneZorder();
+        int ek = app.EventKind();
+        int mx = app.mouseX;
+        int my = app.mouseY;
+
+        int drag = 0 - 1;
+        for (int j = 0; j < list.Count; j = j + 1) {
+            if (list[j].dragging || list[j].sizing) { drag = j; }
+        }
+
+        int active = drag;
+        if (active < 0) {
+            int i = list.Count - 1;
+            while (i >= 0) {
+                LayerState s = list[i];
+                if (s.open && Layer.Contains(app, s, mx, my)) { active = i; i = 0 - 1; }
+                else { i = i - 1; }
+            }
+        }
+
+        if (ek == 2 && active >= 0 && active < list.Count - 1) {
+            LayerState s = list[active];
+            list.RemoveAt(active);
+            list.Add(s);
+            active = list.Count - 1;
+        }
+
+        // 最小化窗口按当前堆叠顺序领取左下角任务条槽位；
+        // 某个窗口还原离场后，余者自动向左收拢。
+        int minIdx = 0;
+        for (int k = 0; k < list.Count; k = k + 1) {
+            LayerState ms = list[k];
+            if (ms.open && ms.state == 2) {
+                ms.minSlot = minIdx;
+                minIdx = minIdx + 1;
+            }
+        }
+
+        for (int k = 0; k < list.Count; k = k + 1) {
+            Layer.RenderActive(app, list[k], k == active);
+        }
+        // 宿主驱动的模态对话框（Layer.Render 单层路径）关闭后宿主不再
+        // 调 Render；这里从打开注册表把尚在出场的对话框补画收场帧
+        // （页面之上、toast 之下），走完由 ClosingFrame 触发 Closed。
+        if (Layer.zorder != null) {
+            for (int k = 0; k < Layer.zorder.Count; k = k + 1) {
+                LayerState zs = Layer.zorder[k];
+                if (!zs.open && zs.modal && (zs.closing || zs.wasOpen)) {
+                    Layer.ClosingFrame(app, zs);
+                }
+            }
+        }
+        Layer.FlushCloseRedraw(app);
+    }
+
+    static void Render(App app, LayerState s) {
+        Layer.RenderActive(app, s, true);
+        Layer.FlushCloseRedraw(app);
+    }
+
+    /// CloseLast/CloseAll 翻开 open 标志时没有 App 可请求重绘；渲染沿
+    /// 结束后在这里兑现（无论该层走的是哪条渲染路径——宿主可能只渲染
+    /// 这一个层就返回）。CloseTopmostDialog/Key/Close 已就地请求。
+    static void FlushCloseRedraw(App app) {
+        if (Layer.requestRedraw) {
+            Layer.requestRedraw = false;
+            app.RequestRedraw();
+        }
+    }
+
+    static void RenderActive(App app, LayerState s, bool active) {
+        if (!s.open) {
+            // 关闭沿：无论谁置的 open=false（X、宿主、CloseLast/CloseAll、
+            // 自动关闭），第一帧启动出场动画；出场期间继续渲染该层的
+            // 收场帧（淡出+上滑），走完触发一次 Closed 并真正摘除。
+            Layer.ClosingFrame(app, s);
+            return;
+        }
+        if (s.AutoCloseMs > 0 && s.openMs > 0
+            && Window.GetTickMs() - s.openMs >= s.AutoCloseMs) {
+            Layer.Close(app, s);
+            return;
+        }
+        if (s.modal) { Layer.RenderDialog(app, s); return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int W = c.Width();
+        int H = c.Height();
+        int top = app.titlebarH;
+        int bar = Layer.BarH(app);
+        int rad = t.borderRadiusLarge;
+
+        // SizeToContent 的现算：窗口可能在画布/DPI 定型（深链启动、
+        // 首帧）前建窗，出生几何不可信。渲染沿按当前画布重新量测定
+        // 尺寸并居中；用户拖动/缩放/最大化过一次即让位（此后是用户
+        // 自己的摆放）。
+        if (s.sizeMinW > 0 && s.state == 0 && !s.dragging && !s.sizing) {
+            s.ApplySizeToContent(app);
+        }
+        if (s.autoCenter && s.state == 0 && !s.dragging && !s.sizing) {
+            int cx = (W - s.w) / 2;
+            int cy = (H - s.h) / 2;
+            if (cy < top) { cy = top; }
+            if (s.x != cx || s.y != cy) {
+                s.x = cx;
+                s.y = cy;
+                s.sx = cx;
+                s.sy = cy;
+                app.RequestRedraw();
+            }
+        }
+
+        int ex = s.x;
+        int ey = s.y;
+        int ew = s.w;
+        int eh = s.h;
+        if (s.state == 1) {
+            ex = 0; ey = top; ew = W; eh = H - top;
+        } else if (s.state == 2) {
+            List<int> mp = new List<int>();
+            Layer.MinPos(app, s, mp);
+            ex = mp[0]; ey = mp[1];
+            ew = app.Scale(260); eh = bar;
+        }
+
+        // 入场：上升 + 回稳。出场：继续上升加速离场（位移同曲线反向）。
+        int entP = Layer.Entrance(app, s);
+        ey = ey - (1000 - entP) * app.Scale(10) / 1000;
+        if (entP >= 1000) { Layer.NotifyOpened(s); }
+
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        int ek = app.EventKind();
+
+        int bw = Layer.BtnW(app);
+        int closeX = ex + ew - bw;
+        int maxX = closeX - bw;
+        int minX = maxX - bw;
+
+        // 对指针不透明：吞掉整个 layer 矩形上的所有命中，
+        // 使其后面的页面控件不再响应（“透明层”bug）。
+        // 最先注册，因此其下的标题栏按钮以及 app 之后绘入
+        // 正文的任何组件后注册，能覆盖它。
+        app.BlockHitsRect(ex, ey, ew, eh);
+
+        app.hitTester.RegisterRect(
+            // 类型 6 = 四向移动光标（IDC_SIZEALL）。此前错用分割条的
+            // 类型 5，标题栏悬停显示的是上下缩放箭头。
+            s.barId, ex, ey, ew - bw * 3, bar, 6);
+        app.hitTester.RegisterRect(
+            s.minId, minX, ey, bw, bar, 0);
+        app.hitTester.RegisterRect(
+            s.maxId, maxX, ey, bw, bar, 0);
+        app.hitTester.RegisterRect(
+            s.closeId, closeX, ey, bw, bar, 0);
+        app.focus.RegisterFocusable(s.minId);
+        app.focus.RegisterFocusable(s.maxId);
+        app.focus.RegisterFocusable(s.closeId);
+
+        if (!active) { ek = 0; }
+
+        if (active && s.state == 0 && Ui.PressedDown(app, s.barId)) {
+            s.dragging = true;
+            s.grabDx = mx - s.x;
+            s.grabDy = my - s.y;
+            // 用户接手摆放：自动居中/重定尺寸都让位。
+            s.autoCenter = false;
+            s.sizeMinW = 0;
+        }
+        if (ek == 1 && s.dragging) {
+            s.x = mx - s.grabDx;
+            s.y = my - s.grabDy;
+            // 模拟窗口属于 page layer，因此要完全保持在
+            // 父级客户区内：它绝不会被拖出任何边缘。
+            int clampMaxX = W - ew;
+            int clampMaxY = H - eh;
+            if (clampMaxX < 0) { clampMaxX = 0; }
+            if (clampMaxY < top) { clampMaxY = top; }
+            if (s.x < 0) { s.x = 0; }
+            if (s.x > clampMaxX) { s.x = clampMaxX; }
+            if (s.y < top) { s.y = top; }
+            if (s.y > clampMaxY) { s.y = clampMaxY; }
+            ex = s.x; ey = s.y;
+            closeX = ex + ew - bw; maxX = closeX - bw; minX = maxX - bw;
+            app.RequestRedraw();
+        }
+
+        if (active && Ui.Clicked(app, s.closeId)) {
+            Layer.Close(app, s);
+            return;
+        }
+        if (active && Ui.Clicked(app, s.maxId)) {
+            if (s.state == 1) {
+                s.state = 0;
+                s.x = s.sx; s.y = s.sy; s.w = s.sw; s.h = s.sh;
+            } else {
+                if (s.state == 0) {
+                    s.sx = s.x; s.sy = s.y; s.sw = s.w; s.sh = s.h;
+                }
+                s.state = 1;
+                s.autoCenter = false;
+                s.sizeMinW = 0;
+            }
+            app.RequestRedraw();
+        } else if (active && Ui.Clicked(app, s.minId)) {
+            if (s.state == 2) {
+                s.state = 0;
+            } else {
+                if (s.state == 0) {
+                    s.sx = s.x; s.sy = s.y; s.sw = s.w; s.sh = s.h;
+                }
+                s.state = 2;
+            }
+            app.RequestRedraw();
+        }
+        if (active && s.state == 2 && Ui.Clicked(app, s.barId)) {
+            // 最小化只剩左下角一条任务条：点标题即还原。
+            // 原几何从未被移动（最小化位置是按槽位现算的），直接回 0 态。
+            s.state = 0;
+            app.RequestRedraw();
+        }
+        if (Ui.MouseReleased(app) && s.dragging) {
+            s.dragging = false;
+            app.RequestRedraw();
+        }
+
+        // 缩放：按下把手记起始几何与鼠标位（grabDx/Dy 复用为起始
+        // 鼠标位），拖动期间由 ApplyResize 从起始几何现推新矩形。
+        if (active && s.state == 0 && ek == 2 && !s.dragging) {
+            int dir = 0;
+            if (Ui.PressedDown(app, s.rsSEId)) { dir = 4; }
+            else if (Ui.PressedDown(app, s.rsSWId)) { dir = 5; }
+            else if (Ui.PressedDown(app, s.rsLId)) { dir = 1; }
+            else if (Ui.PressedDown(app, s.rsRId)) { dir = 2; }
+            else if (Ui.PressedDown(app, s.rsBId)) { dir = 3; }
+            if (dir > 0) {
+                s.sizing = true;
+                s.rDir = dir;
+                s.rStartX = s.x;
+                s.rStartY = s.y;
+                s.rStartW = s.w;
+                s.rStartH = s.h;
+                s.grabDx = mx;
+                s.grabDy = my;
+                // 用户接手摆放：自动居中/重定尺寸都让位。
+                s.autoCenter = false;
+                s.sizeMinW = 0;
+            }
+        }
+        if (ek == 1 && s.sizing) {
+            Layer.ApplyResize(app, s, mx, my);
+            ex = s.x;
+            ey = s.y;
+            ew = s.w;
+            eh = s.h;
+            closeX = ex + ew - bw;
+            maxX = closeX - bw;
+            minX = maxX - bw;
+            app.RequestRedraw();
+        }
+        if (Ui.MouseReleased(app) && s.sizing) {
+            s.sizing = false;
+        }
+
+        c.FillRoundRect(ex - app.Scale(1), ey + app.Scale(6), ew + app.Scale(2),
+                        eh, rad + app.Scale(4), 0x22000000);
+        c.FillRoundRect(ex + app.Scale(1), ey + app.Scale(3), ew - app.Scale(2),
+                        eh, rad + app.Scale(2), 0x33000000);
+
+        StyleBox win = Style.Of(app, "layer", "", Style.SNormal());
+        StyleBox tbs = Style.Part(app, "layer", "titlebar", "", "", "",
+                                  Style.SNormal());
+        int titleFont = tbs.FontOr(Style.FontFallback(app, "medium"));
+        if (s.dragging && t.glass != 0) {
+            c.SurfaceRoundRect(ex, ey, ew, eh, rad, win.bg, win.borderColor,
+                               win.BorderWOr(1));
+        } else {
+            if (ek == 1) { app.ReuseBackdrop(); }
+            app.FillGlass(ex, ey, ew, eh, rad, win.bg, 1000);
+        }
+
+        c.FillRoundRect(ex, ey, ew, bar, rad, tbs.bg);
+        c.FillRect(ex, ey + bar - rad, ew, rad, tbs.bg);
+        int stripH = tbs.borderBottomW;
+        if (stripH <= 0) { stripH = app.Scale(2); }
+        c.FillRect(ex, ey + bar - stripH, ew, stripH, tbs.borderBottomColor);
+
+        int icoS = t.iconSizeSmall;
+        c.DrawGlyph("grid", ex + app.Scale(14),
+                  ey + (bar - icoS) / 2, icoS, tbs.accent);
+        c.DrawText(ex + app.Scale(14) + icoS + t.gapSmall,
+                   Canvas.CenterTextY(ey, bar, titleFont),
+                   s.title, tbs.fg, titleFont);
+
+        int gl = t.iconSizeCaption + app.Scale(2);
+        string minGlyph = "minimize";
+        if (s.state == 2) { minGlyph = "restore"; }
+        string maxGlyph = "maximize";
+        if (s.state == 1) { maxGlyph = "restore"; }
+        Layer.CapButton(app, minX, ey, bw, bar, minGlyph, gl, false);
+        Layer.CapButton(app, maxX, ey, bw, bar, maxGlyph, gl, false);
+        Layer.CapButton(app, closeX, ey, bw, bar, "close", gl, true);
+
+        Layer.RenderLayerBody(app, s, ex, ey, ew, eh, bar);
+
+        // 缩放把手（仅正常态）：左右缘 SIZEWE、下缘 SIZENS、
+        // 右下/左下角走对角缩放光标（wtype 7/8）。右缘从标题栏
+        // 下方开始，避免盖住关闭钮。在正文之后注册——正文里
+        // 的滚动视口（SizeToContent 包的 ScrollColumn）与页脚
+        // 按钮会先注册大块命中区，先前把手注册在正文之前，
+        // 边缘命区全被盖住，缩放基本拖不动（后注册覆盖先注册，
+        // 把手必须最后压上去）。按压检测仍在本帧上方按上一帧
+        // 的命中解析进行，不受此注册位置影响。
+        if (s.state == 0) {
+            int g = app.Scale(5);
+            int cg = app.Scale(9);
+            app.hitTester.RegisterRect(s.rsLId, ex, ey, g, eh - cg, 4);
+            app.hitTester.RegisterRect(s.rsRId, ex + ew - g, ey + bar, g,
+                                       eh - bar - g, 4);
+            app.hitTester.RegisterRect(s.rsBId, ex + cg, ey + eh - g,
+                                       ew - cg * 2, g, 5);
+            app.hitTester.RegisterRect(s.rsSEId, ex + ew - cg,
+                                       ey + eh - cg, cg, cg, 7);
+            app.hitTester.RegisterRect(s.rsSWId, ex, ey + eh - cg, cg, cg, 8);
+        }
+    }
+
+    /// 出场收场帧（closing 层专用）：与 RenderActive 的画法同一套
+    /// 表面/标题栏/正文，但不注册任何命中区（层已在逻辑上关闭，
+    /// 点击应穿透到页面）、不画交互按钮的点击态，整体按 outP
+    /// 淡出并加速上滑（layui isOutAnim 的等价物）。
+    static void RenderClosing(App app, LayerState s, int outP) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int top = app.titlebarH;
+        int bar = Layer.BarH(app);
+        int rad = t.borderRadiusLarge;
+        int ex = s.x;
+        int ew = s.w;
+        int eh = s.h;
+        int ey = s.y;
+        if (s.state == 2) {
+            List<int> mp = new List<int>();
+            Layer.MinPos(app, s, mp);
+            ex = mp[0]; ey = mp[1];
+            ew = app.Scale(260); eh = bar;
+        }
+        // 上滑离场：与入场同一曲线同一幅度（outP 越大越接近原位——
+        // 这里用 (1000-outP) 反向叠加，出场即向上漂走）。
+        ey = ey - outP * app.Scale(10) / 1000;
+        // 表面与阴影整体淡出（乘法衰减——阴影/遮罩是预透明色）。
+        int a = 1000 - outP;
+        c.FillRoundRect(ex - app.Scale(1), ey + app.Scale(6), ew + app.Scale(2),
+                        eh, rad + app.Scale(4), Layer.MulAlpha(0x22000000, a));
+        c.FillRoundRect(ex + app.Scale(1), ey + app.Scale(3), ew - app.Scale(2),
+                        eh, rad + app.Scale(2), Layer.MulAlpha(0x33000000, a));
+        StyleBox win = Style.Of(app, "layer", "", Style.SNormal());
+        StyleBox tbs = Style.Part(app, "layer", "titlebar", "", "", "",
+                                  Style.SNormal());
+        app.FillGlass(ex, ey, ew, eh, rad, win.bg, a);
+        c.FillRoundRect(ex, ey, ew, bar, rad, Layer.MulAlpha(tbs.bg, a));
+        c.FillRect(ex, ey + bar - rad, ew, rad, Layer.MulAlpha(tbs.bg, a));
+        int stripH = tbs.borderBottomW;
+        if (stripH <= 0) { stripH = app.Scale(2); }
+        c.FillRect(ex, ey + bar - stripH, ew, stripH,
+                   Layer.MulAlpha(tbs.borderBottomColor, a));
+        int icoS = t.iconSizeSmall;
+        int titleFont = tbs.FontOr(Style.FontFallback(app, "medium"));
+        c.DrawGlyph("grid", ex + app.Scale(14), ey + (bar - icoS) / 2, icoS,
+                    Layer.MulAlpha(tbs.accent, a));
+        c.DrawText(ex + app.Scale(14) + icoS + t.gapSmall,
+                   Canvas.CenterTextY(ey, bar, titleFont),
+                   s.title, Layer.MulAlpha(tbs.fg, a), titleFont);
+        Layer.RenderLayerBody(app, s, ex, ey, ew, eh, bar);
+        // 出场帧不擦正文背后的页面：页面在这一帧照常整绘（closing 层
+        // 不再注册命中/拦截），所以遮罩/窗口自然从页面之上淡走。
+    }
+
+    /// Layer 正文文本 + 可选的底部按钮（最小化时跳过）。
+    static void RenderLayerBody(App app, LayerState s, int ex, int ey, int ew, int eh, int bar) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        if (s.state != 2) {
+            int footH = 0;
+            if (s.footer) { footH = Layer.FooterH(app); }
+            int bodyBottom = ey + eh - footH;
+            c.PushClip(ex + 1, ey + bar, ew - 2, bodyBottom - (ey + bar));
+            int bx = ex + app.Scale(20);
+            int byy = ey + bar + app.Scale(16);
+            StyleBox bodyStyle = Style.Part(app, "layer", "body", "", "", "",
+                                            Style.SNormal());
+            int bodyFont = bodyStyle.FontOr(Style.FontFallback(app, "medium"));
+            if (s.body != "") {
+                c.DrawText(bx, byy, s.body, bodyStyle.fg, bodyFont);
+            }
+            // page 层的嵌入式控件树：正文视口给不足（固定尺寸窗口 /
+            // SizeToContent 压到 maxH）时包进滚动列——超高滚动、
+            // 不压缩控件本身（FitSize 的停靠钳制会把控件压扁）；视口
+            // 够高时树按自身测量高渲染，多余空间留白。正文文本在上方
+            // 时树整体下移一行。树由宿主构造一次（BeginBody/EndBody
+            // 领保留段 id），这里每帧原样渲染。
+            if (s.view != null) {
+                int vy = byy;
+                if (s.body != "") { vy = byy + app.Scale(28); }
+                int vw = ew - app.Scale(40);
+                int vh = bodyBottom - vy - app.Scale(8);
+                if (vh < 0) { vh = 0; }
+                Control body = s.view;
+                if (s.wrap == null && body.prefH > vh
+                    && body.Kind() != "ScrollColumn") {
+                    // 正文视口给不足（固定尺寸窗口 / 内容超过 maxH）：
+                    // 包滚动列，超出视口的部分交给滚动条，
+                    // 不压缩控件本身（FitSize 的停靠钳制会压扁）。
+                    ScrollColumn sc = new ScrollColumn();
+                    sc.With(body);
+                    s.wrap = sc;
+                }
+                if (s.wrap != null) {
+                    body = s.wrap;
+                } else if (body.prefH > vh) {
+                    vh = body.prefH;
+                }
+                body.RenderInside(app, new Rect(bx, vy, vw, vh));
+            }
+            if (s.action == 1) {
+                app.canvas.DrawStyledText(
+                    Style.Of(app, "label", "secondary", Style.SNormal()),
+                    bx, byy + app.Scale(28), "confirmed",
+                    bodyStyle.fg, Style.FontFallback(app, "medium"));
+            } else if (s.action == 2) {
+                app.canvas.DrawStyledText(
+                    Style.Of(app, "label", "secondary", Style.SNormal()),
+                    bx, byy + app.Scale(28), "cancelled",
+                    bodyStyle.fg, Style.FontFallback(app, "medium"));
+            }
+            c.PopClip();
+
+            if (s.footer) {
+                int fy = ey + eh - footH;
+                StyleBox foot = Style.Part(app, "layer", "footer", "", "",
+                                           "", Style.SNormal());
+                c.FillRect(ex + 1, fy, ew - 2, 1, foot.bg);
+                int fbw = app.Scale(84);
+                int pad = app.Scale(16);
+                int okX = ex + ew - pad - fbw;
+                int cancelX = okX - t.gapMedium - fbw;
+                int fby = fy + (footH - t.heightMedium) / 2;
+                s.cancelBtn.Text = s.cancelText;
+                s.cancelBtn.Class = "primary outline";
+                int cancelId = s.cancelBtn.Render(app, cancelX, fby, fbw);
+                if (Ui.Clicked(app, cancelId)) { s.action = 2; }
+                s.okBtn.Text = s.okText;
+                s.okBtn.Class = "primary";
+                int okId = s.okBtn.Render(app, okX, fby, fbw);
+                if (Ui.Clicked(app, okId)) { s.action = 1; }
+            }
+        }
+    }
+
+    /// 居中的模态对话框：alert / confirm / prompt。将 s.action 设为
+    /// 1 (OK)、2 (Cancel) 或 3 (关闭 X)；调用方读取后关闭。
+    static void RenderDialog(App app, LayerState s) {
+        Canvas c = app.canvas;
+        int W = c.Width();
+        int H = c.Height();
+
+        int entP = Layer.Entrance(app, s);
+        if (entP >= 1000) { Layer.NotifyOpened(s); }
+
+        // 键盘：Esc=取消、Enter=确认。只由最上层对话框消费（同帧多
+        // 个对话框不重复消费），且 photos 顶屏时让位给照片层。
+        if (app.EventKind() == 4 && Layer.IsTopmost(s)
+            && Window.GetTickMs() - Layer.photosTick >= 250) {
+            Layer.Key(app, app.window.EventKeyCode());
+        }
+
+        // 对话框是 420/220 这类桌面定宽：窄视口（手机 ~412 逻辑宽）下
+        // w 会超过 W，x=(W-w)/2 变负值，两侧同时出血到屏外。按可视区
+        // 收缩，四周保 16 逻辑边距；h 同理（横屏矮视口上的 340 prompt）。
+        int w = app.Scale(s.w);
+        int h = app.Scale(s.h);
+        int availW = W - app.Scale(16) * 2;
+        if (w > availW) { w = availW; }
+        int availH = H - app.Scale(16) * 2;
+        if (h > availH) { h = availH; }
+        int x = (W - w) / 2;
+        int y = (H - h) / 2 - (1000 - entP) * app.Scale(12) / 1000;
+
+        // 变暗的背景遮罩。吞掉其下方的点击，使模态真正模态化
+        // （点击遮罩或对话框正文不再穿透到页面）。
+        StyleBox ov = Style.Part(app, "dialog", "overlay", "", "", "",
+                                 Style.SNormal());
+        c.FillRect(0, 0, W, H, ov.bg);
+        int shadeId = app.BlockHitsBelow();
+        NativeLayer.Occlude(app, 0, 0, W, H);
+        Layer.PaintDialog(app, s, x, y, w, h, 1000, shadeId);
+    }
+
+    /// 模态对话框的出场收场帧：整屏遮罩与表面按 outP 淡出并上滑
+    /// （页面窗口 RenderClosing 的对话框对应物，由 ClosingFrame 驱动）。
+    /// 不注册命中、不消费点击——对话框逻辑上已关闭，页面立即恢复可点。
+    static void RenderDialogExit(App app, LayerState s, int outP) {
+        Canvas c = app.canvas;
+        int W = c.Width();
+        int H = c.Height();
+        int a = 1000 - outP;
+        int w = app.Scale(s.w);
+        int h = app.Scale(s.h);
+        int availW = W - app.Scale(16) * 2;
+        if (w > availW) { w = availW; }
+        int availH = H - app.Scale(16) * 2;
+        if (h > availH) { h = availH; }
+        int x = (W - w) / 2;
+        int y = (H - h) / 2 - outP * app.Scale(12) / 1000;
+        StyleBox ov = Style.Part(app, "dialog", "overlay", "", "", "",
+                                 Style.SNormal());
+        c.FillRect(0, 0, W, H, Layer.MulAlpha(ov.bg, a));
+        NativeLayer.Occlude(app, 0, 0, W, H);
+        Layer.PaintDialog(app, s, x, y, w, h, a, 0);
+    }
+
+    /// 对话框的表面绘制：阴影/玻璃/图标标题/正文/嵌入树/操作条/关闭
+    /// 钮。打开帧（a=1000）与出场收场帧（a<1000，MulAlpha 乘法衰减
+    /// 预透明色）共用；shadeId 是打开帧 BlockHitsBelow 的返回值供
+    /// shadeClose 判定，收场帧传 0。嵌入树/按钮自带配色无法外挂
+    /// alpha，与入场动画一样按不透明绘制。
+    static void PaintDialog(App app, LayerState s, int x, int y, int w, int h,
+                            int a, int shadeId) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int rad = t.borderRadiusLarge;
+        string cls = Layer.RoleClass(s.dtype + 2);
+        StyleBox surf = Style.Part(app, "dialog", "surface", "", "", "",
+                                   Style.SNormal());
+        c.FillRoundRect(x + surf.shadowDx, y + surf.shadowDy, w, h, rad,
+                        Layer.MulAlpha(surf.shadow, a));
+        app.FillGlass(x, y, w, h, rad, surf.bg, a);
+
+        StyleBox icoStyle = Style.Part(app, "dialog", "icon", "", cls, "",
+                                       Style.SNormal());
+        StyleBox titleStyle = Style.Part(app, "dialog", "title", "", "", "",
+                                         Style.SNormal());
+        string iconName = Layer.RoleIcon(s.dtype + 2);
+        int titleFont = titleStyle.FontOr(Style.FontFallback(app, "large"));
+
+        int pad = t.paddingLarge;
+        int ico = t.iconSizeLarge;
+        c.DrawGlyph(iconName, x + pad, y + pad, ico,
+                    Layer.MulAlpha(icoStyle.fg, a));
+        c.DrawText(x + pad + ico + t.gapMedium, y + pad, s.title,
+                   Layer.MulAlpha(titleStyle.fg, a), titleFont);
+
+        int bodyY = y + pad + ico + t.gapMedium;
+        if (s.body != "") {
+            StyleBox bodyStyle = Style.Part(app, "dialog", "body", "", "",
+                                            "", Style.SNormal());
+            int bodyFont = bodyStyle.FontOr(Style.FontFallback(app, "medium"));
+            c.DrawText(x + pad + ico + t.gapMedium, bodyY, s.body,
+                       Layer.MulAlpha(bodyStyle.fg, a), bodyFont);
+        }
+
+        if (s.kind == 2 && s.promptInput != null) {
+            int iy = bodyY + app.Scale(30);
+            s.promptInput.Render(app, x + pad, iy, w - pad * 2, t.heightMedium);
+        }
+
+        // 模态对话框的嵌入式正文控件树：宿主构造一次（BeginBody/EndBody
+        // 领保留段 id），这里每帧原样渲染。与 page 层的 SetBody 同一约定，
+        // 表单类对话框（登录、建角）由此在居中模态里放 Input/Button。
+        if (s.view != null) {
+            int vy = bodyY;
+            if (s.body != "") { vy = bodyY + app.Scale(28); }
+            int actionH = s.twoButtons || s.altText != ""
+                ? t.heightMedium + app.Scale(24) : 0;
+            int vh = y + h - pad - actionH - vy;
+            if (vh > 0) {
+                c.PushClip(x + pad, vy, w - pad * 2, vh);
+                s.view.RenderInside(app, new Rect(x + pad, vy,
+                    w - pad * 2, vh));
+                c.PopClip();
+            }
+        }
+
+        // 右对齐的操作条：[alt] [cancel] [ok]。每个按钮至少保持
+        // 标准对话框宽度，标签更长时会变宽，
+        // 这样翻译后的“Don't save”也绝不会被截断。
+        int by = y + h - t.heightMedium - pad;
+        Button okBtn = s.okBtn;
+        okBtn.Text = s.okText;
+        okBtn.Class = "primary";
+        Button cancelBtn = s.cancelBtn;
+        cancelBtn.Text = s.cancelText;
+        Button altBtn = null;
+        if (s.altText != "") {
+            altBtn = s.altBtn;
+            altBtn.Text = s.altText;
+        }
+
+        int minBw = app.Scale(88);
+        List<int> bws = new List<int>();
+        if (altBtn != null) { bws.Add(Layer.ActionWidth(app, altBtn, minBw)); }
+        if (s.twoButtons) { bws.Add(Layer.ActionWidth(app, cancelBtn, minBw)); }
+        bws.Add(Layer.ActionWidth(app, okBtn, minBw));
+
+        Stack actions = Stack.Row(x + pad, by, w - pad * 2, t.heightMedium);
+        actions.SetGap(t.gapMedium);
+        int strip = 0;
+        int bi = 0;
+        for (; bi < bws.Count; bi = bi + 1) {
+            strip = strip + bws[bi] + t.gapMedium;
+        }
+        actions.Space(actions.MainSize() - strip);
+        bi = 0;
+        if (altBtn != null) {
+            Rect altSlot = actions.Slot(bws[bi]);
+            int altId = altBtn.Render(app, altSlot.x, altSlot.y, altSlot.width);
+            if (a >= 1000 && Ui.Clicked(app, altId)) { s.action = 4; }
+            bi = bi + 1;
+        }
+        if (s.twoButtons) {
+            Rect cancelSlot = actions.Slot(bws[bi]);
+            int cancelId = cancelBtn.Render(app, cancelSlot.x, cancelSlot.y,
+                                            cancelSlot.width);
+            if (a >= 1000 && Ui.Clicked(app, cancelId)) { s.action = 2; }
+            bi = bi + 1;
+        }
+        Rect okSlot = actions.Slot(bws[bi]);
+        int okId = okBtn.Render(app, okSlot.x, okSlot.y, okSlot.width);
+        if (a >= 1000 && Ui.Clicked(app, okId)) { s.action = 1; }
+
+        int closeId = s.closeId;
+        int closeX = x + w - t.heightMedium;
+        int closeY = y;
+        int closeState = Style.SNormal();
+        if (app.focus.IsHovered(closeId)) { closeState = Style.SHover(); }
+        StyleBox closeStyle = Style.Part(app, "dialog", "close", "", "", "",
+                                         closeState);
+        if (closeStyle.bg != 0) {
+            c.FillRoundRect(closeX, closeY, t.heightMedium, t.heightMedium,
+                            t.borderRadiusLarge,
+                            Layer.MulAlpha(closeStyle.bg, a));
+        }
+        c.DrawGlyphIn("close", closeX, closeY, t.heightMedium,
+                            t.heightMedium, t.iconSizeSmall,
+                            Layer.MulAlpha(closeStyle.fg, a));
+        if (a >= 1000) {
+            app.hitTester.RegisterRect(closeId, closeX, closeY,
+                                       t.heightMedium, t.heightMedium, 0);
+            if (app.EventKind() == 3
+                && app.ClickTarget() == closeId) {
+                s.action = 3;
+            }
+            // shadeClose：按下与抬起都落在遮罩、且不在对话框矩形内，
+            // 视为取消（action 2，由调用方关闭）。
+            if (s.shadeClose && app.EventKind() == 3
+                && app.ClickTarget() == shadeId
+                && app.PressTarget() == shadeId
+                && !Layer.Inside(app.mouseX, app.mouseY, x, y, w, h)) {
+                s.action = 2;
+            }
+        }
+    }
+
+    /// 一个内嵌的标题栏按钮：圆角 hover 背景 + 居中字形。
+    static void CapButton(App app, int x, int y, int w, int h,
+                          string glyph, int gl, bool danger) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        bool hover = Ui.Over(app, x, y, w, h);
+        int inset = app.Scale(5);
+        string cls = "";
+        if (danger) { cls = "danger"; }
+        int state = Style.SNormal();
+        if (hover) { state = Style.SHover(); }
+        StyleBox s = Style.Part(app, "layer", "cap", "", cls, "", state);
+        if (hover && s.bg != 0) {
+            c.FillRoundRect(x + inset, y + inset, w - inset * 2, h - inset * 2,
+                            t.borderRadiusMedium, s.bg);
+        }
+        c.DrawGlyphIn(glyph, x, y, w, h, gl, s.fg);
+    }
+}

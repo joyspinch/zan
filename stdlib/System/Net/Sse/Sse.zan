@@ -1,0 +1,285 @@
+using System;
+using System.Text;
+using System.Net.Sockets;
+using System.Net.Http;
+
+namespace System.Net.Sse;
+
+
+/// <summary>SSE 各内部类共用的逐字节子串搜索
+/// （避免逐字符 Substring 分配）。</summary>
+class SseText {
+    /// `needle` 在 `s` 中从 `from` 起（含）首次出现的位置，找不到返回 -1。
+    static int Find(string s, string needle, int from) {
+        int n = s.Length;
+        int m = needle.Length;
+        if (m == 0) { return from; }
+        int i = from;
+        while (i + m <= n) {
+            int j = 0;
+            for (; j < m && (s[i + j] & 255) == (needle[j] & 255); j = j + 1) { }
+            if (j == m) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+}
+
+/// <summary>
+/// 一条 Server-Sent Events 消息：可选的 `event` 名称、`data`
+/// 负载（按 SSE 规范，多行 data 字段用 '\n' 连接），
+/// 以及可选的 last-event `id`。
+/// </summary>
+class SseEvent {
+    string name;
+    string data;
+    string id;
+
+    /// <summary>私有构造：空事件，由 ParseBlock 填充。</summary>
+    SseEvent() {
+        this.name = "";
+        this.data = "";
+        this.id = "";
+    }
+
+    /// <summary>事件名（流未设置时默认为 "message"）。</summary>
+    string Name() {
+        if (this.name.Length == 0) { return "message"; }
+        return this.name;
+    }
+
+    /// <summary>负载文本（多行 data 以 '\n' 连接）。</summary>
+    string Data() { return this.data; }
+    /// <summary>last-event id（流未提供时为空串）。</summary>
+    string Id() { return this.id; }
+}
+
+/// <summary>
+/// 服务器端一条已接受的 SSE 订阅者连接。Worker.HandleSse
+/// 完成 HTTP 握手后传给 onSseSubscriber；用
+/// SendAsync/SendDataAsync 推送事件，最后以 Close 收尾。
+/// </summary>
+class SseConnection {
+    TcpClient client;
+    string path;
+    bool open;
+
+    /// <summary>私有工厂：Worker 完成 SSE 握手后构造。</summary>
+    static SseConnection Of(TcpClient client, string path) {
+        SseConnection c = new SseConnection();
+        c.client = client;
+        c.path = path;
+        c.open = true;
+        return c;
+    }
+
+    /// <summary>订阅者请求的路径（如 "/events"）。</summary>
+    string Path() { return this.path; }
+
+    /// <summary>连接是否仍可写（发送失败或 Close 后为 false）。</summary>
+    bool IsOpen() { return this.open; }
+
+    /// 发送具名事件。data 中的每个 '\n' 都会变成独立的
+    /// `data:` 行，保证多行负载在线上格式中不被破坏。
+    /// 返回值 <= 0 表示订阅者已断开。</summary>
+    async int SendAsync(string eventName, string data) {
+        StringBuilder sb = new StringBuilder();
+        if (eventName.Length > 0) {
+            sb.Append("event: ");
+            sb.Append(eventName);
+            sb.Append("\n");
+        }
+        int start = 0;
+        for (int i = 0; i <= data.Length; i = i + 1) {
+            if (i == data.Length || (data[i] & 255) == 10) {
+                sb.Append("data: ");
+                sb.Append(data.Substring(start, i - start));
+                sb.Append("\n");
+                start = i + 1;
+            }
+        }
+        sb.Append("\n");
+        string frame = sb.ToString();
+        // 循环直到整段写出：单次 send 在 TCP 背压下短写会把事件截成
+        // 半帧，下一个事件从中间开始，流就此错位。
+        int total = frame.Length;
+        int sent = 0;
+        while (sent < total) {
+            string rest = frame.Substring(sent, total - sent);
+            int n = await this.client.SendAsync(rest);
+            if (n <= 0) { this.open = false; return n; }
+            sent = sent + n;
+        }
+        return total;
+    }
+
+    /// <summary>发送匿名（"message"）事件。</summary>
+    async int SendDataAsync(string data) {
+        int n = await SendAsync("", data);
+        return n;
+    }
+
+    /// <summary>发送一条 SSE 注释行，可用作 keep-alive 心跳。</summary>
+    async int PingAsync() {
+        int n = await this.client.SendAsync(": ping\n\n");
+        return n;
+    }
+
+    /// <summary>关闭底层连接并标记断开。</summary>
+    void Close() {
+        this.open = false;
+        this.client.Close();
+    }
+}
+
+/// <summary>
+/// Server-Sent Events 客户端：建立连接、完成 HTTP 握手，然后
+/// 逐个产出解析好的事件。
+///
+///   SseClient c = await SseClient.ConnectAsync("127.0.0.1", 8080, "/events");
+///   SseEvent e = await c.NextAsync();
+/// </summary>
+class SseClient {
+    TcpClient client;
+    string buf;
+    bool connected;
+
+    /// <summary>建立连接并发送订阅请求。服务器拒绝该流时，返回的客户端
+    /// 其 IsConnected() 为 false。</summary>
+    static async SseClient ConnectAsync(string host, int port, string path) {
+        SseClient c = new SseClient();
+        c.buf = "";
+        c.connected = false;
+        c.client = await TcpClient.ConnectAsync(host, port);
+        // ConnectAsync 失败/超时按文档返回 null（慢上游正是这种）：
+        // 直接解引用是空对象虚调用，进程以 SIGSEGV 小地址崩溃。
+        // 按类约定返回 IsConnected()==false 的客户端，由调用方检查。
+        if (c.client == null) { return c; }
+        await c.client.SendAsync("GET " + path + " HTTP/1.1\r\n"
+            + "Host: " + host + ":" + Convert.ToString(port) + "\r\n"
+            + "Accept: text/event-stream\r\n"
+            + "Connection: keep-alive\r\n"
+            + "\r\n");
+
+        // 消费响应头；\r\n\r\n 之后的内容就是流数据。终止符必须出现：
+        // 凑不满就按握手失败处理（此前 64KB 上限退出时 bodyAt 为 -1，
+        // 垃圾字节会直接变成首条缓冲事件并宣告连接成功）。握手接收
+        // 受 30 秒空闲窗口约束：沉默的上游不能再永久钉住本协程。
+        HttpDeadlineToken watch = HttpDeadline.Arm(c.client.GetSocket(), 30000);
+        string head = "";
+        while (SseText.Find(head, "\r\n\r\n", 0) < 0 && head.Length < 65536) {
+            string chunk = await c.client.RecvAsync(4096);
+            if (chunk.Length == 0) {
+                HttpDeadline.Disarm(watch);
+                c.client.Close();
+                return c;
+            }
+            if (HttpDeadline.Expired(watch)) {
+                HttpDeadline.Disarm(watch);
+                c.client.Close();
+                return c;
+            }
+            head = head + chunk;
+        }
+        HttpDeadline.Disarm(watch);
+        int bodyAt = SseText.Find(head, "\r\n\r\n", 0);
+        // 状态行必须是 "HTTP/1.x 200"：`" 200 "` 全头扫描会把正文/头里
+        // 恰好带 " 200 " 的 404 也当成功。状态码固定在状态行第 10..12 位。
+        bool ok = false;
+        if (bodyAt >= 0 && head.Length >= 12
+            && (head.Substring(0, 5) == "HTTP/")
+            && (head.Substring(9, 3) == "200")) {
+            ok = true;
+        }
+        if (!ok) { c.client.Close(); return c; }
+        c.buf = head.Substring(bodyAt + 4, head.Length - bodyAt - 4);
+        c.connected = true;
+        return c;
+    }
+
+    /// <summary>握手是否成功（连接失败或服务器拒绝该流时为 false）。</summary>
+    bool IsConnected() { return this.connected; }
+
+    /// <summary>阻塞（挂起协程）直到下一条完整事件
+    /// 到达。服务器关闭流时返回 null。注释行
+    /// （keep-alive 心跳）会被透明跳过。</summary>
+    async SseEvent NextAsync() {
+        if (!this.connected) { return null; }
+        while (true) {
+            // 事件以空行结束；流中可能使用 \n 或 \r\n。
+            int end = SseText.Find(this.buf, "\n\n", 0);
+            int sepLen = 2;
+            int endCrlf = SseText.Find(this.buf, "\r\n\r\n", 0);
+            if (endCrlf >= 0 && (end < 0 || endCrlf < end)) { end = endCrlf; sepLen = 4; }
+            if (end >= 0) {
+                string block = this.buf.Substring(0, end);
+                this.buf = this.buf.Substring(end + sepLen,
+                                              this.buf.Length - end - sepLen);
+                SseEvent e = ParseBlock(block);
+                if (e != null) { return e; }
+                continue;                     // 该块只有注释
+            }
+            string chunk = await this.client.RecvAsync(4096);
+            if (chunk.Length == 0) {
+                this.connected = false;
+                return null;
+            }
+            // 缓冲上限：合法的 SSE 事件以空行收尾，8 MiB 还凑不出一个
+            // 空行只可能是对端在发无界垃圾（或彻底违反协议）——此前
+            // 无上限，恶意上游可把客户端喂到 OOM。超限按断流处理。
+            if (this.buf.Length + chunk.Length > 8388608) {
+                this.connected = false;
+                this.client.Close();
+                return null;
+            }
+            this.buf = this.buf + chunk;
+        }
+        return null;
+    }
+
+    /// <summary>解析一个事件块（"字段: 值" 形式的行）。块中
+    /// 没有 event/data/id 字段（纯注释）时返回 null。</summary>
+    SseEvent ParseBlock(string block) {
+        SseEvent e = new SseEvent();
+        bool any = false;
+        int start = 0;
+        bool firstData = true;
+        for (int i = 0; i <= block.Length; i = i + 1) {
+            if (i == block.Length || (block[i] & 255) == 10) {
+                int lineEnd = i;
+                if (lineEnd > start && (block[lineEnd - 1] & 255) == 13) {
+                    lineEnd = lineEnd - 1;    // 去掉行尾的 \r
+                }
+                string line = block.Substring(start, lineEnd - start);
+                if (line.Length > 0 && line.Substring(0, 1) != ":") {
+                    string field = line;
+                    string val = "";
+                    int colon = SseText.Find(line, ":", 0);
+                    if (colon >= 0) {
+                        field = line.Substring(0, colon);
+                        val = line.Substring(colon + 1, line.Length - colon - 1);
+                        if (val.Length > 0 && val.Substring(0, 1) == " ") {
+                            val = val.Substring(1, val.Length - 1);
+                        }
+                    }
+                    if (field == "event") { e.name = val; any = true; }
+                    else if (field == "data") {
+                        if (firstData) { e.data = val; firstData = false; }
+                        else { e.data = e.data + "\n" + val; }
+                        any = true;
+                    }
+                    else if (field == "id") { e.id = val; any = true; }
+                }
+                start = i + 1;
+            }
+        }
+        if (!any) { return null; }
+        return e;
+    }
+
+    /// <summary>关闭连接并标记断开（幂等）。</summary>
+    void Close() {
+        this.connected = false;
+        if (this.client != null) { this.client.Close(); }
+    }
+}

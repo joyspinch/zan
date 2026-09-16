@@ -1,0 +1,1109 @@
+using System.Diagnostics;
+using System.IO;
+using System.Json;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Net;
+using System.Threading;
+using System;
+
+namespace System.Web;
+
+/// The uniform error body {"code","msg"} used by WebApp.ErrorJson.
+class ApiErrorBody {
+    string code;
+    string msg;
+}
+
+/// The /api/status snapshot: two counters plus the per-route stats array.
+class WebAppStatusDoc {
+    int total_requests;
+    int active_connections;
+    List<RouteHitDoc> routes;
+}
+
+/// <summary>
+/// The application server: coroutine-per-connection HTTP/1.1 event loop
+/// (the zan analogue of the swoole worker), wired to the Router, Hooks,
+/// RateLimiter, Sessions and the in-memory View engine.
+///
+/// Memory-safety rules baked in:
+///  - request bodies larger than maxBodyBytes are rejected with 413 before
+///    they are buffered, so an uploader cannot balloon the heap;
+///  - header blocks larger than 64KB are rejected with 431;
+///  - all per-request state lives on the HttpContext and is ARC-reclaimed
+///    when the request completes.
+/// </summary>
+class WebApp {
+    [DllImport("crt")]
+    static extern long time(nint ptr);
+
+    [DllImport("crt")]
+    static extern nint fopen(string path, string mode);
+
+    [DllImport("crt")]
+    static extern long fwrite(string buf, long size, long count, nint fp);
+
+    [DllImport("crt")]
+    static extern int fclose(nint fp);
+
+    string host;
+    int port;
+    bool running;
+    TcpListener listener;
+    // Every shared-memory table this app uses -- the framework's rate, lock
+    // and route counters included -- is anonymous shared memory the master
+    // creates before it spawns any worker and hands down by handle
+    // (Worker.ShareHandle). Nothing has a machine-global name: nothing outside
+    // this server's own process tree can find or touch the memory, another
+    // copy of the same server cannot collide with it, and the listening port
+    // -- configuration, not identity -- names none of it. Application code
+    // follows the same pattern: build its tables as anonymous shared memory
+    // and hand them down.
+
+    Router router;
+    Hooks hooks;
+    View views;
+    Sessions sessions;
+    RateLimiter limiter;
+    LockManager locks;
+    AuthFn authResolver;
+    PermissionFn permissionResolver;
+    ServerMetrics metrics;
+
+    /// 内存请求体上限（字节），超出回答 413。
+    int maxBodyBytes;      // in-memory request body cap (413 above this)
+    /// 流式上传上限（字节），只作用于 [Upload] 路由。
+    int maxUploadBytes;    // streaming upload cap for .Upload() routes
+    int requestTimeoutMs;  // per-request deadline: a connection that stops
+                           // making progress is closed (slowloris)
+    /// 并发连接上限（0 = 不设上限；超限回答 503 并关闭）。
+    int maxConnections;    // concurrent connections served at once (0 = no cap)
+    string uploadDir;      // where streamed uploads land
+    // Counters shared by every connection coroutine in the process. With
+    // --async-workers those coroutines run on several threads, and `x = x + 1`
+    // is a load-add-store that loses increments (and, for uploadSeq, hands two
+    // uploads the same temp filename), so all three are atomics.
+    AtomicInt uploadSeq;
+    string loginPath;      // where a browser is sent when a page needs a session
+    /// 全局每秒请求上限（0 = 不限；超限 429）。
+    int globalLimit;       // requests/sec across all routes (0 = unlimited)
+    AtomicInt totalRequests;
+    AtomicInt activeConnections;
+    bool reusePort;       // bind with SO_REUSEPORT for multi-worker scaling
+
+    // The app serving this process, so the static Worker raw-connection
+    // callback (ServeSock) can reach it. Set by Server before Worker.RunAll.
+    static WebApp active;
+
+    /// 构造应用服务器并填入默认配置：请求体上限 2MB、流式上传上限
+    /// 512MB、请求超时 30s、并发连接上限 10000、上传目录 uploads；
+    /// 共享表（限流/锁/路由统计）由 InitShared 在派生 worker 之前创建，
+    /// 不在这里。
+    WebApp(string host, int port) {
+        this.host = host;
+        this.port = port;
+        this.running = false;
+        this.router = new Router();
+        this.hooks = new Hooks();
+        this.views = null;
+        this.sessions = new Sessions();
+        this.authResolver = null;
+        this.permissionResolver = null;
+        this.metrics = ServerMetrics.Global();
+        this.maxBodyBytes = 2 * 1024 * 1024;      // 2MB default
+        this.maxUploadBytes = 512 * 1024 * 1024;  // 512MB streamed-upload default
+        this.requestTimeoutMs = 30000;
+        this.maxConnections = 10000;
+        this.uploadDir = "uploads";
+        this.uploadSeq = new AtomicInt(0);
+        this.loginPath = "";
+        this.globalLimit = 0;
+        this.totalRequests = new AtomicInt(0);
+        this.activeConnections = new AtomicInt(0);
+        this.reusePort = false;
+        // Shared tables are created by InitShared (before workers fork), not
+        // here.
+        this.limiter = null;
+        this.locks = null;
+    }
+
+    // ---- configuration ----
+
+    /// 监听主机地址。
+    string Host() { return this.host; }
+    /// 监听端口。
+    int Port() { return this.port; }
+    /// 加载视图目录（编译进内存）并返回自身。
+    WebApp Views(string dir) { this.views = View.LoadDir(dir); return this; }
+    /// 内存请求体上限（字节），超出回答 413。
+    WebApp MaxBody(int bytes) { this.maxBodyBytes = bytes; return this; }
+    /// 流式上传上限（字节），只作用于 [Upload] 路由，超出回答 413。
+    WebApp MaxUpload(int bytes) { this.maxUploadBytes = bytes; return this; }
+    /// <summary>How long one request may take to arrive and be served before
+    /// the connection is closed. Applies per request, not per connection, so a
+    /// keep-alive client that keeps sending is never cut off.</summary>
+    WebApp Timeout(int ms) { this.requestTimeoutMs = ms; return this; }
+    /// <summary>How many connections may be served at once. Past the cap a
+    /// connection is answered 503 and closed instead of being queued: every
+    /// live connection owns a coroutine and a 64KB buffer, and an unbounded
+    /// number of them is how a server dies rather than sheds load. 0 removes
+    /// the cap.</summary>
+    WebApp MaxConnections(int n) { this.maxConnections = n; return this; }
+    /// 流式上传的落盘目录（默认 uploads）。
+    WebApp UploadDir(string dir) { this.uploadDir = dir; return this; }
+    /// 全局每秒请求上限，按 uid（匿名时按对端 IP）计；0 不限，超限 429。
+    WebApp GlobalLimit(int perSecond) { this.globalLimit = perSecond; return this; }
+    /// <summary>The sign-in page a navigation is sent to when the route needs a
+    /// session it does not have. Unset (the default) answers every refusal with
+    /// the JSON body, which is what an API-only server wants.</summary>
+    WebApp LoginPath(string path) { this.loginPath = path; return this; }
+    /// 多进程部署时以 SO_REUSEPORT 监听，由内核把连接分发给各 worker。
+    WebApp ReusePort(bool on) { this.reusePort = on; return this; }
+    /// <summary>Initialise cross-process route stats. Called by InitShared;
+    /// safe to call in every process -- a worker maps the master's table via
+    /// <see cref="AttachShared"/> instead of creating one.</summary>
+    void InitStats() { this.router.InitStatsShared(); }
+
+    // The names the rate, lock and route handles reach the workers under.
+    static const string ShareRate = "WEB_RATE";
+    static const string ShareLock = "WEB_LOCK";
+    static const string ShareRoute = "WEB_ROUTE";
+
+    /// <summary>Creates every shared-memory table of this app (rate limiter,
+    /// request locks, route stats). Called by WebServer in the master before it
+    /// spawns any worker, which is what lets the workers inherit them: a worker
+    /// runs this too and maps the master's tables instead of making a second
+    /// set. Idempotent.</summary>
+    void InitShared() {
+        if (this.AttachShared()) { return; }
+        RateLimiter l = this.Limiter();
+        LockManager k = this.Locks();
+        this.InitStats();
+        // The tables are anonymous, so their handles are the only way in: hand
+        // them to every worker spawned after this point.
+        Worker.ShareHandle(WebApp.ShareRate, l.OsHandle());
+        Worker.ShareHandle(WebApp.ShareLock, k.OsHandle());
+        Worker.ShareHandle(WebApp.ShareRoute, this.router.StatsOsHandle());
+    }
+
+    /// Worker 侧：映射主进程创建并下发的各表。主进程与单进程服务没有
+    /// 可继承句柄，返回 false，由它们自己建表。
+    bool AttachShared() {
+        long rate = Worker.InheritedHandle(WebApp.ShareRate);
+        long lockTable = Worker.InheritedHandle(WebApp.ShareLock);
+        long route = Worker.InheritedHandle(WebApp.ShareRoute);
+        if (rate == 0 && lockTable == 0 && route == 0) { return false; }
+        if (this.limiter == null) {
+            this.limiter = RateLimiter.Attach(rate, 1000);
+        }
+        if (this.locks == null) { this.locks = LockManager.Attach(lockTable); }
+        this.router.AttachStats(route);
+        return true;
+    }
+
+    /// 按需创建；拥有各表的进程已在 InitShared 里提前建好。
+    RateLimiter Limiter() {
+        if (this.limiter == null) { this.limiter = RateLimiter.Owned(1000); }
+        return this.limiter;
+    }
+
+    /// 按需创建请求锁管理器；worker 进程由 AttachShared 映射主进程下发的表。
+    LockManager Locks() {
+        if (this.locks == null) { this.locks = LockManager.Owned(); }
+        return this.locks;
+    }
+    /// 注册 before 钩子（按注册顺序执行；返回 false 短路请求）。
+    WebApp Before(HookFn fn) { this.hooks.Before(fn); return this; }
+    /// 注册 after 钩子（请求结束后按注册顺序执行，收微秒耗时）。
+    WebApp After(AfterFn fn) { this.hooks.After(fn); return this; }
+    /// 安装 token→用户解析器；未安装时用内置 Sessions 表解析。
+    WebApp AuthResolver(AuthFn fn) { this.authResolver = fn; return this; }
+    /// 安装权限解析器；未安装时"任何已登录用户"即被允许。
+    WebApp PermissionResolver(PermissionFn fn) { this.permissionResolver = fn; return this; }
+
+    /// <summary>Generic route registration used by the compiler-generated
+    /// __AttrRoutes.Register. Returns the Route so attribute metadata can be
+    /// chained.</summary>
+    Route Map(string method, string pattern, HttpHandler h) {
+        return this.router.Add(method, pattern, h);
+    }
+
+    /// 注册 GET 路由（= Map("GET", ...)）。
+    Route Get(string pattern, HttpHandler h) { return this.router.Get(pattern, h); }
+    /// 注册 POST 路由。
+    Route Post(string pattern, HttpHandler h) { return this.router.Post(pattern, h); }
+    /// 注册 PUT 路由。
+    Route Put(string pattern, HttpHandler h) { return this.router.Put(pattern, h); }
+    /// 注册 DELETE 路由。
+    Route Delete(string pattern, HttpHandler h) { return this.router.Delete(pattern, h); }
+
+    /// 渲染模板并套最近的布局；未加载视图时返回空串。
+    string RenderPage(string name, ViewData data) {
+        if (this.views == null) { return ""; }
+        return this.views.RenderPage(name, data);
+    }
+
+    /// <summary>Renders a template WITHOUT its layout. This is what an
+    /// in-page update answers with: the browser already has the shell, so
+    /// sending it again would replace the page instead of the panel.</summary>
+    string RenderFragment(string name, ViewData data) {
+        if (this.views == null) { return ""; }
+        return this.views.Render(name, data);
+    }
+
+    /// 墙钟秒（CRT time），上传文件名与错误日志时间戳用。
+    static int NowSeconds() { return time(0); }
+
+    /// <summary>Trims a message before it reaches the error log so one runaway
+    /// exception cannot bloat the log or the in-memory ring. Kept conservative:
+    /// the log never carries request bodies, headers or credentials, only the
+    /// handler's own exception text.</summary>
+    static string Redact(string s) {
+        if (s == null) { return ""; }
+        if (s.Length > 500) { return s.Substring(0, 500); }
+        return s;
+    }
+
+    /// <summary>The start-up screen for this app: the listener, then every
+    /// service that is actually switched on (routes, views, sessions, uploads,
+    /// rate limit). `procs` is how many processes serve it.</summary>
+    ServerBanner Banner(int procs) {
+        string mode = "single process";
+        if (procs > 1) {
+            mode = "master + " + Convert.ToString(procs) + " workers";
+        }
+        ServerBanner b = new ServerBanner("ZAN WEB", "SERVICES").Mode(mode);
+        b.Service("http",
+            "http://" + this.host + ":" + Convert.ToString(this.port),
+            Convert.ToString(procs), "[OK]");
+        b.Info("routes", Convert.ToString(this.router.Count()));
+        if (this.views != null) { b.Info("views", "loaded"); }
+        if (this.sessions != null) { b.Info("sessions", "in-memory"); }
+        b.Info("max body", Convert.ToString(this.maxBodyBytes / (1024 * 1024))
+            + "MB");
+        b.Info("uploads", this.uploadDir + "/ "
+            + Convert.ToString(this.maxUploadBytes / (1024 * 1024)) + "MB max");
+        if (this.globalLimit > 0) {
+            b.Info("rate limit", Convert.ToString(this.globalLimit) + " req/s");
+        }
+        if (this.reusePort) { b.Info("reuseport", "on"); }
+        return b;
+    }
+
+    // ---- server loop ----
+
+    /// <summary>Runs the accept loop forever. Await this from Main so the
+    /// coroutine scheduler drives the server: `int r = await app.Start();`</summary>
+    async int Start() {
+        this.InitShared();
+        Socket.Initialize();
+        this.listener = new TcpListener(this.host, this.port);
+        if (this.reusePort) { this.listener.StartReusePort(); } else { this.listener.Start(); }
+        this.running = true;
+        this.Banner(1).Footer("Press Ctrl+C to stop. Start success.").Print();
+        while (this.running) {
+            nint clientSock = await this.listener.AcceptAsync();
+            if (clientSock >= 0) {
+                if (await this.RefuseOverCapacity(clientSock)) { continue; }
+                Task.Spawn(HandleConnection(clientSock));
+            }
+        }
+        return 0;
+    }
+
+    /// 置停标志并关闭监听 socket，accept 循环随之退出。
+    void Stop() {
+        this.running = false;
+        if (this.listener != null) { this.listener.Stop(); }
+    }
+
+    /// <summary>Registers the app that ServeSock hands connections to. Called
+    /// in every process (master and each worker) before Worker.RunAll.</summary>
+    static void SetActive(WebApp app) {
+        active = app;
+    }
+
+    /// <summary>Worker raw-connection callback for multi-process serving: the
+    /// master (or POSIX SO_REUSEPORT worker) hands each accepted socket here;
+    /// it runs the full request pipeline via the active app's HandleConnection.
+    /// Static so it can be assigned to Worker.onRawConnection without needing
+    /// an instance-method delegate.</summary>
+    static async void ServeSock(nint clientSock) {
+        WebApp app = active;
+        if (app == null) { Socket.Close(clientSock); return; }
+        if (await app.RefuseOverCapacity(clientSock)) { return; }
+        await app.HandleConnection(clientSock);
+    }
+
+    /// <summary>Sheds a connection the server has no capacity for: 503 and
+    /// close, rather than a coroutine and a buffer it cannot afford. True when
+    /// the connection was refused and is already closed.
+    ///
+    /// The slot is CLAIMED here (and released by HandleConnection), not counted
+    /// by the caller afterwards: with accepts landing on several worker threads,
+    /// a check followed by a separate increment lets every thread pass the cap
+    /// at once. Claim first, then hand the slot back if it was over the line.</summary>
+    async bool RefuseOverCapacity(nint clientSock) {
+        long live = this.activeConnections.Increment();
+        if (this.maxConnections <= 0 || live <= (long)this.maxConnections) {
+            return false;
+        }
+        long _back = this.activeConnections.Decrement();
+        TcpClient c = TcpClient.FromSocket(clientSock);
+        int _s = await c.SendAsync(WebApp.SimpleResponse(503,
+            "Service Unavailable", "server is at capacity"));
+        c.Close();
+        return true;
+    }
+
+    /// 一条 keep-alive 连接的完整生命周期：读入并定界请求头（超 64KB 回
+    /// 431）→ 解析（定界失败按 parseStatus 回 400/501）→ 流式上传落盘或
+    /// 缓冲内存正文（超限 413）→ 解析表单 → Dispatch → 写回应答，直到
+    /// 对端断开或非 keep-alive 为止。每个请求重置一次空闲期限（防
+    /// slowloris）；SSE/WS 劫持的连接由 handler 接管，循环随即结束。
+    /// 清理走 finally：即便管线里有未被 catch 的异常展开到这一层，
+    /// deadline 槽位、framer 缓冲、套接字与连接计数也必须归位。
+    async void HandleConnection(nint clientSock) {
+        try {
+            await this.HandleConnectionInner(clientSock);
+        } finally {
+            Socket.Close(clientSock);
+        }
+    }
+
+    /// HandleConnection 的主体：watch/framer/client 三个局部资源
+    /// 在这里创建，正常结束路径统一清理；套接字本身的 Close 由
+    /// HandleConnection 的 finally 负责（ShutdownBoth 无法替代——
+    /// 劫持连接之后的收尾也要真正释放描述符）。
+    async void HandleConnectionInner(nint clientSock) {
+        Socket.SetNoDelay(clientSock);
+        TcpClient client = TcpClient.FromSocket(clientSock);
+        // Framing is the shared HttpFramer: pending bytes are held with an
+        // explicit length, so a header block or body split across TCP segments,
+        // several pipelined requests inside one segment, and a binary body
+        // containing NUL bytes are all framed by exact byte counts. String
+        // concatenation would length-count with strlen and cut such a body at
+        // its first NUL, leaving Content-Length forever unsatisfied.
+        HttpFramer framer = HttpFramer.Create(clientSock);
+        // Every request is given a deadline. Without one a client that opens a
+        // connection and dribbles header bytes (slowloris) holds a coroutine
+        // and its 64KB buffer indefinitely, and a few thousand such
+        // connections are all it takes to stop the worker serving anyone.
+        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
+        // 对端地址是连接的属性，不是请求的属性：一条 keep-alive 连接上
+        // 每个请求都问一次内核（getpeername）等于白付一次系统调用。
+        string remoteIp = Socket.RemoteIp(clientSock);
+        bool keepAlive = true;
+        while (keepAlive) {
+            HttpDeadline.Touch(watch, this.requestTimeoutMs);
+            // The header block must stay under the receive buffer (64KB): a
+            // client that never sends the blank line is answered and dropped
+            // rather than buffered without limit.
+            int headerEnd = await framer.ReadHead(65000);
+            if (headerEnd == -431) {
+                int _s = await client.SendAsync(WebApp.SimpleResponse(431,
+                    "Request Header Fields Too Large",
+                    "header block too large"));
+                break;
+            }
+            if (headerEnd <= 0) { break; }
+
+            HttpRequest request = HttpRequest.Parse(framer.Head(headerEnd),
+                                                   headerEnd);
+            // 定界失败（Content-Length 溢出/重复不一致、非数字、
+            // Transfer-Encoding 未实现等）→ 拒绝，不切分正文：
+            // 剩余字节可能是走私的伪装请求。
+            if (request.parseStatus != 0) {
+                int _s0 = await client.SendAsync(WebApp.SimpleResponse(
+                    request.parseStatus,
+                    request.parseStatus == 501 ? "Not Implemented" : "Bad Request",
+                    "malformed request framing"));
+                break;
+            }
+            keepAlive = request.keepAlive;
+            HttpContext ctx = new HttpContext(request, remoteIp);
+            // Hand the connection to the context: a handler may take it over
+            // (ctx.SseOpen()) and keep writing to it after the pipeline returns.
+            ctx.__Attach(client);
+            // Hand the framing buffer over too: a WebSocket upgrade
+            // (ctx.WsUpgrade()) slices the frame bytes pipelined behind the
+            // handshake head out of it. Idle during normal request/response.
+            ctx.__SetFramer(framer);
+            // Hand the deadline slot to the context: a stream handler that
+            // intends to outlive requestTimeoutMs (SSE relay) re-arms the
+            // slot through ctx.TouchDeadline() as long as the upstream is
+            // alive, so the sweeper only cuts connections that are truly
+            // abandoned — never one that is mid-stream.
+            ctx.__SetDeadlineSlot(watch, this.requestTimeoutMs);
+            Route route = this.router.Match(ctx);
+
+            if (route != null && route.streamUpload && request.contentLength > 0) {
+                // Streaming upload: the body goes to disk in 64KB chunks --
+                // memory stays flat no matter how large the file is.
+                if (request.contentLength > this.maxUploadBytes) {
+                    int _s2 = await client.SendAsync(WebApp.SimpleResponse(413,
+                        "Payload Too Large", "upload exceeds limit"));
+                    break;
+                }
+                string tmp = await this.StreamBodyToFile(clientSock, framer,
+                    request);
+                if (tmp.Length == 0) {
+                    int _s3 = await client.SendAsync(WebApp.SimpleResponse(400,
+                        "Bad Request", "upload failed"));
+                    break;
+                }
+                ctx.uploadPath = tmp;
+                ctx.uploadSize = request.contentLength;
+                request.body = "";
+            } else {
+                // In-memory body: reject oversized bodies BEFORE buffering them.
+                if (request.contentLength > this.maxBodyBytes) {
+                    int _s4 = await client.SendAsync(WebApp.SimpleResponse(413,
+                        "Payload Too Large", "body exceeds limit"));
+                    break;
+                }
+                // Read exactly Content-Length bytes (chunked bodies are decoded
+                // here too); on a pipelined connection the bytes after them
+                // belong to the next request and stay in the framer.
+                int bodyStatus = await framer.ReadBody(request, this.maxBodyBytes);
+                if (bodyStatus > 0) {
+                    int _s4b = await client.SendAsync(WebApp.SimpleResponse(
+                        bodyStatus,
+                        bodyStatus == 413 ? "Payload Too Large" : "Bad Request",
+                        bodyStatus == 413 ? "body exceeds limit"
+                                          : "malformed request body"));
+                    break;
+                }
+                if (bodyStatus < 0) {
+                    int _s5 = await client.SendAsync(WebApp.SimpleResponse(400,
+                        "Bad Request", "incomplete body"));
+                    break;
+                }
+                framer.Consume(framer.RequestBytes());
+                if (request.bodyLength > 0) {
+                    if (HttpContext.StartsWith(request.contentType,
+                                               "multipart/form-data")) {
+                        // 内存路径的 multipart：文本字段进 form 表
+                        // （文件部件由处理器按需取用）。
+                        HttpContext.ParseMultipartFields(request, ctx);
+                    } else {
+                        HttpContext.ParseFormBody(request, ctx);
+                    }
+                }
+            }
+
+            Worker.BumpStat();
+            string responseData = await this.Dispatch(ctx, route, keepAlive);
+            // A stream handler already wrote its own response and has now
+            // finished; there is nothing left to send and nothing to reuse.
+            if (ctx.Hijacked()) { keepAlive = false; break; }
+            int _sent = await client.SendAsync(responseData);
+            // A byte body is not part of the built string (it would be cut at
+            // its first NUL): it follows the header block, written by count.
+            if (ctx.IsBinary()) {
+                int blen = ctx.BodyLength();
+                if (blen > 0 && ctx.method != "HEAD") {
+                    int _sb = await client.SendBytesAsync(ctx.bodyBytes, blen);
+                }
+            }
+            Worker.BumpSent();
+            if (!keepAlive) { break; }
+        }
+        HttpDeadline.Disarm(watch);
+        framer.Dispose();
+        client.Close();
+        long _live = this.activeConnections.Decrement();
+    }
+
+    /// <summary>Streams the request body into a server-named file under
+    /// uploadDir (the client's filename is never used, so path traversal is
+    /// impossible). Every write uses explicit socket-level byte counts +
+    /// fwrite, so binary payloads with NUL bytes land intact, and only one
+    /// 64KB buffer is alive regardless of upload size. Returns "" on IO
+    /// failure.</summary>
+    async string StreamBodyToFile(nint sock, HttpFramer framer,
+                                  HttpRequest request) {
+        if (!Directory.Exists(this.uploadDir)) {
+            Directory.CreateDirectoryRecursive(this.uploadDir);
+        }
+        long seq = this.uploadSeq.Increment();
+        string tmp = this.uploadDir + "/upload_" + Convert.ToString(WebApp.NowSeconds())
+            + "_" + Convert.ToString(seq) + ".bin";
+        nint fp = fopen(tmp, "wb");
+        if (fp == 0) { return ""; }
+        int total = request.contentLength;
+        int have = 0;
+        // Body bytes that arrived in the same packet as the headers are already
+        // in the framer, sliced out by explicit length (binary-safe). Only
+        // Content-Length bytes are taken: on a pipelined connection the rest is
+        // the next request and must stay in the framer.
+        int headerEnd = request.bodyStart;
+        int bodyInBuf = framer.Pending() - headerEnd;
+        if (bodyInBuf > total) { bodyInBuf = total; }
+        if (bodyInBuf > 0) {
+            string firstChunk = framer.Slice(headerEnd, bodyInBuf);
+            int _w0 = (int)fwrite(firstChunk, 1, bodyInBuf, fp);
+            if (_w0 < bodyInBuf) { int _c0 = fclose(fp); return ""; }
+            have = bodyInBuf;
+        }
+        framer.Consume(headerEnd + have);
+        byte[] buf = WebApp.MakeBuffer(65536);
+        while (have < total) {
+            int n = await Socket.RecvIntoAsync(sock, buf, 65535);
+            if (n <= 0) { int _c1 = fclose(fp); return ""; }
+            if (have + n > total) { n = total - have; }
+            // fwrite 短写（磁盘满/配额）必须当失败处理：不校验的话
+            // have 照常推进，落盘文件被静默截断，调用方拿到一个
+            // 看似成功的残缺文件。
+            int _w = (int)fwrite(buf, 1, n, fp);
+            if (_w < n) { int _c3 = fclose(fp); return ""; }
+            have = have + n;
+        }
+        int _c2 = fclose(fp);
+        return tmp;
+    }
+
+    /// <summary>Preallocates a reusable ARC-managed receive buffer.</summary>
+    static byte[] MakeBuffer(int size) {
+        return new byte[size + 1];
+    }
+
+    /// <summary>Full request pipeline: hooks -> rate limit -> auth -> route.
+    /// Times the whole pipeline with a monotonic MICROSECOND clock and feeds the
+    /// shared ServerMetrics (throughput / latency / slow requests) for
+    /// /admin/stats. Microseconds because a request served in 200us is invisible
+    /// to the millisecond clock (~15.6ms per tick on Windows), which reported
+    /// every fast endpoint as "0 ms".</summary>
+    async string Dispatch(HttpContext ctx, Route route, bool keepAlive) {
+        long startUs = ServerMetrics.MonoMicros();
+        long _n = this.totalRequests.Increment();
+        this.metrics.Entered();
+        string resp = "";
+        try {
+            resp = await this.DispatchInner(ctx, route, keepAlive, startUs);
+        } finally {
+            this.metrics.Left();
+        }
+        long elapsedUs = ServerMetrics.MonoMicros() - startUs;
+        // A stream is counted by what it pushed, not by how long it was held:
+        // it has ended by the time it returns here, so it is closed with its
+        // frame and byte totals.
+        if (ctx.MetricsExcluded()) {
+            this.metrics.StreamClosed(ctx.Frames(), ctx.FrameBytes());
+        }
+        // A hijacked connection (SSE, upgrade) lives for as long as the client
+        // keeps it open, so its duration is not a latency sample: recording it
+        // would report every open dashboard as a multi-minute slow request.
+        // Only what the server actually serves is an interface, and only an
+        // interface is worth a per-endpoint row: a 404, a 405 and a scanner
+        // walking /wp-login.php are counted (a probed server must not read as
+        // idle) but never keyed by the URL they invented -- that would turn the
+        // monitor into a mirror for whatever anyone typed at it, one row per
+        // probe. What did serve it named itself in ctx.routePattern: a route by
+        // its registration pattern, an asset by its own path -- both fixed
+        // strings, so the hot path normalizes nothing.
+        if (!ctx.MetricsExcluded()) {
+            if (ctx.routePattern.Length == 0) {
+                this.metrics.RecordUnmatched(ctx.status, elapsedUs);
+            } else {
+                this.metrics.RecordRoute(ctx.routeSlot, ctx.method,
+                    ctx.routePattern, ctx.status, elapsedUs);
+            }
+        }
+        this.hooks.RunAfter(ctx, elapsedUs);
+        return resp;
+    }
+
+    /// 认证之后的请求管线，按序：全局限流 → before 钩子 → 404/405 →
+    /// 填路由元数据 → 路由限流 → 登录/权限门 → [Lock] 请求锁 → handler。
+    /// ApiError 变成它携带的应答；其余异常记录后回答 500，handler 结束
+    /// 时仍未写应答的也兜底 500。
+    async string DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startUs) {
+
+        string uid = await this.AuthUser(ctx);
+        ctx.uid = uid;
+        string principal = uid;
+        if (principal.Length == 0) { principal = ctx.RemoteIp(); }
+        if (principal.Length == 0) { principal = "_unknown_"; }
+
+        if (this.globalLimit > 0
+            && !this.Limiter().Allow("_global_:" + principal, this.globalLimit)) {
+            ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
+            ctx.Json(WebApp.ErrorJson("429", "too many requests"));
+            return ctx.BuildResponse(keepAlive);
+        }
+
+        // Before-hooks may short-circuit (must write a response first).
+        if (!this.hooks.RunBefore(ctx)) {
+            return ctx.BuildResponse(keepAlive);
+        }
+
+        if (route == null) {
+            if (this.router.PathExists(ctx.path)) {
+                ctx.Status(405, "Method Not Allowed");
+                ctx.Json(WebApp.ErrorJson("405", "method not allowed"));
+            } else {
+                ctx.Status(404, "Not Found");
+                ctx.Json(WebApp.ErrorJson("404", "not found"));
+            }
+            return ctx.BuildResponse(keepAlive);
+        }
+
+        // The action is what the route is called everywhere else -- the grant
+        // rows, the audit log, the docs -- so the handler reads it off the
+        // context instead of repeating the name as a literal.
+        ctx.routeAction = route.action;
+        // The pattern, not the URL: "/admin/users/{id}" is the interface,
+        // "/admin/users/42" is one call of it.
+        ctx.routePattern = route.pattern;
+        ctx.routeSlot = route.idx;
+
+        string rateKey = route.Key();
+        if (route.rateScope == "uid") {
+            rateKey = rateKey + ":uid:" + uid;
+        } else if (route.rateScope == "ip") {
+            rateKey = rateKey + ":ip:" + ctx.RemoteIp();
+        }
+        if (route.rateLimit > 0
+            && !this.Limiter().Allow(rateKey, route.rateLimit)) {
+            ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
+            ctx.Json(WebApp.ErrorJson("429", "route rate limit exceeded"));
+            return ctx.BuildResponse(keepAlive);
+        }
+
+        // Refusing a request and refusing a navigation are the same decision
+        // with two shapes: a script caller needs the status and the code, a
+        // person typing a URL needs the sign-in form. Answering a navigation
+        // with the JSON body leaves the browser showing {"code":"401"}, and
+        // answering a background request with the form hands the caller a 200
+        // that reads like success -- so the shape is picked here, once, rather
+        // than in every controller.
+        if (route.needsLogin || route.needsAuth) {
+            if (uid.Length == 0) {
+                if (this.WantsPage(ctx)) {
+                    ctx.Redirect(this.loginPath + "?next="
+                        + Encoding.UrlEncode(ctx.path));
+                    return ctx.BuildResponse(keepAlive);
+                }
+                ctx.Status(401, "Unauthorized");
+                ctx.Json(WebApp.ErrorJson("401", "authentication required"));
+                return ctx.BuildResponse(keepAlive);
+            }
+            if (route.needsAuth) {
+                if (!await this.Allow(uid, route.action)) {
+                    ctx.Status(403, "Forbidden");
+                    ctx.Json(WebApp.ErrorJson("403", "insufficient permission"));
+                    return ctx.BuildResponse(keepAlive);
+                }
+            }
+        }
+
+        // Request lock ([Lock]): one in-flight request per (scope) key. Held for
+        // the duration of the handler and released right after it returns.
+        LockLease lockLease = null;
+        if (route.lockScope.Length > 0) {
+            lockLease = this.Locks().TryAcquire(
+                LockManager.KeyFor(route, principal));
+            if (lockLease == null) {
+                ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
+                ctx.Json(WebApp.ErrorJson("429", "request already in progress"));
+                return ctx.BuildResponse(keepAlive);
+            }
+        }
+
+        int rIdx = route.idx;
+        HttpHandler h = route.handler;
+        // ApiError is the controlled abort every guard throws (Fail/Need/...):
+        // it carries the answer, so it becomes that answer rather than a 500.
+        // The generated trampoline catches it first for attribute routes; this
+        // is what covers a hand-mapped one. Anything else would unwind past
+        // here and take the whole process down with no trace, so it is
+        // contained: record the failure (persisted to the error log) and answer
+        // 500, so one bad request never kills the server.
+        try {
+            await h(ctx);
+        } catch (ApiError ae) {
+            if (!ctx.ended) {
+                ctx.Status(ae.Status(), ApiError.Reason(ae.Status()));
+                ctx.Api(ae.Code(), ae.Message, "null");
+            }
+        } catch (Exception e) {
+            this.metrics.RecordError((long)WebApp.NowSeconds(),
+                ctx.method + " " + ctx.path, WebApp.Redact(e.Message));
+            if (!ctx.ended) {
+                ctx.Status(500, "Internal Server Error");
+                ctx.Json(WebApp.ErrorJson("500", "internal server error"));
+            }
+        }
+        if (lockLease != null) { this.Locks().Release(lockLease); }
+        if (!ctx.ended) {
+            ctx.Status(500, "Internal Server Error");
+            ctx.Json(WebApp.ErrorJson("500", "handler produced no response"));
+        }
+
+        // A hijacked connection (SSE, upgrade) is held open for as long as the
+        // client keeps it, so its duration is not a per-route latency sample:
+        // recording it would report every open event stream as a multi-minute
+        // slow request and skew the route's average. Mirrors the guard around
+        // ServerMetrics.RecordRequest in Dispatch.
+        if (!ctx.MetricsExcluded()) {
+            long elapsedUs = ServerMetrics.MonoMicros() - startUs;
+            this.router.RecordHit(rIdx, elapsedUs);
+        }
+        return ctx.BuildResponse(keepAlive);
+    }
+
+    /// <summary>Whether this request is a browser navigation that should be sent
+    /// to the sign-in page rather than answered with a JSON refusal: a GET that
+    /// did not come from script (htmx / XHR / fetch asking for JSON), with a
+    /// sign-in page configured.</summary>
+    bool WantsPage(HttpContext ctx) {
+        if (this.loginPath.Length == 0) { return false; }
+        if (ctx.method != "GET") { return false; }
+        if (ctx.Header("HX-Request").Length > 0) { return false; }
+        if (ctx.Header("X-Requested-With").Length > 0) { return false; }
+        if (ctx.Header("X-Fragment").Length > 0) { return false; }
+        return !ctx.Header("Accept").Contains("application/json");
+    }
+
+    /// <summary>Whether `uid` may run `action`: the installed PermissionResolver,
+    /// or "any authenticated principal" when none is set. The dispatcher's 403
+    /// and the menu builder both go through here, so a hidden entry and a
+    /// refused request are one decision rather than two that can disagree.
+    /// </summary>
+    async bool Allow(string uid, string action) {
+        if (this.permissionResolver != null) {
+            return await this.permissionResolver(uid, action);
+        }
+        return uid.Length > 0;
+    }
+
+    /// <summary>Resolves the current user from Authorization: Bearer or the
+    /// session cookie; "" when anonymous.</summary>
+    async string AuthUser(HttpContext ctx) {
+        string auth = ctx.Header("Authorization");
+        if (auth.Length > 7 && auth.Substring(0, 7) == "Bearer ") {
+            string token = auth.Substring(7);
+            if (this.authResolver != null) { return await this.authResolver(token); }
+            return this.sessions.UserOf(token);
+        }
+        string cookie = ctx.Cookie("zsession");
+        if (cookie.Length > 0) {
+            if (this.authResolver != null) { return await this.authResolver(cookie); }
+            return this.sessions.UserOf(cookie);
+        }
+        return "";
+    }
+
+    /// <summary>Uniform error body {"code","msg"}, built by the JSON writer.</summary>
+    static string ErrorJson(string code, string msg) {
+        ApiErrorBody o = new ApiErrorBody();
+        o.code = code;
+        o.msg = msg;
+        return Json.Serialize<ApiErrorBody>(o);
+    }
+
+    /// <summary>Status snapshot for /api/status.</summary>
+    string StatusJson() {
+        WebAppStatusDoc o = new WebAppStatusDoc();
+        o.total_requests = (int)this.totalRequests.Load();
+        o.active_connections = (int)this.activeConnections.Load();
+        o.routes = this.router.Stats();
+        return Json.Serialize<WebAppStatusDoc>(o);
+    }
+
+    /// <summary>Full runtime metrics snapshot (CPU, memory, request + query
+    /// throughput/latency, slow-request and slow-query rings) for /admin/stats.</summary>
+    string MetricsJson() {
+        return this.metrics.SnapshotJson();
+    }
+
+    /// <summary>The last `seconds` one-second buckets (requests, errors, average
+    /// and p95 latency, queries, CPU%, RSS) for charts. Recorded on the request
+    /// path itself, so there is no sampling coroutine to schedule and nothing to
+    /// start or stop.</summary>
+    string MetricsSeriesJson(int seconds) {
+        return this.metrics.SeriesJson(seconds);
+    }
+
+    /// 构造一条完整的 HTTP/1.1 JSON 应答字符串（Connection: close），
+    /// 用于 HttpContext 尚不存在的早期拒绝（413/431/503、定界失败）。
+    static string SimpleResponse(int code, string text, string msg) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("code", JsonValue.NewStr(Convert.ToString(code)));
+        o.Put("msg", JsonValue.NewStr(msg));
+        string body = o.ToJson();
+        return "HTTP/1.1 " + Convert.ToString(code) + " " + text
+            + "\r\nContent-Type: application/json\r\nContent-Length: "
+            + Convert.ToString(body.Length)
+            + "\r\nConnection: close\r\n\r\n" + body;
+    }
+
+    /// 报文中头部块的结束位置（"\n\n" 或 "\n\r\n" 之后的首下标）；
+    /// 没有空行返回 -1。
+    static int FindHeaderEnd(string raw) {
+        int n = raw.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            if ((raw[i] & 255) == 10) {
+                // "\n\n"
+                if (i + 1 < n && (raw[i + 1] & 255) == 10) { return i + 2; }
+                // "\n\r\n"
+                if (i + 2 < n && (raw[i + 1] & 255) == 13 && (raw[i + 2] & 255) == 10) { return i + 3; }
+            }
+        }
+        return -1;
+    }
+}
+
+/// <summary>
+/// Global accessor for the running WebApp instance so static controller actions
+/// can reach shared services (views, sessions, request stats) without threading
+/// the app through every call. Set once at startup by main. Named WebHost (not
+/// App) so it does not collide with Gui.App.
+/// </summary>
+class WebHost {
+    static WebApp instance;
+
+    /// 登记当前应用（main 启动时调用一次）。
+    static void Use(WebApp app) { WebHost.instance = app; }
+    /// 当前应用；未设置时为 null。
+    static WebApp Current() { return WebHost.instance; }
+}
+
+/// <summary>Lifecycle hook: return false to short-circuit the request
+/// (the hook must have written a response into ctx first).</summary>
+delegate bool HookFn(HttpContext ctx);
+
+/// <summary>Post-request hook (logging, metrics); cannot short-circuit.
+/// The elapsed time is MICROSECONDS, and 64-bit: a connection held open for an
+/// hour is 3.6 billion of them, past what an int can hold.</summary>
+delegate void AfterFn(HttpContext ctx, long elapsedUs);
+
+/// <summary>
+/// Explicit, typed replacement for runtime `include`-style plugin hooks:
+/// hooks are registered once at startup and run in registration order.
+/// Everything is compile-time checked -- no reflection, no string dispatch.
+/// </summary>
+class Hooks {
+    List<HookFn> before;
+    List<AfterFn> after;
+
+    Hooks() {
+        this.before = new List<HookFn>();
+        this.after = new List<AfterFn>();
+    }
+
+    /// 注册 before 钩子。
+    void Before(HookFn fn) { this.before.Add(fn); }
+    /// 注册 after 钩子。
+    void After(AfterFn fn) { this.after.Add(fn); }
+
+    /// <summary>Runs before-hooks in order; false = request short-circuited.</summary>
+    bool RunBefore(HttpContext ctx) {
+        for (int i = 0; i < this.before.Count; i = i + 1) {
+            HookFn fn = this.before[i];
+            if (!fn(ctx)) { return false; }
+        }
+        return true;
+    }
+
+    /// 按注册顺序执行全部 after 钩子（不可短路）。
+    void RunAfter(HttpContext ctx, long elapsedUs) {
+        for (int i = 0; i < this.after.Count; i = i + 1) {
+            AfterFn fn = this.after[i];
+            fn(ctx, elapsedUs);
+        }
+    }
+}
+
+/// <summary>
+/// Fixed-window rate limiter, the in-process analogue of a swoole_table
+/// counter: one slot per key (route / ip / token), counting requests in the
+/// current window and resetting when the window rolls over. Windows are
+/// wall-clock seconds. Single-threaded event loop => no locking needed.
+/// </summary>
+class RateLimiter {
+    SharedTable table;
+    int windowMs;
+
+    /// 构造限流器；windowMs 为固定窗口宽度（毫秒），非正数忽略。
+    RateLimiter(int windowMs) {
+        if (windowMs > 0) { this.windowMs = windowMs; }
+    }
+
+    // The counters, before they are given a home: 65536 keys of route/ip/token.
+    /// 新建计数表：65536 个键位，每键 count 与 window_start 两列。
+    static SharedTable NewTable() {
+        SharedTable t = new SharedTable("", 65536);
+        t.KeySize(192);
+        t.ColumnInt("count");
+        t.ColumnInt("window_start");
+        return t;
+    }
+
+    /// <summary>A limiter on anonymous shared memory this process owns: no name
+    /// for another server on the machine to collide with, and workers reach it
+    /// through <see cref="OsHandle"/> / <see cref="Attach"/>.</summary>
+    static RateLimiter Owned(int windowMs) {
+        RateLimiter r = new RateLimiter(windowMs);
+        SharedTable t = RateLimiter.NewTable();
+        if (t.CreateAnonymous()) {
+            t.Label("web rate limit");
+            r.table = t;
+        }
+        return r;
+    }
+
+    /// <summary>A limiter on the anonymous table another process created and
+    /// handed down. Handle 0 (nothing was handed down) leaves the limiter
+    /// closed, which refuses the requests it is asked about rather than
+    /// silently letting a limited route run unlimited.</summary>
+    static RateLimiter Attach(long osHandle, int windowMs) {
+        RateLimiter r = new RateLimiter(windowMs);
+        if (osHandle == 0) { return r; }
+        SharedTable t = SharedTable.Attach(osHandle);
+        if (t.IsOpen()) {
+            t.Label("web rate limit");
+            r.table = t;
+        }
+        return r;
+    }
+
+    /// <summary>The handle a worker needs to map this limiter's table, or 0
+    /// when no table was created.</summary>
+    long OsHandle() {
+        if (this.table == null) { return 0; }
+        return this.table.OsHandle();
+    }
+
+    /// 本窗口内 key 是否仍允许通过：limit<=0 恒允许；表未就绪一律拒绝
+    /// （fail closed，被限流的路由不会悄悄放开）。
+    bool Allow(string key, int limit) {
+        if (limit <= 0) { return true; }
+        if (this.table == null) { return false; }
+        return this.table.RateAllow(key, -1, this.windowMs, limit);
+    }
+
+    /// key 当前窗口已计的请求数；表未就绪返回 0。
+    int CountOf(string key) {
+        if (this.table == null) { return 0; }
+        return (int)this.table.GetInt(key, "count");
+    }
+}
+
+/// <summary>
+/// Minimal in-memory session/auth store: token -> user id. A before-hook
+/// checks `route.needsAuth` against this store; swap the storage for Redis
+/// or a database without touching the hook contract.
+/// </summary>
+class Sessions {
+    StrMap tokens;   // token -> uid
+
+    Sessions() { this.tokens = new StrMap(); }
+
+    /// <summary>Issues a token. Locked because the map is shared by every
+    /// request in the process and those run on several worker threads: a Set
+    /// that rehashes while another thread is reading corrupts the table, and
+    /// the count that makes the token unique must be read under the same lock
+    /// as the insert.
+    ///
+    /// Tokens are 32 CSPRNG bytes (RtlGenRandom / /dev/urandom) hex-encoded:
+    /// 256 bits of entropy an attacker cannot guess or forge. The previous
+    /// scheme ("t" + wall-clock seconds + uid + map count) had zero entropy --
+    /// anyone who knew a user's uid and could guess the second their session
+    /// started owned that session. On CSPRNG failure we refuse to issue
+    /// rather than mint something predictable; when the map grows past its
+    /// flood cap it is cleared instead of growing without bound.</summary>
+    string Issue(string uid, int nowSeconds) {
+        lock (this) {
+            byte[] rnd = RandomNumberGenerator.GetBytes(32);
+            if (rnd == null) { return ""; }
+            if (this.tokens.Count() >= 65536) { this.tokens.Clear(); }
+            string h = "0123456789abcdef";
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 32; i = i + 1) {
+                int v = rnd[i] & 255;
+                sb.Append(h.Substring(v >> 4, 1));
+                sb.Append(h.Substring(v & 15, 1));
+            }
+            string token = sb.ToString();
+            this.tokens.Set(token, uid);
+            return token;
+        }
+    }
+
+    /// <summary>Returns the uid for a bearer token / cookie, or "".</summary>
+    string UserOf(string token) {
+        lock (this) {
+            return this.tokens.Get(token);
+        }
+    }
+}
+
+/// <summary>
+/// Boots a <see cref="WebApp"/>: one process running the coroutine event loop,
+/// or a master supervising `count` worker processes (System.Net.Worker), which
+/// is where the listener handoff, respawn-on-crash and the
+/// start/stop/restart/reload/status commands come from.
+///
+/// Single process is the development default -- every connection already runs
+/// in its own coroutine, so it serves thousands of concurrent connections and
+/// logs stream straight into the terminal. With count > 1 the same binary runs
+/// as master and workers; each worker gets connections from the kernel
+/// (SO_REUSEPORT on Linux/macOS) or from the master over a duplicate-socket
+/// channel (Windows).
+/// </summary>
+class WebServer {
+    /// <summary>Runs the app in the foreground: single process when count is 1,
+    /// otherwise a master plus `count` workers. daemon detaches on Linux.</summary>
+    static async int Run(WebApp app, int count, bool daemon) {
+        if (count <= 1) {
+            if (daemon && ProcessHost.Daemonize()) {
+                Console.WriteLine("[server] daemonized; parent process exiting.");
+                return 0;
+            }
+            int r = await app.Start();
+            return r;
+        }
+        WebServer.Prepare(app, count, daemon);
+        await Worker.RunAll();
+        return 0;
+    }
+
+    /// <summary>Same as <see cref="Run"/>, but the process also answers the
+    /// command line: `start`, `start -d`, `stop`, `restart`, `reload`,
+    /// `status`. Use this from Main when the app is deployed as a service.
+    /// Command mode always keeps a supervising master, even with one
+    /// worker.</summary>
+    static async int RunCommand(WebApp app, int count) {
+        return await WebServer.RunCommand(app, count, false);
+    }
+
+    /// <summary>Same as <see cref="RunCommand"/>, with <paramref name="daemon"/>
+    /// standing in for `start -d`: config can ask for a background start
+    /// without the command line repeating it.</summary>
+    static async int RunCommand(WebApp app, int count, bool daemon) {
+        int procs = count;
+        if (procs < 1) { procs = 1; }
+        WebServer.Prepare(app, procs, daemon);
+        await Worker.RunCommand();
+        return 0;
+    }
+
+    // Shared setup for the multi-process paths: the stats table must exist in
+    // every process (the master creates it, workers open the same memory), and
+    // the pipeline is plugged into the worker as a raw-connection handler so
+    // routing/hooks/uploads run exactly as they do single-process.
+    /// 多进程路径的公共装配：初始化共享表、登记活动应用，再建一个
+    /// `count` worker 的 Worker，把 ServeSock 接为原始连接回调，使
+    /// 路由/钩子/上传管线与单进程完全一致；daemon 时以守护进程运行。
+    static void Prepare(WebApp app, int count, bool daemon) {
+        app.InitShared();
+        WebApp.SetActive(app);
+        Worker w = new Worker("http", app.Host(), app.Port());
+        w.SetCount(count);
+        w.onRawConnection = WebApp.ServeSock;
+        if (daemon) { Worker.SetDaemonize(true); }
+    }
+}

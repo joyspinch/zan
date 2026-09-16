@@ -1,0 +1,946 @@
+using System;
+using Gui;
+using Gui.Component;
+using Gui.Backend;
+using Gui.Component.CodeEditor;
+
+namespace Gui.Widget;
+
+/// 输入过滤回调（Naive UI allow-input）：收到「插入后的完整候选
+/// 文本」，返回清洗后的文本；返回 null 表示拒绝这次插入。
+/// 用于「只允许数字」「不许前后空格」这类输入约束。
+delegate string InputFilterFn(string candidate);
+
+/// 带光标、占位符和响应式绑定的单行文本输入框。
+///
+/// 保留式 C# 风格控件：拥有稳定标识（因此焦点在
+/// 兄弟/弹层变动后仍能保持），焦点/点击由框架解析，并
+/// 暴露委托事件：
+///     Input name = new Input("your name");
+///     name.Change += () => { ... };   // 每次编辑时触发
+///     name.Submit += () => { ... };   // 回车时触发
+///     name.Render(app, x, y, w, h);
+/// 获得焦点时消费键盘事件（可打印字符、Backspace、
+/// Delete、Left/Right/Home/End），就地编辑绑定的 SignalString，并将
+/// 光标位置上报给框架，使 IME 组合窗口
+/// 跟随光标移动。
+///
+/// 能力面（对齐 Naive UI Input）：`Disabled`（继承自 Control）、
+/// `SetStatus` 校验态描边、`Prefix`/`Suffix` 文字槽与 `PrefixIcon`、
+/// `Loading` 转圈、`ShowCount`+`MaxLen`(+`CountGraphemes`) 字数统计、
+/// `Round` 圆角、`PassiveActivated` 回车激活、`Filter` 输入过滤、
+/// 以及 Clear/Focus/Blur/SelectAll/ScrollToEnd 手动操作。
+class Input : Control {
+    /// 内部编辑缓冲（SignalString，§6.2 内部状态缓冲）：光标、选区、
+    /// 过滤、IME 组合等编辑操作的运行时真相。不是绑定协议，
+    /// 外部通道是 `data`（Binding<string>）。
+    SignalString editSig;
+    /// 双向绑定文本：`name.data = user.name;` 使输入框与
+    /// 模型双向保持同步（编译器降级的 Binding）。可选的；
+    /// 未设置时，输入框仅编辑其内部 SignalString。
+    Binding<string> data;
+    /// 占位文本（内容为空时显示）。
+    string hint;
+    /// 光标位置（字节偏移）。
+    int cursorPos;
+    // 选区锚点（固定端；光标是移动端）：无选区时
+    // 为 -1。鼠标按下 / Shift 移动时设置，
+    // 任何普通光标移动或编辑时清除。
+    int selAnchor;
+    /// 控件命中 id。
+    int wid;
+    /// 上一帧渲染时的宿主 App：手动操作（Focus/Blur/Clear/
+    /// ScrollToEnd）需要在事件回调里改焦点并请求重绘，而回调
+    /// 没有 app 形参——渲染沿顺手记一笔即可。
+    App liveApp;
+    /// 密码掩码：设置后文本以 `*` 渲染，直到被明文显示。
+    bool password;
+    /// 掩码字段当前是否显示明文（通过眼睛图标切换）。
+    bool reveal;
+    /// 可选的前导 / 尾随图标名（Gui.Icon）。密码框
+    /// 无论 `iconTrail` 如何都会在尾端绘制可点击的眼睛图标。
+    string iconLead;
+    string iconTrail;
+    /// 文本每次变化时触发（C# 风格：`inp.Change += h;`）。
+    UiEvent Change;
+    /// 获得焦点时按下回车触发。
+    UiEvent Submit;
+    /// 校验错误信息；"" 表示有效。SetError 会绘制红色边框，并
+    /// 在字段下方显示消息；任何编辑都会清除它。
+    string errMsg;
+    /// 尺寸变体：对应 Class = "small" / "large"（Naive UI size prop）。
+    /// Binding<string> 使 `inp.Size = vm.density;` 可响应式换档，
+    /// 属性面板（PropSpec.Enum + str 绑定）也能直接读写选项文本。
+    Binding<string> Size;
+    /// 可清空：文本非空且（获焦或悬停）时在尾端显示 X 按钮，
+    /// 点击清空内容并触发 Change（Naive UI clearable prop）。
+    bool Clearable;
+    /// 聚焦时自动全选内容（Naive UI autoselect prop）。适合
+    /// 地址栏、"搜索并跳转" 等点进来就整段替换的字段。
+    bool Autoselect;
+    /// 跟踪 autoselect 已执行过（防止每次获焦都全选）。
+    bool autoselected;
+    /// 输入字符上限（>0 生效）。按码点计——一个 CJK 字符记 1，
+    /// `CountGraphemes` 打开时按字素簇计（👨‍‍👧 记 1）。
+    /// 与 `ShowCount` 显示的计数同一口径。0 表示不限。
+    int MaxLen;
+
+    // ---- 增强：Naive UI Input 的能力面（前缀/后缀/字数/校验态/
+    // 加载/圆角/被动激活）全部走同一套「类选择器 + ::part」样式
+    // 层，控件代码只做几何与输入处理。 --------------------------------
+
+    /// 前缀 / 后缀文字槽（Naive UI prefix/suffix）。画在文本与图标
+    /// 之间，颜色来自 `input::prefix` / `input::suffix`。
+    string Prefix;
+    string Suffix;
+    /// 自定义图标名（Gui.Icon）：前缀槽用 `PrefixIcon`、后缀槽用
+    /// `iconTrail`；密码框用 `PasswordIcon`（默认 "eye"），清除钮用
+    /// `ClearIcon`（默认 "x"）。
+    string PrefixIcon;
+    string PasswordIcon;
+    string ClearIcon;
+    /// 是否显示字数统计（"当前 / 上限"）。上限来自 MaxLen；未设
+    /// MaxLen 时按纯显示处理（Naive UI show-count）。
+    bool ShowCount;
+    /// 字数统计与 MaxLen 是否按字素簇计数（Naive UI count-graphemes）。
+    /// false 时按码点计数。
+    bool CountGraphemes;
+    /// 加载态：后缀区画一个转圈指示器，并禁用编辑（Naive UI loading）。
+    bool Loading;
+    /// 圆角字段：整高半圆角（Naive UI round），走 `.round` 类，
+    /// 皮肤可覆写。
+    bool Round;
+    /// 校验状态：""/success/warning/error，映射到 base.css 的
+    /// 字段状态类。与 errMsg 独立（后者是具体消息文案）。
+    string FieldStatus;
+    /// 被动激活（Naive UI passively-activated）：聚焦后先不接收
+    /// 文本输入，按回车才开始编辑——避免误触 Tab 聚焦就吞掉输入。
+    bool PassiveActivated;
+    bool passiveActive;
+
+    /// 输入过滤（Naive UI allow-input）：返回清洗后的候选文本，
+    /// null 表示原样拒绝。用于「只允许数字」「trim 空白」这类
+    /// 输入约束。内置 `Input.OnlyDigits` / `Input.NoSpaces`。
+    InputFilterFn Filter;
+
+    /// 立即模式工厂与保留模式构造函数共用的初始化函数：
+    /// 设置 Control 基类（停靠顶部，使追加的输入框
+    /// 自动贴齐），再设置输入框专属状态。
+    void InitInput(SignalString sig, string hintText) {
+        this.InitControl("input", 1);
+        editSig = sig;
+        hint = hintText;
+        cursorPos = 0;
+        selAnchor = -1;
+        wid = WidgetId.Next();
+        password = false;
+        reveal = false;
+        iconLead = "";
+        errMsg = "";
+        iconTrail = "";
+        Size = "medium";
+        Clearable = false;
+        Autoselect = false;
+        autoselected = false;
+        Prefix = "";
+        Suffix = "";
+        PrefixIcon = "";
+        PasswordIcon = "";
+        ClearIcon = "";
+        ShowCount = false;
+        CountGraphemes = false;
+        Loading = false;
+        Round = false;
+        FieldStatus = "";
+        PassiveActivated = false;
+        passiveActive = false;
+        Filter = null;
+        liveApp = null;
+        wiresOwnEvents = true;
+        Change = new UiEvent();
+        Submit = new UiEvent();
+    }
+
+    /// Default design-time constructor; the form supplies `placeholder` later.
+    Input() : this("") { }
+
+    /// 保留模式构造函数：`Input name = new Input("Your name");`
+    Input(string hintText) {
+        InitInput(new SignalString(""), hintText);
+    }
+
+    /// 一个与 `s` 等长（按字节）的 `*` 字符串，使掩码显示保持
+    /// 相同的字节布局，光标/选区计算仍然有效。
+    static string Mask(string s) {
+        string m = "";
+        for (int i = 0; i < s.Length; i = i + 1) { m = m + "*"; }
+        return m;
+    }
+
+    /// 当前文本。
+    string GetText() { return editSig.Get(); }
+
+    /// 宿主调整占位文字（SelectBox 的筛选框在 Filterable(true) 之后
+    /// 才由 FilterHint 定文案，晚于构造）。
+    void SetHint(string v) { hint = v; }
+
+    /// Allows a host to move focus to this input programmatically
+    /// (used for the inline rename box in a list).
+    int WidgetId() { return wid; }
+
+    /// 覆盖文本：光标收到末尾、清空选区并写回绑定。
+    void SetText(string v) {
+        editSig.Set(v);
+        cursorPos = v.Length;
+        PushBinding();
+    }
+
+    /// 选中全部文本（等同于用户按 Ctrl+A），因此下一次输入
+    /// 直接替换原内容。地址栏之类「点进来就是要换掉它」的
+    /// 字段在 Focus 事件里调用它。
+    void SelectAll() {
+        selAnchor = 0;
+        cursorPos = editSig.Get().Length;
+    }
+
+    /// 清空内容（Naive UI ref.clear()）。触发 Change，光标归零。
+    void Clear() {
+        if (editSig.Get() == "") { return; }
+        editSig.Set("");
+        cursorPos = 0;
+        selAnchor = -1;
+        Edited();
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    /// 以编程方式把焦点抢到本输入框（Naive UI ref.focus()）。
+    /// 禁用态不响应。
+    void Focus() {
+        if (liveApp == null || this.IsDisabled()) { return; }
+        liveApp.focus.SetFocused(wid);
+        liveApp.RequestRedraw();
+    }
+
+    /// 交出焦点（Naive UI ref.blur()）。
+    void Blur() {
+        if (liveApp == null) { return; }
+        if (liveApp.focus.IsFocused(wid)) { liveApp.focus.ClearFocus(); }
+        liveApp.RequestRedraw();
+    }
+
+    /// 光标移到行尾（Naive UI ref.scrollTo 的等价物：渲染沿本来
+    /// 就会把光标滚进视口）。
+    void ScrollToEnd() {
+        cursorPos = editSig.Get().Length;
+        selAnchor = -1;
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    /// 光标移到行首。
+    void ScrollToStart() {
+        cursorPos = 0;
+        selAnchor = -1;
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    /// 设置校验状态（""/success/warning/error），即 base.css 的
+    /// 字段状态类。与 errMsg 互不影响：前者描边，后者带消息。
+    /// 非白名单值归一为 ""（设计器经 PropSpec 直写字段时，渲染沿兜底同见）。
+    void SetStatus(string v) {
+        string s = Control.StatusSanitize(v);
+        if (s == FieldStatus) { return; }
+        FieldStatus = s;
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    // ---- 计数与过滤（纯函数，无窗口即可验证） ------------------------
+
+    /// 当前文本的计数值（按 CountGraphemes 口径）。
+    int CountOf(string s) {
+        if (CountGraphemes) { return Text.Graphemes(s); }
+        return Text.Chars(s);
+    }
+
+    /// 当前文本的计数值。
+    int CountValue() { return this.CountOf(editSig.Get()); }
+
+    /// 字数统计的显示文本："当前 / 上限"；计数超过 99 时上限侧
+    /// 截为 "99+"（Naive UI 的显示口径）。
+    static string CountText(int count, int max) {
+        string cur = "";
+        if (count > 99) { cur = "99+"; } else { cur = Convert.ToString(count); }
+        if (max <= 0) { return cur; }
+        return cur + " / " + Convert.ToString(max);
+    }
+
+    /// 内置过滤器：只允许数字（Naive UI allow-input 示例一）。
+    static string OnlyDigits(string s) {
+        string outStr = "";
+        int i = 0;
+        while (i < s.Length) {
+            int e = Text.NextCharEnd(s, i);
+            string ch = s.Substring(i, e - i);
+            if (ch.Length == 1) {
+                int b = s[i];
+                if (b >= 48 && b <= 57) { outStr = outStr + ch; }
+            }
+            i = e;
+        }
+        return outStr;
+    }
+
+    /// 内置过滤器：不许有前后空格（Naive UI allow-input 示例二，
+    /// 边输边 trim；词与词之间的空格照常输入）。
+    static string NoSpaces(string s) {
+        return TextWrap.Trim(s);
+    }
+
+    /// 给字段标记校验错误；绘制红色边框，并显示
+    /// `msg` 于字段下方，直到用户编辑（或调用 ClearError）。
+    void SetError(string msg) {
+        errMsg = msg;
+    }
+
+    /// 清除待处理的校验错误（任何编辑时自动调用）。
+    void ClearError() {
+        errMsg = "";
+    }
+
+    /// 把绑定的模型值拉入编辑缓冲区（model -> UI）。
+    override void SyncBinding() {
+        if (data == null) { return; }
+        string cur = data.Get();
+        if (cur != editSig.Get()) {
+            editSig.Set(cur);
+            if (cursorPos > cur.Length) { cursorPos = cur.Length; }
+        }
+    }
+
+    /// 把编辑缓冲区通过绑定写回模型（UI -> model）。
+    void PushBinding() {
+        if (data == null) { return; }
+        data.Set(editSig.Get());
+    }
+
+    /// 所有 UI 编辑都汇入此处：先写回，再通知；同时清除
+    /// 任何校验错误——修正正是问题已解决的最强信号。
+    void Edited() {
+        errMsg = "";
+        PushBinding();
+        Change.Raise();
+    }
+
+    /// 光标与选区锚点钳回文本范围内。
+    void ClampCursor() {
+        string txt = editSig.Get();
+        if (cursorPos > txt.Length) { cursorPos = txt.Length; }
+        if (cursorPos < 0) { cursorPos = 0; }
+        if (selAnchor > txt.Length) { selAnchor = txt.Length; }
+    }
+
+    /// 是否存在非空选区。
+    bool HasSel() { return selAnchor >= 0 && selAnchor != cursorPos; }
+    /// 选区起点（较小端；无选区即光标位置）。
+    int SelStart() { if (selAnchor >= 0 && selAnchor < cursorPos) { return selAnchor; } return cursorPos; }
+    /// 选区终点（较大端）。
+    int SelEnd() { if (selAnchor > cursorPos) { return selAnchor; } return cursorPos; }
+
+    /// 选区文本（无选区为 ""）。
+    string SelText() {
+        if (!HasSel()) { return ""; }
+        return editSig.Get().Substring(SelStart(), SelEnd() - SelStart());
+    }
+
+    /// 删除选中的范围，并把光标收拢到其起点。
+    void DeleteSel() {
+        if (!HasSel()) { return; }
+        string txt = editSig.Get();
+        int s = SelStart();
+        int e = SelEnd();
+        editSig.Set(txt.Substring(0, s) + txt.Substring(e, txt.Length - e));
+        cursorPos = s;
+        selAnchor = -1;
+    }
+
+    /// 插入的唯一闸门：先替换选区，再过宿主过滤器与字符上限。
+    /// 被拒绝时完整回滚（选区也还回去）——"30 上限里再敲一个
+    /// 字"不应有任何可见变化。过滤后整体被改写时（在 "12" 的
+    /// 数字框中间插 "a" → "12"），光标按净增字节平移，不会被
+    /// trim 式过滤器甩到文末。上限按 CountOf 口径计，与字数
+    /// 统计显示同一个数。
+    bool Insert(string s) {
+        string orig = editSig.Get();
+        int origCursor = cursorPos;
+        int origAnchor = selAnchor;
+        bool hadSel = HasSel();
+        if (hadSel) { DeleteSel(); }
+        string txt = editSig.Get();
+        string cand = Text.InsertAt(txt, cursorPos, s);
+        string final = cand;
+        if (Filter != null) { final = Filter(cand); }
+        if (final == null
+            || (MaxLen > 0 && this.CountOf(final) > MaxLen)) {
+            editSig.Set(orig);
+            cursorPos = origCursor;
+            selAnchor = origAnchor;
+            return false;
+        }
+        int delta = final.Length - cand.Length;
+        int cp = cursorPos + s.Length + delta;
+        if (cp < 0) { cp = 0; }
+        if (cp > final.Length) { cp = final.Length; }
+        if (final == txt && cp == cursorPos && !hadSel) {
+            // 净零变化（插入即被过滤掉）：不发 Change、不动状态。
+            selAnchor = -1;
+            return false;
+        }
+        editSig.Set(final);
+        cursorPos = cp;
+        selAnchor = -1;
+        Edited();
+        return true;
+    }
+
+    /// 退格/删除的候选整体再过一次过滤器：删掉词边界上的字母
+    /// 可能"暴露"出前后空格（NoSpaces 场景），删除路径也要被
+    /// 清洗。返回 false 表示过滤器拒绝该结果。
+    bool DeleteCandidate(string cand) {
+        string final = cand;
+        if (Filter != null) { final = Filter(cand); }
+        if (final == null) { return false; }
+        if (final == editSig.Get()) { return false; }
+        editSig.Set(final);
+        if (cursorPos > final.Length) { cursorPos = final.Length; }
+        if (selAnchor > final.Length) { selAnchor = final.Length; }
+        Edited();
+        return true;
+    }
+
+    /// 键盘输入处理（聚焦时由 Render 调用）：编辑键、Ctrl 快捷键、
+    /// 方向键/Home/End 导航与鼠标选择/拖选。
+    void HandleInput(App app) {
+        ClampCursor();
+        int kind = app.EventKind();
+        string txt = editSig.Get();
+        // 被动激活：聚焦后先用回车"解锁"，解锁前不消费任何编辑键
+        // （Naive UI passively-activated：Tab 聚焦不该吞掉输入）。
+        if (PassiveActivated && !passiveActive) {
+            if (kind == 6 && app.window.EventKeyCode() == 13) {
+                passiveActive = true;
+                app.RequestRedraw();
+            }
+            return;
+        }
+        if (kind == 6) {
+            int code = app.window.EventKeyCode();
+            if (code == 8) {
+                if (HasSel()) {
+                    DeleteSel();
+                    Edited();
+                    app.RequestRedraw();
+                } else if (cursorPos > 0) {
+                    int start = Text.PrevCharStart(txt, cursorPos);
+                    if (this.DeleteCandidate(Text.DeleteBefore(txt, cursorPos))) {
+                        cursorPos = start;
+                    }
+                    app.RequestRedraw();
+                }
+            } else if (code == 13) {
+                Submit.Raise();
+                app.RequestRedraw();
+            } else if (code == 9) {
+                // 忽略 Tab（由框架焦点遍历处理）
+            } else {
+                string ch = Text.CharStr(code);
+                if (ch.Length > 0) {
+                    // IME 组合：直接插入（上限/过滤同样生效）。
+                    if (this.Insert(ch)) { app.RequestRedraw(); }
+                }
+            }
+        } else if (kind == 4) {
+            int kc = app.window.EventKeyCode();
+            int mods = app.window.EventMods();
+            bool shift = Modifiers.HasShift(mods);
+            bool ctrl = Modifiers.HasCtrl(mods);
+            if (ctrl && kc == 65) {
+                // Ctrl+A：全选。
+                selAnchor = 0;
+                cursorPos = txt.Length;
+                app.RequestRedraw();
+            } else if (ctrl && kc == 67) {
+                // Ctrl+C：复制选区（无选区时复制全文）。
+                if (HasSel()) { Clipboard.SetText(SelText()); }
+                else { Clipboard.SetText(txt); }
+            } else if (ctrl && kc == 88) {
+                // Ctrl+X：剪切。
+                if (HasSel()) {
+                    Clipboard.SetText(SelText());
+                    DeleteSel();
+                    Edited();
+                    app.RequestRedraw();
+                }
+            } else if (ctrl && kc == 86) {
+                // Ctrl+V：粘贴（整段走同一过滤+上限闸门）。
+                string clip = Clipboard.GetText();
+                if (clip.Length > 0) {
+                    if (this.Insert(clip)) { app.RequestRedraw(); }
+                }
+            } else if (kc == 37 || kc == 39 || kc == 36 || kc == 35) {
+                // 方向键/Home/End：Shift 从光标处扩展选区；
+                // 普通移动则收起选区（方向键收起到选区边缘，
+                // 与所有原生文本框一致）。
+                if (shift) {
+                    if (selAnchor < 0) { selAnchor = cursorPos; }
+                } else if (HasSel()) {
+                    if (kc == 37) { cursorPos = SelStart(); }
+                    else if (kc == 39) { cursorPos = SelEnd(); }
+                    selAnchor = -1;
+                    if (kc == 36) { cursorPos = 0; }
+                    if (kc == 35) { cursorPos = txt.Length; }
+                    app.RequestRedraw();
+                    return;
+                }
+                if (!shift) { selAnchor = -1; }
+                if (kc == 37) { if (cursorPos > 0) { cursorPos = Text.PrevCharStart(txt, cursorPos); } }
+                else if (kc == 39) { if (cursorPos < txt.Length) { cursorPos = Text.NextCharEnd(txt, cursorPos); } }
+                else if (kc == 36) { cursorPos = 0; }
+                else if (kc == 35) { cursorPos = txt.Length; }
+                app.RequestRedraw();
+            } else if (kc == 46) {
+                if (HasSel()) {
+                    DeleteSel();
+                    Edited();
+                    app.RequestRedraw();
+                } else if (cursorPos < txt.Length) {
+                    if (this.DeleteCandidate(Text.RemoveAt(txt, cursorPos))) {
+                        app.RequestRedraw();
+                    }
+                }
+            }
+        }
+    }
+
+    /// 每帧渲染与交互（立即模式入口；停靠布局经 OnPaint 进入）。
+    int Render(App app, int x, int y, int w, int h) {
+        int id = wid;
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        // 事件回调没有 app 形参，渲染沿记一笔宿主供手动操作使用。
+        liveApp = app;
+
+        bool off = this.IsDisabled();
+        app.focus.RegisterFocusable(id);
+        app.focus.RegisterTextEditable(id);
+        bool focused = app.focus.IsFocused(id) && !off;
+
+        // Size 字段映射为 Class 片段（small/medium/large），
+        // base.css 的 input.small/large 规则负责重设高度/字号。
+        string origClass = Class;
+        string szv = "";
+        if (Size != null) { szv = Size.Get(); }
+        this.AddClass(Control.SizeClass(szv));
+        // medium 是默认，不附加。
+        // 校验状态与圆角同理：`.success/.warning/.error` 描边
+        // （base.css 已有），`.round` 整高半圆角。设计器可经
+        // PropSpec 直写字段，脏值先过白名单，不会长出没人认的 class。
+        string stCls = Control.StatusSanitize(FieldStatus);
+        if (stCls != "") { this.AddClass(stCls); }
+        if (Round) { this.AddClass("round"); }
+
+        if (focused) {
+            // Autoselect: 首次获焦时全选。
+            if (Autoselect && !autoselected) {
+                SelectAll();
+                autoselected = true;
+            }
+            HandleInput(app);
+        }
+        if (!focused) {
+            autoselected = false;
+            passiveActive = false;
+        }
+
+        SyncBinding();
+        string txt = editSig.Get();
+        ClampCursor();
+
+        // 整个外框（填充、边框、圆角、阴影、hover/focus 淡变）
+        // 来自样式层，因此皮肤的 `input:hover / input:focus`
+        // 规则即可重设字段样式，无需改动此代码。
+        StyleBox s = this.ResolveEasedStyleAsIn(
+            app, id, "input", Class, off, false, x, y, w, h);
+        s.Paint(app, x, y, w, h);
+        int fs = s.FontOr(Style.FontFallback(app, "medium"));
+        int accent = s.accent;
+        // 校验错误：颜色与线宽来自 `input::error` 部件（在样式层之后
+        // 绘制，皮肤可改写该部件但无法被普通边框规则冲淡）。
+        StyleBox errorStyle = new StyleBox();
+        if (errMsg != "") {
+            errorStyle = this.ResolvePartAs(app, "input", "error", "",
+                                            Class, Style.SNormal());
+            c.DrawRect(x, y, w, h, errorStyle.BorderOr(errorStyle.fg),
+                       errorStyle.BorderWOr(2));
+        }
+
+        int pad = s.PadLOr(t.paddingSmall);
+        // 尾端槽从右往左排：清除钮 / 密码眼 / 加载圈 共用一个图标位
+        // （优先级 loading > clear > eye > iconTrail），其后是后缀
+        // 文字、字数统计。前缀槽与前置图标在最左。
+        int glyphSz = fs;
+        string preIcon = iconLead;
+        if (preIcon == "" && PrefixIcon != "") { preIcon = PrefixIcon; }
+        string pfx = "";
+        if (Prefix != null) { pfx = Prefix; }
+        string sfx = "";
+        if (Suffix != null) { sfx = Suffix; }
+        bool showClear = Clearable && txt != "" && !off && !Loading
+            && (focused || app.focus.IsHovered(id));
+        bool passEye = password && !showClear && !Loading;
+        string trailIcon = iconTrail;
+        if (passEye) {
+            trailIcon = PasswordIcon;
+            if (trailIcon == "") { trailIcon = "eye"; }
+        }
+        if (showClear) {
+            trailIcon = ClearIcon;
+            if (trailIcon == "") { trailIcon = "x"; }
+        }
+        // loading 时不画静态图标，转圈单独绘制（占同一槽位）。
+        bool trailArea = Loading || trailIcon != "";
+        int iconW = 0;
+        if (trailArea) { iconW = glyphSz + pad; }
+        int sfxW = 0;
+        if (sfx != "") { sfxW = Canvas.MeasureText(sfx, fs) + pad; }
+        string countTxt = "";
+        int countW = 0;
+        if (ShowCount) {
+            int n = this.CountOf(txt);
+            countTxt = Input.CountText(n, MaxLen);
+            int cfs = Style.FontFallback(app, "small");
+            countW = Canvas.MeasureText(countTxt, cfs) + pad;
+        }
+        int leadSlot = 0;
+        if (preIcon != "") { leadSlot = leadSlot + glyphSz + pad; }
+        if (pfx != "") { leadSlot = leadSlot + Canvas.MeasureText(pfx, fs) + pad; }
+        int trailSlot = iconW + sfxW + countW;
+        int innerX = x + pad + leadSlot;
+        int innerW = w - pad - s.PadROr(t.paddingSmall) - leadSlot - trailSlot;
+        if (innerW < 0) { innerW = 0; }
+        int textY = Canvas.CenterTextY(y, h, fs);
+        // 掩码显示：字节长度不变，cursorPos 仍可正确索引。
+        string disp = txt;
+        if (password && !reveal) { disp = Input.Mask(txt); }
+        int iconX = x + w - s.PadROr(t.paddingSmall) - iconW + pad;
+        int sfxX = iconX + iconW - sfxW;
+        if (!trailArea && sfxW > 0) { sfxX = x + w - s.PadROr(t.paddingSmall) - sfxW; }
+        int countX = sfxX;
+        if (countW > 0) {
+            int rEdge = x + w - s.PadROr(t.paddingSmall);
+            if (trailArea) { rEdge = rEdge - iconW - sfxW; }
+            countX = rEdge - countW;
+        }
+        bool onTrail = trailArea && !off && app.mouseX >= iconX
+            && app.mouseX < x + w && app.mouseY >= y && app.mouseY < y + h;
+
+        StyleBox placeholderStyle = this.ResolveEasedPartAsIn(
+            app, id, "input", "placeholder", "", Class, false, false,
+            x, y, w, h);
+        StyleBox selectionStyle = this.ResolveEasedPartAsIn(
+            app, id, "input", "selection", "", Class, false, false,
+            x, y, w, h);
+        StyleBox caretStyle = this.ResolveEasedPartAsIn(
+            app, id, "input", "caret", "", Class, false, false,
+            x, y, w, h);
+        int placeholderFont = placeholderStyle.FontOr(fs);
+        int caretColor = caretStyle.BgOr(caretStyle.FgOr(caretStyle.AccentOr(accent)));
+
+        int caretW = 0;
+        if (disp != "") {
+            caretW = Canvas.MeasureText(Text.Left(disp, cursorPos), fs);
+        }
+        int scrollX = 0;
+        if (caretW > innerW) { scrollX = caretW - innerW; }
+
+        c.PushClip(innerX, y, innerW, h);
+        if (focused && HasSel()) {
+            // 文本后的选区高亮。
+            int selPx0 = Canvas.MeasureText(Text.Left(disp, SelStart()), fs);
+            int selPx1 = Canvas.MeasureText(Text.Left(disp, SelEnd()), fs);
+            int selH = Canvas.FontHeight(fs);
+            c.FillRect(innerX - scrollX + selPx0, textY, selPx1 - selPx0, selH,
+                       selectionStyle.BgOr(accent));
+        }
+        // 组词中（拼音等尚未上屏）不画 placeholder：预览会占住文本
+        // 起点，两者叠在一起没法读。桌面端 Composing() 恒为 ""。
+        string composing = focused ? Ime.Composing() : "";
+        if (txt == "" && composing == "") {
+            int placeholderY = Canvas.CenterTextY(y, h, placeholderFont);
+            c.DrawText(innerX, placeholderY, hint,
+                       placeholderStyle.FgOr(s.fg), placeholderFont);
+        } else if (disp != "") {
+            c.DrawText(innerX - scrollX, textY, disp, s.fg, fs);
+        }
+
+        if (focused) {
+            int cursorX = innerX - scrollX + caretW;
+            int cursorH = Canvas.FontHeight(fs);
+            int cursorWidth = caretStyle.WidthOr(1);
+            c.FillRect(cursorX, textY, cursorWidth, cursorH, caretColor);
+            // 让 IME 组合窗口保持在光标处。
+            app.SetImeCaret(cursorX, textY + cursorH);
+            // 组词预览：拼音等组合中、尚未上屏的串以 placeholder 色画在
+            // 光标右侧；上屏后 native 清空预览，真文本接在原文本后面。
+            if (composing != "") {
+                c.DrawText(cursorX + cursorWidth + pad, textY, composing,
+                           placeholderStyle.FgOr(s.fg), fs);
+            }
+        }
+        c.PopClip();
+
+        // 槽位文字/图标位于文本裁剪区之外，在 PopClip 之后绘制。
+        // 前后缀文字颜色来自 `input::prefix` / `input::suffix`。
+        int slotX = x + pad;
+        if (preIcon != "") {
+            StyleBox iconStyle = this.ResolvePartAs(
+                app, "input", "icon", "", Class, Style.SNormal());
+            c.DrawGlyphIn(preIcon, slotX, y, glyphSz, h, glyphSz,
+                iconStyle.FgOr(s.fg));
+            slotX = slotX + glyphSz + pad;
+        }
+        if (pfx != "") {
+            StyleBox pfxStyle = this.ResolvePartAs(
+                app, "input", "prefix", "", Class, Style.SNormal());
+            c.DrawText(slotX, textY, pfx, pfxStyle.FgOr(s.fg), fs);
+        }
+        if (sfx != "") {
+            StyleBox sfxStyle = this.ResolvePartAs(
+                app, "input", "suffix", "", Class, Style.SNormal());
+            c.DrawText(sfxX, textY, sfx, sfxStyle.FgOr(s.fg), fs);
+        }
+        // 字数统计：右对齐在文本与后缀之间（`input::count`，小一号）。
+        if (countTxt != "") {
+            StyleBox countStyle = this.ResolvePartAs(
+                app, "input", "count", "", Class, Style.SNormal());
+            int cfs = countStyle.FontOr(Style.FontFallback(app, "small"));
+            c.DrawText(countX, Canvas.CenterTextY(y, h, cfs), countTxt,
+                       countStyle.FgOr(s.fg), cfs);
+        }
+        if (Loading) {
+            // 8 点转圈，墙钟相位每 90ms 一步（与 Spin 同一节奏），
+            // 头部用强调色。限制重绘只在框可见时。
+            int active = (Window.GetTickMs() / 90) % 8;
+            int spinC = s.AccentOr(accent);
+            int faintC = App.WithAlpha(spinC, 80);
+            int dotR = glyphSz / 8;
+            if (dotR < app.Scale(1)) { dotR = app.Scale(1); }
+            int cx = iconX + iconW / 2 - pad / 2;
+            int cy = y + h / 2;
+            int ring = glyphSz / 2 - dotR - app.Scale(1);
+            if (ring < 1) { ring = 1; }
+            for (int i = 0; i < 8; i = i + 1) {
+                int px = cx + (ring * Spin.OffX(i)) / 1000;
+                int py = cy + (ring * Spin.OffY(i)) / 1000;
+                int d = (active - i + 8) % 8;
+                c.FillCircle(px, py, dotR + (d == 0 ? app.Scale(1) : 0),
+                             d <= 1 ? spinC : faintC);
+            }
+            app.RequestAnimationFrameIn(90, iconX, y, iconW, h);
+        } else if (trailIcon != "") {
+            // 图标颜色来自 `input::icon`：悬停用 :hover，密码明文
+            // （眼睛常亮）用 :selected。
+            StyleBox iconStyle = this.ResolvePartAs(
+                app, "input", "icon", "", Class, Style.SNormal());
+            int iconState = Style.SNormal();
+            if (onTrail) { iconState = Style.SHover(); }
+            if (password && reveal && !showClear) {
+                iconState = iconState + Style.SSelected();
+            }
+            if (iconState != Style.SNormal()) {
+                iconStyle = this.ResolvePartAs(
+                    app, "input", "icon", "", Class, iconState);
+            }
+            c.DrawGlyphIn(trailIcon, iconX, y, glyphSz, h, glyphSz,
+                          iconStyle.FgOr(s.fg));
+        }
+        // 校验消息显示在字段下方（在 PopClip 之后绘制，
+        // 文本裁剪区无法截断它）。
+        if (errMsg != "") {
+            c.DrawText(x, y + h + app.Scale(2), errMsg,
+                       errorStyle.FgOr(s.fg),
+                       errorStyle.FontOr(Style.FontFallback(app, "small")));
+        }
+
+        app.hitTester.RegisterRect(id, x, y, w, h, 1);
+
+        // 密码明文 / 清空按钮点击：都在尾端图标上释放左键。
+        if (onTrail && app.EventKind() == 3
+                && app.window.EventButton() == 0 && app.ClickAvailable()) {
+            if (showClear) {
+                this.Clear();
+            } else if (password) {
+                reveal = !reveal;
+                app.RequestRedraw();
+            }
+            app.ClaimClick();
+        }
+
+        // 鼠标选择：按下锚定选区并放置光标；
+        // 按住拖动移动光标端；松开保留选区
+        // （收起为空的选区清除锚点）。
+        if (Ui.PressedDown(app, id) && !onTrail && !off) {
+            int rel = app.mouseX - innerX + scrollX;
+            cursorPos = CodeEditor.ColFromX(disp, rel, fs);
+            if (Modifiers.HasShift(app.window.EventMods()) && selAnchor >= 0) {
+                // Shift+点击从现有锚点扩展选区。
+            } else {
+                selAnchor = cursorPos;
+            }
+            app.RequestRedraw();
+        } else if (focused && app.focus.IsPressed(id)
+                   && app.EventKind() == 1) {
+            int rel = app.mouseX - innerX + scrollX;
+            int drag = CodeEditor.ColFromX(disp, rel, fs);
+            if (drag != cursorPos) {
+                cursorPos = drag;
+                app.RequestRedraw();
+            }
+        }
+        // 单消费者点击：当本输入框是框架解析出的
+        // 点击目标时，放置光标。
+        if (Ui.Clicked(app, id) && !onTrail && !off) {
+            int rel = app.mouseX - innerX + scrollX;
+            cursorPos = CodeEditor.ColFromX(disp, rel, fs);
+            if (selAnchor == cursorPos) { selAnchor = -1; }
+            app.RequestRedraw();
+        }
+        if (!focused && selAnchor >= 0) { selAnchor = -1; }
+
+        // 恢复 Class，避免设计器/序列化器读到污染的字段。
+        Class = origClass;
+
+        On.Fire(app, id);
+        return id;
+    }
+
+    // --- 设计器 / 序列化模型 ---
+
+    /// 控件类型标识（序列化/设计器用）。
+    override string Kind() { return "Input"; }
+    /// 覆写：返回 Size 绑定字段（设计器经它发现尺寸档位绑定）。
+    override Binding<string> SizeOf() { return Size; }
+
+    /// 覆写：返回设计器属性清单（占位 / 文本 / 尺寸 / 前后缀 / 状态 / 长度等）。
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec ph = PropSpec.Text("hint", "Placeholder");
+        ph.str = hint;
+        ph.Also("placeholder");
+        ps.Add(ph);
+        ps.Add(PropSpec.Text("text", "Text"));
+        PropSpec sz = PropSpec.Enum("size", "Size",
+            PropSpec.Sizes());
+        sz.str = Size;
+        ps.Add(sz);
+        PropSpec clr = PropSpec.Bool("clearable", "Clearable");
+        clr.flag = Clearable;
+        ps.Add(clr);
+        PropSpec asel = PropSpec.Bool("autoselect", "Autoselect");
+        asel.flag = Autoselect;
+        ps.Add(asel);
+        PropSpec pfx = PropSpec.Text("prefix", "Prefix");
+        pfx.str = Prefix;
+        ps.Add(pfx);
+        PropSpec sfx = PropSpec.Text("suffix", "Suffix");
+        sfx.str = Suffix;
+        ps.Add(sfx);
+        PropSpec st = PropSpec.Enum("status", "Status",
+            new List<string>{ "", "success", "warning", "error" });
+        st.str = FieldStatus;
+        ps.Add(st);
+        PropSpec ml = PropSpec.Int("maxlen", "MaxLen");
+        ml.num = MaxLen;
+        ml.Step(1, 0, 4096);
+        ps.Add(ml);
+        PropSpec sc = PropSpec.Bool("showCount", "ShowCount");
+        sc.flag = ShowCount;
+        ps.Add(sc);
+        PropSpec rd = PropSpec.Bool("round", "Round");
+        rd.flag = Round;
+        ps.Add(rd);
+        PropSpec ld = PropSpec.Bool("loading", "Loading");
+        ld.flag = Loading;
+        ps.Add(ld);
+        PropSpec pa = PropSpec.Bool("passive", "PassiveActivated");
+        pa.flag = PassiveActivated;
+        ps.Add(pa);
+        return ps;
+    }
+
+    /// 文本经 SetText 写入，保证光标与选区不越界。
+    override string GetExtra(string key) {
+        if (key == "text" || key == "value") { return editSig.Get(); }
+        return "";
+    }
+
+    /// 覆写：写回扩展属性（文本 / 密码 / 图标 / 状态等键）。
+    override bool SetExtra(string key, string val) {
+        if (key == "text" || key == "value") {
+            // 同一个值再写一遍不算编辑：SetText 会把光标收到末尾，而属性
+            // 写入可能每帧都来（数据绑定、文案刷新），那样方向键就白按了。
+            if (val != editSig.Get()) { this.SetText(val); }
+            return true;
+        }
+        if (key == "password") { password = (val == "true"); return true; }
+        if (key == "iconLead" || key == "icon") { iconLead = val; return true; }
+        if (key == "iconTrail") { iconTrail = val; return true; }
+        if (key == "prefixIcon" || key == "iconLead2") {
+            PrefixIcon = val; return true;
+        }
+        if (key == "passwordIcon") { PasswordIcon = val; return true; }
+        if (key == "clearIcon") { ClearIcon = val; return true; }
+        if (key == "status") { this.SetStatus(val); return true; }
+        if (key == "countGraphemes") {
+            CountGraphemes = (val == "true"); return true;
+        }
+        return false;
+    }
+
+    /// 覆写：公共事件之外提供 "Change" 与 "Submit"。
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        e.Add("Submit");
+        return e;
+    }
+
+    /// 将输入框自身的语义事件（Change/Submit）路由到对应的 UiEvent
+    /// 字段；其余事件落入 `On` 上的通用事件包。
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        if (evt == "Submit") { Submit.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    // --- 保留模式钩子（Control） ---
+
+    /// 覆写：按尺寸档解析样式，高取样式行高，宽缺省 220。
+    override void OnMeasure(App app) {
+        Theme t = app.theme;
+        // 尺寸档（Size → .small/.large）在渲染前也要生效：
+        // 临时把档位 class 并入 Class 再解析，量出的高度
+        // 与每帧渲染一致。
+        string origClass = Class;
+        string szv = "";
+        if (Size != null) { szv = Size.Get(); }
+        this.AddClass(Control.SizeClass(szv));
+        StyleBox s = this.ResolveStyleAs(app, "input", Class, Style.SNormal());
+        prefH = s.HeightOr(t.heightMedium);
+        prefW = s.WidthOr(app.Scale(220));
+        Class = origClass;
+    }
+
+    /// 覆写：保留模式绘制 = 以自身矩形 Render。
+    override void OnPaint(App app) {
+        this.Render(app, bx, by, bw, bh);
+    }
+}

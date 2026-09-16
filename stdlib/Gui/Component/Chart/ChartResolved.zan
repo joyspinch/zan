@@ -1,0 +1,349 @@
+using System;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+/// 单个源系列的只读绘制快照。保留 source 引用，使渲染器
+/// 无需复制数据，同时把继承值和交互状态隔离在当前帧。
+class ResolvedSeries {
+    ChartSeries source;
+    int color;
+    int lineColor;
+    int lineWidth;
+    int areaColor;
+    int labelColor;
+    int labelFontSize;
+    int emphColor;        // itemStyle.emphasis.color（0 = 同 normal）
+    int emphBorderColor;  // 强调描边色
+    int emphBorderWidth;  // 强调描边宽（0 = 无强调描边）
+    bool hidden;
+    int wid;
+    bool animate;
+    bool visBlocked;   // 源系列显式声明了 lineStyle.color
+
+    /// 解析单个系列：主色/线色/线宽/面积色/标签字号按
+    /// 系列值 -> itemStyle.normal -> 调色板/theme 依次回退；
+    /// emphasis 强调 paint 同步解析（缺省回退 normal）。
+    /// hidden/wid/animate 原样记录。
+    static ResolvedSeries Of(ChartSeries source, Theme theme, int index,
+                             int wid, bool animate, bool hidden) {
+        ResolvedSeries r = new ResolvedSeries();
+        r.source = source;
+        r.color = source.color;
+        if (r.color == 0) { r.color = source.itemStyle.normal.color; }
+        if (r.color == 0) { r.color = Chart.Palette(theme, index); }
+        r.lineColor = source.itemStyle.normal.lineStyle.color;
+        r.visBlocked = r.lineColor != 0;
+        if (r.lineColor == 0) { r.lineColor = r.color; }
+        r.lineWidth = source.itemStyle.normal.lineStyle.width;
+        if (r.lineWidth <= 0) { r.lineWidth = 2; }
+        r.areaColor = source.itemStyle.normal.areaStyle.color;
+        if (r.areaColor == 0) { r.areaColor = r.color; }
+        r.labelColor = source.label.color;
+        r.labelFontSize = source.label.fontSize;
+        if (r.labelFontSize <= 0) { r.labelFontSize = theme.fontSizeSmall; }
+        // 强调（hover）paint：解析到 ResolvedSeries，命中时
+        // 渲染器用 Effective* 取色，源系列永不被改写。
+        r.emphColor = source.itemStyle.emphasis.color;
+        if (r.emphColor == 0) { r.emphColor = r.color; }
+        r.emphBorderColor = source.itemStyle.emphasis.borderColor;
+        if (r.emphBorderColor == 0) { r.emphBorderColor = source.itemStyle.normal.borderColor; }
+        r.emphBorderWidth = source.itemStyle.emphasis.borderWidth;
+        if (r.emphBorderWidth < 0) { r.emphBorderWidth = 0; }
+        r.hidden = hidden;
+        r.wid = wid;
+        r.animate = animate;
+        return r;
+    }
+
+    /// 第 index 个数据项的绘制色：数据项自带 color 非零时优先，
+    /// 否则回退系列解析主色。
+    int DataColor(int index) {
+        if (index >= 0 && index < this.source.data.Count
+            && this.source.data[index].color != 0) {
+            return this.source.data[index].color;
+        }
+        return this.color;
+    }
+
+    /// CSS 覆写入口（chart::series-N）：替换系列主色并同步
+    /// 未被显式指定的派生色（线/面积/强调色跟随主色）。
+    void OverrideColor(int cssColor) {
+        if (cssColor == 0) { return; }
+        this.color = cssColor;
+        if (this.source.itemStyle.normal.lineStyle.color == 0) { this.lineColor = cssColor; }
+        if (this.source.itemStyle.normal.areaStyle.color == 0) { this.areaColor = cssColor; }
+        if (this.source.itemStyle.emphasis.color == 0) { this.emphColor = cssColor; }
+    }
+
+    /// 命中（hover）后的有效 paint：强调色优先；普通状态
+    /// 返回解析色。三者都只读，不触碰源系列。
+    int EffectiveColor(bool hovered) {
+        if (hovered) { return this.emphColor; }
+        return this.color;
+    }
+    /// 有效边框色：hovered 取 emphasis.borderColor（解析时缺省
+    /// 已回退 normal），普通状态取 normal.borderColor。
+    int EffectiveBorderColor(bool hovered) {
+        if (hovered) { return this.emphBorderColor; }
+        return this.source.itemStyle.normal.borderColor;
+    }
+    /// 有效边框宽：hovered 取 emphasis.borderWidth（解析时负值
+    /// 已钳为 0），普通状态取 normal.borderWidth。
+    int EffectiveBorderWidth(bool hovered) {
+        if (hovered) { return this.emphBorderWidth; }
+        return this.source.itemStyle.normal.borderWidth;
+    }
+
+    /// 把解析结果物化回一份源系列的深复制：外壳样式字段（主色/
+    /// hidden/线色/线宽/面积色/标签色与字号）用解析值覆盖，数据
+    /// 集合与其余字段原样保留。供仍按 ChartSeries 绘制的路径使用。
+    /// allowShare（阶段 B 克隆税豁免）：本帧渲染路径对数据集合
+    /// 只读时，data/points/candles 等逐项大集合与源系列只读共享
+    /// （ChartSeries.Clone(src, true)），不逐项深拷。凡可能经
+    /// ApplyDataLegend 写 data[].hidden/selected 的系列（pie/rose/
+    /// funnel 面板与 pie/funnel 覆盖层）必须保持全量克隆，否则
+    /// 交互态会漏写进长寿缓存的源 option。
+    ChartSeries Materialize(bool allowShare) {
+        ChartSeries src = this.source;
+        bool share = allowShare && src.type != ChartType.Pie
+            && src.type != ChartType.Funnel;
+        ChartSeries s = ChartSeries.Clone(src, share);
+        if (s == null) { return null; }
+        s.color = this.color; s.hidden = this.hidden;
+        ChartItemStyle style = ChartItemStyle.Create();
+        style.normal.color = src.itemStyle.normal.color;
+        style.normal.color0 = src.itemStyle.normal.color0;
+        style.normal.borderColor = src.itemStyle.normal.borderColor;
+        style.normal.borderWidth = src.itemStyle.normal.borderWidth;
+        style.normal.lineStyle.color = this.lineColor;
+        s.visBlocked = this.visBlocked;
+        style.normal.lineStyle.color0 = src.itemStyle.normal.lineStyle.color0;
+        style.normal.lineStyle.width = this.lineWidth;
+        style.normal.lineStyle.type = src.itemStyle.normal.lineStyle.type;
+        style.normal.lineStyle.shadowColor = src.itemStyle.normal.lineStyle.shadowColor;
+        style.normal.lineStyle.shadowBlur = src.itemStyle.normal.lineStyle.shadowBlur;
+        // __grad 渐变 stops（只读共享引用）。
+        style.normal.lineStyle.gradStops = src.itemStyle.normal.lineStyle.gradStops;
+        style.normal.lineStyle.transparent = src.itemStyle.normal.lineStyle.transparent;
+        style.normal.areaStyle.color = this.areaColor;
+        style.normal.areaStyle.type = src.itemStyle.normal.areaStyle.type;
+        style.normal.areaStyle.gradStops = src.itemStyle.normal.areaStyle.gradStops;
+        style.normal.areaStyle.alpha = src.itemStyle.normal.areaStyle.alpha;
+        style.normal.borderRadius = new List<int>();
+        for (int bri = 0; bri < src.itemStyle.normal.borderRadius.Count; bri = bri + 1) {
+            style.normal.borderRadius.Add(src.itemStyle.normal.borderRadius[bri]);
+        }
+        style.emphasis = ChartItemStyle.CloneState(src.itemStyle.emphasis);
+        s.itemStyle = style;
+        ChartTextStyle label = ChartTextStyle.Create();
+        label.color = this.labelColor; label.fontSize = this.labelFontSize;
+        label.fontStyle = src.label.fontStyle; label.fontWeight = src.label.fontWeight;
+        label.fontFamily = src.label.fontFamily; label.shadowColor = src.label.shadowColor;
+        label.shadowBlur = src.label.shadowBlur; s.label = label;
+        // 富文本表与整块底板随行（rich 表只读共享——解析后渲染期
+        // 不可变，不必逐样式深拷）。
+        label.rich = src.label.rich;
+        label.lineHeight = src.label.lineHeight;
+        label.boxBg = src.label.boxBg;
+        label.boxBorder = src.label.boxBorder;
+        label.boxBorderW = src.label.boxBorderW;
+        label.boxRadius = src.label.boxRadius;
+        label.padT = src.label.padT;
+        label.padR = src.label.padR;
+        label.padB = src.label.padB;
+        label.padL = src.label.padL;
+        return s;
+    }
+}
+
+/// ChartOption 的只读、逐帧规范化结果。
+class ResolvedChart {
+    ChartOption source;
+    List<ResolvedSeries> series;
+    int wid;
+    int stateWid;      // connect 组的交互态基址（组长 wid）；无组 = wid
+    bool animate;
+    int windowStart;   // dataZoom 窗口（类别索引，含端点）；
+    int windowEnd;     //   无 zoom 时 = 全范围 [0, n-1]
+
+    /// 逐帧解析入口：确定 connect 组交互态基址 stateWid（组内
+    /// 首图把组长 wid 登记进组键并初始化共享悬停为 -1）、锁定
+    /// dataZoom 窗口 [windowStart, windowEnd]（无 zoom 或 n<2 时
+    /// 为全范围），并逐系列生成 ResolvedSeries（图例隐藏态与
+    /// CSS chart::series-N 颜色覆写在此一并应用）。
+    static ResolvedChart Resolve(ChartOption source, Theme theme, App app, int wid) {
+        ResolvedChart outp = new ResolvedChart();
+        outp.source = source;
+        outp.series = new List<ResolvedSeries>();
+        outp.wid = wid;
+        outp.animate = source.animate;
+        // connect() 联动：交互态（dataZoom 窗口 / 图例开关）统一
+        // 存取在组长 wid 上。组长登记在组键里（组内第一张图写入），
+        // 本图非组长时用组长 wid 读写这些状态，实现跨图同帧联动。
+        int stateWid = wid;
+        if (app != null && wid != 0 && source.connectGroup != 0) {
+            int gk = Chart.ConnectGroupKey(source.connectGroup);
+            int leader = app.StateGet(gk, 0);
+            if (leader == 0) {
+                app.StateSet(gk, wid);
+                app.StateSet(Chart.ConnectHoverKey(wid), 0 - 1);
+            } else if (leader != wid) {
+                stateWid = leader;
+            }
+        }
+        outp.stateWid = stateWid;
+        // dataZoom 窗口在解析期锁定一次，使指纹读取的窗口
+        // 与渲染器读取的一致。无 zoom（或 n < 2）时
+        // 是干净的全范围，不触发任何 App 状态读写。
+        outp.windowStart = 0;
+        outp.windowEnd = 0 - 1;
+        int n = source.XCategories().Count;
+        if (n < 1) { n = 1; }
+        if (source.zoom && app != null && stateWid != 0 && n > 1) {
+            outp.windowStart = Chart.ZoomI0(app, source, stateWid, n);
+            outp.windowEnd = Chart.ZoomI1(app, source, stateWid, n);
+            if (outp.windowEnd < outp.windowStart) { outp.windowEnd = outp.windowStart; }
+        } else {
+            outp.windowStart = 0;
+            outp.windowEnd = n - 1;
+        }
+        for (int i = 0; i < source.series.Count; i = i + 1) {
+            ChartSeries s = source.series[i];
+            bool hidden = s.hidden;
+            if (app != null && stateWid != 0) {
+                hidden = app.StateGet(Chart.LegendKey(stateWid, i), hidden ? 1 : 0) == 1;
+            }
+            ResolvedSeries rs = ResolvedSeries.Of(s, theme, i, wid, source.animate, hidden);
+            // CSS 通道：样式表可用 chart::series-1..8 的 background
+            // 覆写该系列的定性色。仅显式规则生效——规则不存在时
+            // BgOr 为 0，自动回退 token 调色板 / ECharts 默认色。
+            if (app != null) {
+                int cssCol = Style.Part(app, "chart",
+                                        "series-" + Convert.ToString(i + 1),
+                                        "", "", "", Style.SNormal()).BgOr(0);
+                if (cssCol != 0) { rs.OverrideColor(cssCol); }
+            }
+            outp.series.Add(rs);
+        }
+        return outp;
+    }
+
+    /// 按源系列引用查找解析快照；未命中返回 null。
+    ResolvedSeries For(ChartSeries source) {
+        for (int i = 0; i < this.series.Count; i = i + 1) {
+            if (this.series[i].source == source) { return this.series[i]; }
+        }
+        return null;
+    }
+
+    /// 把全部解析快照物化为 ChartSeries 副本（顺序同源 option）。
+    /// pie/funnel 之外的类型数据集合只读共享（阶段 B）。
+    List<ChartSeries> MaterializeSeries() {
+        List<ChartSeries> outp = new List<ChartSeries>();
+        for (int i = 0; i < this.series.Count; i = i + 1) {
+            outp.Add(this.series[i].Materialize(true));
+        }
+        return outp;
+    }
+
+    /// 创建渲染器使用的帧内 option。数据集合继续共享，可能被旧
+    /// 渲染器修改的 option/series 外壳则复制并与源模型隔离。
+    /// iwid 用 stateWid（connect 组的组长 wid）：渲染器所有交互
+    /// 键（dataZoom/图例/十字线）自动落到组共享的键上。
+    ChartOption DrawOption(int wid, bool animate) {
+        ChartOption o = ChartOption.Create();
+        ChartOption s = this.source;
+        o.title = s.title;
+        o.titleSub = s.titleSub; o.titleAlign = s.titleAlign;
+        o.titleColor = s.titleColor; o.titleSubColor = s.titleSubColor;
+        o.xAxes = new List<ChartAxis>();
+        for (int xi = 0; xi < s.xAxes.Count; xi = xi + 1) { o.xAxes.Add(ChartAxis.Clone(s.xAxes[xi])); }
+        o.datasets = new List<ChartJsonDataset>();
+        for (int dsi = 0; dsi < s.datasets.Count; dsi = dsi + 1) { o.datasets.Add(s.datasets[dsi]); }
+        o.visualMaps = new List<ChartVisualMap>();
+        for (int vmi = 0; vmi < s.visualMaps.Count; vmi = vmi + 1) {
+            o.visualMaps.Add(ChartVisualMap.Clone(s.visualMaps[vmi]));
+        }
+        o.titles = new List<ChartTitleSpec>();
+        for (int tmi = 0; tmi < s.titles.Count; tmi = tmi + 1) { o.titles.Add(s.titles[tmi]); }
+        o.grids = new List<ChartGridSpec>();
+        for (int gmi = 0; gmi < s.grids.Count; gmi = gmi + 1) { o.grids.Add(s.grids[gmi]); }
+        o.markAreas = new List<ChartMarkArea>();
+        for (int mai = 0; mai < s.markAreas.Count; mai = mai + 1) { o.markAreas.Add(s.markAreas[mai]); }
+        o.yAxes = new List<ChartAxis>();
+        for (int yi = 0; yi < s.yAxes.Count; yi = yi + 1) { o.yAxes.Add(ChartAxis.Clone(s.yAxes[yi])); }
+        o.series = this.MaterializeSeries(); o.defaultType = s.defaultType;
+        o.showLegend = s.showLegend; o.showTooltip = s.showTooltip;
+        o.tooltipTrigger = s.tooltipTrigger;
+        o.toolboxShow = s.toolboxShow;
+        o.toolboxDataView = s.toolboxDataView; o.toolboxMagicLine = s.toolboxMagicLine;
+        o.toolboxMagicBar = s.toolboxMagicBar; o.toolboxRestore = s.toolboxRestore;
+        o.toolboxSave = s.toolboxSave; o.toolboxZoom = s.toolboxZoom;
+        o.roam = s.roam; o.roamWheelMode = s.roamWheelMode; o.mapSelect = s.mapSelect;
+        o.showGrid = s.showGrid; o.showValues = s.showValues;
+        o.animate = animate; o.smooth = s.smooth; o.gradient = s.gradient;
+        o.rounded = s.rounded; o.animMs = s.animMs; o.donutPct = s.donutPct;
+        o.gaugeMax = s.gaugeMax; o.pieLabels = s.pieLabels; o.pieRings = s.pieRings;
+        o.radarMax = new List<int>();
+        for (int ri = 0; ri < s.radarMax.Count; ri = ri + 1) { o.radarMax.Add(s.radarMax[ri]); }
+        o.polars = new List<RadarPolar>();
+        for (int ri = 0; ri < s.polars.Count; ri = ri + 1) {
+            o.polars.Add(RadarPolar.Clone(s.polars[ri]));
+        }
+        // 极坐标轴（angleAxis/radiusAxis）：DrawPolarCoord 从
+        // drawOption 读——漏拷会让 startAngle/类目全部回落默认。
+        o.angleAxes = new List<PolarAxisSpec>();
+        for (int ri2 = 0; ri2 < s.angleAxes.Count; ri2 = ri2 + 1) {
+            o.angleAxes.Add(PolarAxisSpec.Clone(s.angleAxes[ri2]));
+        }
+        o.radiusAxes = new List<PolarAxisSpec>();
+        for (int ri3 = 0; ri3 < s.radiusAxes.Count; ri3 = ri3 + 1) {
+            o.radiusAxes.Add(PolarAxisSpec.Clone(s.radiusAxes[ri3]));
+        }
+        // geo 组件必须随 drawOption 一起过河：渲染期的分派
+        // （ChartView.Render 的 pointerKind、RenderOnce 的 kind）
+        // 读的都是 drawOption 而非 source，漏拷等于 geos.Count==0，
+        // `DispatchKind` 的 geo 组件级判定永不命中，geo 形态的
+        // 地图（geo-choropleth-scatter / geo-map-scatter）会按
+        // series[0] 的 scatter 分发，底图与全部投影点一起丢。
+        o.geos = new List<ChartGeo>();
+        for (int gci2 = 0; gci2 < s.geos.Count; gci2 = gci2 + 1) {
+            o.geos.Add(ChartGeo.Clone(s.geos[gci2]));
+        }
+        o.zoom = s.zoom; o.markLine = s.markLine;
+        o.markPoint = s.markPoint; o.markLabel = s.markLabel; o.markLo = s.markLo;
+        o.markHi = s.markHi; o.gridLeft = s.gridLeft; o.gridRight = s.gridRight;
+        o.gridTop = s.gridTop; o.gridBottom = s.gridBottom;
+        o.gridLeftPct = s.gridLeftPct; o.gridRightPct = s.gridRightPct;
+        o.gridTopPct = s.gridTopPct; o.gridBottomPct = s.gridBottomPct;
+        o.containLabel = s.containLabel;
+        o.zoomStart = s.zoomStart; o.zoomEnd = s.zoomEnd;
+        o.windowStart = this.windowStart; o.windowEnd = this.windowEnd;
+        o.backgroundColor = s.backgroundColor; o.iwid = this.stateWid;
+        o.connectGroup = s.connectGroup;
+        o.rampColors = new List<int>();
+        for (int ci = 0; ci < s.rampColors.Count; ci = ci + 1) { o.rampColors.Add(s.rampColors[ci]); }
+        o.rampLo = s.rampLo; o.rampHi = s.rampHi;
+        o.radarShape = s.radarShape; o.radarSplitArea = s.radarSplitArea;
+        o.legendOrient = s.legendOrient; o.legendSelectedMode = s.legendSelectedMode;
+        o.legendX = s.legendX;
+        o.legendLeft = s.legendLeft; o.legendRight = s.legendRight;
+        o.legendTop = s.legendTop; o.legendBottom = s.legendBottom;
+        o.legendHasLeft = s.legendHasLeft; o.legendHasRight = s.legendHasRight;
+        o.legendHasTop = s.legendHasTop; o.legendHasBottom = s.legendHasBottom;
+        o.legendLeftPx = s.legendLeftPx; o.legendRightPx = s.legendRightPx;
+        o.legendTopPx = s.legendTopPx; o.legendBottomPx = s.legendBottomPx;
+        o.legendBoxW = s.legendBoxW; o.legendBoxH = s.legendBoxH;
+        o.legendFormatter = s.legendFormatter;
+        o.dataRangeShow = s.dataRangeShow; o.dataRangeLo = s.dataRangeLo;
+        o.dataRangeHi = s.dataRangeHi; o.dataRangeCalculable = s.dataRangeCalculable;
+        o.dataRangeHoverLink = s.dataRangeHoverLink;
+        o.dataRangeSplit = s.dataRangeSplit;
+        o.dataRangeList = new List<ChartRangeSplit>();
+        for (int di = 0; di < s.dataRangeList.Count; di = di + 1) {
+            o.dataRangeList.Add(ChartRangeSplit.Clone(s.dataRangeList[di]));
+        }
+        return o;
+    }
+}

@@ -1,0 +1,365 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component;
+
+/// 属性表：把一组 PropSpec 画成可编辑的属性行，值直接读写 spec 绑定
+/// 的字段 / signal。行的标签、编辑器、滚动、裁剪都由控件自己完成，
+/// 宿主只提供 spec 列表：
+///
+///     grid.Bind("Field:" + sel.fname, this.FieldSpecs(sel));
+///     grid.RenderInside(app, new Rect(x, y, w, h));
+///
+/// 编辑器按 PropSpec.kind 选：0/4 文本 Input，1 整数 Input，2 Switch，
+/// 3 SelectBox，5 分组标题（PropSpec.Section，只有文字没有编辑器）。
+class PropertyGrid : Control {
+    /// 当前绑定的属性行（Bind 每帧灌入，不拷贝）。
+    List<PropSpec> data;
+    /// 每行一个编辑器（按行索引对齐，未用到的槽为 null）。
+    /// 编辑器由属性协议驱动（GetProp/SetProp/GetText/SetText），
+    /// 不再持有任何外部信号——动态宿主没有编译期字段可绑。
+    List<Input> texts;
+    /// 开关行的编辑器（按行索引对齐，非开关行为 null）。
+    List<Switch> flags;
+    /// 下拉行的编辑器（按行索引对齐，非下拉行为 null）。
+    List<SelectBox> picks;
+    /// 整数属性行的 -/+ 步进按钮稳定控件 id（按行索引对齐，
+    /// 非整数行也占位）。
+    List<int> minusIds;
+    List<int> plusIds;
+    /// 上一帧的值：用来判断这一帧是外部改了模型还是用户改了编辑器。
+    List<string> shadow;
+    /// 当前绑定对象的标识，变化时重建编辑器。
+    string key;
+    /// 纵向滚动偏移（像素）。
+    SignalInt scroll;
+    /// 没有属性时显示的文本（"" 不画）。
+    string Empty;
+    /// 某一行被用户改动后触发（读 ChangedKey 得知是哪一个）。
+    UiEvent Change;
+    /// 最近被用户改动的行号（-1 = 尚无改动；Rebuild 后复位）。
+    int hitRow;
+
+    /// 构造空属性表：未绑定任何行，空态文本为 ""（不画）。
+    PropertyGrid() {
+        this.InitControl("props", 5);
+        data = new List<PropSpec>();
+        texts = new List<Input>();
+        flags = new List<Switch>();
+        picks = new List<SelectBox>();
+        minusIds = new List<int>();
+        plusIds = new List<int>();
+        shadow = new List<string>();
+        key = "";
+        scroll = new SignalInt(0);
+        Empty = "";
+        hitRow = 0 - 1;
+        wiresOwnEvents = true;
+        Change = new UiEvent();
+    }
+
+    /// 控件类型标识（"PropertyGrid"）。
+    override string Kind() { return "PropertyGrid"; }
+
+    /// 订阅属性改动事件（回调里读 ChangedKey/ChangedRow）。
+    PropertyGrid OnChange(Action a) {
+        Change.Add(a);
+        return this;
+    }
+
+    /// 最近被用户改动的行号 / 属性键。
+    int ChangedRow() { return hitRow; }
+    /// 最近被用户改动的属性键（无效时为 ""）。
+    string ChangedKey() {
+        if (hitRow < 0 || hitRow >= data.Count) { return ""; }
+        return data[hitRow].key;
+    }
+
+    /// 绑定一组属性。`k` 标识当前对象（如 "Field:btn0"）：它变化时
+    /// 才重建编辑器，否则沿用现有的，输入焦点和光标不会每帧丢失。
+    void Bind(string k, List<PropSpec> specs) {
+        if (k == key && specs.Count == data.Count) {
+            data = specs;
+            return;
+        }
+        key = k;
+        data = specs;
+        this.Rebuild();
+    }
+
+    /// 强制丢弃现有编辑器并按当前 specs 重建（切对象后 Bind 会自动调）。
+    void Rebuild() {
+        texts = new List<Input>();
+        flags = new List<Switch>();
+        picks = new List<SelectBox>();
+        minusIds = new List<int>();
+        plusIds = new List<int>();
+        shadow = new List<string>();
+        for (int i = 0; i < data.Count; i = i + 1) {
+            PropSpec p = data[i];
+            string cur = p.Read();
+            shadow.Add(cur);
+            Input inp = null;
+            Switch sw = null;
+            SelectBox sb = null;
+            if (p.kind == 5) {
+                // 分组标题：没有编辑器。
+            } else if (p.kind == 2) {
+                // 动态宿主不走 Binding<T>（无编译期字段可指），
+                // 统一经控件的属性协议驱动（§6.1）。
+                sw = new Switch();
+                sw.SetProp("checked", PropSpec.Flag(PropSpec.IsOn(cur)));
+            } else if (p.kind == 3) {
+                sb = SelectBox.FromOptions(p.options, "");
+                sb.SetIndex(this.IndexOfValue(p, cur));
+            } else {
+                inp = new Input("");
+                inp.SetText(cur);
+            }
+            texts.Add(inp);
+            flags.Add(sw);
+            picks.Add(sb);
+            minusIds.Add(WidgetId.Next());
+            plusIds.Add(WidgetId.Next());
+        }
+        hitRow = 0 - 1;
+    }
+
+    /// 枚举值（可能存的是序号，也可能是选项文本）对应的选项下标。
+    int IndexOfValue(PropSpec p, string val) {
+        for (int i = 0; i < p.options.Count; i = i + 1) {
+            if (p.options[i] == val) { return i; }
+        }
+        if (PropertyGrid.IsNumber(val)) {
+            int n = Convert.ToInt32(val);
+            if (n >= 0 && n < p.options.Count) { return n; }
+        }
+        return 0;
+    }
+
+    /// 枚举行当前选择在模型里的字符串形式：绑定到 int 的存序号，
+    /// 绑定到字符串的存选项文本。
+    string PickValue(PropSpec p, int idx) {
+        if (p.num != null || p.snum != null) { return Convert.ToString(idx); }
+        if (idx >= 0 && idx < p.options.Count) { return p.options[idx]; }
+        return "";
+    }
+
+    /// 整数属性编辑器判可解析（允许前导 -）。
+    static bool IsNumber(string s) {
+        if (s == "") { return false; }
+        string digits = "0123456789";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            bool ok = i == 0 && ch == "-" && s.Length > 1;
+            for (int d = 0; d < digits.Length; d = d + 1) {
+                if (digits.Substring(d, 1) == ch) { ok = true; }
+            }
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+
+    /// 编辑器当前值的字符串形式（与 PropSpec.Read 同一种表示）。
+    string Editor(int i) {
+        PropSpec p = data[i];
+        if (p.kind == 2) { return PropSpec.Flag(PropSpec.IsOn(flags[i].GetProp("value"))); }
+        if (p.kind == 3) { return this.PickValue(p, picks[i].Value()); }
+        return texts[i].GetText();
+    }
+
+    /// 把模型值灌回编辑器（外部改了属性时）。
+    void Load(int i, string val) {
+        PropSpec p = data[i];
+        if (p.kind == 2) { flags[i].SetProp("checked", PropSpec.Flag(PropSpec.IsOn(val))); return; }
+        if (p.kind == 3) { picks[i].SetIndex(this.IndexOfValue(p, val)); return; }
+        texts[i].SetText(val);
+    }
+
+    /// 一行的双向同步：外部改动优先灌回编辑器，否则把编辑器的新值
+    /// 写进模型并广播 Change。整数行在输入合法前不写。
+    /// 提交时请求重绘：Change 经 Dispatcher 延迟到 UI 队列，若不保证
+    /// 下一帧，即时模式下循环会空转，处理器不排空、预览慢半拍。
+    void Sync(App app, int i) {
+        PropSpec p = data[i];
+        if (p.kind == 5 || !p.IsBound()) { return; }
+        string cur = p.Read();
+        if (cur != shadow[i]) {
+            this.Load(i, cur);
+            shadow[i] = cur;
+            return;
+        }
+        string ui = this.Editor(i);
+        if (ui == cur) { return; }
+        if (p.kind == 1 && !PropertyGrid.IsNumber(ui)) { return; }
+        p.Write(ui);
+        shadow[i] = p.Read();
+        hitRow = i;
+        Change.Post();
+        app.RequestRedraw();
+    }
+
+    /// 整数属性的 -/+ 步进：按 spec 配置的步长增减、钳制到范围，
+    /// 直接写回模型与编辑器，并立即请求重绘，预览同帧跟新。
+    void Step(App app, int i, int delta) {
+        PropSpec p = data[i];
+        if (!p.IsBound()) { return; }
+        int cur = 0;
+        string r = p.Read();
+        if (PropertyGrid.IsNumber(r)) { cur = Convert.ToInt32(r); }
+        int nv = p.Clamp(cur + delta);
+        string s = Convert.ToString(nv);
+        p.Write(s);
+        texts[i].SetText(s);
+        shadow[i] = p.Read();
+        hitRow = i;
+        Change.Post();
+        app.RequestRedraw();
+    }
+
+    /// 画一个步进小按钮（方形，中间一个字符字形），注册命中区，
+    /// 返回本帧是否被点击。
+    bool StepBtn(App app, int id, int x, int y, int sz, string glyph,
+                 StyleBox normalStyle, StyleBox hoverStyle) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        app.hitTester.RegisterRect(id, x, y, sz, sz, 0);
+        int hv = Ui.HoverLevelMsIn(app, id, 0, x, y, sz, sz);
+        int state = Style.SNormal();
+        if (hv != 0) { state = Style.SHover(); }
+        StyleBox step = normalStyle;
+        if (state == Style.SHover()) { step = hoverStyle; }
+        c.FillRoundRect(x, y, sz, sz, t.borderRadiusSmall, step.BgOr(0));
+        c.DrawRoundRect(x, y, sz, sz, t.borderRadiusSmall,
+                        step.BorderOr(0), 1);
+        int fs = Style.FontFallback(app, "small");
+        int gw = Canvas.MeasureText(glyph, fs);
+        c.DrawText(x + (sz - gw) / 2, Canvas.CenterTextY(y, sz, fs),
+            glyph, step.FgOr(0), fs);
+        return Ui.Clicked(app, id);
+    }
+
+    /// 单行高度（逻辑像素，绘制时按 DPI 缩放）。
+    int RowHeight(App app) { return app.Scale(38); }
+
+    /// 全部行的高度（宿主据此在自己的滚动区里给出槽位）。
+    int ContentHeight(App app) {
+        return data.Count * this.RowHeight(app);
+    }
+
+    /// 布局测量：首选高度 = 全部行高之和。
+    override void OnMeasure(App app) {
+        prefH = this.ContentHeight(app);
+    }
+
+    /// 绘制：处理滚轮并钳制滚动偏移，逐行画标签与编辑器
+    /// （整数行带 -/+ 步进按钮），每行做一次双向同步；
+    /// 悬停行有说明时请求气泡提示，内容溢出时画纵向滚动条。
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = Style.FontFallback(app, "small");
+        StyleBox emptyStyle = Style.Part(app, "propertygrid", "empty", "",
+                                         "", "", Style.SNormal());
+        StyleBox sectionStyle = Style.Part(app, "propertygrid", "section", "",
+                                           "", "", Style.SNormal());
+        StyleBox labelStyle = Style.Part(app, "propertygrid", "label", "",
+                                         "", "", Style.SNormal());
+        StyleBox valueStyle = Style.Part(app, "propertygrid", "value", "",
+                                         "", "", Style.SNormal());
+        StyleBox stepStyle = Style.Part(app, "propertygrid", "step", "",
+                                        "", "", Style.SNormal());
+        StyleBox stepHoverStyle = Style.Part(app, "propertygrid", "step", "",
+                                             "", "", Style.SHover());
+        if (data.Count == 0) {
+            if (Empty != "") {
+                c.DrawText(bx, by + t.paddingSmall, Ellipsis.Fit(Empty, bw, fs),
+                    emptyStyle.FgOr(0), fs);
+            }
+            return;
+        }
+        int rowH = this.RowHeight(app);
+        int contentH = this.ContentHeight(app);
+        Scrollbar.HandleWheel(app, bx, by, bw, bh, contentH, scroll);
+        int maxOff = contentH - bh;
+        if (maxOff < 0) { maxOff = 0; }
+        if (scroll.Get() > maxOff) { scroll.Set(maxOff); }
+        if (scroll.Get() < 0) { scroll.Set(0); }
+        bool overflow = contentH > bh;
+        int barW = app.Scale(6);
+        int rowW = bw;
+        if (overflow) { rowW = bw - barW; }
+        int labelW = app.Scale(92);
+        if (labelW > rowW * 2 / 5) { labelW = rowW * 2 / 5; }
+        int y = by - scroll.Get();
+
+        c.PushClip(bx, by, bw, bh);
+        for (int i = 0; i < data.Count; i = i + 1) {
+            bool onscreen = y + rowH > by && y < by + bh;
+            if (onscreen) {
+                PropSpec p = data[i];
+                if (p.kind == 5) {
+                    c.DrawText(bx, Canvas.CenterTextY(y, rowH, fs),
+                        Ellipsis.Fit(p.label, rowW, fs), sectionStyle.FgOr(0), fs);
+                } else {
+                    c.DrawText(bx, Canvas.CenterTextY(y, rowH, fs),
+                        Ellipsis.Fit(p.label, labelW - t.gapSmall, fs),
+                        valueStyle.FgOr(0), fs);
+                    int ex = bx + labelW;
+                    int ew = rowW - labelW;
+                    int eh = app.Scale(24);
+                    int ey = y + (rowH - eh) / 2;
+                    if (p.kind == 2) {
+                        flags[i].Render(app, ex, ey);
+                    } else if (p.kind == 3) {
+                        picks[i].Render(app, ex, ey, ew);
+                    } else if (p.kind == 1) {
+                        // 整数行：[-] [可点击键入的输入框] [+]。
+                        int gap = app.Scale(4);
+                        int inW = ew - (eh + gap) * 2;
+                        if (inW < app.Scale(24)) { inW = app.Scale(24); }
+                        if (this.StepBtn(app, minusIds[i], ex, ey, eh, "-",
+                                stepStyle, stepHoverStyle)) {
+                            this.Step(app, i, 0 - p.step);
+                        }
+                        texts[i].Render(app, ex + eh + gap, ey, inW, eh);
+                        if (this.StepBtn(app, plusIds[i], ex + eh + gap + inW + gap,
+                                ey, eh, "+", stepStyle, stepHoverStyle)) {
+                            this.Step(app, i, p.step);
+                        }
+                    } else {
+                        texts[i].Render(app, ex, ey, ew, eh);
+                    }
+                    this.Sync(app, i);
+                    // 悬停该行且有说明时请求气泡提示（帧末由宿主 Flush）。
+                    if (p.tip != "" && Ui.Over(app, bx, y, rowW, rowH)
+                            && app.mouseY >= by && app.mouseY < by + bh) {
+                        Tooltip.RequestBox(app, bx, y, rowW, rowH, p.tip,
+                            Tooltip.Left(), app.Scale(240));
+                    }
+                }
+            }
+            y = y + rowH;
+        }
+        c.PopClip();
+
+        if (overflow) {
+            Scrollbar.RenderVerticalScrollIn(app, bx + bw - barW, by, bh, bh,
+                contentH, scroll, bx, by, bw, bh);
+        }
+    }
+
+    /// 控件事件清单：公共事件之外提供 "Change"。
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        return e;
+    }
+
+    /// 绑定事件："Change" 接 UiEvent，其余按名称走通用路由。
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+}

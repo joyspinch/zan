@@ -1,0 +1,262 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+/// 清除条件格式规则弹窗：表里可能同时存在多种规则（数据条/
+/// 色阶/高亮/前后规则，分布在多列），右键菜单的"清除规则"直项
+/// 只能整列一刀切。弹窗把当前生效的规则逐条列出（菜单槽位优先，
+/// 其次列工厂预设），勾选后单删或多删；勾选清除的列写入
+/// menuCfOff 压制工厂预设——否则每帧重建的列会把预设带回来。
+partial class DataTable {
+
+    /// 列的生效条件格式模式：显式清除 > 菜单槽位 > 列工厂预设。
+    static int CfEffectiveMode(DataTableState st, DataColumn dc, int col) {
+        if (col >= 0 && col < st.menuCfOff.Count && st.menuCfOff[col]) { return 0; }
+        if (col >= 0 && col < st.menuCfMode.Count && st.menuCfMode[col] != 0) {
+            return st.menuCfMode[col];
+        }
+        return dc.cfMode;
+    }
+
+    /// 列的生效规则的可读名（数据条 / 色阶 / 大于均值 / …）。
+    static string CfRuleLabel(DataTableState st, DataColumn dc, int col) {
+        int mode = DataTable.CfEffectiveMode(st, dc, col);
+        bool slot = col >= 0 && col < st.menuCfMode.Count && st.menuCfMode[col] != 0;
+        bool pct = slot ? st.menuCfRankPct[col] : dc.cfRankPct;
+        if (mode == 1) { return DataTable.T("Data bar", "数据条"); }
+        if (mode == 2) { return DataTable.T("Color scale", "色阶"); }
+        if (mode == 3) { return DataTable.T("Greater than average", "大于均值"); }
+        if (mode == 4) { return DataTable.T("Less than average", "小于均值"); }
+        if (mode == 5) {
+            return pct ? DataTable.T("Top 10 %", "前 10 %")
+                       : DataTable.T("Top 10 items", "前 10 项");
+        }
+        if (mode == 6) {
+            return pct ? DataTable.T("Bottom 10 %", "后 10 %")
+                       : DataTable.T("Bottom 10 items", "后 10 项");
+        }
+        return "";
+    }
+
+    /// 列的生效规则主色（色板 chip 用；槽位优先）。
+    static int CfRuleColor(DataTableState st, DataColumn dc, int col) {
+        if (col >= 0 && col < st.menuCfMode.Count && st.menuCfMode[col] != 0) {
+            return st.menuCfColor[col];
+        }
+        return dc.cfColor;
+    }
+
+    /// 打开弹窗：枚举全表生效规则，默认全选。没有规则时提示
+    /// 并且不打开。
+    static void OpenCfClear(DataTableState st, List<DataColumn> cols) {
+        st.cfClearCols = new List<int>();
+        st.cfClearSel = new List<bool>();
+        st.cfClearScroll = 0;
+        for (int c = 0; c < cols.Count; c = c + 1) {
+            if (DataTable.CfEffectiveMode(st, cols[c], c) != 0) {
+                st.cfClearCols.Add(c);
+                st.cfClearSel.Add(true);
+            }
+        }
+        if (st.cfClearCols.Count == 0) {
+            DataTable.Flash(st, DataTable.T("No conditional formatting rules",
+                                            "没有条件格式规则"));
+            return;
+        }
+        st.cfClearOpen = true;
+    }
+
+    /// 应用清除：`all` 时忽略勾选整表清（全部清除按钮），否则
+    /// 只清勾选列。被清列写入 menuCfOff（压制工厂预设）并清掉
+    /// 菜单槽；名次缓存随 st.dirty 由下一帧 Recompute 重建。
+    static void ApplyCfClear(DataTableState st, bool all) {
+        int n = 0;
+        for (int i = 0; i < st.cfClearCols.Count; i = i + 1) {
+            if (!all && !st.cfClearSel[i]) { continue; }
+            int col = st.cfClearCols[i];
+            while (st.menuCfOff.Count <= col) { st.menuCfOff.Add(false); }
+            while (st.menuCfMode.Count <= col) {
+                st.menuCfMode.Add(0);
+                st.menuCfColor.Add(0);
+                st.menuCfColor2.Add(0);
+                st.menuCfThreshold.Add(0);
+                st.menuCfRankPct.Add(false);
+            }
+            st.menuCfOff[col] = true;
+            st.menuCfMode[col] = 0;
+            st.menuCfRankPct[col] = false;
+            n = n + 1;
+        }
+        st.cfClearOpen = false;
+        if (n > 0) {
+            st.dirty = true;
+            DataTable.Flash(st, DataTable.TN("Cleared rules on {n} columns",
+                                             n, "已清除 {n} 列的规则"));
+        }
+    }
+
+    /// 弹窗绘制：居中模态（遮罩 + 面板），规则行 = 勾选框 +
+    /// 色板 chip + "列名 — 规则名"。行数多时面板长到窗口限度
+    /// 后列表区出滚动条（弹窗本身不做窄条——能一屏放下就放下）。
+    static void RenderCfClear(App app, int x, int y, int viewW, int viewH,
+                              List<DataColumn> cols, DataTableState st) {
+        if (!st.cfClearOpen) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox sMenu = Style.Part(app, "datatable", "menu", "", "", "",
+                                    Style.SNormal());
+        StyleBox sHint = Style.Part(app, "datatable", "hint", "", "", "",
+                                    Style.SNormal());
+        int fMed = Style.FontFallback(app, "medium");
+        int fSmall = Style.FontFallback(app, "small");
+
+        int pad = app.Scale(16);
+        int rowH = t.heightMedium;
+        int btnH = t.heightSmall;
+        int titleH = t.heightMedium;
+        int listH = st.cfClearCols.Count * rowH;
+        int needH = pad + titleH + app.Scale(10) + listH + app.Scale(10)
+                    + btnH + pad;
+        int margin = app.Scale(8);
+        int maxH = viewH - margin * 2;
+        int ph = needH;
+        bool clips = false;
+        if (ph > maxH) { ph = maxH; clips = true; }
+        int pw = app.Scale(440);
+        if (pw > viewW - margin * 2) { pw = viewW - margin * 2; }
+        int px = x + (viewW - pw) / 2;
+        int py = y + (viewH - ph) / 2;
+
+        // 遮罩 + 模态面板
+        c.FillRect(x, y, viewW, viewH, t.overlay);
+        app.CaptureWheel(px, py, pw, ph);
+        app.BlockHitsRect(px, py, pw, ph);
+        c.FillRoundRect(px, py, pw, ph, t.borderRadiusMedium, sMenu.BgOr(0));
+        c.DrawRoundRect(px, py, pw, ph, t.borderRadiusMedium,
+                        sMenu.BorderOr(0), 1);
+
+        int tx = px + pad;
+        c.DrawText(tx, py + pad,
+                   DataTable.T("Clear formatting rules", "清除条件格式规则"),
+                   sMenu.FgOr(0), fMed);
+
+        // 规则列表（可滚动区）
+        int listTop = py + pad + titleH + app.Scale(10);
+        int listBot = py + ph - pad - btnH - app.Scale(10);
+        int listView = listBot - listTop;
+        if (listView < rowH) { listView = rowH; }
+        int maxScroll = clips ? listH - listView : 0;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (maxScroll > 0 && app.EventKind() == 13) {
+            int wdelta = app.window.EventKeyCode();
+            int cur = st.cfClearScroll - wdelta * app.scrollSpeed / 120;
+            if (cur < 0) { cur = 0; }
+            if (cur > maxScroll) { cur = maxScroll; }
+            st.cfClearScroll = cur;
+            app.RequestRedraw();
+        }
+        int scrollY = st.cfClearScroll;
+        if (scrollY > maxScroll) { scrollY = maxScroll; st.cfClearScroll = scrollY; }
+        c.PushClip(px + app.Scale(4), listTop, pw - app.Scale(8), listView);
+        int first = scrollY / rowH;
+        int idx = first;
+        while (idx < st.cfClearCols.Count
+               && listTop + idx * rowH - scrollY < listBot) {
+            int col = st.cfClearCols[idx];
+            int ry = listTop + idx * rowH - scrollY;
+            int box = app.Scale(15);
+            int bx = tx;
+            int by = ry + (rowH - box) / 2;
+            bool on = idx < st.cfClearSel.Count && st.cfClearSel[idx];
+            Checkbox.PaintBox(app, bx, by, box, on ? 1000 : 0);
+            int cbId = app.focus.AllocId();
+            app.hitTester.RegisterRect(cbId, bx - app.Scale(4), ry,
+                                       rowH, rowH, 0);
+            if (app.EventKind() == 3 && app.window.EventButton() == 0
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == cbId) {
+                st.cfClearSel[idx] = !on;
+                app.RequestRedraw();
+            }
+            // 行内任意点击同样切换（大目标，弹窗不挤）
+            int rowId = app.focus.AllocId();
+            app.hitTester.RegisterRect(rowId, tx + rowH, ry,
+                                       pw - pad * 2 - rowH, rowH, 0);
+            if (app.EventKind() == 3 && app.window.EventButton() == 0
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == rowId) {
+                st.cfClearSel[idx] = !on;
+                app.RequestRedraw();
+            }
+            int chipX = tx + rowH + app.Scale(4);
+            int chip = app.Scale(14);
+            c.FillRoundRect(chipX, ry + (rowH - chip) / 2, chip, chip,
+                            app.Scale(3), DataTable.CfRuleColor(st, cols[col], col));
+            string lbl = cols[col].title + " — "
+                         + DataTable.CfRuleLabel(st, cols[col], col);
+            c.DrawText(chipX + chip + app.Scale(8),
+                       ry + (rowH - fSmall) / 2, lbl, sMenu.FgOr(0), fSmall);
+            idx = idx + 1;
+        }
+        c.PopClip();
+        if (maxScroll > 0) {
+            // 细滚动条：可视比例的滑块
+            int trackX = px + pw - app.Scale(8);
+            int thumbH = listView * listView / listH;
+            if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
+            int thumbY = listTop + (listView - thumbH) * scrollY / maxScroll;
+            c.FillRoundRect(trackX, thumbY, app.Scale(4), thumbH, app.Scale(2),
+                            sHint.BgOr(0));
+        }
+
+        // 按钮行：清除所选（primary）/ 全部清除 / 关闭（右对齐）
+        int byc = py + ph - pad - btnH;
+        string l1 = DataTable.T("Clear selected", "清除所选");
+        string l2 = DataTable.T("Clear all", "全部清除");
+        string l3 = DataTable.T("Close", "关闭");
+        int w1 = Canvas.MeasureText(l1, fSmall) + app.Scale(24);
+        int w2 = Canvas.MeasureText(l2, fSmall) + app.Scale(24);
+        int w3 = Canvas.MeasureText(l3, fSmall) + app.Scale(24);
+        int b1x = px + pw - pad - w1;
+        int b2x = b1x - app.Scale(8) - w2;
+        int b3x = b2x - app.Scale(8) - w3;
+        DataTable.CfClearBtn(app, c, t, b1x, byc, w1, btnH, l1, "small primary");
+        DataTable.CfClearBtn(app, c, t, b2x, byc, w2, btnH, l2, "small");
+        DataTable.CfClearBtn(app, c, t, b3x, byc, w3, btnH, l3, "small text");
+        if (app.EventKind() == 3 && app.window.EventButton() == 0) {
+            if (app.mouseX >= b1x && app.mouseX < b1x + w1
+                && app.mouseY >= byc && app.mouseY < byc + btnH) {
+                DataTable.ApplyCfClear(st, false);
+            } else if (app.mouseX >= b2x && app.mouseX < b2x + w2
+                && app.mouseY >= byc && app.mouseY < byc + btnH) {
+                DataTable.ApplyCfClear(st, true);
+            } else if (app.mouseX >= b3x && app.mouseX < b3x + w3
+                && app.mouseY >= byc && app.mouseY < byc + btnH) {
+                st.cfClearOpen = false;
+            }
+            app.RequestRedraw();
+        }
+        if (app.EventKind() == 4 && app.window.EventKeyCode() == 27) {
+            st.cfClearOpen = false;
+            app.RequestRedraw();
+        }
+    }
+
+    /// 弹窗按钮绘制（点击判定在调用方内联——Zan 委托不能捕获
+    /// 局部，回调走不了闭包）。
+    static void CfClearBtn(App app, Canvas c, Theme t, int bx, int by,
+                           int bw, int bh, string label, string cls) {
+        int fSmall = Style.FontFallback(app, "small");
+        bool hot = app.mouseX >= bx && app.mouseX < bx + bw
+                   && app.mouseY >= by && app.mouseY < by + bh;
+        StyleBox bs = Style.Part(app, "datatable", "button", "", cls,
+                                 "", Style.SNormal());
+        if (hot) {
+            bs = Style.Part(app, "datatable", "button", "", cls,
+                            "", Style.SHover());
+        }
+        c.FillRoundRect(bx, by, bw, bh, bs.RadiusOr(t.borderRadiusSmall),
+                        bs.BgOr(0));
+        c.DrawTextCentered(bx, by, bw, bh, label, bs.FgOr(0), fSmall);
+    }
+}

@@ -1,0 +1,210 @@
+using System;
+
+namespace System.Net;
+
+/// <summary>
+/// 单个网络适配器及其单播地址。Windows 上由
+/// GetAdaptersAddresses 支撑（直接解析原生 x64 ABI 布局）；
+/// Linux/macOS 上由 getifaddrs 支撑（运行时 zan_plat_net_interfaces）。
+/// </summary>
+class NetworkInterface {
+    /// <summary>适配器名（Windows 为 FriendlyName）。</summary>
+    public string name;
+    /// <summary>适配器描述；POSIX 上与 name 相同（运行时只报一列）。</summary>
+    public string description;
+    /// <summary>接口索引。</summary>
+    public int index;
+    /// <summary>接口是否处于 up（OperStatus 1）。</summary>
+    public bool up;
+    /// <summary>MAC 地址（冒号分隔十六进制；无则为空）。</summary>
+    public string macAddress;
+    /// <summary>单播地址列表（IPv4 点分十进制 / IPv6 十六进制组）。</summary>
+    public List<string> ipAddresses;
+
+    /// <summary>主动释放适配器持有的字符串和地址条目。</summary>
+    public void Dispose() {
+        name = null;
+        description = null;
+        macAddress = null;
+        if (ipAddresses != null) { ipAddresses.Clear(); }
+        ipAddresses = null;
+    }
+
+    /// <summary>返回本机已知的所有适配器。</summary>
+    static List<NetworkInterface> GetAllNetworkInterfaces() {
+        #if WINDOWS
+        return NetworkInterface.ReadWindows();
+        #else
+        return NetworkInterface.ReadPosix();
+        #endif
+    }
+
+    #if !WINDOWS
+    /// <summary>运行时接口枚举，每行一个适配器：
+    /// name \t index \t up \t mac \t addr[,addr...]。</summary>
+    [DllImport("crt", EntryPoint = "zan_plat_net_interfaces")]
+    static extern string NativeInterfaces();
+
+    /// <summary>解析 getifaddrs 文本输出为适配器列表；
+    /// 列数不足或空行跳过，地址为空时 ipAddresses 为空列表。</summary>
+    static List<NetworkInterface> ReadPosix() {
+        List<NetworkInterface> result = new List<NetworkInterface>();
+        string text = NetworkInterface.NativeInterfaces();
+        if (text == null || text == "") { return result; }
+        List<string> lines = text.Split("\n");
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i];
+            if (line == "") { continue; }
+            List<string> cols = line.Split("\t");
+            if (cols.Count < 5) { continue; }
+            NetworkInterface item = new NetworkInterface();
+            item.name = cols[0];
+            item.description = cols[0];
+            item.index = Convert.ToInt32(cols[1]);
+            item.up = cols[2] == "1";
+            item.macAddress = cols[3];
+            item.ipAddresses = new List<string>();
+            if (cols[4] != "") {
+                List<string> addrs = cols[4].Split(",");
+                for (int j = 0; j < addrs.Count; j = j + 1) {
+                    if (addrs[j] != "") { item.ipAddresses.Add(addrs[j]); }
+                }
+            }
+            result.Add(item);
+        }
+        return result;
+    }
+    #endif
+
+    #if WINDOWS
+    [DllImport("iphlpapi", EntryPoint = "GetAdaptersAddresses")]
+    static extern int GetAdaptersAddresses(int family, int flags, nint reserved,
+                                           nint addresses, nint size);
+
+    /// <summary>GetAdaptersAddresses 直读：缓冲不足（rc 111）按返回的
+    /// 实际大小重试最多 4 次；非 0 结局返回已收集的空表。</summary>
+    static List<NetworkInterface> ReadWindows() {
+        List<NetworkInterface> result = new List<NetworkInterface>();
+        nint sizeOut = NativeMemory.Alloc(4);
+        int capacity = 15 * 1024;
+        int rc = 111; // ERROR_BUFFER_OVERFLOW
+        nint buffer = 0;
+        for (int attempts = 0; rc == 111 && attempts < 4; attempts = attempts + 1) {
+            if (buffer != 0) { NativeMemory.Free(buffer); }
+            buffer = NativeMemory.Alloc(capacity);
+            new Span<int>(sizeOut, 1)[0] = capacity;
+            rc = NetworkInterface.GetAdaptersAddresses(0 /*AF_UNSPEC*/, 0, 0,
+                                                        buffer, sizeOut);
+            if (rc == 111) {
+                capacity = new Span<int>(sizeOut, 1)[0];
+                if (capacity < 15 * 1024) { capacity = 15 * 1024; }
+            }
+        }
+        NativeMemory.Free(sizeOut);
+        if (rc != 0) {
+            NativeMemory.Free(buffer);
+            return result;
+        }
+
+        nint adapter = buffer;
+        while (adapter != 0) {
+            // IP_ADAPTER_ADDRESSES_LH 的 x64 布局：Length/IfIndex @ 0/4、
+            // Next @ 8、FirstUnicastAddress @ 24、Description/FriendlyName
+            // @ 64/72、PhysicalAddress @ 80、长度 @ 88、OperStatus @ 104。
+            NetworkInterface item = new NetworkInterface();
+            item.index = new Span<int>(adapter + 4, 1)[0];
+            item.description = Wide.Read(new Span<nint>(adapter + 64, 1)[0]);
+            item.name = Wide.Read(new Span<nint>(adapter + 72, 1)[0]);
+            item.up = new Span<int>(adapter + 104, 1)[0] == 1;
+            item.macAddress = NetworkInterface.ReadMac(adapter + 80,
+                new Span<int>(adapter + 88, 1)[0]);
+            item.ipAddresses = new List<string>();
+
+            nint unicast = new Span<nint>(adapter + 24, 1)[0];
+            while (unicast != 0) {
+                // IP_ADAPTER_UNICAST_ADDRESS_LH 的 x64 布局：Next @ 8，内嵌
+                // SOCKET_ADDRESS @ 16（先是 sockaddr 指针，后跟 int 长度）。
+                nint sockaddr = new Span<nint>(unicast + 16, 1)[0];
+                int sockaddrLen = new Span<int>(unicast + 24, 1)[0];
+                string address = NetworkInterface.ReadAddress(sockaddr, sockaddrLen);
+                if (address != "") { item.ipAddresses.Add(address); }
+                unicast = new Span<nint>(unicast + 8, 1)[0];
+            }
+            result.Add(item);
+            adapter = new Span<nint>(adapter + 8, 1)[0];
+        }
+        NativeMemory.Free(buffer);
+        return result;
+    }
+
+    /// <summary>物理地址字节序列格式化为冒号分隔的大写十六进制
+    /// （最多 8 字节）。</summary>
+    static string ReadMac(nint bytes, int length) {
+        if (length <= 0) { return ""; }
+        if (length > 8) { length = 8; }
+        string text = "";
+        for (int i = 0; i < length; i = i + 1) {
+            if (i > 0) { text = text + ":"; }
+            text = text + NetworkInterface.HexByte(
+                (int)new Span<byte>(bytes + i, 1)[0]);
+        }
+        return text;
+    }
+
+    /// <summary>sockaddr 格式化为地址文本：AF_INET（2）为点分 IPv4，
+    /// AF_INET6（23）为 8 组冒号分隔十六进制；其余家族返回空串。</summary>
+    static string ReadAddress(nint sockaddr, int length) {
+        if (sockaddr == 0 || length < 2) { return ""; }
+        int family = (int)new Span<ushort>(sockaddr, 1)[0];
+        if (family == 2 && length >= 8) { // sockaddr_in
+            Span<byte> b = new Span<byte>(sockaddr + 4, 4);
+            return Convert.ToString((int)b[0]) + "." + Convert.ToString((int)b[1])
+                + "." + Convert.ToString((int)b[2]) + "." + Convert.ToString((int)b[3]);
+        }
+        if (family == 23 && length >= 24) { // sockaddr_in6
+            string text = "";
+            for (int i = 0; i < 8; i = i + 1) {
+                if (i > 0) { text = text + ":"; }
+                int word = ((int)new Span<byte>(sockaddr + 8 + i * 2, 1)[0] << 8)
+                    | (int)new Span<byte>(sockaddr + 9 + i * 2, 1)[0];
+                text = text + NetworkInterface.HexWord(word);
+            }
+            return text;
+        }
+        return "";
+    }
+
+    /// <summary>字节为两位大写十六进制。</summary>
+    static string HexByte(int number) {
+        return NetworkInterface.HexDigit((number >> 4) & 15)
+            + NetworkInterface.HexDigit(number & 15);
+    }
+
+    /// <summary>16 位值为去前导零的大写十六进制（全零输出 "0"）。</summary>
+    static string HexWord(int number) {
+        string text = "";
+        bool started = false;
+        int shift = 12;
+        while (shift >= 0) {
+            int digit = (number >> shift) & 15;
+            if (digit != 0 || started || shift == 0) {
+                text = text + NetworkInterface.HexDigit(digit);
+                started = true;
+            }
+            shift = shift - 4;
+        }
+        return text;
+    }
+
+    /// <summary>0-15 为单个大写十六进制字符。</summary>
+    static string HexDigit(int number) {
+        if (number < 10) { return Convert.ToString(number); }
+        if (number == 10) { return "A"; }
+        if (number == 11) { return "B"; }
+        if (number == 12) { return "C"; }
+        if (number == 13) { return "D"; }
+        if (number == 14) { return "E"; }
+        return "F";
+    }
+    #endif
+}

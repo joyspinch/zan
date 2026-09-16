@@ -1,0 +1,152 @@
+using System;
+using System.Data;
+using System.Threading;
+
+namespace System.Data.TDengine;
+
+/// <summary>
+/// 为 <see cref="TDengineConnection"/> 设计的协程感知连接池。
+///
+/// 契约与 <see cref="DbPool"/> 相同——惰性增长到 <c>maxSize</c>，
+/// 等待由 <see cref="Gate"/> 驱动而非轮询，逐出失效连接——
+/// 但它是类型化的，协程查询 API（<c>QueryAsync</c>、
+/// <c>ExecuteAsync</c>）仍可用。打开连接和每条语句都运行在
+/// IO reactor 上，因此限制并发的是池的大小，
+/// 而不是 worker 线程数。
+///
+/// 用法：
+///   TDenginePool pool = new TDenginePool("127.0.0.1", 6041, "root", "taosdata", "", "power", 8);
+///   TDengineConnection db = await pool.AcquireAsync();
+///   DbResult r = await db.QueryAsync("SELECT * FROM meters LIMIT 10");
+///   pool.Release(db);
+///   pool.Close();
+/// </summary>
+class TDenginePool {
+    string host;
+    int port;
+    string user;
+    string password;
+    string token;       // "" 表示使用用户名/密码
+    string database;
+    PoolCore<TDengineConnection> core;
+
+    TDenginePool(string host, int port, string user, string password,
+            string token, string database, int maxSize) {
+        this.host = host;
+        this.port = port;
+        this.user = user;
+        this.password = password;
+        this.token = token;
+        this.database = database;
+        this.core = new PoolCore<TDengineConnection>(maxSize);
+    }
+
+    /// <summary>令牌登录形式的构造，委托给完整构造（无用户名/密码）。</summary>
+    TDenginePool(string host, int port, string token,
+            string database, int maxSize) : this(host, port, "", "", token,
+                    database, maxSize) {
+    }
+
+    /// <summary>新建一个连接：有 token 走令牌登录，否则用户名/密码。</summary>
+    async TDengineConnection OpenOne() {
+        if (this.token != "") {
+            return await TDengineConnection.OpenTokenAsync(this.host, this.port,
+                                                           this.token, this.database);
+        }
+        return await TDengineConnection.OpenAsync(this.host, this.port, this.user,
+                                                  this.password, this.database);
+    }
+
+    /// <summary>借出一个连接：复用空闲连接，未达上限则新建，
+    /// 否则挂起协程，直到有连接被归还。饱和等待有硬上限
+    /// （见 <see cref="PoolWait"/>）：超时返回 null，绝不定死。
+    /// 池已关闭后返回 null。</summary>
+    async TDengineConnection AcquireAsync() {
+        PoolWait wait = new PoolWait();
+        while (true) {
+            if (this.core.IsClosed()) {
+                return null;
+            }
+            TDengineConnection pooled = this.core.TakeIdle();
+            while (pooled != null) {
+                // 连接在停放期间可能失效（服务器重启、空闲超时），
+                // 将其逐出，把位置让给等待者。
+                if (pooled.IsConnected()) {
+                    return pooled;
+                }
+                this.core.Drop(pooled);
+                pooled = this.core.TakeIdle();
+            }
+            // 上一次建连失败后退避：后端不可达时，若每次获取都重试建连，
+            // 失败本身就成了每请求的固定开销（失败的本地 open 也要约
+            // 125us），足以让命中路由的吞吐掉一个数量级。
+            if (this.core.OpenBlocked()) {
+                return null;
+            }
+            if (this.core.TryReserve()) {
+                TDengineConnection opened = await this.OpenOne();
+                if (opened == null || !opened.IsConnected()) {
+                    this.core.NoteOpenFailed();
+                    this.core.UndoReserve();
+                    return null;
+                }
+                this.core.NoteOpenOk();
+                this.core.Borrow(opened);
+                return opened;
+            }
+            // 连接池已满：交给共享的有界等待（见 PoolWait），
+            // 预算耗尽以 null 快速失败。
+            if (!await this.core.WaitForRelease(wait)) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>将连接归还给池。已损坏或 Close() 之后的
+    /// 连接会被直接关闭丢弃，不再入池。</summary>
+    void Release(TDengineConnection c) {
+        if (c == null) {
+            return;
+        }
+        if (this.core.IsClosed() || !c.IsConnected()) {
+            c.Close();
+            this.core.Drop(c);
+            return;
+        }
+        this.core.Pool(c);
+    }
+
+    /// <summary>空闲（已入池、可用）连接数。</summary>
+    int IdleCount() {
+        return this.core.IdleCount();
+    }
+
+    /// <summary>存活连接总数（空闲 + 已借出）。</summary>
+    int LiveCount() {
+        return this.core.LiveCount();
+    }
+
+    /// <summary>当前挂起等待连接的协程数。</summary>
+    int WaitingCount() {
+        return this.core.WaitingCount();
+    }
+
+    /// <summary>并发存活连接数的上限。</summary>
+    int MaxSize() {
+        return this.core.MaxSize();
+    }
+
+    /// <summary>关闭所有空闲连接并将池标记为已关闭。
+    /// 仍借出的连接会在归还时被关闭。</summary>
+    void Close() {
+        this.core.MarkClosed();
+        TDengineConnection c = this.core.TakeIdle();
+        while (c != null) {
+            c.Close();
+            this.core.Drop(c);
+            c = this.core.TakeIdle();
+        }
+        this.core.WakeAll();
+    }
+}

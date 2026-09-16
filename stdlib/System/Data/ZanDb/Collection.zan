@@ -1,0 +1,872 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+/// <summary>
+/// <see cref="ZanDatabase"/> 中一组有名字的文档。文档是
+/// JsonValue 对象树，每篇文档分配一个自增整数 _id。
+/// 存储键在共享 B+Tree 中以命名空间区分：
+///   c:{name}:{id}                   文档正文（key-dict 编码的 JSON）
+///   m:{name}:keys                   字段名字典（JSON 数组）
+///   m:{name}:seq                    最后分配的 id
+///   m:{name}:idx                    逗号分隔的索引字段列表
+///   m:{name}:idxpos:{field}         批量索引构建游标（缺失表示已构建完成）
+///   i:{name}:{field}:{value}\t{id}  二级索引条目 -> id
+/// id 用零填充，因此 B+Tree 顺序即插入顺序，使 FindAll
+/// 和范围迭代变成顺序的页读取。
+/// </summary>
+class Collection {
+    KvStore kv;
+    AsyncRwLock rw;
+    string name;
+    List<string> indexedFields;
+    List<string> keyDict;
+    bool keyDictDirty;
+    long metaVersion;
+
+    /// <summary>批量索引构建中每个事务索引的文档数。</summary>
+    static int INDEX_BATCH = 500;
+
+    // 记录会转义以剔除 0x00（参见 EncodeDoc）；转义
+    // 字节为 0xFF，几乎从不出现，因此读取路径用 memchr——
+    // C 中的一次向量化扫描——判断是否确实需要反转义，而不是
+    // 将每条记录逐字节复制到第二个缓冲区。
+    [DllImport("crt", EntryPoint = "memchr")]
+    static extern nint MemChr(nint p, int c, long n);
+
+    /// 仅初始化空字段；真正的构造走 <see cref="Attach"/>。
+    Collection() {
+        this.name = "";
+        this.indexedFields = new List<string>();
+        this.keyDict = new List<string>();
+        this.keyDictDirty = false;
+        this.metaVersion = 0 - 1;
+    }
+
+    /// 绑定到底层 KvStore 的一个命名空间，并加载索引列表与字段名字典。
+    static Collection Attach(KvStore kv, AsyncRwLock rw, string name) {
+        Collection c = new Collection();
+        c.kv = kv;
+        c.rw = rw;
+        c.name = name;
+        c.LoadIndexMeta();
+        c.LoadKeyDict();
+        c.metaVersion = kv.Version();
+        return c;
+    }
+
+    /// <summary>当数据库更新到新版本（即其他进程已提交）时，重新读取缓存的元数据（字段名字典、索引
+    /// 列表）。操作文档前两者都必需：
+    /// 字典负责编解码对象键，因此过期的副本会
+    /// 用错误的字段名解码其他进程的文档，并将这些 id
+    /// 复用到不同的名称上。开销低：一次版本比较，
+    /// 两次读取只在确实有变化时
+    /// 才发生。</summary>
+    void SyncMeta() {
+        long v = this.kv.Version();
+        if (v == this.metaVersion) { return; }
+        // 绝不要在当前尚未落盘的字典条目上重新加载——
+        // （事务中编码中途的条目）——否则它们会丢失。
+        if (this.keyDictDirty) { return; }
+        this.metaVersion = v;
+        LoadIndexMeta();
+        LoadKeyDict();
+    }
+
+    /// 集合名。
+    string Name() { return this.name; }
+
+    // id 出现在每个文档键和每个索引条目中，其文本形式
+    // 占据文件的一大部分。它们写成六个 base-64 数字，
+    // 取自可打印字符集 '?'..'~' (0x3F..0x7E)：字节序仍
+    // 等于数值顺序，因此 B+Tree 顺序保持为插入顺序；
+    // 该字符集既不含 0x00，也不含分隔键的 ':' 和制表符；
+    // 6 位数字仍可覆盖 64^6 = 680 亿个 id——宽度只有
+    // 之前 12 位十进制数字的一半。
+    static int ID_DIGITS = 6;
+
+    /// 把 id 编码为定宽 6 位 base-64 数字（'?'..'~'）：字节序即数值序，
+    /// 且不含 0x00、':' 与 '\t'，不破坏 B+Tree 顺序与键分隔。
+    static string PadId(int id) {
+        ByteBuffer b = ByteBuffer.Alloc(Collection.ID_DIGITS);
+        int shift = (Collection.ID_DIGITS - 1) * 6;
+        while (shift >= 0) {
+            b.WriteU8(63 + ((id >> shift) & 63));
+            shift = shift - 6;
+        }
+        string s = b.ToStr();
+        b.Free();
+        return s;
+    }
+
+    /// <summary>PadId 的逆操作。</summary>
+    static int UnpadId(string s) {
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            v = (v << 6) | ((s[i] & 255) - 63);
+        }
+        return v;
+    }
+
+    /// 文档正文键 c:{name}:{id(定宽)}。
+    string DocKey(int id) {
+        return "c:" + this.name + ":" + Collection.PadId(id);
+    }
+
+    /// 自增 id 序列键。
+    string SeqKey() {
+        return "m:" + this.name + ":seq";
+    }
+
+    /// 索引字段列表元数据键（逗号分隔）。
+    string IdxMetaKey() {
+        return "m:" + this.name + ":idx";
+    }
+
+    /// 字段名字典元数据键（JSON 数组）。
+    string KeysMetaKey() {
+        return "m:" + this.name + ":keys";
+    }
+
+    /// 批量索引构建游标键；键不存在即表示该索引已构建完成。
+    string IdxPosKey(string field) {
+        return "m:" + this.name + ":idxpos:" + field;
+    }
+
+    /// <summary>同一索引字段所有条目共享的前缀。字段用
+    /// 其字典 id 表示而非拼出全名，因此长字段名
+    /// 对每个条目零开销。</summary>
+    string IdxPrefix(string field, string val) {
+        return "i:" + this.name + ":" + Collection.PadId(KeyIdOf(field)) + ":"
+               + val + "\t";
+    }
+
+    /// 完整二级索引条目键：<see cref="IdxPrefix"/> 加定宽 id。
+    string IdxKey(string field, string val, int id) {
+        return IdxPrefix(field, val) + Collection.PadId(id);
+    }
+
+    /// 从元数据键加载索引字段列表（逗号分隔；空则无索引）。
+    void LoadIndexMeta() {
+        this.indexedFields = new List<string>();
+        string meta = this.kv.Get(IdxMetaKey());
+        if (meta.Length == 0) { return; }
+        int start = 0;
+        for (int i = 0; i <= meta.Length; i = i + 1) {
+            if (i == meta.Length || (meta[i] & 255) == 44) {
+                if (i > start) { this.indexedFields.Add(meta.Substring(start, i - start)); }
+                start = i + 1;
+            }
+        }
+    }
+
+    // ===== 字段名字典 =====
+    //
+    // 对象键在每篇文档中重复出现，原样存储会浪费
+    // 与集合规模成正比的空间。每个集合维护一个
+    // 持久的字段名字典；磁盘上的对象键是 1 起始的
+    // 字典 id，文档正文是紧凑的二进制记录，其中是
+    // 带类型的 varint 编码值（非 JSON 文本）——参见 EncodeDoc/DecodeDoc。
+
+    /// 从元数据键的 JSON 数组加载字段名字典。
+    void LoadKeyDict() {
+        this.keyDict = new List<string>();
+        this.keyDictDirty = false;
+        string meta = this.kv.Get(KeysMetaKey());
+        if (meta.Length == 0) { return; }
+        JsonValue arr = JsonValue.ParseLenient(meta);
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            this.keyDict.Add(arr.At(i).AsString(""));
+        }
+    }
+
+    /// 字段名的 1 起始字典 id；首次出现时追加进字典并标记待持久化（须在 kv 事务内）。
+    int KeyId(string k) {
+        for (int i = 0; i < this.keyDict.Count; i = i + 1) {
+            if (this.keyDict[i] == k) { return i + 1; }
+        }
+        this.keyDict.Add(k);
+        this.keyDictDirty = true;
+        return this.keyDict.Count;
+    }
+
+    /// <summary>字段名的字典 id；若该集合从未
+    /// 存储过该字段则返回 0。与 KeyId 不同，此方法不会扩充字典，
+    /// 因此可在读取路径安全使用。</summary>
+    int KeyIdOf(string k) {
+        for (int i = 0; i < this.keyDict.Count; i = i + 1) {
+            if (this.keyDict[i] == k) { return i + 1; }
+        }
+        return 0;
+    }
+
+    /// 字典 id 反查字段名；越界时返回 "?" 加 id（不抛错）。
+    string KeyName(int id) {
+        if (id >= 1 && id <= this.keyDict.Count) { return this.keyDict[id - 1]; }
+        return "?" + Convert.ToString(id);
+    }
+
+    /// 字典有变更时把整个字典写回元数据键（须在 kv 事务内）。
+    void PersistKeyDict() {
+        if (!this.keyDictDirty) { return; }
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < this.keyDict.Count; i = i + 1) {
+            arr.Append(JsonValue.NewStr(this.keyDict[i]));
+        }
+        this.kv.Put(KeysMetaKey(), arr.ToJson());
+        this.keyDictDirty = false;
+    }
+
+    // 二进制记录的值标签：0 null、1 false、2 true、3 非负整数
+    // （varint）、8 负整数（其幅度的 varint）、9 整数零（无
+    // 载荷）、4 文本数字（非整数）、5 字符串、10 空字符串（无
+    // 载荷）、6 数组、7 对象。标签 9/10 为最常见的两个单元格
+    // （0 和 ""）提供 SQLite 式“值即类型”表示——它们还
+    // 让 0x00 不进入记录，因此下面的 NUL 转义几乎从不触发。
+    /// 字符串是否为纯十进制整数（可带负号，至多 18 位以留在 varint 范围内）。
+    static bool IsIntStr(string s) {
+        int n = s.Length;
+        if (n == 0) { return false; }
+        int i = 0;
+        if ((s[0] & 255) == 45) { i = 1; if (n == 1) { return false; } }
+        if (n - i > 18) { return false; }   // 保持在 zigzag varint 范围内
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// 解析带符号的十进制整数为 64 位。用它替代 Convert.ToInt，因为后者
+    /// 目前降级为 C 的 atoi（声明返回 i64），因此无法
+    /// 符号扩展——负数及大于 2^31 的值会以零扩展的
+    /// 垃圾数据返回。累加器必须是 long：IsIntStr 放行最长 18 位，
+    /// epoch 毫秒时间戳（13 位，>2^31）此前在 int 里静默回绕后落盘。
+    static long ParseI64(string s) {
+        int n = s.Length;
+        int i = 0;
+        bool neg = false;
+        if (n > 0 && (s[0] & 255) == 45) { neg = true; i = 1; }   // '-'
+        long acc = 0;
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { break; }
+            acc = acc * 10 + (c - 48);
+            i = i + 1;
+        }
+        if (neg) { return 0 - acc; }
+        return acc;
+    }
+
+    /// 按上方标签表把一个 JsonValue 写入记录；对象键写作字典 id（须在 kv 事务内）。
+    void WriteVal(ByteBuffer b, JsonValue v) {
+        if (v.IsNull()) { b.WriteU8(0); return; }
+        if (v.IsBool()) {
+            if (v.AsBool(false)) { b.WriteU8(2); } else { b.WriteU8(1); }
+            return;
+        }
+        if (v.IsNumber()) {
+            string raw = v.AsString("");
+            if (Collection.IsIntStr(raw)) {
+                long iv = Collection.ParseI64(raw);
+                if (iv == 0) { b.WriteU8(9); }
+                else if (iv < 0) { b.WriteU8(8); b.WriteVarInt(0 - iv); }
+                else { b.WriteU8(3); b.WriteVarInt(iv); }
+            } else {
+                b.WriteU8(4);
+                b.WriteString(raw);
+            }
+            return;
+        }
+        if (v.IsString()) {
+            string sv = v.AsString("");
+            if (sv.Length == 0) { b.WriteU8(10); }
+            else { b.WriteU8(5); b.WriteString(sv); }
+            return;
+        }
+        if (v.IsArray()) {
+            b.WriteU8(6);
+            b.WriteVarInt(v.Count());
+            for (int i = 0; i < v.Count(); i = i + 1) { WriteVal(b, v.At(i)); }
+            return;
+        }
+        b.WriteU8(7);
+        b.WriteVarInt(v.Count());
+        for (int i = 0; i < v.Count(); i = i + 1) {
+            b.WriteVarInt(KeyId(v.KeyAt(i)));
+            WriteVal(b, v.ValAt(i));
+        }
+    }
+
+    /// <summary>将文档序列化为紧凑的二进制记录：一个 'B'
+    /// 格式字节，随后是顶层对象的字段（字典 id 键 +
+    /// 带类型的值）。冗余的 "_id" 被省略——它是行键，读取时
+    /// 重新附加。必须在 kv 事务内运行：新字段名
+    /// 会与正文一起持久化。</summary>
+    string EncodeDoc(JsonValue doc) {
+        ByteBuffer b = ByteBuffer.Alloc(64);
+        b.WriteU8(66);   // 'B'
+        int n = 0;
+        int i = 0;
+        for (; i < doc.Count(); i = i + 1) {
+            if (doc.KeyAt(i) != "_id") { n = n + 1; }
+        }
+        b.WriteVarInt(n);
+        i = 0;
+        while (i < doc.Count()) {
+            string k = doc.KeyAt(i);
+            if (k != "_id") {
+                b.WriteVarInt(KeyId(k));
+                WriteVal(b, doc.ValAt(i));
+            }
+            i = i + 1;
+        }
+        PersistKeyDict();
+        // 转义为不含 NUL 的字节流。运行时字符串类型（以及
+        // ToStr 和 B+Tree 自带的 ReadString 都在使用的
+        // NativeMemory.GetString）遇到第一个 0x00 即停止，因此原始记录——
+        // 它通常包含 0x00 字节（例如整数 0、空字符串、
+        // 零计数）——无法经受字符串的往返。0xFF 是
+        // 转义字节：0x00 -> FF 01，0xFF -> FF 02；其余字节原样通过。
+        ByteBuffer e = ByteBuffer.Alloc(b.Length() + 8);
+        b.SeekRead(0);
+        while (b.Remaining() > 0) {
+            int by = b.ReadU8();
+            if (by == 0) { e.WriteU8(255); e.WriteU8(1); }
+            else if (by == 255) { e.WriteU8(255); e.WriteU8(2); }
+            else { e.WriteU8(by); }
+        }
+        string s = e.ToStr();
+        b.Free();
+        e.Free();
+        return s;
+    }
+
+    /// 从记录中读取 <see cref="WriteVal"/> 写出的一个值并还原为 JsonValue。
+    JsonValue ReadVal(ByteBuffer b) {
+        int tag = b.ReadU8();
+        if (tag == 0) { return JsonValue.NewNull(); }
+        if (tag == 1) { return JsonValue.NewBool(false); }
+        if (tag == 2) { return JsonValue.NewBool(true); }
+        if (tag == 3) { return JsonValue.NewNum(Convert.ToString(b.ReadVarInt())); }
+        if (tag == 8) { return JsonValue.NewNum(Convert.ToString(0 - b.ReadVarInt())); }
+        if (tag == 9) { return JsonValue.NewNum("0"); }
+        if (tag == 4) { return JsonValue.NewNum(b.ReadString()); }
+        if (tag == 5) { return JsonValue.NewStr(b.ReadString()); }
+        if (tag == 10) { return JsonValue.NewStr(""); }
+        if (tag == 6) {
+            JsonValue a = JsonValue.NewArray();
+            int c = (int)b.ReadVarInt();
+            for (int i = 0; i < c; i = i + 1) { a.Append(ReadVal(b)); }
+            return a;
+        }
+        JsonValue o = JsonValue.NewObject();
+        int c = (int)b.ReadVarInt();
+        for (int i = 0; i < c; i = i + 1) {
+            int kid = (int)b.ReadVarInt();
+            o.Set(KeyName(kid), ReadVal(b));
+        }
+        return o;
+    }
+
+    /// <summary>键尾随数字中编码的 id。行键和
+    /// 索引条目都以定宽 id 结尾，因此无需搜索分隔符——
+    /// id 的某个数字可能恰好像分隔符。</summary>
+    static int IdOfKey(string key) {
+        int off = key.Length - Collection.ID_DIGITS;
+        if (off < 0) { return 0; }
+        return Collection.UnpadId(key.Substring(off, Collection.ID_DIGITS));
+    }
+
+    /// <see cref="IdOfKey"/> 的字符串形式。
+    static string IdFromKey(string key) {
+        return Convert.ToString(Collection.IdOfKey(key));
+    }
+
+    /// <summary>将二进制记录正文（见 EncodeDoc）解码回
+    /// JsonValue 对象。"_id" 不存储在正文中；调用方从
+    /// 行键取出并附加。</summary>
+    /// <summary>包装存储的记录以供读取，仅在记录
+    /// 确实包含转义字节时才反转义。EncodeDoc
+    /// 写出的记录很少包含（标签 9 和 10 让常见单元格不含 0x00），
+    /// 因此通常只需一个缓冲区，无需逐字节复制。</summary>
+    ByteBuffer OpenRecord(string body) {
+        ByteBuffer e = ByteBuffer.FromStr(body);
+        if (Collection.MemChr(e.Raw(), 255, e.Length()) == 0) {
+            e.SeekRead(0);
+            return e;
+        }
+        ByteBuffer b = ByteBuffer.Alloc(e.Length() + 4);
+        e.SeekRead(0);
+        while (e.Remaining() > 0) {
+            int by = e.ReadU8();
+            if (by == 255) {
+                int nx = e.ReadU8();
+                if (nx == 1) { b.WriteU8(0); } else { b.WriteU8(255); }
+            } else {
+                b.WriteU8(by);
+            }
+        }
+        e.Free();
+        b.SeekRead(0);
+        return b;
+    }
+
+    /// <summary>跳过一个编码值，而不从中构建任何内容。
+    /// 字符串和文本形式的数字按长度跳过，而非
+    /// 复制。</summary>
+    void SkipVal(ByteBuffer b) {
+        int tag = b.ReadU8();
+        if (tag == 3 || tag == 8) { b.ReadVarInt(); return; }
+        if (tag == 4 || tag == 5) {
+            int len = (int)b.ReadVarInt();
+            b.SeekRead(b.ReadPos() + len);
+            return;
+        }
+        if (tag == 6) {
+            int c = (int)b.ReadVarInt();
+            for (int i = 0; i < c; i = i + 1) { SkipVal(b); }
+            return;
+        }
+        if (tag == 7) {
+            int c = (int)b.ReadVarInt();
+            for (int i = 0; i < c; i = i + 1) { b.ReadVarInt(); SkipVal(b); }
+            return;
+        }
+        // 标签 0、1、2、9、10 不带载荷。
+    }
+
+    /// <summary>直接从存储的记录中取出一个字段：其他字段
+    /// 被跳过而非解码，因此对大集合做过滤
+    /// 不会为每篇文档构建 JsonValue 树。记录中
+    /// 没有该字段时返回 null。</summary>
+    JsonValue FieldOf(string body, int kid) {
+        if (kid == 0) { return null; }
+        ByteBuffer b = OpenRecord(body);
+        b.ReadU8();                     // 'B'
+        int n = (int)b.ReadVarInt();
+        JsonValue found = null;
+        int i = 0;
+        while (i < n) {
+            int k = (int)b.ReadVarInt();
+            if (k == kid) {
+                found = ReadVal(b);
+                i = n;
+            } else {
+                SkipVal(b);
+                i = i + 1;
+            }
+        }
+        b.Free();
+        return found;
+    }
+
+    /// 把存储的二进制记录（见 <see cref="EncodeDoc"/>）解码回 JsonValue 对象；
+    /// "_id" 由调用方从行键附加。
+    JsonValue DecodeDoc(string body) {
+        ByteBuffer b = OpenRecord(body);
+        int fmt = b.ReadU8();   // 'B' = 66
+        JsonValue o = JsonValue.NewObject();
+        int n = (int)b.ReadVarInt();
+        for (int i = 0; i < n; i = i + 1) {
+            int kid = (int)b.ReadVarInt();
+            JsonValue v = ReadVal(b);
+            o.Set(KeyName(kid), v);
+        }
+        b.Free();
+        return o;
+    }
+
+    /// 为每个已索引字段写入该文档的二级索引条目（须在 kv 事务内）。
+    void AddIndexEntries(int id, JsonValue doc) {
+        for (int i = 0; i < this.indexedFields.Count; i = i + 1) {
+            string f = this.indexedFields[i];
+            JsonValue v = doc.Get(f);
+            if (v != null) {
+                this.kv.Put(IdxKey(f, v.AsString(""), id), "");
+            }
+        }
+    }
+
+    /// 删除一篇文档的全部二级索引条目；doc 为 null（文档已不存在）时无事可做。
+    void RemoveIndexEntries(int id, JsonValue doc) {
+        if (doc == null) { return; }
+        for (int i = 0; i < this.indexedFields.Count; i = i + 1) {
+            string f = this.indexedFields[i];
+            JsonValue v = doc.Get(f);
+            if (v != null) {
+                this.kv.Delete(IdxKey(f, v.AsString(""), id));
+            }
+        }
+    }
+
+    /// 读取并推进自增 id 序列，返回新分配的 id（须在 kv 事务内）。
+    int NextId() {
+        string cur = this.kv.Get(SeqKey());
+        int id = 1;
+        if (cur.Length > 0) { id = Convert.ToInt(cur) + 1; }
+        this.kv.Put(SeqKey(), Convert.ToString(id));
+        return id;
+    }
+
+    // ===== CRUD =====
+
+    /// <summary>存储新文档，分配并返回其 _id
+    /// （同时写入文档中）。</summary>
+    int Insert(JsonValue doc) {
+        this.kv.Begin();
+        SyncMeta();
+        int id = NextId();
+        doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+        this.kv.Put(DocKey(id), EncodeDoc(doc));
+        AddIndexEntries(id, doc);
+        this.kv.Commit();
+        return id;
+    }
+
+    /// <summary>在单个原子提交中批量插入（整个批次
+    /// 只做一次 WAL 刷新）。返回第一个分配的 id。</summary>
+    int InsertBulk(List<JsonValue> docs) {
+        this.kv.Begin();
+        SyncMeta();
+        int first = 0;
+        for (int i = 0; i < docs.Count; i = i + 1) {
+            int id = NextId();
+            if (first == 0) { first = id; }
+            docs[i].Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+            this.kv.Put(DocKey(id), EncodeDoc(docs[i]));
+            AddIndexEntries(id, docs[i]);
+        }
+        this.kv.Commit();
+        return first;
+    }
+
+    /// <summary>返回文档；不存在则返回 null。</summary>
+    JsonValue FindById(int id) {
+        this.kv.BeginSnapshot();
+        SyncMeta();
+        string body = this.kv.Get(DocKey(id));
+        JsonValue doc = null;
+        if (body.Length > 0) {
+            doc = DecodeDoc(body);
+            doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+        }
+        this.kv.EndSnapshot();
+        return doc;
+    }
+
+    /// 文档 id 是否存在。
+    bool Exists(int id) { return this.kv.Contains(DocKey(id)); }
+
+    /// <summary>替换现有文档；id 不存在时返回 false。</summary>
+    bool Update(int id, JsonValue doc) {
+        if (!this.kv.Contains(DocKey(id))) { return false; }
+        this.kv.Begin();
+        SyncMeta();
+        if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindById(id)); }
+        doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+        this.kv.Put(DocKey(id), EncodeDoc(doc));
+        AddIndexEntries(id, doc);
+        this.kv.Commit();
+        return true;
+    }
+
+    /// <summary>在显式 id 下插入或替换。推进自增 id
+    /// 序列越过该 id，避免后续插入冲突。</summary>
+    void Upsert(int id, JsonValue doc) {
+        this.kv.Begin();
+        SyncMeta();
+        string cur = this.kv.Get(SeqKey());
+        int seq = 0;
+        if (cur.Length > 0) { seq = Convert.ToInt(cur); }
+        if (id > seq) { this.kv.Put(SeqKey(), Convert.ToString(id)); }
+        if (this.indexedFields.Count > 0 && this.kv.Contains(DocKey(id))) {
+            RemoveIndexEntries(id, FindById(id));
+        }
+        doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+        this.kv.Put(DocKey(id), EncodeDoc(doc));
+        AddIndexEntries(id, doc);
+        this.kv.Commit();
+    }
+
+    /// 删除文档及其索引条目；返回该 id 是否原本存在。
+    bool DeleteById(int id) {
+        this.kv.Begin();
+        SyncMeta();
+        if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindById(id)); }
+        bool existed = this.kv.Delete(DocKey(id));
+        this.kv.Commit();
+        return existed;
+    }
+
+    // ===== 二级索引 =====
+
+    /// 把索引字段列表写回元数据键（须在 kv 事务内）。
+    void PersistIndexMeta() {
+        string meta = "";
+        for (int i = 0; i < this.indexedFields.Count; i = i + 1) {
+            if (i > 0) { meta = meta + ","; }
+            meta = meta + this.indexedFields[i];
+        }
+        this.kv.Put(IdxMetaKey(), meta);
+    }
+
+    /// <summary>为字段创建（或重建）二级索引，按有界批次
+    /// 索引现有文档。后续写入会自动维护。
+    /// 中断的构建会继续执行，而不是
+    /// 重新开始。</summary>
+    void EnsureIndex(string field) {
+        EnsureIndex(field, Collection.INDEX_BATCH);
+    }
+
+    /// <summary>带显式批次大小的 EnsureIndex（每
+    /// 个事务处理的文档数）。</summary>
+    void EnsureIndex(string field, int batchSize) {
+        bool done = false;
+        while (!done) { done = BuildIndexStep(field, batchSize); }
+    }
+
+    /// <summary>索引下一批文档，每次调用一个事务，
+    /// 覆盖整个集合后返回 true。
+    ///
+    /// 在单个事务中为大集合构建索引会把
+    /// 每个触及的页固定到提交为止，并在整个构建期间持有
+    /// 跨进程写锁；分批将两者都限制在界内。游标
+    /// （m:{name}:idxpos:{field}）与它所覆盖的条目属于同一提交，
+    /// 因此构建中途崩溃或被杀死不会丢失任何内容，下次调用
+    /// 会从上次提交的位置继续。
+    ///
+    /// 字段在第一批就加入索引列表，因此并发写入者
+    /// （包括其他进程）已经在为构建尚未到达的
+    /// 文档维护条目；这些写入与构建结果一致，因为两者都
+    /// 从同一篇文档派生出条目。在构建完成前，
+    /// IndexReady 为 false，FindByIndex 回退为扫描，因此不完整的
+    /// 索引绝不会产生不完整的结果。</summary>
+    bool BuildIndexStep(string field, int batchSize) {
+        if (batchSize <= 0) { batchSize = Collection.INDEX_BATCH; }
+        this.kv.Begin();
+        SyncMeta();
+        if (!HasIndex(field)) {
+            this.indexedFields.Add(field);
+            PersistIndexMeta();
+        }
+        int from = 0;
+        string cursor = this.kv.Get(IdxPosKey(field));
+        if (cursor.Length > 0) {
+            // 文档 id 本身是 int（DocKey 的参数类型）；显式收窄，
+            // 解析已升为 long 只是为了正确读出历史 18 位游标。
+            from = (int)(Collection.ParseI64(cursor) + 1);
+        }
+        // 只从每条记录中读取被索引的字段：构建索引
+        // 永远不需要文档的其他部分。
+        List<KvEntry> entries = new List<KvEntry>();
+        this.kv.Scan(DocKey(from), "c:" + this.name + ";", batchSize, entries);
+        int kid = KeyIdOf(field);
+        int last = from;
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            int id = Collection.IdOfKey(entries[i].key);
+            JsonValue f = FieldOf(entries[i].val, kid);
+            if (f != null) {
+                this.kv.Put(IdxKey(field, f.AsString(""), id), "");
+            }
+            if (id > last) { last = id; }
+        }
+        bool done = entries.Count < batchSize;
+        if (done) { this.kv.Delete(IdxPosKey(field)); }
+        else { this.kv.Put(IdxPosKey(field), Convert.ToString(last)); }
+        this.kv.Commit();
+        return done;
+    }
+
+    /// 字段是否已在索引列表中（含批量构建尚未完成的）。
+    bool HasIndex(string field) {
+        for (int i = 0; i < this.indexedFields.Count; i = i + 1) {
+            if (this.indexedFields[i] == field) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary>当字段已被索引且其批次构建
+    /// 完成（即索引覆盖所有文档）时为 true。</summary>
+    bool IndexReady(string field) {
+        this.kv.BeginSnapshot();
+        SyncMeta();
+        bool ready = HasIndex(field) && !this.kv.Contains(IdxPosKey(field));
+        this.kv.EndSnapshot();
+        return ready;
+    }
+
+    /// <summary>索引查找：字段等于 val（字符串形式）的文档，
+    /// 通过二级索引实现——无需全表扫描。索引仍在构建时
+    /// 回退为扫描，因此结果总是完整的。</summary>
+    List<JsonValue> FindByIndex(string field, string val) {
+        this.kv.BeginSnapshot();
+        SyncMeta();
+        List<JsonValue> docs = new List<JsonValue>();
+        if (HasIndex(field) && !this.kv.Contains(IdxPosKey(field))) {
+            List<KvEntry> entries = new List<KvEntry>();
+            this.kv.ScanPrefix(IdxPrefix(field, val), 0, entries);
+            for (int i = 0; i < entries.Count; i = i + 1) {
+                JsonValue d = FindById(Collection.IdOfKey(entries[i].key));
+                if (d != null) { docs.Add(d); }
+            }
+            this.kv.EndSnapshot();
+            return docs;
+        }
+        this.kv.EndSnapshot();
+        return FindByFieldScan(field, val);
+    }
+
+    /// <summary>通过扫描找出字段等于 val 的文档：每条
+    /// 记录只被询问这一个字段，只有匹配项会被完整解码。
+    /// 用于字段没有可用索引的情况。</summary>
+    List<JsonValue> FindByFieldScan(string field, string val) {
+        this.kv.BeginSnapshot();
+        SyncMeta();
+        List<JsonValue> docs = new List<JsonValue>();
+        int kid = KeyIdOf(field);
+        if (kid == 0) {
+            this.kv.EndSnapshot();
+            return docs;
+        }
+        List<KvEntry> entries = new List<KvEntry>();
+        this.kv.Scan(DocKey(0), "c:" + this.name + ";", 0, entries);
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            JsonValue f = FieldOf(entries[i].val, kid);
+            if (f != null && f.AsString("") == val) {
+                JsonValue doc = DecodeDoc(entries[i].val);
+                doc.Set("_id", JsonValue.NewNum(Collection.IdFromKey(entries[i].key)));
+                docs.Add(doc);
+            }
+        }
+        this.kv.EndSnapshot();
+        return docs;
+    }
+
+    /// <summary>字段值等于 val 的文档数，无需具体化
+    /// 任何文档。</summary>
+    int CountByField(string field, string val) {
+        this.kv.BeginSnapshot();
+        SyncMeta();
+        int n = 0;
+        if (HasIndex(field) && !this.kv.Contains(IdxPosKey(field))) {
+            // 已就绪的索引仅凭其键即可作答：无需读取任何文档。
+            List<KvEntry> entries = new List<KvEntry>();
+            n = this.kv.ScanPrefix(IdxPrefix(field, val), 0, entries);
+            this.kv.EndSnapshot();
+            return n;
+        }
+        int kid = KeyIdOf(field);
+        if (kid == 0) {
+            this.kv.EndSnapshot();
+            return 0;
+        }
+        List<KvEntry> entries2 = new List<KvEntry>();
+        this.kv.Scan(DocKey(0), "c:" + this.name + ";", 0, entries2);
+        for (int i = 0; i < entries2.Count; i = i + 1) {
+            JsonValue f = FieldOf(entries2[i].val, kid);
+            if (f != null && f.AsString("") == val) { n = n + 1; }
+        }
+        this.kv.EndSnapshot();
+        return n;
+    }
+
+    /// <summary>文档总数（对命名空间做范围扫描）。</summary>
+    int Count() {
+        List<KvEntry> entries = new List<KvEntry>();
+        return this.kv.ScanPrefix("c:" + this.name + ":", 0, entries);
+    }
+
+    /// <summary>按 id 顺序返回所有文档。</summary>
+    List<JsonValue> FindAll() {
+        return FindRange(0, 0, 0);
+    }
+
+    /// <summary>满足 fromId <= _id <= toId 的文档（0 表示无界），
+    /// limit 0 表示不限数量，按 id 顺序返回。</summary>
+    List<JsonValue> FindRange(int fromId, int toId, int limit) {
+        this.kv.BeginSnapshot();
+        SyncMeta();
+        string lo = DocKey(fromId);
+        string hi = "";
+        if (toId > 0) { hi = DocKey(toId); }
+        else { hi = "c:" + this.name + ";"; }   // ';' 的排序紧随 ':' 之后
+        List<KvEntry> entries = new List<KvEntry>();
+        this.kv.Scan(lo, hi, limit, entries);
+        List<JsonValue> docs = new List<JsonValue>();
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            if (entries[i].key.Length > 2 && entries[i].key.Substring(0, 2) == "c:") {
+                JsonValue doc = DecodeDoc(entries[i].val);
+                doc.Set("_id", JsonValue.NewNum(Collection.IdFromKey(entries[i].key)));
+                docs.Add(doc);
+            }
+        }
+        this.kv.EndSnapshot();
+        return docs;
+    }
+
+    /// <summary>对集合启动流畅的 LINQ 风格查询。</summary>
+    DocQuery Query() {
+        return DocQuery.Of(this);
+    }
+
+    // ===== 协程安全的异步 API =====
+
+    /// <see cref="FindById"/> 的协程版本：在共享读写锁的读侧执行。
+    async JsonValue FindByIdAsync(int id) {
+        await this.rw.EnterRead();
+        JsonValue v = FindById(id);
+        this.rw.ExitRead();
+        return v;
+    }
+
+    /// <see cref="Insert"/> 的协程版本：在共享读写锁的写侧执行。
+    async int InsertAsync(JsonValue doc) {
+        await this.rw.EnterWrite();
+        int id = Insert(doc);
+        this.rw.ExitWrite();
+        return id;
+    }
+
+    /// <see cref="Update"/> 的协程版本：在共享读写锁的写侧执行。
+    async bool UpdateAsync(int id, JsonValue doc) {
+        await this.rw.EnterWrite();
+        bool ok = Update(id, doc);
+        this.rw.ExitWrite();
+        return ok;
+    }
+
+    /// <see cref="DeleteById"/> 的协程版本：在共享读写锁的写侧执行。
+    async bool DeleteByIdAsync(int id) {
+        await this.rw.EnterWrite();
+        bool ok = DeleteById(id);
+        this.rw.ExitWrite();
+        return ok;
+    }
+
+    /// <summary>对单篇文档的原子读改写：fn 在
+    /// 写临界区内基于最新已提交版本运行，因此
+    /// 并发更新不会丢失写入（判断与写入是
+    /// 一个原子步骤）。当文档存在且 fn
+    /// 返回了替换值时返回 true。</summary>
+    async bool UpdateAtomic(int id, DocUpdater fn) {
+        await this.rw.EnterWrite();
+        JsonValue cur = FindById(id);
+        if (cur == null) {
+            this.rw.ExitWrite();
+            return false;
+        }
+        JsonValue next = fn(cur);
+        bool ok = false;
+        if (next != null) {
+            ok = Update(id, next);
+        }
+        this.rw.ExitWrite();
+        return ok;
+    }
+}

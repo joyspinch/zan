@@ -1,0 +1,353 @@
+using System;
+using System.Threading;
+
+namespace Gui;
+
+/// <summary>
+/// 无参数的 GUI 事件处理器，类似 C# 的 <c>Action</c> / <c>EventHandler</c>。
+/// 可赋值为 lambda（<c>() =&gt; { ... }</c>）或静态方法组。
+/// </summary>
+delegate void Action();
+
+/// <summary>
+/// 对运行时 UI 线程调度队列的轻量封装。后台线程
+/// 调用 <see cref="Post"/> 把委托交回 UI 线程；UI 线程
+/// 每帧清空一次队列（见 <c>App.Post</c> / <c>App.DrainPosts</c>）。
+/// 队列本身由运行时内部的 OS 互斥锁保护，因此从任何线程
+/// 发布都是安全的，也不会在非 UI 线程触碰 Zan 堆。
+/// </summary>
+class Dispatcher {
+    [DllImport("crt", EntryPoint = "zan_dispatch_init")]
+    static extern void PlatInit();
+
+    [DllImport("crt", EntryPoint = "zan_dispatch_post")]
+    static extern int PlatPost(Action handler);
+
+    [DllImport("crt", EntryPoint = "zan_dispatch_take")]
+    static extern Action PlatTake();
+
+    [DllImport("crt", EntryPoint = "zan_dispatch_clear")]
+    static extern void PlatClear();
+
+    /// <summary>重置队列。在 UI 线程上、创建 worker 之前调用一次。</summary>
+    static void Init() { Dispatcher.PlatInit(); }
+
+    /// <summary>把要在 UI 线程运行的委托加入队列。线程安全。</summary>
+    static bool Post(Action handler) { return Dispatcher.PlatPost(handler) != 0; }
+
+    /// <summary>取出下一个排队的委托（UI 线程），为空时返回 null。</summary>
+    static Action Take() { return Dispatcher.PlatTake(); }
+
+    /// <summary>清空所有排队的委托。请在 UI 线程上调用，当
+    /// 窗口关闭时，这样为已失效窗口派发的后台任务
+    /// 就不会在下一个窗口的第一帧执行。</summary>
+    static void Clear() { Dispatcher.PlatClear(); }
+}
+
+/// <summary>
+/// 一个保留式多播事件注册表，将 C# 风格的委托事件
+/// 叠加在即时模式控件上。处理器只需注册一次（在帧
+/// 循环之前，按稳定的整数 key 注册），然后每帧把即时模式的点击
+/// 通过 <see cref="RaiseIf"/> 桥接进来：
+/// <code>
+/// EventHub hub = new EventHub();
+/// hub.On(BTN_SAVE, () =&gt; { ... });   // like  OnClick += handler
+/// // per frame:
+/// int id = Button.Render(app, x, y, "Save");
+/// hub.RaiseIf(BTN_SAVE, Ui.Clicked(app, id));
+/// </code>
+/// 同一 key 的多次 <see cref="On"/> 调用都会被执行（多播）；
+/// <see cref="Off"/> 清除它们（相当于对整个 key 执行 <c>OnClick -= handler</c>）。
+/// </summary>
+class Subscription {
+    int key;
+    Action handler;
+
+    Subscription(int key, Action handler) {
+        this.key = key;
+        this.handler = handler;
+    }
+}
+
+/// <summary>
+/// 整数 key 的多播事件注册表。应用以任意整数常量作事件名，
+/// 在帧循环前用 <see cref="On"/> 常驻订阅一次，之后每帧经
+/// <see cref="RaiseIf"/> 把即时模式的布尔条件（如 Ui.Clicked）
+/// 桥接为事件。
+/// </summary>
+class EventHub {
+    List<Subscription> subs;
+
+    EventHub() {
+        this.subs = new List<Subscription>();
+    }
+
+    /// <summary>为事件 key 追加一个处理器（类似 <c>event += handler</c>）。</summary>
+    void On(int key, Action handler) {
+        subs.Add(new Subscription(key, handler));
+    }
+
+    /// <summary>移除某 key 注册的全部处理器（相当于清空事件）。</summary>
+    void Off(int key) {
+        int i = subs.Count - 1;
+        while (i >= 0) {
+            if (subs[i].key == key) {
+                subs.RemoveAt(i);
+            }
+            i = i - 1;
+        }
+    }
+
+    /// <summary>某 key 注册的处理器数量。</summary>
+    int Count(int key) {
+        int n = 0;
+        for (int i = 0; i < subs.Count; i = i + 1) {
+            if (subs[i].key == key) { n = n + 1; }
+        }
+        return n;
+    }
+
+    /// <summary>调用某 key 注册的全部处理器（多播）。</summary>
+    void Raise(int key) {
+        for (int i = 0; i < subs.Count; i = i + 1) {
+            if (subs[i].key == key) {
+                Action h = subs[i].handler;
+                h();
+            }
+        }
+    }
+
+    /// <summary>仅当 <paramref name="fire"/> 为 true 时触发某 key 的处理器
+    /// （例如传入 <c>Ui.Clicked(app, id)</c> 在点击时触发）。</summary>
+    void RaiseIf(int key, bool fire) {
+        if (fire) { Raise(key); }
+    }
+}
+
+/// <summary>
+/// C# 风格的多播事件。与 <see cref="EventHub"/>（按键轮询）不同，
+/// UiEvent 是控件上的一个一等字段，支持委托
+/// <c>+=</c> / <c>-=</c> 运算符，因此注册处理器的方式与 C# 完全一致：
+/// C#：
+/// <code>
+/// Button save = new Button { Text = "Save" };   // retained
+/// save.Click += () =&gt; { Console.WriteLine("saved"); };
+/// save.Click += Store.Commit;            // method group
+/// // per frame:
+/// save.Render(app, x, y, 120);           // fires Click on click
+/// </code>
+/// 内置控件事件在 <c>Render</c> 内部触发，即在 UI 线程上，
+/// 因此处理器访问 UI 始终是安全的。要从工作线程触发，
+/// 可使用 <see cref="Post"/>，它会将所有处理器调度回
+/// UI 线程的分发队列。
+/// </summary>
+class UiEvent {
+    List<Action> handlers;
+
+    UiEvent() {
+        this.handlers = new List<Action>();
+    }
+
+    /// 支持 <c>event += handler</c> 的运算符（追加，多播）。
+    static UiEvent op_add(UiEvent self, Action handler) {
+        self.handlers.Add(handler);
+        return self;
+    }
+
+    /// 支持 <c>event -= handler</c> 的运算符（移除最近的
+    /// 相同注册项；若从未添加则为空操作）。
+    static UiEvent op_sub(UiEvent self, Action handler) {
+        int i = self.handlers.Count - 1;
+        while (i >= 0) {
+            if (self.handlers[i] == handler) {
+                self.handlers.RemoveAt(i);
+                return self;
+            }
+            i = i - 1;
+        }
+        return self;
+    }
+
+    /// 注册一个处理器（等同 <c>+=</c>）。
+    void Add(Action handler) { handlers.Add(handler); }
+
+    /// 清空所有处理器。
+    void Clear() { handlers = new List<Action>(); }
+
+    /// 已注册的处理器数量。
+    int Count() { return handlers.Count; }
+
+    /// 在当前线程上调用所有处理器。
+    void Raise() {
+        for (int i = 0; i < handlers.Count; i = i + 1) {
+            Action h = handlers[i];
+            h();
+        }
+    }
+
+    /// 仅当 <paramref name="fire"/> 为 true 时才调用处理器。
+    void RaiseIf(bool fire) {
+        if (fire) { this.Raise(); }
+    }
+
+    /// 将所有处理器调度到 UI 线程的分发队列。可从
+    /// 任何线程安全调用；处理器稍后在 UI 线程上执行（参见 App.DrainPosts）。
+    void Post() {
+        for (int i = 0; i < handlers.Count; i = i + 1) {
+            Action h = handlers[i];
+            Dispatcher.Post(h);
+        }
+    }
+}
+
+/// <summary>
+/// 常用控件事件的可复用集合。保留式控件内嵌
+/// 一个 <c>WidgetEvents</c> 字段，每帧调用一次 <see cref="Fire"/>
+/// （在渲染完并注册命中区域之后），而不必手动
+/// 推导每次状态转换，应用代码因此呈声明式风格：
+/// <code>
+/// btn.On.Enter += () =&gt; { ... };
+/// btn.On.Click += () =&gt; { ... };
+/// </code>
+/// 触屏安全：在触摸屏上，单次触摸会作为合成的鼠标
+/// 事件序列到达，因此 <c>Click</c> 相当于轻点，<c>MouseDown</c>/<c>MouseUp</c> 框住
+/// 整个触摸过程；没有真正的悬停，所以 <c>Enter</c>/<c>Leave</c> 只在按压期间触发
+/// 且不会误触发。
+/// </summary>
+class WidgetEvents {
+    // 指针事件。
+    UiEvent Click;
+    UiEvent DoubleClick;
+    UiEvent RightClick;
+    UiEvent MouseDown;
+    UiEvent MouseUp;
+    UiEvent Enter;
+    UiEvent Leave;
+    UiEvent Move;
+    UiEvent Wheel;
+    // 焦点 + 键盘事件。
+    UiEvent Focus;
+    UiEvent Blur;
+    UiEvent KeyDown;
+    UiEvent KeyUp;
+    UiEvent KeyPress;
+    // 触摸 / 手势事件。
+    UiEvent Tap;
+    UiEvent LongPress;
+    UiEvent Swipe;
+    // 拖放（由单指指针合成）。
+    UiEvent DragStart;
+    UiEvent Drag;
+    UiEvent Drop;
+
+    WidgetEvents() {
+        Click = new UiEvent();
+        DoubleClick = new UiEvent();
+        RightClick = new UiEvent();
+        MouseDown = new UiEvent();
+        MouseUp = new UiEvent();
+        Enter = new UiEvent();
+        Leave = new UiEvent();
+        Move = new UiEvent();
+        Wheel = new UiEvent();
+        Focus = new UiEvent();
+        Blur = new UiEvent();
+        KeyDown = new UiEvent();
+        KeyUp = new UiEvent();
+        KeyPress = new UiEvent();
+        Tap = new UiEvent();
+        LongPress = new UiEvent();
+        Swipe = new UiEvent();
+        DragStart = new UiEvent();
+        Drag = new UiEvent();
+        Drop = new UiEvent();
+    }
+
+    /// 将 `a` 订阅到名为 `evt` 的通用事件（该名称由
+    /// Control.CommonEvents 返回，也用于设计器的 `on<Event>` JSON 键）。
+    /// 未知名称会被忽略，这样引用特定控件
+    /// 事件（在别处接线）的文档不会在此报错。匹配时返回 true。
+    bool AddByName(string evt, Action a) {
+        if (evt == "Click") { Click.Add(a); return true; }
+        if (evt == "DoubleClick") { DoubleClick.Add(a); return true; }
+        if (evt == "RightClick") { RightClick.Add(a); return true; }
+        if (evt == "MouseDown") { MouseDown.Add(a); return true; }
+        if (evt == "MouseUp") { MouseUp.Add(a); return true; }
+        if (evt == "Enter") { Enter.Add(a); return true; }
+        if (evt == "Leave") { Leave.Add(a); return true; }
+        if (evt == "Move") { Move.Add(a); return true; }
+        if (evt == "Wheel") { Wheel.Add(a); return true; }
+        if (evt == "Focus") { Focus.Add(a); return true; }
+        if (evt == "Blur") { Blur.Add(a); return true; }
+        if (evt == "KeyDown") { KeyDown.Add(a); return true; }
+        if (evt == "KeyUp") { KeyUp.Add(a); return true; }
+        if (evt == "KeyPress") { KeyPress.Add(a); return true; }
+        if (evt == "Tap") { Tap.Add(a); return true; }
+        if (evt == "LongPress") { LongPress.Add(a); return true; }
+        if (evt == "Swipe") { Swipe.Add(a); return true; }
+        if (evt == "DragStart") { DragStart.Add(a); return true; }
+        if (evt == "Drag") { Drag.Add(a); return true; }
+        if (evt == "Drop") { Drop.Add(a); return true; }
+        return false;
+    }
+
+    /// 当内置事件中至少有一个监听器时返回 true。允许
+    /// 容器跳过命中区域的注册（从而不抢占
+    /// 下方内容的指针），直到有人监听。
+    bool Any() {
+        if (Click.Count() > 0) { return true; }
+        if (DoubleClick.Count() > 0) { return true; }
+        if (RightClick.Count() > 0) { return true; }
+        if (MouseDown.Count() > 0) { return true; }
+        if (MouseUp.Count() > 0) { return true; }
+        if (Enter.Count() > 0) { return true; }
+        if (Leave.Count() > 0) { return true; }
+        if (Move.Count() > 0) { return true; }
+        if (Wheel.Count() > 0) { return true; }
+        if (Focus.Count() > 0) { return true; }
+        if (Blur.Count() > 0) { return true; }
+        if (KeyDown.Count() > 0) { return true; }
+        if (KeyUp.Count() > 0) { return true; }
+        if (KeyPress.Count() > 0) { return true; }
+        if (Tap.Count() > 0) { return true; }
+        if (LongPress.Count() > 0) { return true; }
+        if (Swipe.Count() > 0) { return true; }
+        if (DragStart.Count() > 0) { return true; }
+        if (Drag.Count() > 0) { return true; }
+        if (Drop.Count() > 0) { return true; }
+        return false;
+    }
+
+    /// 本帧对 `id` 满足条件的已注册处理器都会触发，
+    /// 在控件注册命中区域后每帧调用一次。
+    /// 低频/轮询驱动的事件（移动、滚轮、按键、手势、拖拽）以
+    /// 有无监听器为门槛，空闲控件无需付出开销。
+    void Fire(App app, int id) {
+        Click.RaiseIf(Ui.Clicked(app, id));
+        DoubleClick.RaiseIf(Ui.DoubleClicked(app, id));
+        MouseDown.RaiseIf(Ui.PressedDown(app, id));
+        MouseUp.RaiseIf(Ui.MouseUpOn(app, id));
+        Enter.RaiseIf(Ui.Entered(app, id));
+        Leave.RaiseIf(Ui.Left(app, id));
+        Focus.RaiseIf(Ui.FocusGained(app, id));
+        Blur.RaiseIf(Ui.FocusLost(app, id));
+        Tap.RaiseIf(Ui.Tapped(app, id));
+        if (RightClick.Count() > 0) { RightClick.RaiseIf(Ui.RightClicked(app, id)); }
+        if (Move.Count() > 0) { Move.RaiseIf(Ui.MovedOver(app, id)); }
+        if (Wheel.Count() > 0) { Wheel.RaiseIf(Ui.Wheeled(app, id)); }
+        if (KeyDown.Count() > 0) { KeyDown.RaiseIf(Ui.KeyDownOn(app, id)); }
+        if (KeyUp.Count() > 0) { KeyUp.RaiseIf(Ui.KeyUpOn(app, id)); }
+        if (KeyPress.Count() > 0) { KeyPress.RaiseIf(Ui.KeyDownOn(app, id)); }
+        if (Swipe.Count() > 0) { Swipe.RaiseIf(Ui.SwipedAny(app, id)); }
+        if (DragStart.Count() > 0) { DragStart.RaiseIf(Ui.PressedDown(app, id)); }
+        if (Drag.Count() > 0) { Drag.RaiseIf(Ui.Dragging(app, id)); }
+        if (Drop.Count() > 0) { Drop.RaiseIf(Ui.Dropped(app, id)); }
+        // 仅在有人监听时才轮询长按计时器：
+        // 轮询会在按住期间调度低频率的后续帧，跳过它可保持
+        // 不使用长按的控件在空闲/按压时零 CPU 开销。
+        if (LongPress.Count() > 0) {
+            LongPress.RaiseIf(Ui.LongPressed(app, id));
+        }
+    }
+}
+

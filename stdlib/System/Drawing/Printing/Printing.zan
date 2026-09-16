@@ -1,0 +1,360 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+
+namespace System.Drawing.Printing;
+
+/// <summary>只读访问当前用户已安装的打印机。Windows 上走
+/// winspool（EnumPrintersW/GetDefaultPrinterW），Linux/macOS 上走 CUPS
+/// 的 lpstat。不含网络发现，仅本地与已连接打印机。</summary>
+class PrinterSettings {
+    /// <summary>枚举本地打印机及打印机连接。列表可能为空
+    /// （无打印机或 lpstat 不可用），不为 null。</summary>
+    static List<string> InstalledPrinters() {
+        #if WINDOWS
+        return PrinterSettings.WinInstalledPrinters();
+        #else
+        List<string> printers = new List<string>();
+        // lpstat -e 每行一个目的地名（含类和远程连接）。
+        ProcessResult r = Process.Capture("lpstat -e");
+        if (r.exitCode != 0) { return printers; }
+        for (int i = 0; i < r.lines.Count; i = i + 1) {
+            string name = r.lines[i].Trim();
+            if (name != "") { printers.Add(name); }
+        }
+        return printers;
+        #endif
+    }
+
+    /// <summary>返回默认打印机名称；未配置时返回空字符串。</summary>
+    static string DefaultPrinterName() {
+        #if WINDOWS
+        nint charsOut = NativeMemory.Alloc(4);
+        new Span<int>(charsOut, 1)[0] = 0;
+        PrinterSettings.GetDefaultPrinterW(0, charsOut);
+        int chars = new Span<int>(charsOut, 1)[0];
+        if (chars <= 0) {
+            NativeMemory.Free(charsOut);
+            return "";
+        }
+        nint buffer = NativeMemory.Alloc(chars * 2);
+        int ok = PrinterSettings.GetDefaultPrinterW(buffer, charsOut);
+        string name = "";
+        if (ok != 0) { name = Wide.Read(buffer); }
+        NativeMemory.Free(buffer);
+        NativeMemory.Free(charsOut);
+        return name;
+        #else
+        // "system default destination: name"，未配置时为
+        // "no system default destination"。
+        ProcessResult r = Process.Capture("lpstat -d");
+        if (r.exitCode != 0) { return ""; }
+        for (int i = 0; i < r.lines.Count; i = i + 1) {
+            string line = r.lines[i].Trim();
+            int colon = line.IndexOf(":");
+            if (colon < 0) { continue; }
+            return line.Substring(colon + 1, line.Length - colon - 1).Trim();
+        }
+        return "";
+        #endif
+    }
+
+    #if WINDOWS
+    [DllImport("winspool", EntryPoint = "EnumPrintersW")]
+    static extern int EnumPrintersW(int flags, nint name, int level,
+                                    nint buffer, int bufferBytes,
+                                    nint neededBytes, nint returnedCount);
+
+    [DllImport("winspool", EntryPoint = "GetDefaultPrinterW")]
+    static extern int GetDefaultPrinterW(nint buffer, nint chars);
+
+    /// EnumPrintersW（PRINTER_INFO_4）两段式枚举：先探缓冲区大小再取数据。
+    static List<string> WinInstalledPrinters() {
+        List<string> printers = new List<string>();
+        nint neededOut = NativeMemory.Alloc(4);
+        nint countOut = NativeMemory.Alloc(4);
+        new Span<int>(neededOut, 1)[0] = 0;
+        new Span<int>(countOut, 1)[0] = 0;
+        // PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS, PRINTER_INFO_4.
+        PrinterSettings.EnumPrintersW(6, 0, 4, 0, 0, neededOut, countOut);
+        int needed = new Span<int>(neededOut, 1)[0];
+        if (needed <= 0) {
+            NativeMemory.Free(countOut);
+            NativeMemory.Free(neededOut);
+            return printers;
+        }
+
+        nint buffer = NativeMemory.Alloc(needed);
+        int ok = PrinterSettings.EnumPrintersW(
+            6, 0, 4, buffer, needed, neededOut, countOut);
+        if (ok != 0) {
+            int count = new Span<int>(countOut, 1)[0];
+            // 在 Win64 目标上 PRINTER_INFO_4W 为 24 字节；pPrinterName 是
+            // 其第一个指针。
+            for (int i = 0; i < count; i = i + 1) {
+                nint name = new Span<nint>(buffer + i * 24, 1)[0];
+                if (name != 0) { printers.Add(Wide.Read(name)); }
+            }
+        }
+        NativeMemory.Free(buffer);
+        NativeMemory.Free(countOut);
+        NativeMemory.Free(neededOut);
+        return printers;
+    }
+    #endif
+}
+
+/// <summary>RAW 打印状态机使用的后台打印程序操作。Open/StartDoc/
+/// StartPage/Write/EndPage/EndDoc/Close 按此顺序调用；失败路径用
+/// Abort 替代 EndDoc。一个文档一页一份数据的简化协议。</summary>
+internal interface IRawPrinterBackend {
+    /// 打开与打印机的连接；失败返回 false。
+    bool Open(string printerName);
+    /// 开始一个 RAW 文档；失败返回 false。
+    bool StartDoc(string documentName);
+    /// 开始一页；失败返回 false。
+    bool StartPage();
+    /// 写入一页数据，返回实际写入的字节数；失败返回 -1。
+    int Write(byte[] data);
+    /// 结束当前页；失败返回 false。
+    bool EndPage();
+    /// 正常结束文档并提交打印；失败返回 false。
+    bool EndDoc();
+    /// 放弃当前文档（StartDoc 成功而后续失败时替代 EndDoc）。
+    void Abort();
+    /// 关闭连接；关闭失败时整体结果按失败计。
+    bool Close();
+}
+
+#if WINDOWS
+/// <summary>winspool RAW 后端：协议各步一一对应 OpenPrinterW/
+/// StartDocPrinterW/WritePrinter 等 spooler 调用。</summary>
+internal class WinRawPrinterBackend : IRawPrinterBackend {
+    nint handle;
+
+    /// OpenPrinterW 打开打印机；调用成功且句柄非 0 才返回 true。
+    bool Open(string printerName) {
+        nint printerNameW = Wide.Of(printerName);
+        nint handleOut = NativeMemory.Alloc(8);
+        new Span<nint>(handleOut, 1)[0] = 0;
+        int opened = WinRawPrinterBackend.OpenPrinterW(printerNameW, handleOut, 0);
+        Wide.Free(printerNameW);
+        this.handle = new Span<nint>(handleOut, 1)[0];
+        NativeMemory.Free(handleOut);
+        return opened != 0 && this.handle != 0;
+    }
+
+    /// StartDocPrinterW 以 RAW 数据类型开始作业（作业号非 0 为成功）。
+    bool StartDoc(string documentName) {
+        nint documentNameW = Wide.Of(documentName);
+        nint rawW = Wide.Of("RAW");
+        nint docInfo = NativeMemory.Alloc(24);
+        NativeMemory.Fill(docInfo, 0, 24);
+        Span<nint> info = new Span<nint>(docInfo, 3);
+        info[0] = documentNameW;
+        info[2] = rawW;
+        int job = WinRawPrinterBackend.StartDocPrinterW(this.handle, 1, docInfo);
+        NativeMemory.Free(docInfo);
+        Wide.Free(rawW);
+        Wide.Free(documentNameW);
+        return job != 0;
+    }
+
+    /// StartPagePrinter。
+    bool StartPage() {
+        return WinRawPrinterBackend.StartPagePrinter(this.handle) != 0;
+    }
+
+    /// WritePrinter 写入 data，返回实际字节数；失败返回 -1。
+    int Write(byte[] data) {
+        nint writtenOut = NativeMemory.Alloc(4);
+        new Span<int>(writtenOut, 1)[0] = 0;
+        int wrote = WinRawPrinterBackend.WritePrinter(
+            this.handle, data, data.Length, writtenOut);
+        int written = new Span<int>(writtenOut, 1)[0];
+        NativeMemory.Free(writtenOut);
+        if (wrote == 0) { return -1; }
+        return written;
+    }
+
+    /// EndPagePrinter。
+    bool EndPage() {
+        return WinRawPrinterBackend.EndPagePrinter(this.handle) != 0;
+    }
+
+    /// EndDocPrinter 提交作业。
+    bool EndDoc() {
+        return WinRawPrinterBackend.EndDocPrinter(this.handle) != 0;
+    }
+
+    /// AbortPrinter 丢弃当前作业。
+    void Abort() { WinRawPrinterBackend.AbortPrinter(this.handle); }
+
+    /// ClosePrinter 关闭打印机句柄。
+    bool Close() {
+        return WinRawPrinterBackend.ClosePrinter(this.handle) != 0;
+    }
+
+    [DllImport("winspool", EntryPoint = "OpenPrinterW")]
+    static extern int OpenPrinterW(nint printerName, nint handle, nint defaults);
+
+    [DllImport("winspool", EntryPoint = "StartDocPrinterW")]
+    static extern int StartDocPrinterW(nint printer, int level, nint docInfo);
+
+    [DllImport("winspool", EntryPoint = "StartPagePrinter")]
+    static extern int StartPagePrinter(nint printer);
+
+    [DllImport("winspool", EntryPoint = "WritePrinter")]
+    static extern int WritePrinter(nint printer, byte[] data, int count,
+                                   nint written);
+
+    [DllImport("winspool", EntryPoint = "EndPagePrinter")]
+    static extern int EndPagePrinter(nint printer);
+
+    [DllImport("winspool", EntryPoint = "EndDocPrinter")]
+    static extern int EndDocPrinter(nint printer);
+
+    [DllImport("winspool", EntryPoint = "AbortPrinter")]
+    static extern int AbortPrinter(nint printer);
+
+    [DllImport("winspool", EntryPoint = "ClosePrinter")]
+    static extern int ClosePrinter(nint printer);
+}
+#endif
+
+#if !WINDOWS
+/// CUPS 没有逐页的 spooler API：把 RAW 字节流收集到临时文件，
+/// EndDoc 时用 `lp -o raw` 整份提交（-o raw 让 CUPS 跳过过滤链，
+/// 字节原样送给打印机，与 Windows 的 RAW 数据类型一致）。
+internal class CupsRawPrinterBackend : IRawPrinterBackend {
+    string printer;
+    string document;
+    string spoolPath;
+    bool failed;
+
+    /// 记住打印机名；系统里有 lp 命令才算打开成功。
+    bool Open(string printerName) {
+        this.printer = printerName;
+        this.spoolPath = "";
+        this.failed = false;
+        // 没有 lp 就谈不上打印，直接失败而不是假装成功。
+        return Process.Capture("command -v lp").exitCode == 0;
+    }
+
+    /// 创建按 PID 命名的临时 spool 文件；创建失败返回 false。
+    bool StartDoc(string documentName) {
+        this.spoolPath = Path.GetTempPath() + "zan_raw_"
+            + Convert.ToString(ProcessHost.Pid()) + ".prn";
+        try {
+            File.WriteAllBytes(this.spoolPath, new byte[0]);
+        } catch (IOException e) {
+            this.spoolPath = "";
+            return false;
+        }
+        this.document = documentName;
+        return true;
+    }
+
+    /// spool 文件就绪即成功（CUPS 无逐页提交的概念）。
+    bool StartPage() { return this.spoolPath != ""; }
+
+    /// 追加到 spool 文件，返回写入字节数；失败返回 -1 并标记文档失败。
+    int Write(byte[] data) {
+        if (this.spoolPath == "") { return 0 - 1; }
+        try {
+            File.AppendAllBytes(this.spoolPath, data);
+        } catch (IOException e) {
+            this.failed = true;
+            return 0 - 1;
+        }
+        return data.Length;
+    }
+
+    /// 本页是否无失败。
+    bool EndPage() { return !this.failed; }
+
+    /// 用 `lp -d <printer> -t <doc> -o raw` 提交整份 spool 文件。
+    bool EndDoc() {
+        if (this.spoolPath == "" || this.failed) { return false; }
+        string cmd = "lp -d " + CupsRawPrinterBackend.Quote(this.printer)
+            + " -t " + CupsRawPrinterBackend.Quote(this.document)
+            + " -o raw " + CupsRawPrinterBackend.Quote(this.spoolPath);
+        return Process.Capture(cmd).exitCode == 0;
+    }
+
+    /// 标记文档失败：EndDoc 将拒绝提交。
+    void Abort() { this.failed = true; }
+
+    /// 删除 spool 临时文件。
+    bool Close() {
+        if (this.spoolPath != "") {
+            File.Delete(this.spoolPath);
+            this.spoolPath = "";
+        }
+        return true;
+    }
+
+    /// 单引号包裹 shell 参数，内部单引号按 POSIX 方式（'\''）转义。
+    static string Quote(string s) {
+        return "'" + s.Replace("'", "'\\''") + "'";
+    }
+}
+#endif
+
+/// <summary>将已格式化的字节流直接发送到打印队列（Windows 走
+/// winspool 的 RAW 数据类型，Linux/macOS 走 CUPS 的 `lp -o raw`）。
+/// 适用于打印机原生语言数据（如 ESC/POS、PCL）；不排版、不分页，
+/// 内容必须由调用方按目标打印机格式生成。</summary>
+class RawPrinter {
+    /// <summary>
+    /// 发送一个 RAW 文档。字节原样传递给所选
+    /// 打印机驱动。documentName 为空时用默认名。
+    /// 任何后台打印操作失败时返回 false。
+    /// </summary>
+    static bool Send(string printerName, string documentName, byte[] data) {
+        #if WINDOWS
+        if (printerName == null || printerName.Length == 0) {
+            throw new ArgumentException("printerName must not be empty");
+        }
+        if (documentName == null || documentName.Length == 0) {
+            documentName = "Zan RAW document";
+        }
+        if (data == null) { throw new ArgumentException("data must not be null"); }
+
+        return RawPrinter.SendWithBackend(
+            printerName, documentName, data, new WinRawPrinterBackend());
+        #else
+        if (printerName == null || printerName.Length == 0) {
+            throw new ArgumentException("printerName must not be empty");
+        }
+        if (documentName == null || documentName.Length == 0) {
+            documentName = "Zan RAW document";
+        }
+        if (data == null) { throw new ArgumentException("data must not be null"); }
+
+        return RawPrinter.SendWithBackend(
+            printerName, documentName, data, new CupsRawPrinterBackend());
+        #endif
+    }
+
+    /// <summary>针对注入的后端运行 RAW 后台打印协议。</summary>
+    internal static bool SendWithBackend(string printerName, string documentName,
+                                         byte[] data, IRawPrinterBackend backend) {
+        if (!backend.Open(printerName)) { return false; }
+
+        bool documentStarted = backend.StartDoc(documentName);
+        bool success = documentStarted;
+        if (success) { success = backend.StartPage(); }
+        if (success) { success = backend.Write(data) == data.Length; }
+        if (success) { success = backend.EndPage(); }
+        if (documentStarted) {
+            if (success) {
+                success = backend.EndDoc();
+            } else {
+                backend.Abort();
+            }
+        }
+        if (!backend.Close()) { success = false; }
+        return success;
+    }
+}

@@ -1,0 +1,326 @@
+using System.Json;
+using System.Text;
+using System;
+
+namespace System.Web;
+
+/// <summary>
+/// Request parameter validation. Chain rules, then check Ok():
+///
+///   Validator v = new Validator();
+///   v.Require(ctx.Form("user"), "user");
+///   v.MaxLen(ctx.Form("user"), 32, "user");
+///   v.IsInt(ctx.Param("id"), "id");
+///   if (!v.Ok()) { ctx.Status(422, "Unprocessable Entity");
+///                  ctx.Api("1003", "validation failed", v.ErrorsJson()); return; }
+///
+/// Also carries the upload-safety helpers: client-supplied file names are
+/// never trusted as paths -- SafeFileName strips directories and dangerous
+/// characters, ExtAllowed enforces an extension whitelist.
+/// </summary>
+class Validator {
+    List<string> errors;
+
+    Validator() { this.errors = new List<string>(); }
+
+    /// 值为空记一条 "<field> is required"（可链式）。
+    Validator Require(string val, string field) {
+        if (val.Length == 0) { this.errors.Add(field + " is required"); }
+        return this;
+    }
+
+    /// 尚无任何错误时为真。
+    bool Ok() { return this.errors.Count == 0; }
+
+    /// 长度超过 max 记错误（可链式）。
+    Validator MaxLen(string val, int max, string field) {
+        if (val.Length > max) {
+            this.errors.Add(field + " exceeds " + Convert.ToString(max) + " chars");
+        }
+        return this;
+    }
+
+    /// 非空且长度不足 min 记错误；空值跳过（可链式）。
+    Validator MinLen(string val, int min, string field) {
+        if (val.Length > 0 && val.Length < min) {
+            this.errors.Add(field + " is shorter than " + Convert.ToString(min) + " chars");
+        }
+        return this;
+    }
+
+    /// <summary>Digits only (optional leading minus).</summary>
+    Validator IsInt(string val, string field) {
+        if (val.Length == 0) { return this; }
+        int i = 0;
+        if (val.Substring(0, 1) == "-") { i = 1; }
+        if (i >= val.Length) { this.errors.Add(field + " must be an integer"); return this; }
+        bool ok = true;
+        while (i < val.Length) {
+            string ch = val.Substring(i, 1);
+            if (ch < "0" || ch > "9") { ok = false; i = val.Length; }
+            i = i + 1;
+        }
+        if (!ok) { this.errors.Add(field + " must be an integer"); }
+        return this;
+    }
+
+    /// <summary>Value must be one of the comma-separated whitelist entries.</summary>
+    Validator OneOf(string val, string allowedCsv, string field) {
+        if (val.Length == 0) { return this; }
+        string csv = "," + allowedCsv + ",";
+        if (!Validator.ContainsStr(csv, "," + val + ",")) {
+            this.errors.Add(field + " is not an allowed value");
+        }
+        return this;
+    }
+
+    /// <summary>Multi-character substring search (string.Contains only
+    /// supports single characters reliably).</summary>
+    static bool ContainsStr(string s, string pat) {
+        int n = s.Length;
+        int pl = pat.Length;
+        if (pl == 0 || pl > n) { return false; }
+        for (int i = 0; i + pl <= n; i = i + 1) {
+            if (s.Substring(i, pl) == pat) { return true; }
+        }
+        return false;
+    }
+
+    /// 错误列表的 JSON 数组。
+    string ErrorsJson() {
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < this.errors.Count; i = i + 1) {
+            arr.Append(JsonValue.NewStr(this.errors[i]));
+        }
+        return arr.ToJson();
+    }
+
+    // ---- upload safety ----
+
+    /// <summary>Reduces a client-supplied file name to a safe base name:
+    /// strips any directory components (both separators), rejects "..",
+    /// and keeps only [A-Za-z0-9._-]. Returns "file" if nothing survives.</summary>
+    static string SafeFileName(string name) {
+        // Drop everything before the last path separator.
+        int i = name.Length - 1;
+        int cut = 0;
+        while (i >= 0) {
+            string ch = name.Substring(i, 1);
+            if (ch == "/" || ch == "\\") { cut = i + 1; i = 0 - 1; }
+            else { i = i - 1; }
+        }
+        string base_ = name.Substring(cut);
+        string outp = "";
+        string prev = "";
+        for (int j = 0; j < base_.Length; j = j + 1) {
+            string c = base_.Substring(j, 1);
+            bool ok = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+                || (c >= "0" && c <= "9") || c == "." || c == "_" || c == "-";
+            if (ok && !(c == "." && prev == ".")) { outp = outp + c; prev = c; }
+        }
+        if (outp.Length == 0 || outp == ".") { return "file"; }
+        return outp;
+    }
+
+    /// <summary>True if the file's extension is in the comma-separated
+    /// whitelist (e.g. "jpg,png,mp4"). Case-insensitive is NOT applied;
+    /// pass lowercase names.</summary>
+    static bool ExtAllowed(string name, string allowedCsv) {
+        int dot = 0 - 1;
+        for (int i = 0; i < name.Length; i = i + 1) {
+            if (name.Substring(i, 1) == ".") { dot = i; }
+        }
+        if (dot < 0 || dot == name.Length - 1) { return false; }
+        string ext = name.Substring(dot + 1);
+        string csv = "," + allowedCsv + ",";
+        return Validator.ContainsStr(csv, "," + ext + ",");
+    }
+}
+
+/// <summary>
+/// Unified input filtering. Every frontend parameter fetched through
+/// HttpContext.In* runs through here, so sanitising is centralised instead of
+/// being repeated (and forgotten) in each controller:
+///   Clean  -- trim + strip CR/LF/TAB control chars (safe default)
+///   Html   -- Clean + HTML-entity escape (safe to echo into a page)
+///   ToInt  -- tolerant integer parse with a fallback
+///
+/// Implemented with Substring / Length / char comparison only (no string.Trim /
+/// Replace / IndexOf), matching the rest of the framework, so it stays correct
+/// on binary-safe, byte-length strings.
+/// </summary>
+class Filter {
+    /// 是否空白符：空格 / TAB / CR / LF。
+    static bool IsSpace(string c) {
+        return c == " " || c == "\t" || c == "\r" || c == "\n";
+    }
+
+    /// <summary>Trim surrounding whitespace and drop CR/LF (TAB -> space) so a
+    /// value cannot smuggle header/log-injection control characters.</summary>
+    static string Clean(string s) {
+        int n = s.Length;
+        if (n == 0) { return s; }
+        int start = 0;
+        for (; start < n; start = start + 1) {
+            int c = s[start] & 255;
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+        }
+        int end = n;
+        while (end > start) {
+            int c = s[end - 1] & 255;
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+            end = end - 1;
+        }
+        // Fast path: scan for any control chars in trimmed range.
+        bool hasControl = false;
+        int k = start;
+        while (k < end) {
+            int c = s[k] & 255;
+            if (c == 13 || c == 10 || c == 9) { hasControl = true; break; }
+            k = k + 1;
+        }
+        if (!hasControl) { return s.Substring(start, end - start); }
+        // Flush buffered runs: only allocate on control chars.
+        StringBuilder sb = new StringBuilder();
+        int flush = start;
+        int i = start;
+        while (i < end) {
+            int c = s[i] & 255;
+            if (c == 13 || c == 10) {
+                if (i > flush) { sb.Append(s.Substring(flush, i - flush)); }
+                flush = i + 1;
+            } else if (c == 9) {
+                if (i > flush) { sb.Append(s.Substring(flush, i - flush)); }
+                sb.Append(" ");
+                flush = i + 1;
+            }
+            i = i + 1;
+        }
+        if (end > flush) { sb.Append(s.Substring(flush, end - flush)); }
+        return sb.ToString();
+    }
+
+    /// <summary>Clean + escape the five HTML-significant characters. Use this
+    /// for any value that will be rendered back into HTML.</summary>
+    static string Html(string s) {
+        string t = Filter.Clean(s);
+        // Fast path: skip the builder entirely when no special chars are present.
+        if (t.IndexOf("&") < 0 && t.IndexOf("<") < 0 && t.IndexOf(">") < 0
+            && t.IndexOf("\"") < 0 && t.IndexOf("'") < 0) { return t; }
+        StringBuilder sb = new StringBuilder();
+        int n = t.Length;
+        int start = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = t[i] & 255;
+            string esc = "";
+            if (c == 38) { esc = "&amp;"; }       // '&'
+            else if (c == 60) { esc = "&lt;"; }   // '<'
+            else if (c == 62) { esc = "&gt;"; }   // '>'
+            else if (c == 34) { esc = "&quot;"; } // '"'
+            else if (c == 39) { esc = "&#39;"; }  // '\''
+            if (esc.Length > 0) {
+                if (i > start) { sb.Append(t.Substring(start, i - start)); }
+                sb.Append(esc);
+                start = i + 1;
+            }
+        }
+        if (n > start) { sb.Append(t.Substring(start, n - start)); }
+        return sb.ToString();
+    }
+
+    /// '0'–'9' 映射 0–9，其余 -1。
+    static int DigitValue(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        return -1;
+    }
+
+    /// <summary>Parses a (cleaned) decimal integer, returning def on any
+    /// non-numeric input. Accepts an optional leading '-'.</summary>
+    static int ToInt(string s, int def) {
+        string t = Filter.Clean(s);
+        if (t.Length == 0) { return def; }
+        int i = 0;
+        bool neg = false;
+        if ((t[0] & 255) == 45) { neg = true; i = 1; }  // '-'
+        if (i >= t.Length) { return def; }
+        int val = 0;
+        while (i < t.Length) {
+            int d = Filter.DigitValue(t[i] & 255);
+            if (d < 0) { return def; }
+            val = val * 10 + d;
+            i = i + 1;
+        }
+        if (neg) { return -val; }
+        return val;
+    }
+
+    /// <summary>Parses a (cleaned) decimal integer into a long, returning def on
+    /// any non-numeric input. Ids and timestamps outgrow int; parsing them as
+    /// int and widening afterwards would wrap silently.</summary>
+    static long ToLong(string s, long def) {
+        string t = Filter.Clean(s);
+        if (t.Length == 0) { return def; }
+        int i = 0;
+        bool neg = false;
+        if ((t[0] & 255) == 45) { neg = true; i = 1; }  // '-'
+        if (i >= t.Length) { return def; }
+        long val = 0;
+        while (i < t.Length) {
+            int d = Filter.DigitValue(t[i] & 255);
+            if (d < 0) { return def; }
+            val = val * 10 + (long)d;
+            i = i + 1;
+        }
+        if (neg) { return -val; }
+        return val;
+    }
+
+    /// <summary>Parses a decimal number (optional sign, optional fraction),
+    /// returning def on anything else.</summary>
+    static double ToDouble(string s, double def) {
+        string t = Filter.Clean(s);
+        if (t.Length == 0) { return def; }
+        int i = 0;
+        bool neg = false;
+        if ((t[0] & 255) == 45) { neg = true; i = 1; }
+        if (i >= t.Length) { return def; }
+        double val = 0.0;
+        bool any = false;
+        while (i < t.Length) {
+            int c = t[i] & 255;
+            if (c == 46) { break; }  // '.'
+            int d = Filter.DigitValue(c);
+            if (d < 0) { return def; }
+            val = val * 10.0 + (double)d;
+            any = true;
+            i = i + 1;
+        }
+        if (i < t.Length && (t[i] & 255) == 46) {
+            i = i + 1;
+            double scale = 0.1;
+            while (i < t.Length) {
+                int d = Filter.DigitValue(t[i] & 255);
+                if (d < 0) { return def; }
+                val = val + (double)d * scale;
+                scale = scale * 0.1;
+                any = true;
+                i = i + 1;
+            }
+        }
+        if (!any) { return def; }
+        if (neg) { return -val; }
+        return val;
+    }
+
+    /// <summary>Reads a checkbox/flag parameter. "1", "true", "on", "yes" are
+    /// true; "0", "false", "off", "no", "" are false; anything else is def.
+    /// Browsers send "on" for a checked box, APIs send true/1 -- both are the
+    /// same intent and must not depend on which client is calling.</summary>
+    static bool ToBool(string s, bool def) {
+        string t = Filter.Clean(s).ToLower();
+        if (t.Length == 0) { return def; }
+        if (t == "1" || t == "true" || t == "on" || t == "yes") { return true; }
+        if (t == "0" || t == "false" || t == "off" || t == "no") { return false; }
+        return def;
+    }
+}

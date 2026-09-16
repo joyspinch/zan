@@ -1,0 +1,140 @@
+using System;
+
+namespace Gui.Component.Chart;
+
+/// 已注册地图：echarts registerMap 的对应物。regions 是 0.01°
+/// 屏幕系几何（GeoJSON 形态，ChartGeoJson.ParseText 解析）或
+/// SVG 用户单位几何（SVG 形态，ChartSvgMap.Scan 惰性扫描）；
+/// svg 非 "" 即 SVG 地图，vx..vh 为其 viewBox（布局源框）。
+class ChartMapEntry {
+    string name;
+    string svg;
+    double vx;
+    double vy;
+    double vw;
+    double vh;
+    bool scanned;
+    List<ChartMapRegion> regions;
+
+    static ChartMapEntry Of(string name) {
+        ChartMapEntry e = new ChartMapEntry();
+        e.name = name;
+        e.svg = "";
+        e.scanned = false;
+        e.regions = new List<ChartMapRegion>();
+        return e;
+    }
+}
+
+/// 地图注册表：程序启动时把随包携带的地图数据注册进来
+/// （GeoJSON 文本 / Zan 侧区域表 / SVG 源码），map 系列与 geo
+/// 组件按名字取几何（ChartMaps.BindSeries 并入数据值与覆盖）。
+/// 全仓约定：注册表是进程级的只读几何源，绑定进系列的 regions
+/// 是克隆——渲染器对 regions 的任何修改都不回写注册表。
+class ChartMaps {
+    static List<ChartMapEntry> all;
+
+    /// 初始化兜底（静态字段不依赖初始化器顺序）。
+    static List<ChartMapEntry> Table() {
+        if (ChartMaps.all == null) { ChartMaps.all = new List<ChartMapEntry>(); }
+        return ChartMaps.all;
+    }
+
+    /// 按名查注册表；未注册返回 null。
+    static ChartMapEntry Find(string name) {
+        if (name == null || name.Length == 0) { return null; }
+        List<ChartMapEntry> tab = ChartMaps.Table();
+        for (int i = 0; i < tab.Count; i = i + 1) {
+            if (tab[i].name == name) { return tab[i]; }
+        }
+        return null;
+    }
+
+    /// 注册 GeoJSON 地图（明文 GeoJSON 或 echarts UTF8Encoding
+    /// 形态，见 ChartGeoJson）。无可渲染要素时不入表。
+    static void Register(string name, string geoJsonText) {
+        if (name == null || name.Length == 0) { return; }
+        if (ChartMaps.Find(name) != null) { return; }
+        List<ChartMapRegion> regions = ChartGeoJson.ParseText(geoJsonText);
+        if (regions.Count < 1) { return; }
+        ChartMapEntry e = ChartMapEntry.Of(name);
+        e.regions = regions;
+        e.scanned = true;
+        ChartMaps.Table().Add(e);
+    }
+
+    /// 注册 Zan 侧区域表（如 gui_gallery 的 MapChinaData）。表被
+    /// 直接持有，调用方注册后不要再改。
+    static void RegisterRegions(string name, List<ChartMapRegion> regions) {
+        if (name == null || name.Length == 0 || regions == null
+            || regions.Count < 1) { return; }
+        if (ChartMaps.Find(name) != null) { return; }
+        ChartMapEntry e = ChartMapEntry.Of(name);
+        e.regions = regions;
+        e.scanned = true;
+        ChartMaps.Table().Add(e);
+    }
+
+    /// 注册 SVG 地图（echarts registerMap(name, {svg: text})）。
+    /// 几何在首次绑定时惰性扫描（大 SVG 的解析只发生一次）。
+    static void RegisterSvg(string name, string svgText) {
+        if (name == null || name.Length == 0 || svgText == null
+            || svgText.Length == 0) { return; }
+        if (ChartMaps.Find(name) != null) { return; }
+        ChartMapEntry e = ChartMapEntry.Of(name);
+        e.svg = svgText;
+        ChartMaps.Table().Add(e);
+    }
+
+    /// SVG 地图确保已扫描（幂等；GeoJSON 表是空操作）。
+    static void EnsureScanned(ChartMapEntry e) {
+        if (e == null) { return; }
+        if (e.svg.Length > 0) { ChartSvgMap.Scan(e); }
+    }
+
+    /// 把注册表几何绑定进 map 系列：克隆注入 s.regions，按名字
+    /// 并入 s.data 的值（data 优先）与 regions[] 覆盖（值/显式色；
+    /// 带 ring 的自定义覆盖区域原样追加）。未注册的地图名不报错、
+    /// 不注入（渲染器画空面板）。
+    static void BindSeries(ChartSeries s) {
+        if (s == null || s.mapName == null || s.mapName.Length == 0) { return; }
+        // 已带几何（对象 API 或自定义 rings 覆盖）的系列不绑定。
+        if (s.regions != null) {
+            bool hasGeo = false;
+            for (int g = 0; g < s.regions.Count; g = g + 1) {
+                if (s.regions[g].rings.Count > 0) { hasGeo = true; break; }
+            }
+            if (hasGeo) { return; }
+        }
+        ChartMapEntry e = ChartMaps.Find(s.mapName);
+        if (e == null) { return; }
+        ChartMaps.EnsureScanned(e);
+        if (e.regions.Count < 1) { return; }
+        List<ChartMapRegion> merged = new List<ChartMapRegion>();
+        for (int r = 0; r < e.regions.Count; r = r + 1) {
+            ChartMapRegion g = ChartMapRegion.Clone(e.regions[r]);
+            if (g == null) { continue; }
+            for (int d = 0; d < s.data.Count; d = d + 1) {
+                ChartData dt = s.data[d];
+                if (dt.name.Length > 0 && dt.name == g.name) {
+                    g.value = dt.val;
+                    break;
+                }
+            }
+            for (int v = 0; v < s.regions.Count; v = v + 1) {
+                ChartMapRegion ov = s.regions[v];
+                if (ov.rings.Count > 0) { continue; }
+                if (ov.name == g.name) {
+                    g.value = ov.value;
+                    if (ov.color != 0) { g.color = ov.color; }
+                }
+            }
+            merged.Add(g);
+        }
+        // 带几何的自定义覆盖区域（调用方自画形状）原样保留。
+        for (int v2 = 0; v2 < s.regions.Count; v2 = v2 + 1) {
+            if (s.regions[v2].rings.Count > 0) { merged.Add(s.regions[v2]); }
+        }
+        s.regions = merged;
+    }
+}

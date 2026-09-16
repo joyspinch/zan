@@ -1,0 +1,82 @@
+using System;
+using System.Json;
+
+namespace Sdk.Steam;
+
+/// <summary>
+/// AuthenticateUserTicket 的校验结果。
+///
+/// Steam 约定：result 的 EResult 值为 1（OK）才算通过；ownersteamid 与
+/// steamid 不同说明该授权来自共享库 / 家庭共享，做防作弊与时长统计时
+/// 应以 ownersteamid 为准。
+/// </summary>
+class SteamTicketResult {
+    /// <summary>通过校验的玩家 64 位 SteamID（字符串形式原样保留）。</summary>
+    public string SteamId;
+
+    /// <summary>拥有该游戏许可的账号 64 位 SteamID（家庭共享时与 SteamId 不同）。</summary>
+    public string OwnerSteamId;
+
+    /// <summary>该账号是否被 VAC 封禁。</summary>
+    public bool VacBanned;
+
+    /// <summary>该账号是否被发行商封禁。</summary>
+    public bool PublisherBanned;
+
+    SteamTicketResult(string steamId, string ownerSteamId,
+                      bool vacBanned, bool publisherBanned) {
+        this.SteamId = steamId;
+        this.OwnerSteamId = ownerSteamId;
+        this.VacBanned = vacBanned;
+        this.PublisherBanned = publisherBanned;
+    }
+
+    /// <summary>从 AuthenticateUserTicket 的 JSON 树解析；result != 1 时抛 SteamException。</summary>
+    static SteamTicketResult Parse(JsonValue root) {
+        // Steam 对 64 位整数一律以字符串返回；防御性兼容数字形态。
+        string steamId = SteamTicketResult.IdText(root, "response.params.steamid");
+        string ownerSteamId = SteamTicketResult.IdText(root,
+            "response.params.ownersteamid");
+        int result = SteamTicketResult.ResultCode(root);
+        if (result != 1) {
+            throw new SteamException("auth." + Convert.ToString(result),
+                "票据校验未通过（EResult " + Convert.ToString(result) + "，1=OK）",
+                root.ToJson());
+        }
+        if (steamId.Length == 0) {
+            throw new SteamException("auth.0",
+                "校验通过但响应缺少 steamid", root.ToJson());
+        }
+        return new SteamTicketResult(steamId, ownerSteamId,
+            SteamTicketResult.Banned(root, "response.params.vacbanned"),
+            SteamTicketResult.Banned(root, "response.params.publisherbanned"));
+    }
+
+    // result（EResult）：文档上是数字，线上实际返回字符串 "OK"（=1）。
+    // 两种形态都要接住，其余字符串按 0 处理走失败分支。
+    static int ResultCode(JsonValue root) {
+        JsonValue v = root.PathGet("response.params.result");
+        if (v == null) { return 0; }
+        if (v.IsString()) {
+            string s = v.AsString("");
+            if (s == "OK") { return 1; }
+            return JsonValue.IntOf(s);
+        }
+        return v.AsInt(0);
+    }
+
+    // steamid / ownersteamid 按字符串取，缺失或为数字时退回其字面量。
+    static string IdText(JsonValue root, string path) {
+        JsonValue v = root.PathGet(path);
+        if (v == null) { return ""; }
+        return v.AsString("");
+    }
+
+    // vacbanned / publisherbanned：Steam 返回布尔；数值 1 也按真处理。
+    static bool Banned(JsonValue root, string path) {
+        JsonValue v = root.PathGet(path);
+        if (v == null) { return false; }
+        if (v.IsNumber()) { return v.AsInt(0) != 0; }
+        return v.AsBool(false);
+    }
+}

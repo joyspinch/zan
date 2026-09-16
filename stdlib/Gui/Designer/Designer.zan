@@ -1,0 +1,2012 @@
+using System;
+using System.Json;
+using Gui.Widget;
+using Gui;
+using Gui.Component;
+
+namespace Gui.Designer;
+
+/// 自包含、可复用的 FormCreate/form-builder 风格可视化设计器。
+///
+/// 不做自由像素拖拽，而是编辑有序的表单字段列表
+/// （FormField 控件作为 `form` 根面板的子级），并渲染为
+/// 带标签的纵向表单——即大家在 VB /
+/// WinForms / element-plus 表单设计器里手工搭的那种布局，但无需操作坐标。
+///
+/// 界面：
+///   * 左侧分类字段面板（点击类型即可追加一行），
+///   * 中间为纵向表单预览（标签 + 必填星号 + 每个字段控件的
+///     预览；点击行可选中），
+///   * 右侧检查器，带 Field / Form 两个标签页：Field 编辑
+///     选中行（标签、model 名、placeholder、必填、选项、change
+///     处理器）；Form 编辑表单级配置（名称、标签位置、尺寸、标签
+///     宽度、必填星号显隐、提交/重置按钮、提交处理器），
+///   * 底部状态栏。
+///
+/// 一切通过 Serialize 往返：表单配置是一行头部，
+/// 字段是序列化的 Control 子树，因此关系、顺序、
+/// 属性和事件绑定都能持久化。
+///
+/// 用法：
+///   Designer d = new Designer();   // 创建一次
+///   d.Seed(app);                      // 可选：填充示例字段
+///   d.Render(app, x, y, w, h);        // 每帧调用
+
+/// 一个已保存的用户组件：显示名 + 设计 JSON。用一个实体
+/// 而非并行的 name/json 列表。
+class UserComponent {
+    string name;
+    string json;
+
+    UserComponent(string name, string json) {
+        this.name = name;
+        this.json = json;
+    }
+}
+
+/// 画布上一个页签的屏幕矩形。渲染标签条时逐个登记，指针按下
+/// 时据此把点击判成「翻到那一页」，而不是选中或拖动 Tabs 容器。
+class TabHeaderHit {
+    FormField tabs;
+    int page;
+    int x;
+    int y;
+    int w;
+    int h;
+
+    TabHeaderHit(FormField tabs, int page, int x, int y, int w, int h) {
+        this.tabs = tabs;
+        this.page = page;
+        this.x = x;
+        this.y = y;
+        this.w = w;
+        this.h = h;
+    }
+}
+
+partial class Designer {
+    // UI language code ("zh" / "en"). Set by the host (e.g. the IDE) so the
+    // designer 界面文案跟随宿主 UI 语言，通过 T(en, zh) 读取。
+    static string lang = "en";
+
+    List<FormField> fields;
+    FormField sel;
+    FormField selPrev;
+    string doc;
+    string msg;
+    int inspTab;      // 0 = 字段，1 = 表单
+    bool preview;
+    // 宿主（IDE）把组件面板和属性面板挂在自己的 dock 里时置位：
+    // 设计器本体只留功能区 + 画布，不再自己开左右两栏。
+    bool hostPanels;
+    int seq;          // 生成字段名的递增计数器
+
+    // 面板添加新组件时放入的容器：当前选中
+    // 的容器，或选中子级的父容器；null 表示
+    // 顶层表单。点击 Card / Tabs 后即可把组件放入其中。
+    FormField activeContainer;
+    // 组件工具箱（TreeView 控件 + 与其绑定的节点表）。
+    // palKind / palCustom 与 palNodes 一一对应：行 -> 组件类型。
+    TreeView palTv;
+    List<TreeNode> palNodes;
+    List<int> palKind;
+    List<string> palCustom;
+    // 单击工具箱添加组件被推迟到抬起：按下时还不知道这是一次点击
+    // 还是一次拖拽，立刻添加会让拖入的第一个组件变成两个
+    // （点击加一个、放下再加一个）。
+    bool palClickPending;
+    int palClickKind;
+    string palClickCustom;
+    bool palBuilt;      // 节点表是否已构建
+    string palBuiltQ;   // 上次构建节点时的过滤串
+    int palBuiltUser;   // 上次构建节点时的用户组件数量
+
+    // 工具箱中被折叠起来的分组标题（Visual Studio 风格的
+    // 可折叠分组），按标题记住，跨帧保留。
+    List<string> palFolded;
+
+    // 被设计窗口的布局模式：0 = 流式（24 列，form-builder
+    // 风格），1 = 自由（绝对定位的设计画布，场景设计器风格）。
+    int layoutMode;
+    // 自由画布缩放，以设计尺寸的千分比表示（1000 = 100%，0 = 适配
+    // 到编辑器视口）。默认 1000：100% 的语义是"目标设备 1:1"——
+    // 渲染比例 = 视图缩放 × dpiScale，任何显示比例的机器打开同一张
+    // 设计，看到的逻辑布局都一致；「适应」把显示器 DPI 烘进缩放
+    // 结果（同一张设计在不同 DPI 屏上适应出的比例不同），只作为
+    // 缩放下拉里的一档，不作为默认视图。
+    int winZoom;
+    // 最近一帧「适应」算出的实际缩放（千分比，1000 = 100%），供功能区
+    // 显示与从 Fit 缩放的起步值使用。
+    int lastFitPct;
+    // 自由画布交互状态。名称带前缀，避免与
+    // 流式模式的面板拖拽（`dragging` 等）冲突。
+    bool freeDragging;   // 在自由画布上拖移选区
+    bool freeResizing;   // 通过角/边手柄调整大小
+    int freeResizeH;     // 当前活动的手柄 0-7（TL,T,TR,R,BR,B,BL,L）
+    int freeDragDx;      // 设计空间中从元素原点指向光标的偏移
+    int freeDragDy;
+    int freeGuideX;      // 纵向智能参考线的设计空间 x 坐标（-1 = 无）
+    int freeGuideY;      // 横向智能参考线的设计空间 y 坐标（-1 = 无）
+    int freeSelPX;       // 选区父级内容的设计空间原点
+    int freeSelPY;       // （这样嵌套子级拖动位置才正确）
+    int freeDropPX;      // 从工具箱拖入时命中的容器内容框原点
+    int freeDropPY;      // （新组件的坐标要相对它）
+    bool showGrid;       // 绘制自由画布网格
+    bool snapGrid;       // 自由画布上的放置吸附到网格
+    int gridSize;        // 自由画布网格步长（设计像素）
+    // 自由画布设计尺寸预设下拉框（保留的 SelectBox）以及
+    // 最后应用到 winW/winH 的预设索引，这样外部尺寸编辑（检查器的
+    // Width/Height 行）会重新同步下拉框，而不是被它
+    // 覆盖。
+    // 自由画布的平移偏移（屏幕像素，0,0 = 居中/左上），另有
+    // 拖拽平移状态：按住画布空白处拖动视口，
+    // 用于放大后的设计超出编辑器面板的情况。
+    int freePanX;
+    int freePanY;
+    bool freePanning;
+    /// 自由画布上的附加选中项（Ctrl+点击 / 框选），
+    /// `sel` 是其中的主选中项（手柄和检查器跟着它）。
+    List<FormField> freeExtra;
+    // --- 撤销 / 重做与剪贴板 -------------------------------------
+    /// 整份设计 JSON 快照（最多 60 份）：任何修改前压栈，
+    /// 撤销时把当前快照压回重做栈再载入栈顶。和场景设计器
+    /// 同一套模型——SaveJson/LoadJson 就是文档的完整往返。
+    List<string> undoStack;
+    List<string> redoStack;
+    /// 剪贴板：复制选中项的 FieldJson 片段，粘贴时重建
+    /// （容器连子级一起）。
+    List<string> clipFields;
+    bool freeHand;       // 抓手模式：左键拖动即平移画布
+    bool freeMarquee;    // 正在空白处拉框选
+    int freeMqSX;        // 框选起点（屏幕坐标）
+    int freeMqSY;
+    int freePanSX;   // 平移拖拽开始时指针的位置
+    int freePanSY;
+    int freePanOX;   // 平移拖拽开始时的偏移
+    int freePanOY;
+    // 圆形显示（智能手表）：设计器在自由画布上叠加圆形可视
+    // 区域。以 `winRound` 保存在设计 JSON 中。
+    bool winRound;
+    // 预览缩放（千分比，参见 PvS/PvFont）；1000 = 1:1（流式模式）。
+    int pvScale;
+    /// 本帧画出的页签矩形（渲染时填，指针处理时读）。
+    List<TabHeaderHit> tabHits;
+    // 真实控件预览的等比缩放：渲染真控件（输入/表格/图表等）时
+    // 临时把 app.dpiScale 和主题度量按视图缩放放大/缩小，让它们
+    // 的字号、内边距随画布一起等比缩放，渲染完精确还原。
+    // czBase 是被缩放前的主题度量快照，czDpi 是原 dpiScale。
+    List<int> czBase;
+    int czDpi;
+    // 进入缩放前的 app.metricsScale（退出时原值还原）。
+    int czScale;
+    // 嵌套深度：预览整体已经夹在一层缩放里时，里层的 PvCtrl /
+    // 图表等再夹一次只能是空操作，否则度量会被重复缩放。
+    int czDepth;
+
+    // 缩放下拉菜单（50%–200% 档位）：点功能区缩放按钮弹出，
+    // 在叠层顶部绘制。zoomMenuArm 跳过打开当帧的那次点击，
+    // 避免同帧自关。
+    bool zoomMenuOpen;
+    int zoomMenuX;
+    int zoomMenuY;
+    bool zoomMenuArm;
+
+    // 表单级配置。
+    int labelPos;     // 0 左侧，1 右侧，2 顶部
+    int formSize;     // 0 大，1 默认，2 小
+    int labelWidth;   // 为标签列预留的逻辑像素宽度
+    bool hideStar;    // 隐藏必填字段的红星
+    bool showSubmit;
+    bool showReset;
+
+    // 拖拽状态（从面板拖到表单添加；表单内拖动排序）。
+    bool dragging;
+    bool dragFromPalette;
+    bool dragMoved;
+    int dragKind;     // 正从面板拖出的字段类型
+    string dragCustomKind; // 当 dragKind == 100 时的自定义组件 tag
+    int dragIndex;    // 排序时的源行索引
+    int dropIndex;    // 计算出的插入索引
+    int dropY;        // 插入指示线的 y 坐标
+    int dragMouseX;
+    int dragMouseY;
+    // 拖拽指针当前所在的容器（拖拽期间每帧重新计算）；
+    // 放置时嵌套进该容器而非顶层表单。
+    FormField dropContainer;
+    int dragUserComp; // 正在拖拽的用户组件索引，否则为 -1
+
+    // 面板悬停（用于绘制在面板之上的 tooltip）。
+    int hoverFt;
+    int hoverX;
+    int hoverY;
+
+    // 属性表：普通属性行全由它画，检查器只提供 PropSpec 列表。
+    PropertyGrid propGrid;
+    // 属性表的目标序号：选中目标变了才递增，编辑名字
+    // 不会把编辑器重建掉。
+    int inspKeySeq;
+
+    // 内联编辑器（跨帧保留；选区变化时重新初始化）。
+    // 文本经 GetText()/SetText() 读写——动态宿主没有
+    // 编译期字段可绑，不走 Binding<T>（§6.1）。
+    Input optInput;
+    Input optFieldInput;   // 表格列的数据字段键
+    Input evtInput;
+    string evtEditing;   // 处理器框正在编辑选中字段的哪个事件
+    Input formNameInput;
+    Input submitInput;
+
+    // 根窗口（正在设计的最外层组件）：其自身的属性
+    // 和事件处理器。未选中任何子级时由检查器编辑。
+    /// 窗口标题的唯一真相（普通字段）：标题输入框经 `data` 绑定、
+    /// PropertyGrid 的 title 行经 PropSpec.str 指到同一字段。
+    string winTitle;
+    Input winTitleInput;
+    int winW;
+    int winH;
+    bool winResizable;
+    bool winTool;
+    bool winCenter;
+    bool winGlass;
+    int winShape;        // 0 矩形，1 圆角矩形，2 椭圆，3 自定义并集
+    int winShapeRadius;  // 圆角半径（逻辑像素）
+    string winShapeSpec; // 自定义形状描述 "t,x,y,w,h,r;..."（winShape == 3）
+    bool winChrome;      // 绘制自定义标题栏 chrome
+    int winOpacity;      // 整窗不透明度百分比（0 = 保持不透明）
+    /// 设计文档的 "role"："control" 的文档编译成可嵌入的自定义
+    /// 组件（partial class X : Control）而不是窗口。设计器自己
+    /// 不用它，但必须原样往返：丢了这一键，一次另存就把组件
+    /// 变成窗口，代码后置里的字段访问全部编译不过。
+    string docRole;
+    int winPosX;   // 手动设置的窗口 X（winCenter 为 false 时使用）
+    int winPosY;   // 手动设置的窗口 Y（winCenter 为 false 时使用）
+    /// 目标设备画像 id（DeviceProfile，"" = 桌面自由尺寸）。锁定类
+    /// 画像下 winW/winH 由画像给出，属性面板不再提供宽高输入，
+    /// 只保留画像允许的横竖屏切换。
+    string device;
+    /// device/方向在属性面板里的镜像下标：每帧从模型同步，
+    /// PropertyGrid 经绑定写回，渲染后与模型差量即用户改动。
+    int devSelIdx;
+    int devOrient;
+    List<EventBinding> winEvents;  // 窗口事件 → 处理器的绑定
+    string winEvtEditing;          // 处理器框正在编辑哪个窗口事件
+
+    // 组件面板过滤器（搜索框）+ 检查器滚动状态。
+    Input filterInput;
+    int inspScroll;
+    int inspContentH;
+
+    // 从配对的 code-behind 文件扫描出的可绑定变量（宿主 IDE
+    // 通过 SetBindVars 提供）。检查器的绑定路径行以
+    // 小型选择器展示它们，这样组件可双向绑定到代码变量，
+    // 无需手打变量名。
+    List<string> bindVars;
+    bool bindPickOpen;
+
+    // 可编辑的 JSON 抽屉：设计内容的唯一权威文本框
+    // （取代旧的 Save/Load/Export 按钮）。编辑后
+    // 点击 Apply 重建设计；打开它则导出当前设计。
+    TextArea jsonArea;
+    bool jsonOpen;
+    bool evtRootPrev;              // 上一次事件标签页的目标是窗口根
+    FormField evtSelPrev;         // 上一次事件标签页的组件目标
+
+    // 项目用户组件：保存为可复用组件的设计（宿主
+    // IDE 以 components/*.zcomp 持久化并回喂）。保存
+    // 请求由检查器发起、宿主消费。
+    List<UserComponent> userComps;
+    bool saveCompRequested;
+
+    // 引用节点画布预览的构建缓存：key = 代次|组件名|宽x高。
+    // 组件文档只在加载/保存时变（SetUserComponents 递增代次），
+    // 尺寸变化才重建 FormBuilder 树，其余帧只重渲染。
+    List<string> pvCompKeys;
+    List<Control> pvCompCtls;
+    int pvCompGen;
+
+    // 当前选中引用节点的组件属性声明缓存（组件文档根上的
+    // "props":[{key,label,kind,target,prop,def}]，v1 只消费 text 型）。
+    // 实例值存引用节点 extra 的 "props" 直通表，序列化/展开全链路
+    // 复用既有通道。
+    string compPropFor;
+    List<string> compPropKeys;
+    List<string> compPropLabels;
+    List<string> compPropDefs;
+
+    // 检查器里的组件属性行（即时模式）：每条声明一个输入框 +
+    // 影子值，选中节点/组件代次变化时重建；输入变化写回
+    // f.extra 的 "props" 直通表。
+    string compPropEditFor;
+    List<Input> compPropInputs;
+    List<string> compPropShadow;
+
+    // 检查器里的 STYLE（CSS 声明行）编辑器：一行一条声明，选中
+    // 节点变化时按 f.styleText 重建；输入变化每帧重组写回
+    // f.styleText（空行跳过），画布预览下一帧经 FormBuilder.FromField
+    // → SetProp("style") 即时生效。
+    string styleEditFor;
+    List<Input> styleInputs;
+
+    // 画布双击引用节点的开门请求：宿主轮询 ConsumeOpenComponent，
+    // 打开 components/<名>.zcomp 文档本身供编辑（组件的一等
+    // 编辑入口，与「保存为组件」对称）。
+    bool openCompRequested;
+    string openCompName;
+
+    /// 切换被设计窗口的布局模型。宿主在打开一份设计时
+    /// 调用（.zform 里存了 layoutMode），设计器自己不提供
+    /// 切换命令：两种布局不共享坐标，来回切会丢摆放。
+    void SetLayoutMode(int mode) {
+        layoutMode = mode;
+        if (mode == 1) { this.SeedFreeBounds(); }
+    }
+
+    /// 给还没有绝对坐标的组件在自由画布上排一列，
+    /// 免得它们全叠在原点。
+    void SeedFreeBounds() {
+        int cy2 = 16;
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            FormField f = fields[i];
+            if (f.fw <= 0) { f.fw = 200; }
+            if (f.fh <= 0) { f.fh = 32; }
+            if (f.fx == 0 && f.fy == 0) {
+                f.fx = 16;
+                f.fy = cy2;
+            }
+            cy2 = f.fy + f.fh + 12;
+        }
+    }
+
+    /// 按当前 UI 语言选取字符串：键式查找（System.Globalization.Lang），
+    /// 英文原文作键、内置中文为缺省串；语言包未加载时回退缺省串。
+    static string T(string en, string zh) {
+        return Lang.Tr(en, zh);
+    }
+
+    Designer() {
+        this.fields = new List<FormField>();
+        this.sel = null;
+        this.selPrev = null;
+        this.doc = "";
+        this.msg = Designer.T("click a field type on the left to add a row", "点击左侧组件类型以添加一行");
+        this.inspTab = 0;
+        this.preview = false;
+        this.seq = 0;
+        this.activeContainer = null;
+        this.palFolded = new List<string>();
+        this.layoutMode = 0;
+        // 1000 = 100%：打开设计按真实尺寸编辑，超出视口的部分平移查看；
+        // 「适应」仍是缩放下拉里的一档，要看全貌时手动切。
+        this.winZoom = 1000;
+        this.lastFitPct = 1000;
+        this.zoomMenuOpen = false;
+        this.zoomMenuX = 0;
+        this.zoomMenuY = 0;
+        this.zoomMenuArm = false;
+        this.czBase = null;
+        this.czDpi = 0;
+        this.czScale = 1000;
+        this.czDepth = 0;
+        this.freeDragging = false;
+        this.freeResizing = false;
+        this.freeResizeH = 4;
+        this.freeDragDx = 0;
+        this.freeDragDy = 0;
+        this.freeGuideX = 0 - 1;
+        this.freeGuideY = 0 - 1;
+        this.freeSelPX = 0;
+        this.freeSelPY = 0;
+        this.showGrid = true;
+        this.snapGrid = true;
+        this.gridSize = 8;
+        this.freePanX = 0;
+        this.freePanY = 0;
+        this.freePanning = false;
+        this.freeExtra = new List<FormField>();
+        this.undoStack = new List<string>();
+        this.redoStack = new List<string>();
+        this.clipFields = new List<string>();
+        this.freeHand = false;
+        this.freeMarquee = false;
+        this.freeMqSX = 0;
+        this.freeMqSY = 0;
+        this.freePanSX = 0;
+        this.freePanSY = 0;
+        this.freePanOX = 0;
+        this.freePanOY = 0;
+        this.winRound = false;
+        this.pvScale = 1000;
+        this.tabHits = new List<TabHeaderHit>();
+        this.labelPos = 0;
+        this.formSize = 1;
+        this.labelWidth = 92;
+        this.hideStar = false;
+        this.showSubmit = false;
+        this.showReset = false;
+        this.palClickPending = false;
+        this.palClickKind = 0;
+        this.palClickCustom = "";
+        this.dragging = false;
+        this.dragFromPalette = false;
+        this.dragCustomKind = "";
+        this.dragMoved = false;
+        this.dragKind = 0;
+        this.dragIndex = -1;
+        this.dropIndex = -1;
+        this.dropY = 0;
+        this.dragMouseX = 0;
+        this.dragMouseY = 0;
+        this.dropContainer = null;
+        this.dragUserComp = -1;
+        this.hoverFt = -1;
+        this.hoverX = 0;
+        this.hoverY = 0;
+        this.propGrid = new PropertyGrid();
+        this.inspKeySeq = 0;
+        this.optInput = new Input(Designer.T("new option", "新选项"));
+        this.optFieldInput = new Input(Designer.T("field", "字段"));
+        this.evtInput = new Input(Designer.T("handler", "处理器"));
+        this.evtEditing = "";
+        this.formNameInput = new Input(Designer.T("form name", "表单名称"));
+        this.formNameInput.SetText(Designer.T("My form", "我的表单"));
+        this.submitInput = new Input(Designer.T("handler", "处理器"));
+        this.winTitle = Designer.T("Tool Window", "工具窗口");
+        this.winTitleInput = new Input(Designer.T("window title", "窗口标题"));
+        this.winTitleInput.data = this.winTitle;
+        this.winW = 480;
+        this.winH = 360;
+        this.winResizable = true;
+        this.winTool = true;
+        this.winCenter = true;
+        this.winGlass = false;
+        this.winShape = 0;
+        this.winShapeRadius = 0;
+        this.winShapeSpec = "";
+        this.winChrome = true;
+        this.winOpacity = 0;
+        this.docRole = "";
+        this.winPosX = 0;
+        this.winPosY = 0;
+        this.device = "";
+        this.devSelIdx = 0;
+        this.devOrient = 0;
+        this.winEvents = new List<EventBinding>();
+        this.winEvtEditing = "";
+        this.filterInput = new Input(Designer.T("filter…", "筛选…"));
+        this.inspScroll = 0;
+        this.inspContentH = 0;
+        this.bindVars = new List<string>();
+        this.bindPickOpen = false;
+        this.evtRootPrev = false;
+        this.evtSelPrev = null;
+        this.jsonArea = new TextArea(Designer.T("paste or edit the design JSON, then Apply", "粘贴或编辑设计 JSON，然后点击应用"));
+        this.jsonOpen = false;
+        this.userComps = new List<UserComponent>();
+        this.saveCompRequested = false;
+        this.pvCompKeys = new List<string>();
+        this.pvCompCtls = new List<Control>();
+        this.pvCompGen = 0;
+        this.compPropFor = "";
+        this.compPropKeys = new List<string>();
+        this.compPropLabels = new List<string>();
+        this.compPropDefs = new List<string>();
+        this.compPropEditFor = "";
+        this.compPropInputs = new List<Input>();
+        this.compPropShadow = new List<string>();
+        this.openCompRequested = false;
+        this.openCompName = "";
+    }
+
+    /// 把工具箱滚到末尾。
+    void ScrollPaletteToEnd() {
+        this.EnsurePalette();
+        palTv.ScrollToEnd();
+    }
+
+    /// 可选的示例内容，让新建的设计器不是空表单——
+    /// 包含一个 Card 和带嵌套组件的 Tabs 容器，让组合 /
+    /// 标签切换行为开箱即可见。
+    void Seed(App app) {
+        activeContainer = null;
+        // A 24-column 网格: two halves, then thirds, showing 等分 layout.
+        AddField(0); fields[fields.Count - 1].span = 12;
+        AddField(2); fields[fields.Count - 1].span = 12;
+        AddField(3); fields[fields.Count - 1].span = 8;
+        AddField(6); fields[fields.Count - 1].span = 8;
+        AddField(7); fields[fields.Count - 1].span = 8;
+
+        // 带嵌套子级的 Card 容器。
+        activeContainer = null;
+        AddField(18);
+        AddField(15);
+        AddField(0);
+
+        // Tabs 容器：标签 1 放表格 + 统计，标签 2 放 alert。
+        activeContainer = null;
+        AddField(36);
+        AddField(23);
+        AddField(22);
+        if (activeContainer != null) { activeContainer.uiState.Set(1); }
+        AddField(28);
+        if (activeContainer != null) { activeContainer.uiState.Set(0); }
+
+        // 一个全宽图表。
+        activeContainer = null;
+        AddField(43);
+
+        activeContainer = null;
+        sel = null;
+        selPrev = null;
+        inspTab = 0;
+    }
+
+    // --- 字段变更 ------------------------------------------------------
+
+    /// `f` 是否还挂在设计树上。删除组件后 activeContainer /
+    /// dropContainer 这类引用可能指向已经被删掉的容器，往里加组件
+    /// 会得到一个谁也看不见、也存不下去的字段。
+    bool FieldAlive(List<FormField> lst, FormField f) {
+        for (int i = 0; i < lst.Count; i = i + 1) {
+            if (lst[i] == f) { return true; }
+            if (this.FieldAlive(lst[i].kids, f)) { return true; }
+        }
+        return false;
+    }
+
+    /// 丢弃指向已删组件的容器引用。
+    void DropDeadRefs() {
+        if (activeContainer != null && !this.FieldAlive(fields, activeContainer)) {
+            activeContainer = null;
+        }
+        if (dropContainer != null && !this.FieldAlive(fields, dropContainer)) {
+            dropContainer = null;
+        }
+        if (sel != null && !this.FieldAlive(fields, sel)) {
+            sel = null;
+            selPrev = null;
+            freeExtra = new List<FormField>();
+        }
+    }
+
+    /// 添加新组件。有活动容器时组件会嵌套进去（Tabs 则进入活动
+    /// 标签页）；否则追加到顶层表单。添加容器后会把它设为活动
+    /// 容器，可以立刻往里面放置组件。
+    void AddField(int ftype) {
+        this.PushUndo();
+        this.DropDeadRefs();
+        FormField f = FormField.New(ftype, seq);
+        seq = seq + 1;
+        if (FormField.IsNonVisualOf(ftype)) {
+            // 非可视组件始终位于顶层：画布下方的
+            // 托盘展示它们，从不放进容器。
+            fields.Add(f);
+            sel = f;
+            inspTab = 0;
+            msg = Designer.T("added ", "已添加 ") + FormField.TypeName(ftype);
+            return;
+        }
+        if (activeContainer != null) {
+            f.childTab = 0;
+            if (activeContainer.kind == "Tabs") {
+                f.childTab = Designer.TabActivePage(activeContainer);
+            }
+            activeContainer.kids.Add(f);
+        } else {
+            fields.Add(f);
+        }
+        sel = f;
+        inspTab = 0;
+        if (f.IsContainer()) { activeContainer = f; }
+        msg = Designer.T("added ", "已添加 ") + FormField.TypeName(ftype);
+    }
+
+    /// 宿主 IDE 提供从表单配对的 code-behind 文件
+    /// 扫描出的可绑定变量名（见检查器的绑定路径选择器）。
+    void SetBindVars(List<string> vars) {
+        bindVars = vars;
+        bindPickOpen = false;
+    }
+
+    /// 宿主 IDE 提供项目保存的用户组件（每个组件一个实体，
+    /// 来自 components/*.zcomp）。组件文档可能随时被重新加载
+    /// 或保存，引用节点据此作废预览缓存。
+    void SetUserComponents(List<UserComponent> comps) {
+        userComps = comps;
+        pvCompGen = pvCompGen + 1;
+    }
+
+    /// 组件名对应的 .zcomp 文档原文；不存在返回 ""。
+    string UserCompJson(string name) {
+        for (int i = 0; i < userComps.Count; i = i + 1) {
+            if (userComps[i].name == name) { return userComps[i].json; }
+        }
+        return "";
+    }
+
+    /// 用户请求把当前设计保存为可复用组件后，恰好返回一次 true；
+    /// 宿主 IDE 持久化它并重新加载列表。
+    bool ConsumeSaveComponent() {
+        if (saveCompRequested) { saveCompRequested = false; return true; }
+        return false;
+    }
+
+    /// 表单名称输入框的当前文本（宿主保存组件时用作文件名）。
+    string FormNameText() {
+        return formNameInput.GetText();
+    }
+
+    /// 双击引用节点后恰好返回一次组件名（"" 表示无请求）；宿主
+    /// 打开 components/<名>.zcomp 文档本身供编辑。
+    string ConsumeOpenComponent() {
+        if (openCompRequested) {
+            openCompRequested = false;
+            return openCompName;
+        }
+        return "";
+    }
+
+    /// 在表单上放置一个已保存用户组件的**引用**节点：.zform 里
+    /// 只写 {"kind":名,"ref":名,...}——组件设计的每次进化自动
+    /// 跟随所有实例（WinForms UserControl 语义），要改内部就打开
+    /// 组件本身，检查器提供「解包为内联副本」作逃生门。默认矩形
+    /// 取组件文档自己的画布尺寸（winW/winH），缺省 240x一行高。
+    /// 画布预览按组件文档用 FormBuilder 建真控件渲染。
+    void AddUserComponent(int k) {
+        if (k < 0 || k >= userComps.Count) { return; }
+        this.DropDeadRefs();
+        FormField f = FormField.NewCustom(userComps[k].name, seq);
+        seq = seq + 1;
+        f.compRef = true;
+        JsonValue doc = JsonValue.ParseLenient(userComps[k].json);
+        int dw = 240;
+        int dh = 0;
+        if (doc != null) {
+            dw = doc.Int("winW", 240);
+            dh = doc.Int("winH", 0);
+        }
+        if (dw < 60) { dw = 60; } else if (dw > 2000) { dw = 2000; }
+        if (dh <= 0) { dh = f.RowUnits(); }
+        if (dh < 28) { dh = 28; } else if (dh > 2000) { dh = 2000; }
+        f.fw = dw;
+        f.fh = dh;
+        if (activeContainer != null) {
+            f.childTab = 0;
+            if (activeContainer.kind == "Tabs") {
+                f.childTab = Designer.TabActivePage(activeContainer);
+            }
+            activeContainer.kids.Add(f);
+        } else {
+            fields.Add(f);
+        }
+        sel = f;
+        inspTab = 0;
+        msg = Designer.T("added ", "已添加 ") + userComps[k].name
+            + Designer.T(" (reference)", "（引用）");
+    }
+
+    /// 「解包为内联副本」：把引用节点换成组件文档的字段树
+    /// （单容器文档直接换成那个容器，多字段的包一层同名
+    /// Card），首节点继承引用的矩形/停靠/跨度。解包后的副本
+    /// 与组件脱钩，之后组件进化不再跟随。
+    void UnpackUserComponent(FormField f) {
+        string doc = this.UserCompJson(f.customKind);
+        if (doc == "") {
+            msg = Designer.T("component not found: ", "找不到组件：")
+                + f.customKind;
+            return;
+        }
+        List<FormField> parsed = this.ParseComponentFields(doc);
+        if (parsed.Count == 0) {
+            msg = Designer.T("component has no fields: ", "组件没有字段：")
+                + f.customKind;
+            return;
+        }
+        this.PushUndo();
+        List<FormField> host = fields;
+        FormField owner = this.ParentContainerOf(f);
+        if (owner != null) { host = owner.kids; }
+        int idx = IndexIn(host, f);
+        if (idx < 0) { return; }
+        FormField head = null;
+        if (parsed.Count == 1 && parsed[0].IsContainer()) {
+            head = parsed[0];
+        } else {
+            head = FormField.New(18, seq);
+            seq = seq + 1;
+            head.label = f.customKind;
+            head.kids = parsed;
+            for (int ci = 0; ci < parsed.Count; ci = ci + 1) { parsed[ci].childTab = 0; }
+        }
+        head.fname = f.fname;
+        head.name = f.name;
+        head.fx = f.fx;
+        head.fy = f.fy;
+        head.fw = f.fw;
+        head.fh = f.fh;
+        head.dockSide = f.dockSide;
+        head.span = f.span;
+        head.childTab = f.childTab;
+        host[idx] = head;
+        sel = head;
+        msg = Designer.T("unpacked ", "已解包 ") + f.customKind;
+    }
+
+    /// 组件文档根上声明的对外属性（"props":[{key,label,kind,
+    /// target,prop,def}]，v1 只消费 text 型），解析进并行表缓存，
+    /// 缓存键为 组件名|代次。组件没声明或文档缺失时表为空。
+    void EnsureCompPropDecls(string compName) {
+        string id = compName + "|" + Convert.ToString(pvCompGen);
+        if (compPropFor == id) { return; }
+        compPropFor = id;
+        compPropKeys.Clear();
+        compPropLabels.Clear();
+        compPropDefs.Clear();
+        string doc = this.UserCompJson(compName);
+        if (doc == "") { return; }
+        JsonValue root = JsonValue.ParseLenient(doc);
+        if (root == null) { return; }
+        JsonValue decls = root.Get("props");
+        if (decls == null || !decls.IsArray()) { return; }
+        for (int i = 0; i < decls.Count(); i = i + 1) {
+            JsonValue dd = decls.At(i);
+            if (dd == null || !dd.IsObject()) { continue; }
+            string key = dd.Str("key", "");
+            string target = dd.Str("target", "");
+            if (key == "" || target == "") { continue; }
+            compPropKeys.Add(key);
+            compPropLabels.Add(dd.Str("label", key));
+            compPropDefs.Add(dd.Str("def", ""));
+        }
+    }
+
+    /// 引用节点实例值读/写：存 f.extra 的 "props" 直通对象
+    /// （"props" 不在 IsModeledKey 里，SaveJson/LoadJson 原样
+    /// 透传，GenForm 展开时落给目标内部控件）。
+    static string CompPropValue(FormField f, string key, string def) {
+        if (f.extra == null) { return def; }
+        JsonValue props = f.extra.Get("props");
+        if (props == null || !props.IsObject()) { return def; }
+        return props.Str(key, def);
+    }
+
+    static void SetCompPropValue(FormField f, string key, string val) {
+        if (f.extra == null) { f.extra = JsonValue.NewObject(); }
+        JsonValue props = f.extra.Get("props");
+        if (props == null || !props.IsObject()) {
+            props = JsonValue.NewObject();
+            f.extra.Put("props", props);
+        }
+        props.Set(key, JsonValue.NewStr(val));
+    }
+
+    /// 内置组件的直通属性行：kind → "键|双语标签" 列表。值存
+    /// f.extra["props"]——与引用节点实例值同一张直通表，GenForm
+    /// 泛化发射 SetProp、画布预览经 ApplyFieldProps 落到真控件。
+    /// 只列设计期有意义的形态/展示属性；运行态开关（如 Countdown
+    /// 的 active）不进来。没有行的 kind 返回 null。
+    static List<string> BuiltinPropRows(string kind) {
+        if (kind == "Chart") {
+            List<string> r = new List<string>();
+            r.Add("type|" + Designer.T(
+                "Type (line/bar/area/stacked/hbar/pie/donut/scatter/gauge/funnel/radar/wordCloud)",
+                "类型 (line/bar/area/stacked/hbar/pie/donut/scatter/gauge/funnel/radar/wordCloud)"));
+            r.Add("title|" + Designer.T("Title", "标题"));
+            return r;
+        }
+        if (kind == "Image") {
+            List<string> r = new List<string>();
+            r.Add("src|" + Designer.T("Src", "图片地址"));
+            r.Add("alt|" + Designer.T("Alt text", "替代文本"));
+            r.Add("fit|" + Designer.T("Fit (contain/cover/fill/none)",
+                "适配 (contain/cover/fill/none)"));
+            return r;
+        }
+        if (kind == "Countdown") {
+            List<string> r = new List<string>();
+            r.Add("duration|" + Designer.T("Duration (ms)", "时长 (毫秒)"));
+            r.Add("format|" + Designer.T("Format", "格式"));
+            return r;
+        }
+        if (kind == "NumberAnimation") {
+            List<string> r = new List<string>();
+            r.Add("from|" + Designer.T("From (scaled)", "起点 (放大值)"));
+            r.Add("to|" + Designer.T("To (scaled)", "终点 (放大值)"));
+            r.Add("duration|" + Designer.T("Duration (ms)", "时长 (毫秒)"));
+            r.Add("precision|" + Designer.T("Precision", "小数位"));
+            r.Add("separator|" + Designer.T("Separator", "千分位符"));
+            return r;
+        }
+        if (kind == "InputOtp") {
+            List<string> r = new List<string>();
+            r.Add("length|" + Designer.T("Length", "字符数"));
+            r.Add("size|" + Designer.T("Size (tiny/small/medium/large)",
+                "尺寸 (tiny/small/medium/large)"));
+            r.Add("mask|" + Designer.T("Mask (true/false)", "掩码 (true/false)"));
+            r.Add("readonly|" + Designer.T("ReadOnly (true/false)",
+                "只读 (true/false)"));
+            return r;
+        }
+        return null;
+    }
+
+    /// 把字段 extra["props"] 直通表落到真控件上（画布预览用）：
+    /// 预览件每帧新建，逐键 SetProp；控件不认的键走基类 fallback
+    /// 退化为样式类，无副作用。
+    static void ApplyFieldProps(Control ctl, FormField f) {
+        if (ctl == null || f.extra == null) { return; }
+        JsonValue props = f.extra.Get("props");
+        if (props == null || !props.IsObject()) { return; }
+        for (int i = 0; i < props.Count(); i = i + 1) {
+            ctl.SetProp(props.KeyAt(i), props.ValAt(i).AsString(""));
+        }
+    }
+
+    /// 预览树上应用组件属性：与运行期注册表（UserComponentRegistry.
+    /// ApplyProps）共用同一语义——实例值优先，缺省取声明里的 def，
+    /// 落到目标控件（预览树按组件文档原名查找）。实例值存
+    /// f.extra 的 "props" 直通对象。
+    void ApplyCompProps(Control root, JsonValue compRoot, FormField f) {
+        JsonValue inst = f.extra == null ? null : f.extra.Get("props");
+        UserComponentRegistry.ApplyProps(root, compRoot, inst);
+    }
+
+    /// 引用节点画布预览的构建缓存：组件文档只在代次变化时
+    /// 重建（SetUserComponents / 尺寸变化 / 实例属性变化），
+    /// 其余帧复用整棵 FormBuilder 树只重渲染。找不到组件或
+    /// 解析失败返回 null，调用方退回占位块。
+    Control PvCompCtl(FormField f, int w, int h) {
+        if (f.customKind == "") { return null; }
+        string doc = this.UserCompJson(f.customKind);
+        if (doc == "") { return null; }
+        string instFp = "";
+        if (f.extra != null) {
+            JsonValue ip = f.extra.Get("props");
+            if (ip != null) { instFp = ip.PrettyToJson(); }
+        }
+        string key = Convert.ToString(pvCompGen) + "|" + f.customKind
+            + "|" + Convert.ToString(w) + "x" + Convert.ToString(h)
+            + "|" + instFp;
+        for (int i = 0; i < pvCompKeys.Count; i = i + 1) {
+            if (pvCompKeys[i] == key) { return pvCompCtls[i]; }
+        }
+        JsonValue root = JsonValue.ParseLenient(doc);
+        if (root == null) { return null; }
+        Control ctl = FormBuilder.Build(root);
+        this.ApplyCompProps(ctl, root, f);
+        pvCompKeys.Add(key);
+        pvCompCtls.Add(ctl);
+        if (pvCompKeys.Count > 64) {
+            pvCompKeys.Clear();
+            pvCompCtls.Clear();
+        }
+        return ctl;
+    }
+
+    /// 按 ProjectComponents tag 添加发现的项目自定义组件
+    /// 到表单/活动容器，与内置组件的 AddField 对应。
+    void AddCustomField(string kind) {
+        this.DropDeadRefs();
+        FormField f = FormField.NewCustom(kind, seq);
+        seq = seq + 1;
+        if (activeContainer != null) {
+            f.childTab = 0;
+            if (activeContainer.kind == "Tabs") {
+                f.childTab = Designer.TabActivePage(activeContainer);
+            }
+            activeContainer.kids.Add(f);
+        } else {
+            fields.Add(f);
+        }
+        sel = f;
+        inspTab = 0;
+        msg = Designer.T("added ", "已添加 ") + kind;
+    }
+
+    /// 当 `inner` 位于 `owner` 子树的任意位置时返回 true。
+    bool InSubtree(FormField owner, FormField inner) {
+        if (!owner.IsContainer()) { return false; }
+        if (ContainsRef(owner.kids, inner)) { return true; }
+        for (int i = 0; i < owner.kids.Count; i = i + 1) {
+            if (InSubtree(owner.kids[i], inner)) { return true; }
+        }
+        return false;
+    }
+
+    /// 列表中是否含该组件引用。
+    bool ContainsRef(List<FormField> lst, FormField target) {
+        for (int i = 0; i < lst.Count; i = i + 1) {
+            if (lst[i] == target) { return true; }
+        }
+        return false;
+    }
+
+    /// 组件在列表中的下标，不存在时 -1。
+    int IndexIn(List<FormField> lst, FormField f) {
+        for (int i = 0; i < lst.Count; i = i + 1) {
+            if (lst[i] == f) { return i; }
+        }
+        return -1;
+    }
+
+    /// 把 `target` 作为子级的容器；若 target 是
+    /// 顶层字段（或未找到）则返回 null。递归查找。
+    FormField ParentContainerOf(FormField target) {
+        if (ContainsRef(fields, target)) { return null; }
+        return FindOwner(fields, target);
+    }
+
+    /// 递归查找把 target 作为直接子级的容器，找不到返回 null。
+    FormField FindOwner(List<FormField> lst, FormField target) {
+        for (int i = 0; i < lst.Count; i = i + 1) {
+            FormField f = lst[i];
+            if (f.IsContainer()) {
+                if (ContainsRef(f.kids, target)) { return f; }
+                FormField r = FindOwner(f.kids, target);
+                if (r != null) { return r; }
+            }
+        }
+        return null;
+    }
+
+    /// 重建不含 `target` 的 `lst`（列表中间位置的 RemoveAt 在其他地方使用，
+    /// 但重建与下方的 Insert 规避方案保持一致）。
+    List<FormField> ListRemove(List<FormField> lst, FormField target) {
+        List<FormField> nl = new List<FormField>();
+        for (int i = 0; i < lst.Count; i = i + 1) {
+            if (lst[i] != target) { nl.Add(lst[i]); }
+        }
+        return nl;
+    }
+
+    /// 把 `from` 处的元素移动到 `to`，通过 Add 重建（
+    /// 运行时在列表中间 Insert 会溢出缓冲区并破坏堆）。
+    List<FormField> ListMove(List<FormField> lst, int from, int to) {
+        if (from < 0 || from >= lst.Count) { return lst; }
+        FormField mv = lst[from];
+        List<FormField> rest = new List<FormField>();
+        int i = 0;
+        for (; i < lst.Count; i = i + 1) {
+            if (i != from) { rest.Add(lst[i]); }
+        }
+        if (to < 0) { to = 0; }
+        if (to > rest.Count) { to = rest.Count; }
+        List<FormField> nl = new List<FormField>();
+        i = 0;
+        while (i < rest.Count) {
+            if (i == to) { nl.Add(mv); }
+            nl.Add(rest[i]);
+            i = i + 1;
+        }
+        if (to >= rest.Count) { nl.Add(mv); }
+        return nl;
+    }
+
+    /// 把选中项在同级列表内上/下移动 delta 个位置（先压撤销栈）。
+    void MoveSel(int delta) {
+        if (sel == null) { return; }
+        this.PushUndo();
+        FormField pc = ParentContainerOf(sel);
+        if (pc == null) {
+            int idx = IndexIn(fields, sel);
+            if (idx < 0) { return; }
+            int to = idx + delta;
+            if (to < 0) { to = 0; }
+            if (to >= fields.Count) { to = fields.Count - 1; }
+            if (to != idx) { fields = ListMove(fields, idx, to); }
+        } else {
+            int idx = IndexIn(pc.kids, sel);
+            if (idx < 0) { return; }
+            int to = idx + delta;
+            if (to < 0) { to = 0; }
+            if (to >= pc.kids.Count) { to = pc.kids.Count - 1; }
+            if (to != idx) { pc.kids = ListMove(pc.kids, idx, to); }
+        }
+    }
+
+    /// 插入 `nf`，使其最终位于顶层列表的 `at` 索引处。
+    void InsertFieldAt(int at, FormField nf) {
+        if (at < 0) { at = 0; }
+        if (at > fields.Count) { at = fields.Count; }
+        List<FormField> nl = new List<FormField>();
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            if (i == at) { nl.Add(nf); }
+            nl.Add(fields[i]);
+        }
+        if (at >= fields.Count) { nl.Add(nf); }
+        fields = nl;
+    }
+
+    /// 组件是否在多选里（主选中项或附加项）。
+    bool IsExtraSel(FormField f) {
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            if (freeExtra[i] == f) { return true; }
+        }
+        return false;
+    }
+
+    /// 把组件加入/移出多选的附加选中项（Ctrl+点击）。
+    void ToggleExtraSel(FormField f) {
+        List<FormField> keep = new List<FormField>();
+        bool found = false;
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            if (freeExtra[i] == f) { found = true; }
+            else { keep.Add(freeExtra[i]); }
+        }
+        if (!found) { keep.Add(f); }
+        freeExtra = keep;
+    }
+
+    /// 清空多选的附加选中项。
+    void ClearExtraSel() { freeExtra = new List<FormField>(); }
+
+    /// 把多选里其余成员的宽/高设成主选中项的（0=等宽，1=等高），
+    /// 和场景设计器的「尺寸」组同义。
+    void SizeSelGroup(int mode) {
+        if (sel == null || freeExtra.Count == 0) { return; }
+        this.PushUndo();
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            FormField f = freeExtra[i];
+            if (mode == 0) { f.fw = sel.LayoutW(); }
+            else { f.fh = sel.LayoutH(); }
+        }
+        msg = Designer.T("sized", "已统一尺寸");
+    }
+
+    /// 把选中项移到同级的最前/最后（1=置顶，0=置底）。
+    void SelToEdge(int top) {
+        if (sel == null) { return; }
+        FormField pc = ParentContainerOf(sel);
+        List<FormField> list = fields;
+        if (pc != null) { list = pc.kids; }
+        int idx = IndexIn(list, sel);
+        if (idx < 0) { return; }
+        int to = 0;
+        if (top == 0) { to = list.Count - 1; }
+        if (to == idx) { return; }
+        this.PushUndo();
+        list = ListMove(list, idx, to);
+        if (pc == null) { fields = list; } else { pc.kids = list; }
+    }
+
+    /// 复制选中项，副本偏移一点并成为新的选中项。
+    void DuplicateSel() {
+        if (sel == null) { return; }
+        this.PushUndo();
+        FormField nf = sel.Clone();
+        nf.fx = sel.LayoutX() + 16;
+        nf.fy = sel.LayoutY() + 16;
+        nf.fw = sel.LayoutW();
+        nf.fh = sel.LayoutH();
+        nf.fname = FormField.TypeKey(nf.ftype) + Convert.ToString(seq);
+        nf.name = nf.fname;
+        seq = seq + 1;
+        FormField pc = ParentContainerOf(sel);
+        if (pc == null) { fields.Add(nf); } else { pc.kids.Add(nf); }
+        ClearExtraSel();
+        sel = nf;
+        msg = Designer.T("duplicated", "已复制");
+    }
+
+    // --- 撤销 / 重做（整份设计 JSON 快照，同场景设计器） ----------
+
+    /// 记录当前设计；在任何修改前调用。当前状态和栈顶相同
+    /// （上一次压栈后设计没真正变过）时不重复压栈。
+    void PushUndo() {
+        string j = this.SaveJson();
+        if (undoStack.Count > 0 && undoStack[undoStack.Count - 1] == j) {
+            return;
+        }
+        undoStack.Add(j);
+        if (undoStack.Count > 60) { undoStack.RemoveAt(0); }
+        redoStack = new List<string>();
+    }
+
+    /// 拖拽/缩放结束（或任何「压了栈但没改成」的操作收尾）时调用：
+    /// 设计和栈顶一致说明这次操作没有实际改动，把栈顶退掉，
+    /// 免得 Ctrl+Z 第一脚踩空。
+    void PopUndoIfUnchanged() {
+        if (undoStack.Count > 0 && undoStack[undoStack.Count - 1] == this.SaveJson()) {
+            undoStack.RemoveAt(undoStack.Count - 1);
+        }
+    }
+
+    /// 撤销：当前设计压入重做栈，载入撤销栈顶；栈空时仅提示。
+    /// 恢复快照必须走 ApplyJson——LoadJson 会清空两个历史栈，
+    /// 一步撤销之后整个历史就没了。
+    void Undo() {
+        if (undoStack.Count == 0) {
+            msg = Designer.T("nothing to undo", "没有可撤销的操作");
+            return;
+        }
+        redoStack.Add(this.SaveJson());
+        string j = undoStack[undoStack.Count - 1];
+        undoStack.RemoveAt(undoStack.Count - 1);
+        this.ApplyJson(j);
+        this.SyncFreeSelBase();
+        msg = Designer.T("undone", "已撤销");
+    }
+
+    /// 重做：当前设计压入撤销栈，载入重做栈顶；栈空时仅提示。
+    void Redo() {
+        if (redoStack.Count == 0) {
+            msg = Designer.T("nothing to redo", "没有可重做的操作");
+            return;
+        }
+        undoStack.Add(this.SaveJson());
+        string j = redoStack[redoStack.Count - 1];
+        redoStack.RemoveAt(redoStack.Count - 1);
+        this.ApplyJson(j);
+        this.SyncFreeSelBase();
+        msg = Designer.T("redone", "已重做");
+    }
+
+    // --- 剪贴板：复制 / 粘贴选中项（容器连子级一起） --------------
+
+    /// 复制选中项（含多选）为 FieldJson 片段列表；无选中时仅提示。
+    void CopySel() {
+        if (sel == null) {
+            msg = Designer.T("nothing to copy", "没有可复制的内容");
+            return;
+        }
+        List<FormField> all = new List<FormField>();
+        all.Add(sel);
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            if (freeExtra[i] != sel) { all.Add(freeExtra[i]); }
+        }
+        clipFields = new List<string>();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            clipFields.Add(this.FieldJson(all[i]).PrettyToJson());
+        }
+        msg = Designer.T("copied ", "已复制 ")
+            + Convert.ToString(clipFields.Count)
+            + Designer.T(" component(s)", " 个组件");
+    }
+
+    /// 粘贴的组件整组换新名字（含容器子级），避免和原组件、
+    /// 以及代码后置里的字段撞名。
+    void RenameFresh(FormField f) {
+        f.fname = FormField.TypeKey(f.ftype) + Convert.ToString(seq);
+        f.name = f.fname;
+        seq = seq + 1;
+        for (int i = 0; i < f.kids.Count; i = i + 1) {
+            this.RenameFresh(f.kids[i]);
+        }
+    }
+
+    /// 粘贴到原父容器（没有选中就贴到顶层），整组偏移 16px，
+    /// 贴完的组成为新的选中组。
+    void PasteClip() {
+        if (clipFields == null || clipFields.Count == 0) {
+            msg = Designer.T("clipboard is empty", "剪贴板是空的");
+            return;
+        }
+        this.PushUndo();
+        FormField pc = null;
+        if (sel != null) { pc = ParentContainerOf(sel); }
+        List<FormField> list = fields;
+        if (pc != null) { list = pc.kids; }
+        this.ClearExtraSel();
+        sel = null;
+        for (int i = 0; i < clipFields.Count; i = i + 1) {
+            JsonValue o = JsonValue.ParseLenient(clipFields[i]);
+            if (o == null || !o.IsObject()) { continue; }
+            FormField nf = this.FieldFromJson(o);
+            nf.fx = nf.fx + 16;
+            nf.fy = nf.fy + 16;
+            this.RenameFresh(nf);
+            list.Add(nf);
+            if (sel == null) { sel = nf; } else { freeExtra.Add(nf); }
+        }
+        if (pc != null) { activeContainer = pc; }
+        inspTab = 0;
+        msg = Designer.T("pasted ", "已粘贴 ")
+            + Convert.ToString(clipFields.Count)
+            + Designer.T(" component(s)", " 个组件");
+    }
+
+    /// 方向键微调整个多选组（自由布局；Shift=1px）。
+    void NudgeSel(int dx, int dy) {
+        if (sel == null) { return; }
+        this.PushUndo();
+        this.NudgeOne(sel, dx, dy);
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            FormField ef = freeExtra[i];
+            if (ef == null || ef.locked) { continue; }
+            this.NudgeOne(ef, dx, dy);
+        }
+    }
+
+    /// 单个组件按像素增量微调并钳制到非负坐标。
+    void NudgeOne(FormField f, int dx, int dy) {
+        f.fx = f.LayoutX() + dx;
+        f.fy = f.LayoutY() + dy;
+        if (f.fx < 0) { f.fx = 0; }
+        if (f.fy < 0) { f.fy = 0; }
+    }
+
+    /// 锁定/解锁整个多选：以主选中项的状态取反，其余成员跟随，
+    /// 这样一组组件的锁定状态始终一致。
+    void ToggleLockSel() {
+        if (sel == null) { return; }
+        this.PushUndo();
+        bool on = !sel.locked;
+        sel.locked = on;
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            freeExtra[i].locked = on;
+        }
+        if (on) { msg = Designer.T("locked", "已锁定"); }
+        else { msg = Designer.T("unlocked", "已解锁"); }
+    }
+
+    /// 删除整个多选：先删附加项，再删主选中项。
+    /// 无论从功能区按钮还是 Delete 键触发，都走这里，
+    /// 保证多选里的每一个都被删掉（而不是只删主选中项）。
+    void DeleteSelGroup() {
+        if (sel != null || freeExtra.Count > 0) { this.PushUndo(); }
+        dropContainer = null;
+        activeContainer = null;
+        dragging = false;
+        dragFromPalette = false;
+        dragMoved = false;
+        dragIndex = -1;
+        List<FormField> extra = freeExtra;
+        freeExtra = new List<FormField>();
+        int n = 0;
+        for (int i = 0; i < extra.Count; i = i + 1) {
+            FormField f = extra[i];
+            if (f == null || f == sel) { continue; }
+            FormField pc = ParentContainerOf(f);
+            if (pc == null) { fields = ListRemove(fields, f); }
+            else { pc.kids = ListRemove(pc.kids, f); }
+            n = n + 1;
+        }
+        DeleteSel();
+        if (n > 0) {
+            msg = Designer.T("deleted selection", "已删除选中的组件");
+        }
+    }
+
+    /// 删除主选中项，并清掉多选与可能引用它的交互状态
+    /// （避免悬空引用崩溃）。
+    void DeleteSel() {
+        if (sel == null) {
+            // 即使没有主选中项，也把残留的多选和交互状态清干净，
+            // 避免后续帧引用已删对象或向 freeExtra 加入 null。
+            freeExtra = new List<FormField>();
+            return;
+        }
+        FormField pc = ParentContainerOf(sel);
+        if (pc == null) {
+            fields = ListRemove(fields, sel);
+        } else {
+            pc.kids = ListRemove(pc.kids, sel);
+        }
+        sel = null;
+        selPrev = null;
+        activeContainer = null;
+        // 清掉可能引用已删组件的交互状态，避免悬空引用崩溃。
+        freeExtra = new List<FormField>();
+        freeDragging = false;
+        freeResizing = false;
+        freeMarquee = false;
+        msg = Designer.T("deleted field", "已删除组件");
+    }
+
+    // --- 顶层布局 ----------------------------------------------------
+
+    /// 每帧入口：把进程级 WidgetId 计数器固定到设计器专用基值
+    /// （800000）后绘制整个设计器，完成即恢复，使即时模式控件
+    /// 每帧获得稳定 id（hover/press/click 都按 id 关联）。
+    void Render(App app, int x, int y, int w, int h) {
+        // 设计器的按钮/分段控件/步进器是即时模式绘制的，
+        // 每帧重建；但宿主（IDE）是保留式风格，从不
+        // 回卷进程级 WidgetId 计数器。固定一个较高的
+        // 基值作为设计器每帧的起点，让每个控件每帧获得相同的 id——
+        // hover/press/click 都以 id 为键，并对照上一帧的
+        // 命中区域解析，id 漂移会让整个检查器
+        // 无法点击。之后恢复计数器（与 FilePicker 的对话框
+        // 固定 900000 的做法一致）。
+        int savedSeq = WidgetId.SeqValue();
+        WidgetId.SetSeq(800000);
+        RenderPinned(app, x, y, w, h);
+        WidgetId.SetSeq(savedSeq);
+    }
+
+    /// 宿主把组件面板和属性面板画进自己的 dock 面板里。调用
+    /// 它就等于告诉设计器「左右两栏归我管」，设计器自己那份
+    /// 不再排版。id 基值和 Render 分开，避免两趟互相错位。
+    void RenderHostPanels(App app, Rect toolRect, Rect propRect) {
+        hostPanels = true;
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int savedSeq = WidgetId.SeqValue();
+        WidgetId.SetSeq(840000);
+        RenderPalette(app, c, t, toolRect.x, toolRect.y, toolRect.width, toolRect.height);
+        WidgetId.SetSeq(860000);
+        RenderInspector(app, c, t, propRect.x, propRect.y, propRect.width, propRect.height);
+        WidgetId.SetSeq(savedSeq);
+    }
+
+    /// 设计器本体的一帧：功能区、画布（或 JSON 抽屉）、组件托盘、
+    /// 左右面板与状态栏；处理键盘快捷键、拖拽收尾、工具箱
+    /// tooltip、拖拽幽灵块与缩放下拉菜单。
+    void RenderPinned(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int statusH = app.Scale(20);
+        int top = y + app.Scale(6);
+        int bot = y + h - statusH - app.Scale(6);
+
+        // 三栏宽度跟着宿主面板走：宿主窄了先按比例压缩面板和
+        // 检查器，压不动就收起来，绝不把内容画到面板外。
+        int pad = app.Scale(12);
+        // 功能区横跨整个设计器（不只是画布那一栏），
+        // 这样命令有地方排，也不会挤到画布上。
+        int barH = this.RibbonH(app);
+        int bodyY = top + barH + app.Scale(6);
+        int palX = x + pad;
+        int avail = w - pad * 5;
+        if (avail < app.Scale(80)) { avail = app.Scale(80); }
+        int palW = app.Scale(176);
+        int inspW = app.Scale(288);
+        if (hostPanels) { palW = 0; inspW = 0; avail = w - pad * 2; }
+        int minCan = app.Scale(220);
+        if (palW + inspW + minCan > avail) {
+            int side = avail - minCan;
+            if (side < 0) { side = 0; }
+            int sum = palW + inspW;
+            palW = side * palW / sum;
+            inspW = side - palW;
+            if (palW < app.Scale(130)) { inspW = inspW + palW; palW = 0; }
+            if (inspW < app.Scale(190)) { palW = palW + inspW; inspW = 0; }
+            if (palW > 0 && palW < app.Scale(130)) { palW = 0; }
+        }
+        int canW = avail - palW - inspW;
+        if (canW < app.Scale(80)) { canW = app.Scale(80); }
+        int canX = palX + pad;
+        if (palW > 0) { canX = palX + palW + pad; }
+        if (hostPanels) { canX = palX; }
+        int inspX = canX + canW + pad;
+        int bodyH = bot - bodyY;
+
+        // 设计器整体裁剪在宿主给的矩形内。
+        c.PushClip(x, y, w, h);
+        RenderRibbon(app, c, t, palX, top, w - pad * 2);
+
+        int ek = app.EventKind();
+        // 拖拽进行中跟踪指针；实际放置由
+        // RenderForm 解析（它掌握行几何）。
+        if (dragging && ek == 1) {
+            if (app.mouseX != dragMouseX || app.mouseY != dragMouseY) { dragMoved = true; }
+            dragMouseX = app.mouseX;
+            dragMouseY = app.mouseY;
+            app.RequestRedraw();
+        }
+
+        hoverFt = -1;
+        // 键盘编辑：Delete 删除选中组，Ctrl+Z/Y 撤销重做，
+        // Ctrl+C/V 复制粘贴，Ctrl+D 复制副本，方向键按网格步长
+        // 微调整组（Shift = 1px，仅自由布局）。文本框持有键盘
+        // 焦点时全部忽略，避免影响输入。Ctrl+字母以控制码到达
+        //（^Z=26 ^Y=25 ^C=3 ^V=22 ^D=4），和场景设计器一致。
+        if (!preview && app.focus.focusedId < 0 && !app.PointerCaptured()) {
+            if (ek == 6) {
+                int cc = app.window.EventKeyCode();
+                if (cc == 26) { this.Undo(); app.RequestRedraw(); }
+                else if (cc == 25) { this.Redo(); app.RequestRedraw(); }
+                else if (cc == 3) { this.CopySel(); app.RequestRedraw(); }
+                else if (cc == 22) { this.PasteClip(); app.RequestRedraw(); }
+                else if (cc == 4 && sel != null) { this.DuplicateSel(); app.RequestRedraw(); }
+            } else if (ek == 4) {
+                int kc = app.window.EventKeyCode();
+                if (kc == 46 && sel != null) {
+                    DeleteSelGroup();
+                    app.RequestRedraw();
+                } else if (layoutMode == 1 && sel != null
+                        && kc >= 37 && kc <= 40) {
+                    int step = 1;
+                    if (snapGrid && gridSize > 0
+                        && !Modifiers.HasShift(app.window.EventMods())) {
+                        step = gridSize;
+                    }
+                    int ndx = 0;
+                    int ndy = 0;
+                    if (kc == 37) { ndx = 0 - step; }
+                    if (kc == 39) { ndx = step; }
+                    if (kc == 38) { ndy = 0 - step; }
+                    if (kc == 40) { ndy = step; }
+                    this.NudgeSel(ndx, ndy);
+                    app.RequestRedraw();
+                }
+            }
+        }
+        if (jsonOpen) {
+            RenderJsonPanel(app, c, t, canX, bodyY, canW, bodyH);
+        } else {
+            // 画布下方的 WinForms 风格组件托盘：非可视
+            // 组件（右键菜单、图层、定时器、弹窗等）放在这里，
+            // 而不占用被设计窗口内的空间。
+            int trayH = app.Scale(46);
+            RenderForm(app, c, t, canX, bodyY, canW, bodyH - trayH - app.Scale(8));
+            RenderTray(app, c, t, canX, bodyY + bodyH - trayH, canW, trayH);
+        }
+        if (palW > 0) { RenderPalette(app, c, t, palX, bodyY, palW, bodyH); }
+        if (inspW > 0) { RenderInspector(app, c, t, inspX, bodyY, inspW, bodyH); }
+        if (hostPanels) { inspX = palX + avail; }
+        RenderStatus(app, c, t, palX, bot + app.Scale(4), inspX + inspW - palX);
+
+        // 在表单外结束的拖拽直接取消。指针没动过就是一次点击，
+        // 按工具箱的点击添加处理。
+        if (dragging && ek == 3) {
+            if (dragFromPalette && !dragMoved) { this.PalClickRelease(); }
+            palClickPending = false;
+            dragging = false;
+            dragFromPalette = false;
+            dragMoved = false;
+            dragIndex = -1;
+            dragUserComp = -1;
+            dropContainer = null;
+            app.RequestRedraw();
+        }
+
+        // 面板 tooltip（名称 + 描述），绘制在所有面板之上。
+        if (hoverFt >= 0 && !dragging) {
+            Tooltip.RenderRich(app, hoverX, hoverY,
+                FormField.TypeName(hoverFt), FieldDesc(hoverFt));
+        }
+        // 拖拽时跟随光标的幽灵块——无论是从面板拖出的
+        // 新字段还是被重排的现有行——这样
+        // 始终清楚正在拖哪个组件。
+        if (dragging && dragMoved) {
+            int gkind = dragKind;
+            if (!dragFromPalette && dragIndex >= 0 && dragIndex < fields.Count) {
+                gkind = fields[dragIndex].ftype;
+            }
+            string gl = FormField.TypeName(gkind);
+            if (gkind == 200 && dragUserComp >= 0 && dragUserComp < userComps.Count) {
+                gl = userComps[dragUserComp].name;
+                gkind = 18;
+            }
+            int gh = app.Scale(26);
+            int icoW = app.Scale(22);
+            int gw = icoW + Canvas.MeasureText(gl, Style.FontFallback(app, "small")) + app.Scale(16);
+            int gx = dragMouseX + app.Scale(8);
+            int gy = dragMouseY - gh / 2;
+            c.FillRoundRect(gx + 1, gy + 2, gw, gh, t.borderRadiusSmall,
+                Style.Part(app, "designer", "shadow", "", "", "", Style.SNormal()).BgOr(0));
+            c.FillRoundRect(gx, gy, gw, gh, t.borderRadiusSmall, Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0));
+            c.DrawGlyphIn(FieldIcon(gkind), gx + app.Scale(4), gy, icoW, gh,
+                Style.FontFallback(app, "small"), Style.Part(app, "designer", "badge", "", "", "", Style.SNormal()).FgOr(0));
+            c.DrawText(gx + icoW + app.Scale(4), gy + app.Scale(6), gl, Style.Part(app, "designer", "badge", "", "", "", Style.SNormal()).FgOr(0), Style.FontFallback(app, "small"));
+        }
+
+        // 缩放下拉菜单（50%–200%）：画在所有面板之上。开启的
+        // 那一帧忽略触发点击（zoomMenuArm），选中档位后设 winZoom。
+        if (zoomMenuOpen) {
+            int zc = ContextMenu.Render(app, zoomMenuX, zoomMenuY, this.ZoomMenuLabels());
+            if (!zoomMenuArm) {
+                zoomMenuArm = true;
+                app.RequestRedraw();
+            } else if (zc == 0 - 2) {
+                zoomMenuOpen = false;
+                app.RequestRedraw();
+            } else if (zc >= 0) {
+                List<int> zps = this.ZoomPresets();
+                if (zc < zps.Count) { winZoom = zps[zc]; }
+                zoomMenuOpen = false;
+                app.RequestRedraw();
+            }
+        }
+        c.PopClip();
+    }
+
+    // --- 工具栏 -------------------------------------------------------------
+
+    /// 开启 JSON 时替代画布显示的可编辑 JSON 抽屉。
+    /// 文本框就是文档：Apply 从中重建设计，
+    /// Regenerate 把当前设计重新导出到其中。
+    void RenderJsonPanel(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        int fs = Style.FontFallback(app, "small");
+        c.FillRoundRect(x, y, w, h, app.Scale(6), Style.Part(app, "designer", "panel", "", "", "", Style.SNormal()).BgOr(0));
+        c.DrawRoundRect(x, y, w, h, app.Scale(6), Style.Part(app, "designer", "panel", "", "", "", Style.SNormal()).BorderOr(0), 1);
+        int pad = app.Scale(12);
+        int ix = x + pad;
+        int iw = w - pad * 2;
+        int iy = y + app.Scale(10);
+        c.DrawText(ix, iy, Designer.T("DESIGN JSON  ·  edit then Apply", "设计 JSON  ·  编辑后点击应用"), Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+        iy = iy + app.Scale(24);
+        int btnH = app.Scale(30);
+        int taH = y + h - iy - btnH - app.Scale(20);
+        if (taH < app.Scale(80)) { taH = app.Scale(80); }
+        jsonArea.Render(app, ix, iy, iw, taH);
+        int by = iy + taH + app.Scale(8);
+        int applyId = SmallBtn(app, Designer.T("Apply", "应用"), 1, ix, by,
+            app.Scale(80));
+        if (Ui.Clicked(app, applyId)) {
+            LoadJson(jsonArea.GetText());
+            msg = Designer.T("loaded ", "已从 JSON 加载 ") + Convert.ToString(fields.Count) + Designer.T(" components from JSON", " 个组件");
+        }
+        int dumpId = SmallBtn(app, Designer.T("Regenerate", "重新生成"), 0,
+            ix + app.Scale(88), by, app.Scale(104));
+        if (Ui.Clicked(app, dumpId)) {
+            jsonArea.SetText(SaveJson());
+            msg = Designer.T("regenerated JSON from the current design", "已根据当前设计重新生成 JSON");
+        }
+        int closeId = SmallBtn(app, Designer.T("Close", "关闭"), 0,
+            ix + iw - app.Scale(70), by, app.Scale(70));
+        if (Ui.Clicked(app, closeId)) { jsonOpen = false; }
+    }
+
+    // --- 字段面板 -------------------------------------------------------
+
+    /// 组件工具箱：一棵 TreeView（分组是目录，组件是叶子），
+    /// 行的绘制、滚动、过滤、折叠全部由控件自己完成，这里
+    /// 只负责喂数据和处理「选中 = 添加 / 按下 = 开始拖拽」。
+    void RenderPalette(App app, Canvas c, Theme t, int px, int py, int pw, int ph) {
+        this.EnsurePalette();
+        palTv.RenderInside(app, new Rect(px, py, pw, ph));
+    }
+
+    /// 惰性创建工具箱 TreeView，并在过滤串或用户组件数量变化时重建节点。
+    void EnsurePalette() {
+        if (palTv == null) {
+            palNodes = new List<TreeNode>();
+            palKind = new List<int>();
+            palCustom = new List<string>();
+            palTv = new TreeView();
+            palTv.WithFilter(filterInput);
+            palTv.Empty = Designer.T("No components match.", "没有匹配的组件。");
+            palTv.OnSelect(() => { this.PalActivate(); });
+            palTv.OnPress(() => { this.PalPress(); });
+            palTv.OnExpand(() => { this.PalFoldNote(false); });
+            palTv.OnCollapse(() => { this.PalFoldNote(true); });
+            palBuilt = false;
+            palBuiltQ = "";
+            palBuiltUser = 0 - 1;
+        }
+        string q = filterInput.GetText();
+        if (!palBuilt || q != palBuiltQ || userComps.Count != palBuiltUser) {
+            this.BuildPalette(q);
+            palBuilt = true;
+            palBuiltQ = q;
+            palBuiltUser = userComps.Count;
+            palTv.Bind(palNodes);
+        }
+    }
+
+    /// 重建工具箱节点。过滤串非空时是一层扁平的匹配结果，
+    /// 否则是按类别分组的两层树。
+    void BuildPalette(string q) {
+        palNodes = new List<TreeNode>();
+        palKind = new List<int>();
+        palCustom = new List<string>();
+        if (q != "") {
+            for (int ft = 0; ft <= FormField.MaxType(); ft = ft + 1) {
+                if (this.MatchesFilter(ft, q)) {
+                    this.PalLeaf(FormField.TypeName(ft), FieldIcon(ft), ft, "", 0);
+                }
+            }
+            for (int k = 0; k < userComps.Count; k = k + 1) {
+                if (Designer.Contains(userComps[k].name, q)) {
+                    this.PalLeaf(userComps[k].name, "layout", 200,
+                        userComps[k].name, 0);
+                }
+            }
+            return;
+        }
+        this.PalGroup(Designer.T("Basic", "基础"), 0, 8);
+        this.PalGroup(Designer.T("Advanced", "高级"), 8, 15);
+        this.PalGroup(Designer.T("Layout", "布局"), 15, 18);
+        this.PalGroup(Designer.T("Display", "展示"), 18, 28);
+        this.PalGroup(Designer.T("Feedback", "反馈"), 28, 34);
+        this.PalGroup(Designer.T("Navigation", "导航"), 34, 40);
+        this.PalGroup(Designer.T("Display+", "展示+"), 40, 47);
+        this.PalGroup(Designer.T("Feedback+", "反馈+"), 47, 53);
+        this.PalGroup(Designer.T("More", "更多"), 53, 55);
+        this.PalGroup(Designer.T("Non-visual", "功能组件"), 55, 58);
+        this.PalGroup(Designer.T("Shell", "窗口外壳"), 58, 62);
+        this.PalGroup(Designer.T("Industrial", "工控"), 62, 72);
+        this.PalGroup(Designer.T("Web", "网页"), 72, 73);
+        this.PalGroup(Designer.T("Extended", "扩展"), 73, 86);
+        if (userComps.Count > 0) {
+            this.PalDir(Designer.T("My Components", "我的组件"));
+            for (int k = 0; k < userComps.Count; k = k + 1) {
+                this.PalLeaf(userComps[k].name, "layout", 200,
+                    userComps[k].name, 1);
+            }
+        }
+    }
+
+    /// 添加一个分组目录及其 [lo, hi) 类型区间内的组件叶子。
+    void PalGroup(string title, int lo, int hi) {
+        this.PalDir(title);
+        for (int ft = lo; ft < hi; ft = ft + 1) {
+            this.PalLeaf(FormField.TypeName(ft), FieldIcon(ft), ft, "", 1);
+        }
+    }
+
+    /// 添加一个分组目录节点（折叠状态按标题跨帧记忆）。
+    void PalDir(string title) {
+        palNodes.Add(TreeNode.Dir(title, 0, !this.PalFolded(title)));
+        palKind.Add(0 - 1);
+        palCustom.Add("");
+    }
+
+    /// 添加一个组件叶子节点（palKind/palCustom 与行下标一一对应）。
+    void PalLeaf(string label, string icon, int kind, string custom, int depth) {
+        palNodes.Add(TreeNode.FileIcon(label, depth, icon));
+        palKind.Add(kind);
+        palCustom.Add(custom);
+    }
+
+    /// 事件涉及的行是组件叶子时返回其下标，否则返回 -1。
+    int PalLeafRow() {
+        int row = palTv.ContextRow();
+        if (preview) { return 0 - 1; }
+        if (row < 0 || row >= palKind.Count) { return 0 - 1; }
+        if (palNodes[row].isDir) { return 0 - 1; }
+        return row;
+    }
+
+    /// 按名查找用户组件下标，不存在时 -1。
+    int UserCompIndex(string name) {
+        for (int k = 0; k < userComps.Count; k = k + 1) {
+            if (userComps[k].name == name) { return k; }
+        }
+        return 0 - 1;
+    }
+
+    /// 单击工具箱里的组件即添加一个；随后清掉选中，
+    /// 这样连点同一行可以连续添加。实际添加发生在抬起时
+    /// （见 PalClickRelease），因为按下这一刻还分不清点击和拖拽。
+    void PalActivate() {
+        int row = this.PalLeafRow();
+        if (row < 0) { return; }
+        palClickKind = palKind[row];
+        palClickCustom = palCustom[row];
+        palClickPending = true;
+        palTv.ClearSelection();
+    }
+
+    /// 在工具箱上按下又原地抬起：这是一次点击，添加组件。
+    void PalClickRelease() {
+        if (!palClickPending) { return; }
+        palClickPending = false;
+        if (palClickKind == 200) {
+            int k = this.UserCompIndex(palClickCustom);
+            if (k >= 0) { AddUserComponent(k); }
+        } else if (palClickCustom != "") {
+            AddCustomField(palClickCustom);
+        } else {
+            AddField(palClickKind);
+        }
+    }
+
+    /// 在组件行上按下即开始一次拖拽，拖到画布上放开即添加。
+    void PalPress() {
+        int row = this.PalLeafRow();
+        if (row < 0) { return; }
+        dragging = true;
+        dragFromPalette = true;
+        dragMoved = false;
+        dragKind = palKind[row];
+        dragCustomKind = "";
+        dragUserComp = 0 - 1;
+        if (dragKind == 200) {
+            dragUserComp = this.UserCompIndex(palCustom[row]);
+        } else if (palCustom[row] != "") {
+            dragCustomKind = palCustom[row];
+        }
+        dragMouseX = palTv.ContextX();
+        dragMouseY = palTv.ContextY();
+    }
+
+    /// 记住分组的折叠状态，重建节点后仍然保留。
+    void PalFoldNote(bool folded) {
+        int row = palTv.ContextRow();
+        if (row < 0 || row >= palNodes.Count) { return; }
+        string title = palNodes[row].label;
+        if (this.PalFolded(title) != folded) { this.PalToggleFold(title); }
+    }
+
+    /// 当字段类型的 key 或显示名包含过滤关键字时为 true。
+    bool MatchesFilter(int ft, string q) {
+        if (q == "") { return true; }
+        return Designer.Contains(FormField.TypeKey(ft), q)
+            || Designer.Contains(FormField.TypeName(ft), q);
+    }
+
+    /// 已折叠的分组标题。折叠状态按标题记住，跨帧保留。
+    bool PalFolded(string title) {
+        for (int i = 0; i < palFolded.Count; i = i + 1) {
+            if (palFolded[i] == title) { return true; }
+        }
+        return false;
+    }
+
+    /// 切换分组标题的折叠记忆。
+    void PalToggleFold(string title) {
+        for (int i = 0; i < palFolded.Count; i = i + 1) {
+            if (palFolded[i] == title) {
+                palFolded = ListRemoveStr(palFolded, i);
+                return;
+            }
+        }
+        palFolded.Add(title);
+    }
+
+    /// 重建不含 idx 处元素的字符串列表（与 ListMove 同一规避）。
+    static List<string> ListRemoveStr(List<string> src, int idx) {
+        List<string> outl = new List<string>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (i != idx) { outl.Add(src[i]); }
+        }
+        return outl;
+    }
+
+    /// 点是否在矩形内（含右/下边界）。
+    bool InRect(int mx, int my, int x, int y, int w, int h) {
+        return mx >= x && mx <= x + w && my >= y && my <= y + h;
+    }
+
+    /// WinForms 风格组件托盘：表单上的每个非可视组件
+    /// 在此显示为一个小块。点击选中它，其属性和
+    /// 事件即可在检查器中编辑；选中的小块会高亮。
+    void RenderTray(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        int fs = Style.FontFallback(app, "small");
+        c.FillRoundRect(x, y, w, h, app.Scale(6), Style.Part(app, "designer", "panel", "", "", "", Style.SNormal()).BgOr(0));
+        c.DrawRoundRect(x, y, w, h, app.Scale(6), Style.Part(app, "designer", "panel", "", "", "", Style.SNormal()).BorderOr(0), 1);
+        bool overTray = dragging && dragFromPalette
+            && FormField.IsNonVisualOf(dragKind)
+            && InRect(dragMouseX, dragMouseY, x, y, w, h);
+        if (overTray) { c.DrawRect(x, y, w, h, Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0), 2); }
+        int bx = x + app.Scale(10);
+        int by = y + (h - app.Scale(28)) / 2;
+        bool any = false;
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            FormField f = fields[i];
+            if (f.IsNonVisual()) {
+                any = true;
+                string nm = f.fname;
+                if (nm == "") { nm = FormField.TypeName(f.ftype); }
+                int ty = 0;
+                if (!preview && f == sel) { ty = 1; }
+                Button b = new Button { Text = nm, Icon = FieldIcon(f.ftype),
+                                        Class = "small " + Style.TypeClass(ty) };
+                int bw = Canvas.MeasureText(nm, fs) + app.Scale(44);
+                int id = b.Render(app, bx, by, bw);
+                if (!preview && Ui.Clicked(app, id)) {
+                    sel = f;
+                    activeContainer = null;
+                    inspTab = 0;
+                    app.RequestRedraw();
+                }
+                bx = bx + bw + app.Scale(8);
+            }
+        }
+        if (!any) {
+            c.DrawText(bx, Canvas.CenterTextY(y, h, fs),
+                Designer.T("Component tray — context menus, layers, timers and other non-visual components land here.",
+                    "组件托盘 —— 右键菜单、Layer、定时器等功能组件会放在这里。"),
+                Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+        }
+        // 把非可视字段的拖拽放到托盘任意位置即可添加。
+        if (overTray && app.EventKind() == 3) {
+            activeContainer = null;
+            AddField(dragKind);
+            dragging = false;
+            dragFromPalette = false;
+            dragMoved = false;
+            dropContainer = null;
+            app.RequestRedraw();
+        }
+    }
+
+    /// 把字段的列跨度限制到合法的 1..24 网格范围。
+    int ClampSpan(int sp) {
+        if (sp < 1) { return 24; }
+        if (sp > 24) { return 24; }
+        return sp;
+    }
+
+    /// 面板悬停 tooltip 中显示的一行描述。
+    string FieldDesc(int ft) {
+        if (ft == 0) { return Designer.T("Single-line text input", "单行文本输入框"); }
+        if (ft == 1) { return Designer.T("Multi-line text area", "多行文本域"); }
+        if (ft == 2) { return Designer.T("Masked password input", "密码输入框"); }
+        if (ft == 3) { return Designer.T("Numeric stepper input", "数字步进输入框"); }
+        if (ft == 4) { return Designer.T("Single choice from options", "单选项"); }
+        if (ft == 5) { return Designer.T("Multiple choice from options", "多选项"); }
+        if (ft == 6) { return Designer.T("Dropdown selector", "下拉选择器"); }
+        if (ft == 7) { return Designer.T("On / off toggle", "开 / 关开关"); }
+        if (ft == 8) { return Designer.T("Star rating", "星级评分"); }
+        if (ft == 9) { return Designer.T("Value slider", "滑块"); }
+        if (ft == 10) { return Designer.T("Date picker", "日期选择器"); }
+        if (ft == 11) { return Designer.T("Time picker", "时间选择器"); }
+        if (ft == 12) { return Designer.T("File upload area", "文件上传区域"); }
+        if (ft == 13) { return Designer.T("Colour picker", "颜色选择器"); }
+        if (ft == 14) { return Designer.T("Rich text editor", "富文本编辑器"); }
+        if (ft == 15) { return Designer.T("Section heading text", "章节标题文本"); }
+        if (ft == 16) { return Designer.T("Static paragraph text", "静态段落文本"); }
+        if (ft == 17) { return Designer.T("Horizontal separator", "水平分隔线"); }
+        if (ft == 18) { return Designer.T("Content card panel", "内容卡片面板"); }
+        if (ft == 19) { return Designer.T("Coloured label tag", "彩色标签"); }
+        if (ft == 20) { return Designer.T("Count / status badge", "计数 / 状态徽标"); }
+        if (ft == 21) { return Designer.T("User avatar circle", "用户头像"); }
+        if (ft == 22) { return Designer.T("Statistic figure", "统计数值"); }
+        if (ft == 23) { return Designer.T("Data table with columns", "带列的数据表格"); }
+        if (ft == 24) { return Designer.T("Vertical timeline", "垂直时间轴"); }
+        if (ft == 25) { return Designer.T("Tree / hierarchy", "树 / 层级结构"); }
+        if (ft == 26) { return Designer.T("Collapsible panels", "折叠面板"); }
+        if (ft == 27) { return Designer.T("Empty-state placeholder", "空状态占位"); }
+        if (ft == 28) { return Designer.T("Inline alert banner", "内联警告横幅"); }
+        if (ft == 29) { return Designer.T("Progress bar", "进度条"); }
+        if (ft == 30) { return Designer.T("Result / status page", "结果 / 状态页"); }
+        if (ft == 31) { return Designer.T("Skeleton placeholder", "骨架屏占位"); }
+        if (ft == 32) { return Designer.T("Loading spinner", "加载动画"); }
+        if (ft == 33) { return Designer.T("Tooltip trigger", "提示气泡触发器"); }
+        if (ft == 34) { return Designer.T("Step progress", "步骤条"); }
+        if (ft == 35) { return Designer.T("Breadcrumb trail", "面包屑导航"); }
+        if (ft == 36) { return Designer.T("Tab bar", "标签页栏"); }
+        if (ft == 37) { return Designer.T("Pagination controls", "分页控件"); }
+        if (ft == 38) { return Designer.T("Navigation menu", "导航菜单"); }
+        if (ft == 39) { return Designer.T("Page header", "页面头部"); }
+        if (ft == 40) { return Designer.T("Scrollable list of rows", "可滚动行列表"); }
+        if (ft == 41) { return Designer.T("Sortable data grid", "可排序数据网格"); }
+        if (ft == 42) { return Designer.T("Image / slide carousel", "图片 / 幻灯轮播"); }
+        if (ft == 43) { return Designer.T("Chart (line/bar/pie/gauge... set Type)", "图表（折线/柱状/饼图/仪表盘…属性里选类型）"); }
+        if (ft == 44) { return Designer.T("Truncated text with ellipsis", "带省略号的截断文本"); }
+        if (ft == 45) { return Designer.T("Titled content panel", "带标题内容面板"); }
+        if (ft == 46) { return Designer.T("Vertical scrollbar", "垂直滚动条"); }
+        if (ft == 47) { return Designer.T("Loading indicator", "加载指示器"); }
+        if (ft == 48) { return Designer.T("Dropdown trigger", "下拉触发器"); }
+        if (ft == 49) { return Designer.T("Floating action button", "悬浮操作按钮"); }
+        if (ft == 50) { return Designer.T("Anchored popover", "锚定气泡卡片"); }
+        if (ft == 51) { return Designer.T("Inline confirm popover", "内联确认气泡"); }
+        if (ft == 52) { return Designer.T("Notification toast", "通知提示"); }
+        if (ft == 53) { return Designer.T("Command ribbon", "命令功能区"); }
+        if (ft == 54) { return Designer.T("Standalone icon", "独立图标"); }
+        if (ft == 55) { return Designer.T("Right-click context menu (component tray)", "右键上下文菜单（组件托盘）"); }
+        if (ft == 56) { return Designer.T("Popup layer / overlay (component tray)", "弹出层 / 遮罩（组件托盘）"); }
+        if (ft == 57) { return Designer.T("Interval timer (component tray)", "定时器（组件托盘）"); }
+        if (ft == 58) { return Designer.T("Tool strip of icon / text buttons", "工具条（图标 / 文字按钮）"); }
+        if (ft == 59) { return Designer.T("Window status bar", "窗口状态栏"); }
+        if (ft == 60) { return Designer.T("Two panes with a draggable splitter", "可拖拽分隔的两栏容器"); }
+        if (ft == 61) { return Designer.T("Dock container (children dock to an edge)", "停靠容器（子组件停靠到某一边）"); }
+        if (ft == 62) { return Designer.T("Status indicator lamp", "状态指示灯"); }
+        if (ft == 63) { return Designer.T("Large numeric process readout", "数显表（大字号过程值）"); }
+        if (ft == 64) { return Designer.T("Dial gauge with alarm bands", "圆盘仪表（带报警区段）"); }
+        if (ft == 65) { return Designer.T("Range bar with limit marks", "棒图 / 量程条（带限值标线）"); }
+        if (ft == 66) { return Designer.T("Rolling trend chart", "实时趋势曲线"); }
+        if (ft == 67) { return Designer.T("Alarm banner with acknowledge", "报警横幅（可确认）"); }
+        if (ft == 68) { return Designer.T("Alarm list (time / level / tag)", "报警列表（时间 / 级别 / 位号）"); }
+        if (ft == 69) { return Designer.T("On-screen numeric keypad", "屏幕数字键盘"); }
+        if (ft == 70) { return Designer.T("Device status card", "设备状态卡"); }
+        if (ft == 71) { return Designer.T("Equipment state card wall", "设备状态面板（卡片墙）"); }
+        if (ft == 72) {
+            return Designer.T("Native web view (browser)", "原生网页视图（浏览器）");
+        }
+        if (ft == 73) { return Designer.T("Elastic flow row / column", "弹性流式行 / 列容器"); }
+        if (ft == 74) { return Designer.T("Responsive equal-width grid", "响应式等宽网格"); }
+        if (ft == 75) { return Designer.T("Image with alt / fit", "图片（带替代文本 / 适配）"); }
+        if (ft == 76) { return Designer.T("Month calendar", "月历"); }
+        if (ft == 77) { return Designer.T("Live countdown timer", "实时倒计时"); }
+        if (ft == 78) { return Designer.T("QR code from label text", "二维码（内容取标签）"); }
+        if (ft == 79) { return Designer.T("Tiled watermark overlay", "平铺水印"); }
+        if (ft == 80) { return Designer.T("Scrolling announcement text", "滚动公告"); }
+        if (ft == 81) { return Designer.T("Editable tag list", "动态标签（可增删）"); }
+        if (ft == 82) { return Designer.T("Animated count-up number", "数字滚动动画"); }
+        if (ft == 83) { return Designer.T("One-time-code input boxes", "一次性验证码输入"); }
+        if (ft == 84) { return Designer.T("Two-pane shuttle picker", "穿梭框（双栏选择）"); }
+        if (ft == 85) { return Designer.T("Virtualized long list", "虚拟化长列表"); }
+        return Designer.T("Form field", "表单字段");
+    }
+
+    /// 把字段类型映射为面板用的 Segoe MDL2 图标名。
+    string FieldIcon(int ft) {
+        if (ft == 0) { return "edit"; }
+        if (ft == 1) { return "menu"; }
+        if (ft == 2) { return "lock"; }
+        if (ft == 3) { return "sort"; }
+        if (ft == 4) { return "like"; }
+        if (ft == 5) { return "check"; }
+        if (ft == 6) { return "chevron-down"; }
+        if (ft == 7) { return "settings"; }
+        if (ft == 8) { return "star"; }
+        if (ft == 9) { return "more"; }
+        if (ft == 10) { return "calendar"; }
+        if (ft == 11) { return "clock"; }
+        if (ft == 12) { return "upload"; }
+        if (ft == 13) { return "color"; }
+        if (ft == 14) { return "font"; }
+        if (ft == 15) { return "font"; }
+        if (ft == 16) { return "align-left"; }
+        if (ft == 17) { return "minus"; }
+        if (ft == 18) { return "grid"; }
+        if (ft == 19) { return "pin"; }
+        if (ft == 20) { return "bell"; }
+        if (ft == 21) { return "user"; }
+        if (ft == 22) { return "sort"; }
+        if (ft == 23) { return "table"; }
+        if (ft == 24) { return "more"; }
+        if (ft == 25) { return "folder"; }
+        if (ft == 26) { return "chevron-down"; }
+        if (ft == 27) { return "file"; }
+        if (ft == 28) { return "warning"; }
+        if (ft == 29) { return "refresh"; }
+        if (ft == 30) { return "success"; }
+        if (ft == 31) { return "copy"; }
+        if (ft == 32) { return "refresh"; }
+        if (ft == 33) { return "info"; }
+        if (ft == 34) { return "check"; }
+        if (ft == 35) { return "chevron-right"; }
+        if (ft == 36) { return "layout"; }
+        if (ft == 37) { return "more"; }
+        if (ft == 38) { return "menu"; }
+        if (ft == 39) { return "arrow-left"; }
+        if (ft == 40) { return "menu"; }
+        if (ft == 41) { return "grid"; }
+        if (ft == 42) { return "image"; }
+        if (ft == 43) { return "sort"; }
+        if (ft == 44) { return "more"; }
+        if (ft == 45) { return "layout"; }
+        if (ft == 46) { return "more"; }
+        if (ft == 47) { return "refresh"; }
+        if (ft == 48) { return "chevron-down"; }
+        if (ft == 49) { return "plus"; }
+        if (ft == 50) { return "info"; }
+        if (ft == 51) { return "warning"; }
+        if (ft == 52) { return "bell"; }
+        if (ft == 53) { return "grid"; }
+        if (ft == 54) { return "star"; }
+        if (ft == 55) { return "menu"; }
+        if (ft == 56) { return "copy"; }
+        if (ft == 57) { return "clock"; }
+        if (ft == 58) { return "settings"; }
+        if (ft == 59) { return "align-left"; }
+        if (ft == 60) { return "layout"; }
+        if (ft == 61) { return "grid"; }
+        if (ft == 62) { return "success"; }
+        if (ft == 63) { return "font"; }
+        if (ft == 64) { return "clock"; }
+        if (ft == 65) { return "filter"; }
+        if (ft == 66) { return "sort"; }
+        if (ft == 67) { return "warning"; }
+        if (ft == 68) { return "table"; }
+        if (ft == 69) { return "grid"; }
+        if (ft == 70) { return "archive"; }
+        if (ft == 71) { return "grid"; }
+        if (ft == 72) { return "globe"; }
+        if (ft == 73) { return "layout"; }
+        if (ft == 74) { return "grid"; }
+        if (ft == 75) { return "image"; }
+        if (ft == 76) { return "calendar"; }
+        if (ft == 77) { return "clock"; }
+        if (ft == 78) { return "copy"; }
+        if (ft == 79) { return "align-left"; }
+        if (ft == 80) { return "more"; }
+        if (ft == 81) { return "pin"; }
+        if (ft == 82) { return "sort"; }
+        if (ft == 83) { return "edit"; }
+        if (ft == 84) { return "like"; }
+        if (ft == 85) { return "menu"; }
+        return "file";
+    }
+
+    /// 渲染一个小按钮（高 28）并返回其 id。检查器各处使用，
+    /// 让控件能放进紧凑的行内。
+    int SmallBtn(App app, string text, int type, int x, int y, int w) {
+        Button b = new Button { Text = text, Class = "small " + Style.TypeClass(type) };
+        return b.Render(app, x, y, w);
+    }
+
+    /// 小号（高 28）纯图标按钮——尺寸与 SmallBtn 相同，但
+    /// 标签是矢量 Icon 字形而非文本字符。
+    int SmallIconBtn(App app, string iconName, int type, int x, int y, int w) {
+        Button b = new Button { Icon = iconName,
+                                Class = "circle small " + Style.TypeClass(type) };
+        return b.Render(app, x, y, w);
+    }
+
+    // --- 表单预览 --------------------------------------------------------
+}

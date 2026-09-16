@@ -1,0 +1,176 @@
+using System;
+using System.Net.Sockets;
+
+namespace System.Net.Sockets;
+
+/// <summary>
+/// 跨平台的异步 TCP 服务器监听器。
+/// 借鉴 Workerman 的思路：每个被接受的连接都可以
+/// 在独立的协程中处理，从而支持海量并发。
+///
+/// 用法：
+///   var listener = new TcpListener("0.0.0.0", 8080);
+///   TcpListener.Start(listener);
+///   while (true) {
+///       nint client = await TcpListener.AcceptAsync(listener);
+///       // 派生一个协程来处理该客户端
+///   }
+/// </summary>
+class TcpListener {
+    nint sock;
+    string host;
+    int port;
+    bool running;
+    int backlog;
+
+    TcpListener(string host, int port) {
+        Socket.Initialize();
+        this.host = host;
+        this.port = port;
+        this.running = false;
+        this.backlog = 128;
+        this.sock = -1;
+    }
+
+    /// <summary>创建并启动一个带自定义 backlog 的监听器。</summary>
+    static TcpListener CreateAndStart(string host, int port, int backlog) {
+        TcpListener listener = new TcpListener(host, port);
+        listener.backlog = backlog;
+        listener.Start();
+        return listener;
+    }
+
+    /// <summary>开始监听传入的连接。任一步（创建套接字、绑定、
+    /// 监听、设为非阻塞）失败时关闭已创建的 fd 并抛
+    /// SocketException（端口被占用等），绝不留下一个
+    /// running=true 但实际没在监听的监听器。</summary>
+    void Start() {
+        nint s = Socket.CreateTcp();
+        if (s < 0) {
+            throw new SocketException(Socket.LastSocketError(),
+                "socket() failed: " + Convert.ToString(Socket.LastSocketError()));
+        }
+        Socket.SetReuseAddr(s);
+        if (Socket.Bind(s, this.host, this.port) != 0) {
+            int err = Socket.LastSocketError();
+            Socket.Close(s);
+            throw new SocketException(err,
+                "bind(" + this.host + ":" + Convert.ToString(this.port)
+                + ") failed: " + Convert.ToString(err));
+        }
+        if (Socket.Listen(s, this.backlog) != 0) {
+            int err = Socket.LastSocketError();
+            Socket.Close(s);
+            throw new SocketException(err,
+                "listen() failed: " + Convert.ToString(err));
+        }
+        if (Socket.SetNonBlocking(s) != 0) {
+            int err = Socket.LastSocketError();
+            Socket.Close(s);
+            throw new SocketException(err,
+                "set nonblocking failed: " + Convert.ToString(err));
+        }
+        this.sock = s;
+        this.running = true;
+    }
+
+    /// <summary>在 bind 前启用 SO_REUSEPORT 再开始监听，这样
+    /// 多个 worker 进程可共享同一地址:端口，由内核
+    /// 在它们之间负载均衡入站连接（Linux/macOS）。Windows 上行为同
+    /// Start（无 SO_REUSEPORT）。任一步失败时关闭 fd 并抛
+    /// SocketException。</summary>
+    void StartReusePort() {
+        nint s = Socket.CreateTcp();
+        if (s < 0) {
+            throw new SocketException(Socket.LastSocketError(),
+                "socket() failed: " + Convert.ToString(Socket.LastSocketError()));
+        }
+        Socket.SetReuseAddr(s);
+        Socket.SetReusePort(s);
+        if (Socket.Bind(s, this.host, this.port) != 0) {
+            int err = Socket.LastSocketError();
+            Socket.Close(s);
+            throw new SocketException(err,
+                "bind(" + this.host + ":" + Convert.ToString(this.port)
+                + ") failed: " + Convert.ToString(err));
+        }
+        if (Socket.Listen(s, this.backlog) != 0) {
+            int err = Socket.LastSocketError();
+            Socket.Close(s);
+            throw new SocketException(err,
+                "listen() failed: " + Convert.ToString(err));
+        }
+        if (Socket.SetNonBlocking(s) != 0) {
+            int err = Socket.LastSocketError();
+            Socket.Close(s);
+            throw new SocketException(err,
+                "set nonblocking failed: " + Convert.ToString(err));
+        }
+        this.sock = s;
+        this.running = true;
+    }
+
+    /// <summary>在 IO reactor 上挂起直到客户端连接，然后接受
+    /// 连接。接受的套接字被设为非阻塞，因此其上的异步 recv/send 也会
+    /// 在 reactor 上挂起。</summary>
+    async nint AcceptAsync() {
+        this.EnsureStarted();
+        nint client = await Socket.AcceptAsync(this.sock);
+        if (client >= 0) {
+            Socket.SetNonBlocking(client);
+        }
+        return client;
+    }
+
+    /// <summary>同步接受客户端连接。</summary>
+    nint Accept() {
+        this.EnsureStarted();
+        return Socket.Accept(this.sock);
+    }
+
+    /// <summary>接受连接前的自愈：构造器只记录 host:port，真正的
+    /// socket/bind/listen 在 <see cref="Start"/> 里做，所以直接对
+    /// `new TcpListener(...)` 调用 Accept 曾经在一个 -1 的 fd 上永远
+    /// 挂起。这里补上一次 Start（失败照常抛 SocketException）。</summary>
+    void EnsureStarted() {
+        if (this.running && this.sock >= 0) { return; }
+        this.Start();
+    }
+
+    /// <summary>停止监听器。Windows 上必须先对句柄做 CancelIoEx
+    /// 再关闭：closesocket 自己不会给挂起的 AcceptEx 投递完成包，
+    /// accept 里的协程会带着整条服务端对象链永远挂起（泄漏探测在
+    /// 退出时全部记为仍可达）。CancelIoEx 让挂起的 accept 立刻以
+    /// -1 复位——与 POSIX 侧 dead-fd sweep 的语义一致；recv 版的
+    /// 同样机制见 <see cref="Socket.ShutdownBoth"/> 的注释。</summary>
+    void Stop() {
+        this.running = false;
+        if (this.sock >= 0) {
+            #if WINDOWS
+            Socket.ShutdownBoth(this.sock);
+            #endif
+            Socket.Close(this.sock);
+            this.sock = -1;
+        }
+    }
+
+    /// <summary>返回监听器是否正在运行。</summary>
+    bool IsRunning() {
+        return this.running;
+    }
+
+    /// <summary>返回底层套接字句柄。</summary>
+    nint GetSocket() {
+        return this.sock;
+    }
+
+    /// <summary>返回绑定的端口。</summary>
+    int GetPort() {
+        return this.port;
+    }
+
+    /// <summary>返回绑定的主机。</summary>
+    string GetHost() {
+        return this.host;
+    }
+}

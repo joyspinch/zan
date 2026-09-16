@@ -1,0 +1,185 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>AES-GCM（NIST SP 800-38D）认证加密，96 位（12 字节）IV。
+/// 实现走 OpenSSL libcrypto 的 EVP 接口（AES-NI + PCLMULQDQ，
+/// GB/s 级吞吐；OpenSSL 3 的 EVP_aes_*_gcm 仍是公开导出）。
+///
+/// 驱动：System/Net/Tls/drivers 捆绑的 libcrypto（driver.manifest
+/// 声明 "crypto"，zanc --publish 自动携带）。静态发布未捆绑
+/// libcrypto 时导入被 zanc 桩化（调用返回 0），本类各方法按
+/// 认证失败/参数不合法的同款契约返回 null。纯 Zan 参考实现见
+/// examples/crypto_reference/。</summary>
+class AesGcm {
+    [DllImport("crypto")]
+    static extern string EVP_CIPHER_CTX_new();
+    [DllImport("crypto")]
+    static extern void EVP_CIPHER_CTX_free(string ctx);
+    [DllImport("crypto")]
+    static extern int EVP_EncryptInit_ex(string ctx, string cipher, string impl, string key, string iv);
+    [DllImport("crypto")]
+    static extern int EVP_EncryptUpdate(string ctx, byte[] outb, nint outl, byte[] inb, int inl);
+    /* string 输入绑定：省掉逐字节 Zan 拷贝（与 Aes.zan 同款） */
+    [DllImport("crypto", EntryPoint = "EVP_EncryptUpdate")]
+    static extern int EVP_EncryptUpdateS(string ctx, byte[] outb, nint outl, string inb, int inl);
+    [DllImport("crypto")]
+    static extern int EVP_EncryptFinal_ex(string ctx, byte[] outb, nint outl);
+    [DllImport("crypto")]
+    static extern int EVP_DecryptInit_ex(string ctx, string cipher, string impl, string key, string iv);
+    [DllImport("crypto")]
+    static extern int EVP_DecryptUpdate(string ctx, byte[] outb, nint outl, byte[] inb, int inl);
+    [DllImport("crypto", EntryPoint = "EVP_DecryptUpdate")]
+    static extern int EVP_DecryptUpdateS(string ctx, byte[] outb, nint outl, string inb, int inl);
+    [DllImport("crypto")]
+    static extern int EVP_DecryptFinal_ex(string ctx, byte[] outb, nint outl);
+    [DllImport("crypto")]
+    static extern int EVP_CIPHER_CTX_ctrl(string ctx, int type, int arg, string ptr);
+    [DllImport("crypto")]
+    static extern string EVP_aes_128_gcm();
+    [DllImport("crypto")]
+    static extern string EVP_aes_192_gcm();
+    [DllImport("crypto")]
+    static extern string EVP_aes_256_gcm();
+    /* 防御收缩拷贝（GCM 下不触发）：native memcpy，理由同 Aes.zan */
+    [DllImport("crt", EntryPoint = "memcpy")]
+    static extern void BufCopy(byte[] dst, byte[] src, int n);
+
+    /* EVP_CTRL_GCM_SET_IVLEN = 0x9, GET_TAG = 0x10, SET_TAG = 0x11 */
+    static int EVP_CTRL_GCM_SET_IVLEN() { return 0x9; }
+    static int EVP_CTRL_GCM_GET_TAG() { return 0x10; }
+    static int EVP_CTRL_GCM_SET_TAG() { return 0x11; }
+
+    static string GcmCipher(int keyLen) {
+        if (keyLen == 16) { return EVP_aes_128_gcm(); }
+        if (keyLen == 24) { return EVP_aes_192_gcm(); }
+        if (keyLen == 32) { return EVP_aes_256_gcm(); }
+        return null;
+    }
+
+    static int CellRead(nint cell) {
+        return new Span<int>(cell, 1)[0];
+    }
+
+    /// GCM 两段式 Init：先 cipher（IV 长度未定），SET_IVLEN 后再补
+    /// key+iv。注意 key/iv 参数是字节缓冲区（可能含 0x00），全程
+    /// 不读 .Length，只用固定 16/12 字节布局。
+    static string GcmInit(string cipher, string key, string iv, int enc) {
+        string ctx = EVP_CIPHER_CTX_new();
+        if (ctx == null) { return null; }
+        int ok;
+        if (enc == 1) {
+            ok = EVP_EncryptInit_ex(ctx, cipher, null, null, null);
+        } else {
+            ok = EVP_DecryptInit_ex(ctx, cipher, null, null, null);
+        }
+        if (ok == 1) { ok = EVP_CIPHER_CTX_ctrl(ctx, AesGcm.EVP_CTRL_GCM_SET_IVLEN(), 12, null); }
+        if (ok == 1) {
+            if (enc == 1) {
+                ok = EVP_EncryptInit_ex(ctx, null, null, key, iv);
+            } else {
+                ok = EVP_DecryptInit_ex(ctx, null, null, key, iv);
+            }
+        }
+        if (ok != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return null;
+        }
+        return ctx;
+    }
+
+    /* tag 缓冲一律用 byte[]：GetString 产出的 string 一旦被元素写，
+       长度缓存失效后按 strlen 重算，内容含 NUL 就会缩成短串，后续
+       下标操作全部撞界。byte[] 的头部是数组魔数，元素数不撒谎。 */
+
+    /// <summary>AES-GCM 加密，使用 96 位（12 字节）IV。密文
+    /// （与明文等长）写入返回值，16 字节 tag 写入
+    /// <paramref name="tagOut"/>。参数不合法（密钥长度、
+    /// 长度字段为负、输出缓冲区缺失等）时返回 null。</summary>
+    static byte[] Encrypt(string key, int keyLen, string iv, string aad, int aadLen, string pt, int ptLen, string tagOut) {
+        if (keyLen != 16 && keyLen != 24 && keyLen != 32) { return null; }
+        if (aadLen < 0 || ptLen < 0) { return null; }
+        if (iv == null || tagOut == null) { return null; }
+        if (aadLen > 0 && aad == null) { return null; }
+        if (ptLen > 0 && pt == null) { return null; }
+        string cipher = AesGcm.GcmCipher(keyLen);
+        if (cipher == null) { return null; }
+        string ctx = AesGcm.GcmInit(cipher, key, iv, 1);
+        if (ctx == null) { return null; }
+        nint cell = NativeMemory.Alloc(4);
+        /* GCM 是流式（CTR）：密文与明文等长、Final 不产出。输出缓冲
+           按精确长度分配，EVP 直接写入、原样返回（aad 同样以零拷贝
+           string 直接过边界，另建 byte[] 逐字节拷贝是死代码）。 */
+        byte[] ctB = new byte[ptLen];
+        int ok = 1;
+        if (aadLen > 0) {
+            ok = EVP_EncryptUpdateS(ctx, null, cell, aad, aadLen);
+        }
+        if (ok == 1) { ok = EVP_EncryptUpdateS(ctx, ctB, cell, pt, ptLen); }
+        if (ok == 1) {
+            byte[] fin = new byte[16];
+            ok = EVP_EncryptFinal_ex(ctx, fin, cell);
+        }
+        if (ok == 1) {
+            /* GET_TAG 只在 Final 之后合法；写进 byte[] 载荷再拷回 tagOut */
+            byte[] tagB = new byte[17];
+            string tagBuf = tagB;
+            ok = EVP_CIPHER_CTX_ctrl(ctx, AesGcm.EVP_CTRL_GCM_GET_TAG(), 16, tagBuf);
+            if (ok == 1) {
+                for (int i = 0; i < 16; i = i + 1) { tagOut[i] = tagB[i]; }
+            }
+        }
+        NativeMemory.Free(cell);
+        EVP_CIPHER_CTX_free(ctx);
+        if (ok != 1) { return null; }
+        return ctB;
+    }
+
+    /// <summary>AES-GCM 解密，使用 96 位 IV。校验通过时返回明文
+    /// 并将 <paramref name="ok"/>[0] 置 -1（true）；tag/aad/密文被篡改时
+    /// 返回 null 并将 <paramref name="ok"/>[0] 置 0。**调用方绝不能
+    /// 在 ok != -1 时使用任何返回值**——认证失败不产出明文是 GCM 的
+    /// 核心安全性质，API 本身保证这一点（EVP 的 SET_TAG + Final_ex
+    /// 在 tag 不匹配时不产出明文），而非依赖调用方检查。</summary>
+    static byte[] Decrypt(string key, int keyLen, string iv, string aad, int aadLen, string ct, int ctLen, string tag, List<int> ok) {
+        if (keyLen != 16 && keyLen != 24 && keyLen != 32) { ok[0] = 0; return null; }
+        if (aadLen < 0 || ctLen < 0) { ok[0] = 0; return null; }
+        if (iv == null || tag == null || ok == null) { ok[0] = 0; return null; }
+        if (aadLen > 0 && aad == null) { ok[0] = 0; return null; }
+        if (ctLen > 0 && ct == null) { ok[0] = 0; return null; }
+        string cipher = AesGcm.GcmCipher(keyLen);
+        if (cipher == null) { ok[0] = 0; return null; }
+        string ctx = AesGcm.GcmInit(cipher, key, iv, 0);
+        if (ctx == null) { ok[0] = 0; return null; }
+        nint cell = NativeMemory.Alloc(4);
+        byte[] ptB = new byte[ctLen];
+        int good = 1;
+        if (aadLen > 0) {
+            good = EVP_DecryptUpdateS(ctx, null, cell, aad, aadLen);
+        }
+        if (good == 1) { good = EVP_DecryptUpdateS(ctx, ptB, cell, ct, ctLen); }
+        int produced = 0;
+        if (good == 1) { produced = AesGcm.CellRead(cell); }
+        if (good == 1) {
+            /* SET_TAG 必须在 Final 之前；Final 失败即 tag 不匹配 */
+            byte[] tagB = new byte[17];
+            for (int i = 0; i < 16; i = i + 1) { tagB[i] = tag[i]; }
+            string tagBuf = tagB;
+            good = EVP_CIPHER_CTX_ctrl(ctx, AesGcm.EVP_CTRL_GCM_SET_TAG(), 16, tagBuf);
+            if (good == 1) {
+                byte[] fin = new byte[16];
+                good = EVP_DecryptFinal_ex(ctx, fin, cell);
+            }
+        }
+        NativeMemory.Free(cell);
+        EVP_CIPHER_CTX_free(ctx);
+        if (good != 1) { ok[0] = 0; return null; }
+        ok[0] = -1;
+        if (produced == ptB.Length) { return ptB; }
+        /* 防御收缩：GCM(CTR) 下 produced 恒等于 ctLen，此分支仅为保留
+           旧契约（返回精确 produced 长度）而存在 */
+        byte[] exact = new byte[produced];
+        AesGcm.BufCopy(exact, ptB, produced);
+        return exact;
+    }
+}

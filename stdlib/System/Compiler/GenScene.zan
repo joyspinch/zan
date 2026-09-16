@@ -1,0 +1,362 @@
+// GenScene.zan -- .zscene 场景设计文档 → 合成 partial class 的代码生成器。
+// 等价迁移自 src/compiler/scenegen.c(输出逐字节一致)。
+//
+// 输入(design 请求的 files[i]):
+//   { "name": "App.zscene", "text": "<.zscene JSON>", "emitMain": bool }
+// 输出:reply.sources 里追加一段名为 name 的 .zan 源码。
+namespace System.Compiler;
+
+/// <summary>.zscene 场景设计文档到合成 partial class 的代码生成器。
+/// 与 src/compiler/scenegen.c 等价(输出逐字节一致);入口是
+/// <see cref="Translate"/>,由 design 请求分派 .zscene 文件进来。</summary>
+class GenScene {
+    /// 翻译 design 请求里所有 .zscene 文件(.zform 归 GenForm):
+    /// 逐个解析、合成为 .zan 源码,经 GenCommon.AddSource 追加进
+    /// reply 的 sources;失败时写 reply 的 error 后返回。
+    static void Translate(JsonValue req, JsonValue reply) {
+        JsonValue files = req.Get("files");
+        if (files == null) { return; }
+        for (int i = 0; i < files.Count(); i = i + 1) {
+            JsonValue f = files.At(i);
+            string fname = f.Str("name", "");
+            /* 只处理 .zscene;.zform 归 GenForm(与旧 C 的按扩展名分派一致)。 */
+            if (!fname.EndsWith(".zscene")) { continue; }
+            string text = f.Str("text", "");
+            bool emitMain = f.Bool("emitMain", false);
+            StringBuilder outText = GenScene.TranslateOne(reply, text, fname, emitMain);
+            if (outText == null) {
+                if (!GenCommon.HasError(reply)) {
+                    GenCommon.Fail(reply,
+                        "cannot translate scene document '" + fname + "'");
+                }
+                return;
+            }
+            GenCommon.AddSource(reply, fname, outText);
+        }
+    }
+
+    /// 转义为可嵌入 .zan 字符串字面量正文的文本。
+    /// 与旧 scenegen 的 sg_esc 一致:反斜杠/双引号前置反斜杠、
+    /// LF -> \n、CR -> \r、TAB -> \t,其余原样(注意 CR 是保留的,
+    /// 与 GenCommon.Esc 不同)。
+    static string Esc(string s) {
+        StringBuilder b = new StringBuilder();
+        int n = s.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\\" || ch == "\"") { b.Append("\\" + ch); }
+            else if (ch == "\n") { b.Append("\\n"); }
+            else if (ch == "\r") { b.Append("\\r"); }
+            else if (ch == "\t") { b.Append("\\t"); }
+            else { b.Append(ch); }
+        }
+        return b.ToString();
+    }
+
+    /// 读对象的整数属性:存在且为数字时取其值,否则返回 def。
+    static int ObjNum(JsonValue o, string key, int def) {
+        JsonValue v = o.Get(key);
+        if (v != null && v.IsNumber()) { return v.AsInt(def); }
+        return def;
+    }
+
+    /// 读对象的字符串属性:缺省或非字符串返回 ""。
+    static string ObjStr(JsonValue o, string key) {
+        JsonValue v = o.Get(key);
+        if (v != null && v.IsString()) { return v.AsString(""); }
+        return "";
+    }
+
+    /// 读对象的布尔属性:缺省或非布尔返回 def(与 GenForm 的
+    /// ObjBool 不同,这里允许指定缺省,如 visible 缺省 true)。
+    static bool ObjBool(JsonValue o, string key, bool def) {
+        JsonValue v = o.Get(key);
+        if (v != null && v.IsBool()) { return v.AsBool(def); }
+        return def;
+    }
+
+    /// 数值数组属性的第 i 个分量("color"/"clearColor")。
+    static int ArrNum(JsonValue o, string key, int i, int def) {
+        JsonValue a = o.Get(key);
+        if (a == null || !a.IsArray() || i >= a.Count()) { return def; }
+        JsonValue v = a.At(i);
+        if (v != null && v.IsNumber()) { return v.AsInt(def); }
+        return def;
+    }
+
+    /// 元素名是否已被用作静态字段名(重名元素改用局部变量)。
+    static bool UsedHas(List<string> used, string n) {
+        return used.Contains(n);
+    }
+
+    /// 翻译单个 .zscene 文档。解析失败返回 null(不设 error,
+    /// 由 C 端报通用错误)。
+    static StringBuilder TranslateOne(JsonValue reply, string json,
+                                      string file_name, bool emit_main) {
+        JsonValue root;
+        try {
+            root = JsonValue.Parse(json);
+        } catch (Exception ex) {
+            return null;
+        }
+
+        string name = GenScene.ObjStr(root, "name");
+        if (!GenCommon.IsIdent(name)) {
+            string base0 = file_name;
+            if (base0 == null) { base0 = ""; }
+            int slash = base0.LastIndexOf("/");
+            int bslash = base0.LastIndexOf("\\");
+            int p = 0;
+            if (slash >= 0 && (bslash < 0 || slash > bslash)) { p = slash + 1; }
+            else if (bslash >= 0) { p = bslash + 1; }
+            string nm = base0.Substring(p);
+            if (nm.EndsWith(".zscene")) { nm = nm.Substring(0, nm.Length - 7); }
+            if (nm.Length > 127) { nm = nm.Substring(0, 127); }
+            if (!GenCommon.IsIdent(nm)) { nm = "Scene"; }
+            name = nm;
+        }
+
+        int dw = GenScene.ObjNum(root, "designWidth", 1280);
+        if (dw <= 0) { dw = 1280; }
+        int dh = GenScene.ObjNum(root, "designHeight", 720);
+        if (dh <= 0) { dh = 720; }
+
+        StringBuilder decls = new StringBuilder();
+        StringBuilder body = new StringBuilder();
+        List<string> used = new List<string>();
+
+        JsonValue elems = root.Get("elements");
+        int ecount = (elems != null && elems.IsArray()) ? elems.Count() : 0;
+        for (int i = 0; i < ecount; i = i + 1) {
+            JsonValue e = elems.At(i);
+            if (e == null || !e.IsObject()) { continue; }
+            string ename = GenScene.ObjStr(e, "name");
+            string vn;
+            if (GenCommon.IsIdent(ename) && !GenScene.UsedHas(used, ename)) {
+                vn = ename;
+                used.Add(ename);
+                decls.Append("    static SceneElement " + vn + ";\n");
+            } else {
+                vn = "e" + Convert.ToString(i);
+                body.Append("        SceneElement " + vn + ";\n");
+            }
+            body.Append("        " + vn + " = new SceneElement(\"");
+            body.Append(GenScene.Esc(GenScene.ObjStr(e, "kind")));
+            body.Append("\", \"");
+            body.Append(GenScene.Esc(ename));
+            body.Append("\");\n");
+            body.Append("        " + vn + ".At(" +
+                        Convert.ToString(GenScene.ObjNum(e, "x", 0)) + ", " +
+                        Convert.ToString(GenScene.ObjNum(e, "y", 0)) + ");\n");
+            body.Append("        " + vn + ".Size(" +
+                        Convert.ToString(GenScene.ObjNum(e, "w", 0)) + ", " +
+                        Convert.ToString(GenScene.ObjNum(e, "h", 0)) + ");\n");
+            body.Append("        " + vn + ".AnchorTo(" +
+                        Convert.ToString(GenScene.ObjNum(e, "anchorX", 0)) + ", " +
+                        Convert.ToString(GenScene.ObjNum(e, "anchorY", 0)) + ");\n");
+            body.Append("        " + vn + ".Order(" +
+                        Convert.ToString(GenScene.ObjNum(e, "z", 0)) + ");\n");
+            body.Append("        " + vn + ".Tint(" +
+                        Convert.ToString(GenScene.ArrNum(e, "color", 0, 255)) + ", " +
+                        Convert.ToString(GenScene.ArrNum(e, "color", 1, 255)) + ", " +
+                        Convert.ToString(GenScene.ArrNum(e, "color", 2, 255)) + ", " +
+                        Convert.ToString(GenScene.ArrNum(e, "color", 3, 255)) + ");\n");
+            string img = GenScene.ObjStr(e, "image");
+            if (img.Length > 0) {
+                body.Append("        " + vn + ".Image(\"");
+                body.Append(GenScene.Esc(img));
+                body.Append("\");\n");
+            }
+            string text = GenScene.ObjStr(e, "text");
+            if (text.Length > 0) {
+                body.Append("        " + vn + ".Caption(\"");
+                body.Append(GenScene.Esc(text));
+                body.Append("\");\n");
+            }
+            int rows = GenScene.ObjNum(e, "rows", 0);
+            int cols = GenScene.ObjNum(e, "cols", 0);
+            int gapx = GenScene.ObjNum(e, "gapX", 0);
+            int gapy = GenScene.ObjNum(e, "gapY", 0);
+            if (rows > 0 || cols > 0 || gapx != 0 || gapy != 0) {
+                body.Append("        " + vn + ".Grid(" +
+                            Convert.ToString(rows) + ", " +
+                            Convert.ToString(cols) + ", " +
+                            Convert.ToString(gapx) + ", " +
+                            Convert.ToString(gapy) + ");\n");
+            }
+            int value = GenScene.ObjNum(e, "value", 0);
+            if (value != 0) {
+                body.Append("        " + vn + ".SetValue(" +
+                            Convert.ToString(value) + ");\n");
+            }
+            string items = GenScene.ObjStr(e, "items");
+            if (items.Length > 0) {
+                body.Append("        " + vn + ".SetItems(\"");
+                body.Append(GenScene.Esc(items));
+                body.Append("\");\n");
+            }
+            if (GenScene.ObjBool(e, "locked", false)) {
+                body.Append("        " + vn + ".SetLocked(true);\n");
+            }
+            string layer = GenScene.ObjStr(e, "layer");
+            if (layer.Length > 0) {
+                body.Append("        " + vn + ".SetLayer(\"");
+                body.Append(GenScene.Esc(layer));
+                body.Append("\");\n");
+            }
+            if (GenScene.ObjStr(e, "onClick").Length > 0) {
+                body.Append("        " + vn + ".On(\"Click\", \"");
+                body.Append(GenScene.Esc(GenScene.ObjStr(e, "onClick")));
+                body.Append("\");\n");
+            }
+            if (!GenScene.ObjBool(e, "visible", true)) {
+                body.Append("        " + vn + ".SetVisible(false);\n");
+            }
+            body.Append("        d.Add(" + vn + ");\n");
+        }
+
+        StringBuilder out0 = new StringBuilder();
+        out0.Append("// <auto-generated> compile-time projection of ");
+        if (file_name == null) { out0.Append("(scene)"); } else { out0.Append(file_name); }
+        out0.Append("\n");
+        out0.Append("// The .zscene design document is the source of truth; put\n");
+        out0.Append("// your initialization and game logic in " + name + ".zan.\n");
+        out0.Append("using System;\n");
+        out0.Append("using Gui;\n");
+        out0.Append("using Game.Scene;\n\n");
+        out0.Append("partial class " + name + " {\n");
+        if (decls.Length > 0) { out0.Append(decls.ToString()); }
+        out0.Append("    static SceneDoc scene;\n\n");
+        out0.Append("    /// Builds the designed scene document (design-resolution tree).\n");
+        out0.Append("    static SceneDoc BuildScene() {\n");
+        out0.Append("        SceneDoc d = new SceneDoc(\"");
+        out0.Append(GenScene.Esc(name));
+        out0.Append("\", " + Convert.ToString(dw) + ", " +
+                    Convert.ToString(dh) + ");\n");
+        out0.Append("        d.SetMode(" +
+                    Convert.ToString(GenScene.ObjNum(root, "scaleMode", 0)) +
+                    ");\n");
+        out0.Append("        d.SetClearColor(" +
+                    Convert.ToString(GenScene.ArrNum(root, "clearColor", 0, 0)) + ", " +
+                    Convert.ToString(GenScene.ArrNum(root, "clearColor", 1, 0)) + ", " +
+                    Convert.ToString(GenScene.ArrNum(root, "clearColor", 2, 0)) + ");\n");
+        string bg = GenScene.ObjStr(root, "background");
+        if (bg.Length > 0) {
+            out0.Append("        d.SetBackground(\"");
+            out0.Append(GenScene.Esc(bg));
+            out0.Append("\");\n");
+        }
+        if (body.Length > 0) { out0.Append(body.ToString()); }
+        out0.Append("        return d;\n");
+        out0.Append("    }\n\n");
+        out0.Append("    /// Opens this designed scene and renders it until the window\n");
+        out0.Append("    /// closes, so one design opens another with `" + name + ".Run();`.\n");
+        out0.Append("    static void Run() {\n");
+        out0.Append("        scene = BuildScene();\n");
+        string wtitle = GenScene.ObjStr(root, "winTitle");
+        if (wtitle.Length == 0) { wtitle = name; }
+        out0.Append("        App app = App.CreateDark(\"");
+        out0.Append(GenScene.Esc(wtitle));
+        out0.Append("\", " + Convert.ToString(dw) + ", " +
+                    Convert.ToString(dh) + ");\n");
+        if (GenScene.ObjNum(root, "winCenter", 0) != 0) {
+            out0.Append("        app.CenterWindow();\n");
+        } else {
+            out0.Append("        app.SetWindowPos(" +
+                        Convert.ToString(GenScene.ObjNum(root, "winPosX", 0)) + ", " +
+                        Convert.ToString(GenScene.ObjNum(root, "winPosY", 0)) + ");\n");
+        }
+        if (GenScene.ObjNum(root, "winResizable", 1) == 0) {
+            out0.Append("        app.SetResizable(false);\n");
+        }
+        if (GenScene.ObjNum(root, "winChrome", 1) == 0) {
+            out0.Append("        app.SetChromeVisible(false);\n");
+        }
+        out0.Append("        app.Show();\n");
+        out0.Append("        " + name + ".OnLoad(app);\n");
+        out0.Append("        scene.SetLayersActive(true);\n");
+        out0.Append("        while (app.isRunning) {\n");
+        out0.Append("            if (!app.ProcessEvent()) { break; }\n");
+        out0.Append("            if (!app.needsRedraw) { continue; }\n");
+        out0.Append("            app.BeginFrame();\n");
+        out0.Append("            SceneView.Render(app, scene);\n");
+        out0.Append("            SceneView.HandleClicks(app, scene);\n");
+        out0.Append("            app.RenderChrome(\"");
+        out0.Append(GenScene.Esc(wtitle));
+        out0.Append("\");\n");
+        out0.Append("            app.PresentFrame();\n");
+        out0.Append("            if (scene.PendingScene().Length > 0) {\n");
+        out0.Append("                app.RequestClose();\n");
+        out0.Append("            }\n");
+        out0.Append("        }\n");
+        out0.Append("    }\n");
+        if (emit_main) {
+            out0.Append("\n    static void Main() {\n");
+            out0.Append("        " + name + ".Run();\n");
+            out0.Append("    }\n");
+        }
+        /* ---- IGameScene adapter ----------------------------------
+         * 让设计好的场景直接接进 Game.Foundation.SceneStack：
+         *     stack.Push(new <Name>Scene());
+         * Enter 在宿主窗口里重建 SceneDoc 并开层过滤，Update(int)
+         * 由 SceneStack.Update 逐帧调用（宿主先 Host(app) 把窗口
+         * 交给适配器，帧体 = Render + HandleClicks），Exit 清状态。
+         * 设计动作里的 OpenScene 在栈语境下由宿主处理：读
+         * adapter.PendingScene() 后 Replace/Pop，ClearPendingScene
+         * 消费。业务钩子 OnScene* 在代码后置 partial 里实现
+         * （IDE 生成的业务壳带空实现）。 */
+        out0.Append("\n    /// Adapts this designed scene to Game.Foundation.IGameScene\n");
+        out0.Append("    /// so it plugs into a SceneStack directly:\n");
+        out0.Append("    ///     var s = new " + name + "Scene();\n");
+        out0.Append("    ///     stack.Push(s);\n");
+        out0.Append("    ///     s.Host(app);          // once, before the loop\n");
+        out0.Append("    ///     stack.Update(deltaMs); // per frame\n");
+        out0.Append("    /// PendingScene() names the scene queued by an OpenScene\n");
+        out0.Append("    /// action (the host decides how to switch);\n");
+        out0.Append("    /// ClearPendingScene() consumes it.\n");
+        out0.Append("    partial class " + name + "Scene : Game.Foundation.IGameScene {\n");
+        out0.Append("        SceneDoc d;\n");
+        out0.Append("        App host;\n\n");
+        out0.Append("        public string Name() { return \"" + GenScene.Esc(name) + "\"; }\n\n");
+        out0.Append("        /// Gives the adapter the host window; call once after\n");
+        out0.Append("        /// the App exists, before the first Update.\n");
+        out0.Append("        public void Host(App app) { host = app; }\n\n");
+        out0.Append("        /// Rebuilds the design document for this entry.\n");
+        out0.Append("        public void Enter() {\n");
+        out0.Append("            d = " + name + ".BuildScene();\n");
+        out0.Append("            d.SetLayersActive(true);\n");
+        out0.Append("            " + name + ".OnSceneEnter();\n");
+        out0.Append("        }\n\n");
+        out0.Append("        public void Exit() {\n");
+        out0.Append("            " + name + ".OnSceneExit();\n");
+        out0.Append("            d = null;\n");
+        out0.Append("        }\n\n");
+        out0.Append("        public void Pause() { " + name + ".OnScenePause(); }\n\n");
+        out0.Append("        public void Resume() { " + name + ".OnSceneResume(); }\n\n");
+        out0.Append("        public void FixedUpdate(int deltaMilliseconds) {\n");
+        out0.Append("            " + name + ".OnSceneFixedUpdate(deltaMilliseconds);\n");
+        out0.Append("        }\n\n");
+        out0.Append("        /// One frame: render + click dispatch on the live design\n");
+        out0.Append("        /// into the host window (no-op while paused/without host).\n");
+        out0.Append("        public void Update(int deltaMilliseconds) {\n");
+        out0.Append("            if (d == null || host == null) { return; }\n");
+        out0.Append("            if (!host.needsRedraw) { return; }\n");
+        out0.Append("            host.BeginFrame();\n");
+        out0.Append("            SceneView.Render(host, d);\n");
+        out0.Append("            SceneView.HandleClicks(host, d);\n");
+        out0.Append("            host.PresentFrame();\n");
+        out0.Append("        }\n\n");
+        out0.Append("        /// The live design document (null before Enter /\n");
+        out0.Append("        /// after Exit): register click handlers here, e.g.\n");
+        out0.Append("        ///     Doc().SetHandler(\"OnNext\", () => { ... });\n");
+        out0.Append("        public SceneDoc Doc() { return d; }\n\n");
+        out0.Append("        /// OpenScene 目标排队名（宿主负责切换与\n");
+        out0.Append("        /// ClearPendingScene）；空 = 无。\n");
+        out0.Append("        public string PendingScene() {\n");
+        out0.Append("            return d == null ? \"\" : d.PendingScene();\n");
+        out0.Append("        }\n");
+        out0.Append("    }\n");
+        out0.Append("}\n");
+        return out0;
+    }
+}

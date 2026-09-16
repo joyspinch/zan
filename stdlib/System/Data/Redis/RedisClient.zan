@@ -1,0 +1,412 @@
+using System;
+using System.Net.Sockets;
+using System.Data.Redis;
+
+namespace System.Data.Redis;
+
+/// <summary>
+/// 基于异步 IO reactor、使用 RESP（RESP2）协议的协程化 Redis 客户端。
+///
+/// 所有网络操作都通过异步
+/// <see cref="Socket"/> 层（非阻塞 connect / send / recv）挂起到无栈 reactor，因此
+/// 单个工作线程上可同时有数千个 Redis 调用在途，而不阻塞线程
+/// ——与 HTTP/WebSocket 栈采用相同模型。这是刻意
+/// 的无依赖设计：RESP 是行协议，因此无需任何原生客户端库
+/// 。
+///
+/// 用法：
+///   RedisClient r = await RedisClient.ConnectAsync("127.0.0.1", 6379);
+///   await r.SetAsync("name", "Alice");
+///   string v = await r.GetAsync("name");     // "Alice"
+///   int n = await r.DelAsync("name");        // 1
+///   RedisReply pong = await r.CommandAsync2("PING", "");   // +PONG
+///   r.Close();
+///
+/// 二进制安全：bulk *回复* 按显式字节长度解析，因此含
+/// NUL 字节的值可原样返回（使用 RedisReply.len）。命令
+/// *参数* 用 strlen 度量，因此参数值不应包含
+/// 内嵌的 NUL 字节。
+/// </summary>
+class RedisClient {
+    nint sock;
+    string host;
+    int port;
+    bool connected;
+    string lastError;
+
+    // 接收缓冲区带显式 [head, tail) 有效区间，使 RESP 回复可
+    // 按字节精确解析（二进制安全），而非依赖 NUL 结尾。
+    byte[] inbuf;
+    int incap;
+    int inhead;
+    int intail;
+    byte[] tmp;      // 每次 recv 系统调用使用的固定暂存缓冲区
+    int tmpcap;
+
+    [DllImport("crt")]
+    static extern long strlen(string str);
+
+    /// 私有构造；统一经 <see cref="ConnectAsync"/> 创建。
+    RedisClient() {
+        this.sock = -1;
+        this.host = "";
+        this.port = 6379;
+        this.connected = false;
+        this.lastError = "";
+        this.inbuf = null;
+        this.incap = 0;
+        this.inhead = 0;
+        this.intail = 0;
+        this.tmp = null;
+        this.tmpcap = 16384;
+    }
+
+    /// <summary>连接 Redis 服务器，在 IO reactor 上挂起直到
+    /// （非阻塞）连接建立完成。</summary>
+    static async RedisClient ConnectAsync(string host, int port) {
+        return await RedisClient.ConnectAsync(host, port, 0);
+    }
+
+    /// 带连接超时（毫秒，0 = 不限时）的连接；失败返回 null。
+    static async RedisClient ConnectAsync(string host, int port, int timeoutMs) {
+        Socket.Initialize();
+        RedisClient c = new RedisClient();
+        c.host = host;
+        c.port = port;
+        c.sock = Socket.CreateTcp();
+        Socket.SetNonBlocking(c.sock);
+        int err = await Socket.ConnectAsync(c.sock, host, port, timeoutMs);
+        if (err != 0) {
+            Socket.Close(c.sock);
+            c.sock = -1;
+            return null;
+        }
+        c.connected = true;
+        c.incap = 16384;
+        c.inbuf = new byte[c.incap + 1];
+        c.inhead = 0;
+        c.intail = 0;
+        c.tmp = new byte[c.tmpcap + 1];
+        return c;
+    }
+
+    /// <summary>关闭连接并释放缓冲区。</summary>
+    void Close() {
+        // 套接字在就关闭，不依赖 connected 标志（死连接泄漏 fd）。
+        if (this.connected || this.sock >= 0) {
+            Socket.Close(this.sock);
+            this.connected = false;
+            this.sock = -1;
+        }
+        this.inbuf = null;
+        this.tmp = null;
+    }
+
+    /// <summary>从接收缓冲区中复制 <paramref name="len"/> 字节
+    /// （从 <paramref name="start"/> 起）到新的 NUL 结尾字符串中。
+    /// 二进制安全：按索引复制，内嵌 NUL 字节也能保留。</summary>
+    string sliceBytes(int start, int len) {
+        return this.inbuf.ToStr(start, len);
+    }
+
+    /// <summary>确保接收缓冲区在尾位置之后还能容纳 <paramref name="extra"/> 字节，
+    /// 必要时先压缩再扩容。</summary>
+    void ensureRoom(int extra) {
+        if (this.intail + extra <= this.incap) {
+            return;
+        }
+        if (this.inhead > 0) {
+            int span = this.intail - this.inhead;
+            for (int k = 0; k < span; k = k + 1) {
+                this.inbuf[k] = this.inbuf[this.inhead + k];
+            }
+            this.inhead = 0;
+            this.intail = span;
+        }
+        if (this.intail + extra <= this.incap) {
+            return;
+        }
+        int ncap = this.incap * 2;
+        while (this.intail + extra > ncap) {
+            ncap = ncap * 2;
+        }
+        byte[] nb = new byte[ncap + 1];
+        for (int j = 0; j < this.intail; j = j + 1) {
+            nb[j] = this.inbuf[j];
+        }
+        this.inbuf = nb;
+        this.incap = ncap;
+    }
+
+    /// <summary>从套接字接收一块数据存入缓冲区。返回
+    /// 字节数（对端关闭时为 0）。在 reactor 上挂起直到可读。</summary>
+    async int fillMore() {
+        int n = await Socket.RecvIntoAsync(this.sock, this.tmp, this.tmpcap);
+        if (n <= 0) {
+            this.Close();
+            return 0;
+        }
+        this.ensureRoom(n);
+        for (int k = 0; k < n; k = k + 1) {
+            this.inbuf[this.intail + k] = this.tmp[k];
+        }
+        this.intail = this.intail + n;
+        return n;
+    }
+
+    /// <summary>确保缓冲区中至少有 <paramref name="need"/> 字节，
+    /// 需要时从套接字补读。对端关闭时返回 false。</summary>
+    async bool ensureAvailable(int need) {
+        while ((this.intail - this.inhead) < need) {
+            int got = await this.fillMore();
+            if (got == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>从头游标处读取一行以 CRLF 结尾的行（不含 CRLF），
+    /// 需要时补读更多数据。对端
+    /// 关闭时返回 null。</summary>
+    async string readLine() {
+        int scan = this.inhead;
+        while (true) {
+            while (scan + 1 < this.intail) {
+                if (this.inbuf[scan] == 13 && this.inbuf[scan + 1] == 10) {
+                    int lineLen = scan - this.inhead;
+                    string line = this.sliceBytes(this.inhead, lineLen);
+                    this.inhead = scan + 2;
+                    return line;
+                }
+                scan = scan + 1;
+            }
+            int got = await this.fillMore();
+            if (got == 0) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>读取恰好 <paramref name="n"/> 字节的 bulk 负载，其后
+    /// 跟一个结尾 CRLF，并将头游标越过这两部分。</summary>
+    async string readBulk(int n) {
+        bool ok = await this.ensureAvailable(n + 2);
+        if (!ok) {
+            return null;
+        }
+        string data = this.sliceBytes(this.inhead, n);
+        this.inhead = this.inhead + n + 2;
+        return data;
+    }
+
+    /// <summary>从流中解析一条完整的 RESP 回复（数组递归解析），
+    /// 需要更多字节时在 reactor 上挂起。</summary>
+    async RedisReply readReply() {
+        string line = await this.readLine();
+        RedisReply r = new RedisReply();
+        if (line == null) {
+            r.kind = RedisReply.ERROR;
+            r.str = "connection closed";
+            return r;
+        }
+        int prefix = line[0];
+        string rest = line.Substring(1);
+        if (prefix == 43) {                 // '+' 简单字符串
+            r.kind = RedisReply.STR;
+            r.str = rest;
+            r.len = (int)strlen(rest);
+            return r;
+        }
+        if (prefix == 45) {                 // '-' 错误
+            r.kind = RedisReply.ERROR;
+            r.str = rest;
+            r.len = (int)strlen(rest);
+            return r;
+        }
+        if (prefix == 58) {                 // ':' 整数
+            r.kind = RedisReply.INT;
+            r.integer = Convert.ToInt(rest);
+            return r;
+        }
+        if (prefix == 36) {                 // '$' bulk 字符串
+            int blen = Convert.ToInt(rest);
+            if (blen < 0) {
+                r.kind = RedisReply.NIL;
+                return r;
+            }
+            string data = await this.readBulk(blen);
+            if (data == null) {
+                r.kind = RedisReply.ERROR;
+                r.str = "connection closed";
+                return r;
+            }
+            r.kind = RedisReply.BULK;
+            r.str = data;
+            r.len = blen;
+            return r;
+        }
+        if (prefix == 42) {                 // '*' 数组
+            int count = Convert.ToInt(rest);
+            if (count < 0) {
+                r.kind = RedisReply.NIL;
+                return r;
+            }
+            r.kind = RedisReply.ARRAY;
+            r.items = new List<RedisReply>();
+            for (int i = 0; i < count; i = i + 1) {
+                RedisReply child = await this.readReply();
+                r.items.Add(child);
+            }
+            return r;
+        }
+        r.kind = RedisReply.ERROR;
+        r.str = "protocol error: " + line;
+        this.Close();
+        return r;
+    }
+
+    /// <summary>将 <paramref name="args"/> 编码为 RESP 数组（bulk 字符串），
+    /// 然后发送。参数长度用 strlen 度量。</summary>
+    async int sendArgs(List<string> args) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("*");
+        sb.Append(Convert.ToString(args.Count));
+        sb.Append("\r\n");
+        for (int i = 0; i < args.Count; i = i + 1) {
+            string a = args[i];
+            sb.Append("$");
+            sb.Append(Convert.ToString((int)strlen(a)));
+            sb.Append("\r\n");
+            sb.Append(a);
+            sb.Append("\r\n");
+        }
+        string payload = sb.ToString();
+        int expected = (int)strlen(payload);
+        int sent = await Socket.SendAsync(this.sock, payload, expected);
+        if (sent != expected) { this.Close(); }
+        return sent;
+    }
+
+    /// <summary>发送命令（参数向量）并等待其回复。</summary>
+    async RedisReply CommandAsync(List<string> args) {
+        int sent = await this.sendArgs(args);
+        RedisReply r = new RedisReply();
+        if (!this.connected || sent <= 0) {
+            r.kind = RedisReply.ERROR;
+            r.str = "connection closed";
+            this.lastError = r.str;
+            return r;
+        }
+        r = await this.readReply();
+        if (r.IsError()) {
+            this.lastError = r.str;
+        }
+        return r;
+    }
+
+    /// <summary>便捷方法：单参数命令（例如 PING）。</summary>
+    async RedisReply CommandAsync1(string a0) {
+        List<string> args = new List<string>();
+        args.Add(a0);
+        RedisReply r = await this.CommandAsync(args);
+        return r;
+    }
+
+    /// <summary>便捷方法：双参数命令（例如 GET key）。</summary>
+    async RedisReply CommandAsync2(string a0, string a1) {
+        List<string> args = new List<string>{
+            a0,
+            a1 };
+        RedisReply r = await this.CommandAsync(args);
+        return r;
+    }
+
+    /// <summary>便捷方法：三参数命令（例如 SET key value）。</summary>
+    async RedisReply CommandAsync3(string a0, string a1, string a2) {
+        List<string> args = new List<string>{
+            a0,
+            a1,
+            a2 };
+        RedisReply r = await this.CommandAsync(args);
+        return r;
+    }
+
+    /// <summary>PING；服务器回复 PONG 时返回 true。</summary>
+    async bool PingAsync() {
+        RedisReply r = await this.CommandAsync1("PING");
+        return r.AsString() == "PONG";
+    }
+
+    /// <summary>使用密码进行认证。收到 +OK 返回 true。</summary>
+    async bool AuthAsync(string password) {
+        RedisReply r = await this.CommandAsync2("AUTH", password);
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>选择逻辑数据库编号。收到 +OK 返回 true。</summary>
+    async bool SelectAsync(int index) {
+        RedisReply r = await this.CommandAsync2("SELECT", Convert.ToString(index));
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>SET key value。收到 +OK 返回 true。</summary>
+    async bool SetAsync(string key, string val) {
+        RedisReply r = await this.CommandAsync3("SET", key, val);
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>GET key。返回对应的值；键不存在（nil）时
+    /// 返回空字符串。如需区分 nil 与
+    /// 空值，请使用 <see cref="GetReplyAsync"/>。</summary>
+    async string GetAsync(string key) {
+        RedisReply r = await this.CommandAsync2("GET", key);
+        if (r.IsNil()) {
+            return "";
+        }
+        return r.AsString();
+    }
+
+    /// <summary>GET key，返回原始回复，使调用方可区分
+    /// 空字符串值和不存在的键（nil）。</summary>
+    async RedisReply GetReplyAsync(string key) {
+        RedisReply r = await this.CommandAsync2("GET", key);
+        return r;
+    }
+
+    /// <summary>DEL key。返回被删除的键数（0 或 1）。</summary>
+    async int DelAsync(string key) {
+        RedisReply r = await this.CommandAsync2("DEL", key);
+        return r.AsInt();
+    }
+
+    /// <summary>EXISTS key。键存在返回 1，否则返回 0。</summary>
+    async int ExistsAsync(string key) {
+        RedisReply r = await this.CommandAsync2("EXISTS", key);
+        return r.AsInt();
+    }
+
+    /// <summary>INCR key。返回自增后的值。</summary>
+    async int IncrAsync(string key) {
+        RedisReply r = await this.CommandAsync2("INCR", key);
+        return r.AsInt();
+    }
+
+    /// <summary>EXPIRE key seconds。设置成功返回 1。</summary>
+    async int ExpireAsync(string key, int seconds) {
+        RedisReply r = await this.CommandAsync3("EXPIRE", key,
+                                                Convert.ToString(seconds));
+        return r.AsInt();
+    }
+
+    /// <summary>返回最近记录到的服务器错误消息（如有）。</summary>
+    string GetLastError() {
+        return this.lastError;
+    }
+
+    /// <summary>已连接则返回 true。</summary>
+    bool IsConnected() {
+        return this.connected;
+    }
+}

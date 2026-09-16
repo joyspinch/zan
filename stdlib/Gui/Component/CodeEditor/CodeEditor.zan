@@ -1,0 +1,1756 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Backend;
+
+namespace Gui.Component.CodeEditor;
+
+/// <summary>一行的缓存语法高亮：计算所用的源码
+/// 及并行的 token/颜色段，未变化的行在每次重绘时不会被
+/// 重新分词（和重新分配）。`blockOpen` 记录
+/// 该行是否以未闭合的 /* 块注释结尾，
+/// 下一行继承它作为起始状态。</summary>
+class CeHlLine {
+    string src;
+    // null while the line is only a block-comment-state checkpoint: catching
+    // up after a jump tokenises the skipped lines but does not keep their
+    // spans, which are built on demand when the line is actually drawn.
+    List<CodeSpan> spans;
+    bool blockIn;
+    bool blockOpen;
+}
+
+/// <summary>一条撤销/重做记录：完整的缓冲区文本及要恢复的
+/// 光标行/列。用单个实体取代并行的文本/行/列栈。</summary>
+class EditSnapshot {
+    string text;
+    int line;
+    int col;
+
+    EditSnapshot(string text, int line, int col) {
+        this.text = text;
+        this.line = line;
+        this.col = col;
+    }
+}
+
+/// <summary>一条诊断：所在行（从 0 起）和消息。
+/// 用单个实体取代并行的行/消息列表。</summary>
+class Diagnostic {
+    int line;
+    string msg;
+
+    Diagnostic(int line, string msg) {
+        this.line = line;
+        this.msg = msg;
+    }
+}
+
+/// <summary>一条缺失 using 的快速修复：其解决错误的行以及
+/// 要导入的命名空间。用单个实体取代并行的行/命名空间列表。</summary>
+class QuickFix {
+    int line;
+    string ns;
+
+    QuickFix(int line, string ns) {
+        this.line = line;
+        this.ns = ns;
+    }
+}
+
+/// <summary>一个次要光标的位置（行 + 列）。用单个实体取代
+/// 并行的行/列列表。</summary>
+class Caret {
+    int line;
+    int col;
+
+    Caret(int line, int col) {
+        this.line = line;
+        this.col = col;
+    }
+}
+
+/// <summary>一条 CodeLens "N references" 标注：声明所在行、
+/// 所标注的名称及可点击的屏幕矩形（x/y/width）。用单个实体
+/// 取代五个并行列表。</summary>
+class CodeLensRef {
+    int line;
+    string name;
+    int x;
+    int y;
+    int w;
+    /// 透镜显示的内容：本缓冲区的使用数加项目其余
+    /// 部分的使用数。点击时与缓冲区可列出的比较，
+    /// 不同则请求宿主提供完整列表。
+    int count;
+
+    CodeLensRef(int line, string name, int x, int y, int w, int count) {
+        this.line = line;
+        this.name = name;
+        this.x = x;
+        this.y = y;
+        this.w = w;
+        this.count = count;
+    }
+}
+
+/// <summary>一个项目类型：名称及其空格分隔的
+/// 声明成员名列表。用单个实体取代并行的名称/成员列表。</summary>
+class ProjType {
+    string name;
+    string members;
+
+    ProjType(string name, string members) {
+        this.name = name;
+        this.members = members;
+    }
+}
+
+/// 右键菜单的一项：标签、右侧显示的快捷键提示，以及动作编号
+/// （0 = 分隔行，其余由编辑器的菜单执行器解释）。
+class ContextMenuItem {
+    string label;
+    string key;
+    int action;
+
+    /// `action` 为 0 时 label/key 被忽略（纯分隔行）。
+    ContextMenuItem(string label, string key, int action) {
+        this.label = label;
+        this.key = key;
+        this.action = action;
+    }
+}
+
+/// <summary>
+/// 多行、带行号的纯文本代码编辑器。持有自己的缓冲区
+/// （行列表）和光标，获得焦点时响应键盘输入自行编辑
+/// —— 它是 IDE 的编辑界面。即时模式：
+/// 创建一个，跨帧保留，每帧调用 Render(app, area)。
+///
+///   CodeEditor ed = new CodeEditor();      // 只创建一次
+///   ed.LoadText("using System;\n\nclass Main {}");
+///   ...
+///   ed.Render(app, editorRect);               // 每帧调用
+/// </summary>
+partial class CodeEditor {
+    /// 编辑器自有界面（上下文菜单）的 UI 语言码："zh" / "en"。
+    /// 由宿主应用设置；仅影响显示。
+    static string lang = "zh";
+
+    List<string> lines;
+    int curLine;
+    int curCol;
+    int scrollLine;
+    // 视图上次自动滚动保持可见的行。"保持光标
+    // 在视野内"的钳制只在光标行变化时触发（输入/方向键/点击），
+    // 因此单纯的滚轮/滚动条滚动不会被拉回光标行。
+    int ensuredCaretLine;
+    int lastId;
+
+    // ---- 本帧的行布局 ----
+    // CodeLens 标注位于其装饰的声明上方独占的一行
+    // （与 Visual Studio 一致），因此屏幕行不再是
+    // `scrollLine + y / lineH`：这些表按序保存本帧布局的
+    // 代码行、每行顶部 y 及其透镜行顶部 y
+    // （无透镜行为 -1）。所有行与像素的映射
+    // 都经 LineAtY / LineTopY，而非算术计算。
+    List<int> rowLine;
+    List<int> rowTop;
+    List<int> rowLensY;
+    /// 透镜行高度（未显示时为 0）。
+    int lensRowH;
+
+    // ---- 自动补全弹窗状态 ----
+    List<string> acItems;   // 当前候选列表（已按前缀 + 种类过滤）
+    List<string> acAllItems; // 应用种类过滤器之前的候选
+    List<string> acAllKinds; // 每个 acAllItems 条目的种类标签
+    string acFilter;        // "" = 显示所有种类；否则为单个种类字母
+    // 弹窗种类过滤条的几何（供点击命中测试）。
+    int filtX;
+    int filtY;
+    int filtW;
+    int filtH;
+    List<string> acFull;    // 完整未过滤的候选（供点号模式重新过滤）
+    // CodeLens：可点击的 "N references" 标注（每次渲染重建）。
+    List<CodeLensRef> codeLens;
+    // 可展开的引用列表弹窗（点击 CodeLens 计数打开）。
+    bool refPopOpen;
+    string refPopName;
+    List<int> refPopLines;
+    int refPopX;
+    int refPopY;
+    int refPopSel;
+    // 上次渲染后的最终钳制弹窗几何，用于命中测试。
+    int refPopGX;
+    int refPopGY;
+    int refPopGW;
+    int refPopGH;
+    int refPopRowH;
+    int refPopHeadH;
+    int refPopShown;
+    // Ctrl+点击请求宿主执行转到定义时置位。
+    bool gotoRequested;
+    int acSel;              // 选中的候选索引
+    bool acActive;          // 弹窗当前是否显示
+    int acStart;            // 正在输入的字词的起始列
+    bool acDot;             // 弹窗由 '.' 触发（成员补全）时为 true
+    bool acForced;          // Ctrl+Space：列出所有内容，即使没有前缀
+    List<string> acKinds;   // 每项种类标签："M"=方法、"P"=属性、"T"=类型、"K"=关键字、"S"=片段、"F"=字段
+
+    // ---- 弹窗几何（Render 时设置，点击时读取） ----
+    int popX;
+    int popY;
+    int popW;
+    int popH;
+    int popItemH;
+    int popFirst;
+    int popShown;
+
+    // ---- 选区 ----
+    bool selActive;
+    int selAnchorLine;
+    int selAnchorCol;
+    // 按住左键拖出选区期间为 true。
+    bool mouseSelecting;
+    // 左键按在右侧滚动条上时为 true；
+    // 视图随后跟随指针（滑块拖动）而不移动光标。
+    bool barDragging;
+    // 双击/三击检测：在（大致）同一位置
+    // 短时间内连续点击依次选中单词、再选中整行。
+    int lastClickMs;
+    int lastClickLine;
+    int lastClickCol;
+    int clickCount;
+    // 上次 Render 中完全可见的文本行数（供 Page Up/Down）。
+    int pageRows;
+
+    // ---- 多光标（次要光标，各在不同行） ----
+    List<Caret> carets;
+
+    // ---- 剪贴板与撤销 ----
+    string clipboard;
+    /// 剪切 / 复制 / 粘贴 / 全选已经在按键事件里做过了，后面紧跟的
+    /// 那个控制字符事件要丢掉，否则会粘贴两次。
+    bool ateCtrlKey;
+    List<EditSnapshot> undoStack;
+    List<EditSnapshot> redoStack;
+
+    // ---- 错误诊断 ----
+    List<Diagnostic> errors;
+    int lastDiagLine;       // 上次 CheckErrors 运行时的光标行（-1 = 从未）
+    // 上次 Run/Build 的真实编译器诊断，映射到本文件。
+    // 与启发式诊断分开保存，下次编辑时失效
+    // （以设置诊断时的缓冲区长度 cErrStamp 跟踪）。
+    List<Diagnostic> compErrors;
+    int cErrStamp;
+    // CompilerDiagStale 的每帧记忆：-1 未知、0 有效、1 过期。
+    // 过期测试要遍历整个缓冲区，而每个可见行都会查询它，
+    // 因此大文件上每帧只算一次答案，
+    // 而非每行一次（InvalidateDiagStale 在输入处理后运行）。
+    int diagStaleFrame;
+    // 本缓冲区声明的类型（名称 + 空格分隔的成员列表），以及解析它时
+    // 的行快照：类型表只依赖声明行与花括号层次，所以快照能告诉
+    // EnsureBufTypes 哪些编辑根本不必重扫。
+    List<string> muTypeNames;
+    List<string> muTypeMembers;
+    List<string> btLineSrc;
+    // 与光标无关的补全候选（片段/关键字/标准库/项目与缓冲区类型），
+    // 及其构建时的代次；项目扫描或缓冲区类型表重建时代次 +1。
+    List<string> cbItems;
+    List<string> cbKinds;
+    int cbGen;
+    int candBaseGen;
+
+    // ---- 符号索引（精确、感知 using 的补全） ----
+    // 项目其他文件中声明的类型（class/struct/enum），以及
+    // 每个类型空格分隔的声明成员名列表。由宿主 IDE
+    // 经 SetProjectFiles() 提供，使 `Utils.` 用 Utils 的真实成员补全
+    // 而非猜测。当前缓冲区按需扫描。
+    List<ProjType> projTypes;
+    // 所有其他项目文件的原始源码，保留以便签名帮助解析
+    // 用户/项目方法的真实参数列表（不只是名称）。
+    List<string> projFileSrc;
+    // 跨文件类型扫描被延迟：SetProjectFiles() 只保存
+    // 源码（开销小，切换标签页保持流畅）并标记此处为脏；
+    // 真正的逐文件 ScanTypesInto 只在补全首次需要时
+    // 经 EnsureProjectScan() 运行。
+    bool projScanDirty;
+    // 跨文件引用计数，本缓冲区声明的每个 "Owner.member" 一个条目，
+    // 一次性遍历 projFileSrc 构建（见 EnsureExternRefs），
+    // 每帧绘制的每个声明的计数只需一次查找。
+    List<string> extRefKeys;
+    List<int> extRefVals;
+    bool extRefDirty;
+    // 跨文件统计的进度：待统计的下一个 projFileSrc 下标，
+    // 已算完为 -1。一帧里把整个项目扫完要数秒，因此声明
+    // 列表和计数在帧之间保留，每帧只推进几个文件。
+    int extRefAt;
+    List<string> extRefDeclOwner;
+    List<string> extRefDeclName;
+    // 当前文件内的进度：已建好的行索引、下一个待统计的
+    // 声明，以及该声明类型在本文件里的接收者。一个大文件
+    // 乘上上百个声明也不能独占一帧，因此切片粒度到声明。
+    CeFileIndex extRefFileIdx;
+    int extRefDeclAt;
+    string extRefOwnerCur;
+    List<string> extRefFamily;
+    List<string> extRefRecvs;
+    // 当前缓冲区的扫描索引（抹除行/逐行 owner/逐行声明名）
+    // 及其对应的 TextStamp()。它与被查的成员无关，
+    // 每个声明重建一份时单个 CodeLens 就要 50 ms。
+    CeFileIndex refIdx;
+    int refStamp;
+    // 签名帮助记忆：参数列表在屏幕上的被调用者、
+    // 为其解析的签名及解析时的 TextStamp()。解析
+    // 会遍历缓冲区和项目源码，因此光标仅仅停在调用内时
+    // 不能每帧运行。
+    string sigMemoName;
+    string sigMemoText;
+    int sigMemoStamp;
+    // CodeLens 计数，按成员名对照缓冲区指纹记忆化。
+    // 统计一个成员要多次遍历缓冲区，大文件一屏
+    // 容纳数十个声明，因此每帧至多重算 lensBudget 个：
+    // 其余保留上次计数（或等下一帧），
+    // lensPending 请求完成剩余工作的重绘。
+    List<string> lensKeys;
+    List<int> lensVals;
+    List<int> lensFresh;
+    int lensStamp;
+    int lensBudget;
+    bool lensPending;
+    // 缓冲区上次变化的时间，使重算等待输入
+    // 停顿而非每次击键都运行。
+    int lensQuietMs;
+    // 按行语法高亮缓存，与 `lines` 按索引对齐，
+    // 以源码文本校验，滚动/空闲时零重新分词。
+    // 调色板（主题/覆盖）变化时 hlThemeSig 使整个缓存失效。
+    List<CeHlLine> hlCache;
+    int hlThemeSig;
+    // 缺失 using 的快速修复：每个把出错行映射到
+    // 要导入的命名空间以解决错误。
+    List<QuickFix> fixes;
+    // Missing-`using` scan cache, indexed like `lines`: the line text it was
+    // computed from plus the namespace and type name it found ("" for none).
+    // muCtx fingerprints everything outside the line the answer depends on
+    // (file namespace, imports, known type counts); muStamp is the buffer
+    // fingerprint the cache was last completed for.
+    List<string> muLineSrc;
+    List<string> muLineNs;
+    List<string> muLineWord;
+    string muCtx;
+    int muStamp;
+    // 括号配平扫描的按行缓存，同样以 `lines` 为下标：行文本、它带来的
+    // 花括号/圆括号增量，以及它是否是缺分号的 using 行。
+    List<string> ceLineSrc;
+    List<int> ceBrace;
+    List<int> ceParen;
+    List<int> ceUsingBad;
+
+    // ---- 调试 ----
+    List<int> bps;
+    int execLine;
+    List<DbgVar> dbgVars;   // 调试悬停提示的变量
+    DbgVar hoverTip;        // 当前悬停提示条目（无则为 null）
+    int hoverTipX;
+    int hoverTipY;
+
+    // 右键上下文菜单状态。
+    bool ctxOpen;
+    int ctxX;
+    int ctxY;
+    string ctxCmd;          // 宿主 IDE 必须处理的命令（"find"/"gotoline"）
+
+    // ---- 外观（字体 + 语法颜色），由宿主经 ApplyTheme 设置 ----
+    // edFont 是代码字号；0 表示"使用 UI 主题的中等字号"。
+    // 语法颜色为 ARGB；0 表示"回退到内置默认值"。
+    int edFont;
+    int synKw;
+    int synTy;
+    int synStr;
+    int synCom;
+    int synNum;
+    int synText;
+
+    // ---- 皮肤 CSS 的语法色（codeeditor::keyword 等部件）----
+    // 每帧由 Render 解析一次；0 = 皮肤未声明该部件，按调色板回退。
+    // 优先级：调色板 < 皮肤 CSS < 宿主 ApplyTheme——用户在设置里
+    // 点名的配色预设，比环境皮肤更具体。
+    int cssKw;
+    int cssTy;
+    int cssStr;
+    int cssCom;
+    int cssNum;
+
+    // ---- 语法语言 ----
+    // 0 = Zan、1 = Lua、2 = Python。决定关键字表、注释引导符
+    // （// / -- / #）和块注释形式，使内嵌的 .lua/.py 脚本不会
+    // 按 Zan 高亮，Ctrl+/ 也插入该语言的注释符。
+    int syntaxLang;
+
+    /// 设置本缓冲区的语法语言（0=Zan、1=Lua、2=Python）。语言
+    /// 变化时丢弃按行高亮缓存，使已绘制的行按新语言重新分词。
+    void SetSyntaxLang(int lang) {
+        int v = lang;
+        if (v < 0 || v > 2) { v = 0; }
+        if (v == syntaxLang) { return; }
+        syntaxLang = v;
+        hlCache = new List<CeHlLine>();
+    }
+
+    /// 当前语法语言（0=Zan、1=Lua、2=Python）。
+    int SyntaxLang() {
+        return syntaxLang;
+    }
+
+    /// 按文件名推断语法语言：.lua 为 Lua、.py/.pyw 为 Python，
+    /// 其余（含无扩展名）按 Zan 处理。
+    static int LangForName(string path) {
+        int n = path.Length;
+        int dot = -1;
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            int b = path[i];
+            if (b == 46) { dot = i; break; }
+            if (b == 47 || b == 92) { break; }
+        }
+        if (dot < 0) { return 0; }
+        string ext = CodeEditor.LowerAscii(path.Substring(dot, n - dot));
+        if (ext == ".lua") { return 1; }
+        if (ext == ".py" || ext == ".pyw") { return 2; }
+        return 0;
+    }
+
+    /// ASCII 小写化（扩展名比较用，不触碰多字节字节）。
+    static string LowerAscii(string s) {
+        string lo = "abcdefghijklmnopqrstuvwxyz";
+        string outs = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int b = s[i];
+            if (b >= 65 && b <= 90) { outs = outs + lo.Substring(b - 65, 1); }
+            else { outs = outs + s.Substring(i, 1); }
+        }
+        return outs;
+    }
+
+    /// 本语言的行注释引导符（Ctrl+/ 插入的就是它）。
+    string LineComment() {
+        if (syntaxLang == 1) { return "--"; }
+        if (syntaxLang == 2) { return "#"; }
+        return "//";
+    }
+
+    /// 设置编辑器的代码字号和语法高亮颜色。任一参数为 0
+    /// 则该方面保持内置默认值。
+    void ApplyTheme(int fontPx, int kw, int ty, int str, int com, int num, int text) {
+        edFont = fontPx;
+        synKw = kw; synTy = ty; synStr = str; synCom = com; synNum = num; synText = text;
+    }
+
+    /// 渲染所用的代码字号，未设置时遵循主题默认值。
+    int FontSize(Gui.Theme t) {
+        if (edFont > 0) { return edFont; }
+        return t.fontSizeMedium;
+    }
+
+    CodeEditor() {
+        this.syntaxLang = 0;
+        this.edFont = 0;
+        this.synKw = 0; this.synTy = 0; this.synStr = 0; this.synCom = 0; this.synNum = 0; this.synText = 0;
+        this.lines = new List<string>();
+        this.lines.Add("");
+        this.curLine = 0;
+        this.curCol = 0;
+        this.scrollLine = 0;
+        this.ensuredCaretLine = -1;
+        this.lastId = -1;
+        this.rowLine = new List<int>();
+        this.rowTop = new List<int>();
+        this.rowLensY = new List<int>();
+        this.lensRowH = 0;
+        this.acItems = new List<string>();
+        this.acAllItems = new List<string>();
+        this.acAllKinds = new List<string>();
+        this.acFilter = "";
+        this.filtX = 0; this.filtY = 0; this.filtW = 0; this.filtH = 0;
+        this.acFull = new List<string>();
+        this.codeLens = new List<CodeLensRef>();
+        this.refPopOpen = false;
+        this.refPopName = "";
+        this.refPopLines = new List<int>();
+        this.refPopX = 0; this.refPopY = 0; this.refPopSel = 0;
+        this.refPopGX = 0; this.refPopGY = 0; this.refPopGW = 0; this.refPopGH = 0;
+        this.refPopRowH = 0; this.refPopHeadH = 0; this.refPopShown = 0;
+        this.gotoRequested = false;
+        this.acSel = 0;
+        this.acActive = false;
+        this.acStart = 0;
+        this.acDot = false;
+        this.acKinds = new List<string>();
+        this.popX = 0; this.popY = 0; this.popW = 0; this.popH = 0;
+        this.popItemH = 0; this.popFirst = 0; this.popShown = 0;
+        this.selActive = false;
+        this.selAnchorLine = 0;
+        this.selAnchorCol = 0;
+        this.mouseSelecting = false;
+        this.barDragging = false;
+        this.lastClickMs = 0 - 100000;
+        this.lastClickLine = -1;
+        this.lastClickCol = -1;
+        this.clickCount = 0;
+        this.pageRows = 20;
+        this.carets = new List<Caret>();
+        this.clipboard = "";
+        this.undoStack = new List<EditSnapshot>();
+        this.redoStack = new List<EditSnapshot>();
+        this.errors = new List<Diagnostic>();
+        this.lastDiagLine = -1;
+        this.compErrors = new List<Diagnostic>();
+        this.cErrStamp = -1;
+        this.diagStaleFrame = -1;
+        this.muTypeNames = null;
+        this.muTypeMembers = null;
+        this.btLineSrc = null;
+        this.cbItems = null;
+        this.cbKinds = null;
+        this.cbGen = -1;
+        this.candBaseGen = 0;
+        this.ceLineSrc = null;
+        this.ceBrace = null;
+        this.ceParen = null;
+        this.ceUsingBad = null;
+        this.projTypes = new List<ProjType>();
+        this.projFileSrc = new List<string>();
+        this.projScanDirty = false;
+        this.extRefKeys = new List<string>();
+        this.extRefVals = new List<int>();
+        this.extRefDirty = false;
+        this.extRefAt = 0 - 1;
+        this.extRefDeclOwner = new List<string>();
+        this.extRefDeclName = new List<string>();
+        this.extRefFileIdx = null;
+        this.extRefDeclAt = 0;
+        this.extRefOwnerCur = "";
+        this.extRefFamily = null;
+        this.extRefRecvs = null;
+        this.refIdx = null;
+        this.refStamp = 0 - 1;
+        this.sigMemoName = "";
+        this.sigMemoText = "";
+        this.sigMemoStamp = 0 - 1;
+        this.lensKeys = new List<string>();
+        this.lensVals = new List<int>();
+        this.lensFresh = new List<int>();
+        this.lensStamp = 0 - 1;
+        this.lensBudget = 0;
+        this.lensPending = false;
+        this.lensQuietMs = 0 - 100000;
+        this.hlCache = new List<CeHlLine>();
+        this.hlThemeSig = 0;
+        this.fixes = new List<QuickFix>();
+        this.muLineSrc = null;
+        this.muLineNs = null;
+        this.muLineWord = null;
+        this.muCtx = "";
+        this.muStamp = 0 - 1;
+        this.bps = new List<int>();
+        this.execLine = -1;
+        this.dbgVars = new List<DbgVar>();
+        this.hoverTip = null;
+        this.hoverTipX = 0;
+        this.hoverTipY = 0;
+        this.ctxOpen = false;
+        this.ctxX = 0;
+        this.ctxY = 0;
+        this.ctxCmd = "";
+    }
+
+    /// 按 '\n' 把字符串拆分为行（去除 '\r'）。
+    static List<string> SplitLines(string s) {
+        return s.Replace("\r", "").Split("\n");
+    }
+
+    /// 整体替换缓冲区：保证至少一行，光标与滚动复位到开头，
+    /// 并强制下一帧重新计算诊断。
+    void SetLines(List<string> ls) {
+        lines = ls;
+        if (lines.Count == 0) { lines.Add(""); }
+        curLine = 0;
+        curCol = 0;
+        scrollLine = 0;
+        ensuredCaretLine = -1;
+        lastDiagLine = -1;  // 强制对新内容重新计算诊断
+    }
+
+    /// 载入整段文本（SetLines 的字符串版），同时清空 CodeLens、
+    /// 签名备忘等派生自旧内容的缓存。
+    void LoadText(string s) {
+        SetLines(CodeEditor.SplitLines(s));
+        extRefDirty = true;
+        // 其他文件的成员不属于本文件。
+        sigMemoName = "";
+        lensKeys = new List<string>();
+        lensVals = new List<int>();
+        lensFresh = new List<int>();
+        lensStamp = 0 - 1;
+    }
+
+    /// 全部文本（行以 '\n' 连接）。
+    string GetText() {
+        return string.Join("\n", lines);
+    }
+
+    /// 廉价的内容指纹（行数 + 总字符数）；使宿主
+    /// 无需实例化完整文本即可每帧检测缓冲区变化。
+    int TextStamp() {
+        int n = 0;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            n = n + lines[i].Length;
+        }
+        return n * 131 + lines.Count;
+    }
+
+    /// 缓冲区行数。
+    int LineCount() {
+        return lines.Count;
+    }
+
+    /// 当前光标行（0 起）。
+    int CurLine() { return curLine; }
+    /// 当前光标列（0 起）。
+    int CurCol() { return curCol; }
+
+    /// 第 `i` 行的文本（越界返回 ""）。使宿主（查找栏）
+    /// 无需每次击键实例化整个文档即可遍历缓冲区。
+    string LineAt(int i) {
+        if (i < 0 || i >= lines.Count) { return ""; }
+        return lines[i];
+    }
+
+    /// 本编辑器上一帧渲染所用的焦点 id，宿主可在
+    /// 自己的覆盖层关闭时把键盘交还给它。
+    int LastWidgetId() { return lastId; }
+
+    /// 选区激活期间返回 true。
+    bool HasSelection() { return selActive; }
+
+    /// 首个可见行。拥有多个缓冲区的宿主把它与
+    /// 光标一起保存，以恢复缓冲区离开时的状态。
+    int ScrollLine() { return scrollLine; }
+    /// 设置首个可见行（钳制到 [0, 行数-1]）。
+    void SetScrollLine(int line) {
+        if (line < 0) { line = 0; }
+        if (line >= lines.Count) { line = lines.Count - 1; }
+        if (line < 0) { line = 0; }
+        scrollLine = line;
+    }
+
+    // ---- 自动化 / 自省访问器（供 Gui.UiDriver 使用） ----
+    // 自动补全弹窗的只读视图，使 AI 驱动可断言
+    // 补全候选和选区，而无需屏幕抓取弹窗。
+    /// 补全弹窗显示期间返回 true。
+    bool CompletionActive() { return acActive; }
+    /// 可见补全候选的数量。
+    int CompletionCount() { return acItems.Count; }
+    /// 高亮候选的索引（从 0 起）。
+    int CompletionSel() { return acSel; }
+    /// 索引 i 处的候选标签（越界返回 ""）。
+    string CompletionItem(int i) {
+        if (i < 0 || i >= acItems.Count) { return ""; }
+        return acItems[i];
+    }
+    /// 索引 i 处的候选种类标签：M/P/T/K/S/F（越界返回 ""）。
+    string CompletionKind(int i) {
+        if (i < 0 || i >= acKinds.Count) { return ""; }
+        return acKinds[i];
+    }
+
+    /// 返回光标下的标识符（无则为空字符串）。
+    string WordAtCaret() {
+        if (curLine < 0 || curLine >= lines.Count) { return ""; }
+        string s = lines[curLine];
+        int col = curCol;
+        if (col >= s.Length) { col = s.Length - 1; }
+        if (col < 0) { return ""; }
+        return CodeEditor.WordAt(s, col);
+    }
+
+    /// Ctrl+点击请求转到定义后返回一次 true，
+    /// 并清除标志，使宿主恰好处理一次。
+    bool ConsumeGotoRequest() {
+        if (gotoRequested) { gotoRequested = false; return true; }
+        return false;
+    }
+
+    /// 替换调试变量面板的内容（宿主自己的数据，编辑器只负责显示）。
+    void SetDebugVars(List<DbgVar> vars) { dbgVars = vars; }
+
+    /// 跳到某行行首（钳制行号、清除选区）。
+    void GoToLine(int line) {
+        if (line < 0) { line = 0; }
+        if (line >= lines.Count) { line = lines.Count - 1; }
+        curLine = line;
+        curCol = 0;
+        selActive = false;
+    }
+
+    /// 缓冲区总大小，仅用作使编译器诊断失效的廉价变化信号
+    /// （用户编辑文件时）。
+    int BufLen() {
+        int n = 0;
+        for (int i = 0; i < lines.Count; i = i + 1) { n = n + lines[i].Length + 1; }
+        return n;
+    }
+
+    /// 用上次 Run/Build 针对本文件报告的真实错误
+    /// 替换红色下划线 + 提示显示的编译器诊断，并
+    /// 把光标跳到第一个错误，使其原因立即可见。
+    void SetCompilerDiagnostics(List<Diagnostic> diagnostics) {
+        compErrors = diagnostics;
+        cErrStamp = BufLen();
+        diagStaleFrame = 0 - 1;
+        if (compErrors.Count > 0) {
+            GoToLine(compErrors[0].line);
+        }
+    }
+
+    /// 设置编译器诊断后缓冲区一旦变化即返回 true，
+    /// 用户一开始编辑，过期错误即停止绘制。
+    bool CompilerDiagStale() {
+        if (diagStaleFrame == 0) { return false; }
+        if (diagStaleFrame == 1) { return true; }
+        bool stale = cErrStamp < 0 || BufLen() != cErrStamp;
+        diagStaleFrame = 0;
+        if (stale) { diagStaleFrame = 1; }
+        return stale;
+    }
+
+    /// 丢弃每帧的过期记忆；渲染流程在本帧
+    /// 缓冲区不再变化后调用一次。
+    void InvalidateDiagStale() { diagStaleFrame = 0 - 1; }
+
+    /// 某行的编译器诊断消息，无或已过期返回 ""。
+    string CompilerErrMsg(int ln) {
+        if (CompilerDiagStale()) { return ""; }
+        return CodeEditor.DiagMsg(compErrors, ln);
+    }
+
+    /// 第 `ln` 行当前携带有效编译器诊断时返回 true。
+    bool HasCompilerErr(int ln) {
+        if (CompilerDiagStale()) { return false; }
+        return CodeEditor.DiagHas(compErrors, ln);
+    }
+
+    /// 跳到指定行列（列超界时钳到行尾）。
+    void GoToLineCol(int line, int col) {
+        GoToLine(line);
+        curCol = col;
+        ClampCol();
+    }
+
+    /// ---- 编辑原语 ----
+    /// 在光标处插入一段无换行文本，光标随之前移。
+    void InsertStr(string ins) {
+        string ln = lines[curLine];
+        lines[curLine] = Text.InsertAt(ln, curCol, ins);
+        curCol = curCol + ins.Length;
+    }
+
+    /// 在光标处换行：拆分当前行，并把被拆行的前导空白（自动缩进）
+    /// 带到新行，光标落在缩进之后。
+    void NewLine() {
+        string ln = lines[curLine];
+        string left = Text.Left(ln, curCol);
+        string right = Text.Right(ln, curCol);
+        // 自动缩进：把被分割行的前导空白（ASCII 空格/制表符，
+        // 字节偏移安全）带到新行，并把光标放在
+        // 在它之后，与常见代码编辑器行为一致。
+        int ws = 0;
+        while (ws < left.Length) {
+            string ch = left.Substring(ws, 1);
+            if (ch == " " || ch == "\t") { ws = ws + 1; } else { break; }
+        }
+        string indent = Text.Left(left, ws);
+        lines[curLine] = left;
+        lines.Insert(curLine + 1, indent + right);
+        curLine = curLine + 1;
+        curCol = ws;
+    }
+
+    /// 退格：删光标前一字符；行首时与上一行合并。
+    void BackspaceEdit() {
+        if (curCol > 0) {
+            string ln = lines[curLine];
+            int start = Text.PrevCharStart(ln, curCol);
+            lines[curLine] = Text.DeleteBefore(ln, curCol);
+            curCol = start;
+        } else if (curLine > 0) {
+            string prev = lines[curLine - 1];
+            string cur = lines[curLine];
+            int newCol = prev.Length;
+            lines[curLine - 1] = prev + cur;
+            lines.RemoveAt(curLine);
+            curLine = curLine - 1;
+            curCol = newCol;
+        }
+    }
+
+    /// 删除光标处字符；行尾时吞掉下一行。
+    void DeleteEdit() {
+        string ln = lines[curLine];
+        if (curCol < ln.Length) {
+            lines[curLine] = Text.RemoveAt(ln, curCol);
+        } else if (curLine + 1 < lines.Count) {
+            string next = lines[curLine + 1];
+            lines[curLine] = ln + next;
+            lines.RemoveAt(curLine + 1);
+        }
+    }
+
+    /// 把光标列钳回当前行合法范围（[0, 行长]）。
+    void ClampCol() {
+        string ln = lines[curLine];
+        if (curCol > ln.Length) { curCol = ln.Length; }
+        if (curCol < 0) { curCol = 0; }
+    }
+
+    /// 左移一字符；行首时退到上一行行尾。
+    void MoveLeft() {
+        if (curCol > 0) {
+            curCol = Text.PrevCharStart(lines[curLine], curCol);
+        } else if (curLine > 0) {
+            curLine = curLine - 1;
+            curCol = lines[curLine].Length;
+        }
+    }
+
+    /// 右移一字符；行尾时进到下一行行首。
+    void MoveRight() {
+        string ln = lines[curLine];
+        if (curCol < ln.Length) {
+            curCol = Text.NextCharEnd(ln, curCol);
+        } else if (curLine + 1 < lines.Count) {
+            curLine = curLine + 1;
+            curCol = 0;
+        }
+    }
+
+    /// 上移一行（列号钳制到新行长）。
+    void MoveUp() {
+        if (curLine > 0) {
+            curLine = curLine - 1;
+            ClampCol();
+        }
+    }
+
+    /// 下移一行（列号钳制到新行长）。
+    void MoveDown() {
+        if (curLine + 1 < lines.Count) {
+            curLine = curLine + 1;
+            ClampCol();
+        }
+    }
+
+    /// 将光标移到上一个单词开头（Ctrl+Left）。
+    void MoveWordLeft() {
+        if (curCol == 0) {
+            if (curLine > 0) { curLine = curLine - 1; curCol = lines[curLine].Length; }
+            return;
+        }
+        string s = lines[curLine];
+        int c = curCol;
+        while (c > 0 && s.Substring(c - 1, 1) == " ") { c = c - 1; }
+        if (c > 0 && CodeEditor.IsIdentChar(s.Substring(c - 1, 1))) {
+            while (c > 0 && CodeEditor.IsIdentChar(s.Substring(c - 1, 1))) { c = c - 1; }
+        } else {
+            while (c > 0 && !CodeEditor.IsIdentChar(s.Substring(c - 1, 1))
+                   && s.Substring(c - 1, 1) != " ") { c = c - 1; }
+        }
+        curCol = c;
+    }
+
+    /// 将光标移到下一个单词开头（Ctrl+Right）。
+    void MoveWordRight() {
+        string s = lines[curLine];
+        int n = s.Length;
+        if (curCol >= n) {
+            if (curLine + 1 < lines.Count) { curLine = curLine + 1; curCol = 0; }
+            return;
+        }
+        int c = curCol;
+        if (CodeEditor.IsIdentChar(s.Substring(c, 1))) {
+            while (c < n && CodeEditor.IsIdentChar(s.Substring(c, 1))) { c = c + 1; }
+        } else if (s.Substring(c, 1) != " ") {
+            while (c < n && !CodeEditor.IsIdentChar(s.Substring(c, 1))
+                   && s.Substring(c, 1) != " ") { c = c + 1; }
+        }
+        while (c < n && s.Substring(c, 1) == " ") { c = c + 1; }
+        curCol = c;
+    }
+
+    /// 智能 Home 目标：首个非空白字符列；或当光标已在此列时
+    /// 回到第 0 列（可切换，同 Visual Studio / JetBrains）。
+    int SmartHomeCol() {
+        string s = lines[curLine];
+        int i = 0;
+        for (; i < s.Length && s.Substring(i, 1) == " "; i = i + 1) { }
+        if (curCol == i) { return 0; }
+        return i;
+    }
+
+    /// 将当前行与上一行交换（Alt+Up）。
+    void MoveLineUp() {
+        if (curLine == 0) { return; }
+        SaveUndo();
+        string tmp = lines[curLine - 1];
+        lines[curLine - 1] = lines[curLine];
+        lines[curLine] = tmp;
+        curLine = curLine - 1;
+        ClampCol();
+        selActive = false;
+    }
+
+    /// 将当前行与下一行交换（Alt+Down）。
+    void MoveLineDown() {
+        if (curLine + 1 >= lines.Count) { return; }
+        SaveUndo();
+        string tmp = lines[curLine + 1];
+        lines[curLine + 1] = lines[curLine];
+        lines[curLine] = tmp;
+        curLine = curLine + 1;
+        ClampCol();
+        selActive = false;
+    }
+
+    /// 给选区覆盖的每一行增加一级缩进（Tab）。
+    void IndentSelection() {
+        SaveUndo();
+        int a = selAnchorLine;
+        int b = curLine;
+        if (a > b) { int tmp = a; a = b; b = tmp; }
+        int i = a;
+        while (i <= b) {
+            lines[i] = "    " + lines[i];
+            i = i + 1;
+        }
+        selAnchorCol = selAnchorCol + 4;
+        curCol = curCol + 4;
+    }
+
+    /// 从每个选中行移除最多一级缩进（Shift+Tab）。
+    void OutdentSelection() {
+        SaveUndo();
+        int a = selAnchorLine;
+        int b = curLine;
+        if (a > b) { int tmp = a; a = b; b = tmp; }
+        int i = a;
+        while (i <= b) {
+            string s = lines[i];
+            int rem = 0;
+            for (; rem < 4 && rem < s.Length && s.Substring(rem, 1) == " "; rem = rem + 1) { }
+            lines[i] = s.Substring(rem, s.Length - rem);
+            if (i == selAnchorLine) {
+                selAnchorCol = selAnchorCol - rem;
+                if (selAnchorCol < 0) { selAnchorCol = 0; }
+            }
+            if (i == curLine) {
+                curCol = curCol - rem;
+                if (curCol < 0) { curCol = 0; }
+            }
+            i = i + 1;
+        }
+    }
+
+    /// 从当前行移除最多一级缩进（Shift+Tab，无
+    /// 选区时）。
+    void OutdentCurrentLine() {
+        SaveUndo();
+        string s = lines[curLine];
+        int rem = 0;
+        for (; rem < 4 && rem < s.Length && s.Substring(rem, 1) == " "; rem = rem + 1) { }
+        lines[curLine] = s.Substring(rem, s.Length - rem);
+        curCol = curCol - rem;
+        if (curCol < 0) { curCol = 0; }
+    }
+
+    /// ---- 撤销 / 重做 ----
+    /// 把当前全文与光标压入撤销栈（上限 50 条，超出丢最旧），
+    /// 并清空重做栈。
+    void SaveUndo() {
+        undoStack.Add(new EditSnapshot(GetText(), curLine, curCol));
+        if (undoStack.Count > 50) {
+            undoStack.RemoveAt(0);
+        }
+        // 新编辑会使重做历史失效。
+        redoStack = new List<EditSnapshot>();
+    }
+
+    /// 撤销最近一次编辑：撤销前状态先压入重做栈，恢复后清除选区。
+    void Undo() {
+        if (undoStack.Count == 0) { return; }
+        int last = undoStack.Count - 1;
+        EditSnapshot s = undoStack[last];
+        undoStack.RemoveAt(last);
+        // 记录撤销前的状态，供 Redo 恢复。
+        redoStack.Add(new EditSnapshot(GetText(), curLine, curCol));
+        LoadText(s.text);
+        curLine = s.line;
+        curCol = s.col;
+        ClampCol();
+        selActive = false;
+    }
+
+    /// 重做最近一次被撤销的编辑（对称地更新撤销栈）。
+    void Redo() {
+        if (redoStack.Count == 0) { return; }
+        int last = redoStack.Count - 1;
+        EditSnapshot s = redoStack[last];
+        redoStack.RemoveAt(last);
+        undoStack.Add(new EditSnapshot(GetText(), curLine, curCol));
+        LoadText(s.text);
+        curLine = s.line;
+        curCol = s.col;
+        ClampCol();
+        selActive = false;
+    }
+
+    /// ---- 选区 ----
+    /// 全选：锚点置 (0,0)，光标置文末。
+    void SelectAll() {
+        selAnchorLine = 0;
+        selAnchorCol = 0;
+        curLine = lines.Count - 1;
+        curCol = lines[curLine].Length;
+        selActive = true;
+    }
+
+    /// 取消选区（锚点保留但不再激活）。
+    void ClearSelection() { selActive = false; }
+
+    /// 从 (aLine, aCol) 选中到 (bLine, bCol)，光标停在
+    /// 末尾，与拖拽选择完全一致：查找栏返回的搜索命中
+    /// 会像普通选区一样高亮并滚动入视野。
+    void SelectRange(int aLine, int aCol, int bLine, int bCol) {
+        if (lines.Count == 0) { return; }
+        if (aLine < 0) { aLine = 0; }
+        if (aLine >= lines.Count) { aLine = lines.Count - 1; }
+        if (bLine < 0) { bLine = 0; }
+        if (bLine >= lines.Count) { bLine = lines.Count - 1; }
+        if (aCol < 0) { aCol = 0; }
+        if (aCol > lines[aLine].Length) { aCol = lines[aLine].Length; }
+        if (bCol < 0) { bCol = 0; }
+        if (bCol > lines[bLine].Length) { bCol = lines[bLine].Length; }
+        selAnchorLine = aLine;
+        selAnchorCol = aCol;
+        curLine = bLine;
+        curCol = bCol;
+        selActive = aLine != bLine || aCol != bCol;
+        ClearExtraCarets();
+        // 即使命中就在光标所在行，也强制运行可见光标检查，
+        // 确保光标所在行可见。
+        ensuredCaretLine = 0 - 1;
+    }
+
+    /// 选中光标下的标识符（双击）。若光标位于
+    /// 单词右缘（紧邻分隔符），则选中前一个单词，
+    /// 与 Visual Studio / JetBrains 行为一致。
+    void SelectWordCaret() {
+        string s = lines[curLine];
+        int n = s.Length;
+        int probe = curCol;
+        bool onIdent = probe < n && CodeEditor.IsIdentChar(s.Substring(probe, 1));
+        if (!onIdent && probe > 0 && CodeEditor.IsIdentChar(s.Substring(probe - 1, 1))) {
+            probe = probe - 1;
+            onIdent = true;
+        }
+        if (!onIdent) { return; }
+        int start = probe;
+        int end = probe + 1;
+        while (start > 0 && CodeEditor.IsIdentChar(s.Substring(start - 1, 1))) { start = start - 1; }
+        while (end < n && CodeEditor.IsIdentChar(s.Substring(end, 1))) { end = end + 1; }
+        selAnchorLine = curLine;
+        selAnchorCol = start;
+        curCol = end;
+        selActive = true;
+        ClearExtraCarets();
+    }
+
+    /// 选中当前整行；若后面还有行则包含行尾换行符
+    /// （三击）。
+    void SelectLineCaret() {
+        selAnchorLine = curLine;
+        selAnchorCol = 0;
+        if (curLine + 1 < lines.Count) {
+            curLine = curLine + 1;
+            curCol = 0;
+        } else {
+            curCol = lines[curLine].Length;
+        }
+        selActive = true;
+        ClearExtraCarets();
+    }
+
+    /// 光标移动前准备选区状态：按住 `shift` 时
+    /// 在当前位置埋下锚点（若尚未处于选区中），
+    /// 移动会扩展选区；否则丢弃选区。
+    void SelPrepare(bool shift) {
+        if (shift) {
+            if (!selActive) {
+                selAnchorLine = curLine;
+                selAnchorCol = curCol;
+                selActive = true;
+            }
+        } else {
+            selActive = false;
+        }
+    }
+
+    /// 布局本帧各行：从 `scrollLine` 起所有能放入
+    /// `area` 的代码行，声明了成员的代码行前加 lens 行。
+    /// 每帧在行与像素互相换算之前调用一次。
+    void BuildRowLayout(Rect area, int lineH, int lensH) {
+        rowLine = new List<int>();
+        rowTop = new List<int>();
+        rowLensY = new List<int>();
+        lensRowH = lensH;
+        int y = area.y;
+        int bottom = area.y + area.height;
+        int ln = scrollLine;
+        if (ln < 0) { ln = 0; }
+        while (ln < lines.Count && y + lineH <= bottom) {
+            int ly = 0 - 1;
+            // lens 行要么完整绘制要么整行丢弃，而不是在顶部或底部边缘半绘，
+            // 因此代码行永远不会被自己的
+            // 注解挤出视野。
+            if (lensH > 0 && ln > scrollLine
+                && CodeEditor.DeclNameAt(lines[ln]).Length > 0
+                && y + lensH + lineH <= bottom) {
+                ly = y;
+                y = y + lensH;
+            }
+            rowLine.Add(ln);
+            rowTop.Add(y);
+            rowLensY.Add(ly);
+            y = y + lineH;
+            ln = ln + 1;
+        }
+    }
+
+    /// 本帧布局的代码行数（至少 1），作为滚动页大小。
+    int VisibleRowCount() {
+        if (rowLine.Count < 1) { return 1; }
+        return rowLine.Count;
+    }
+
+    /// 绝对坐标 `yPix` 所在的行；该点不在已布局行内时返回 -1。
+    /// lens 行返回其注解的行，因此点击声明
+    /// 上方也能命中声明行，而非落到空白处。
+    int LineAtY(int lineH, int yPix) {
+        for (int i = 0; i < rowLine.Count; i = i + 1) {
+            int top = rowTop[i];
+            if (rowLensY[i] >= 0) { top = rowLensY[i]; }
+            if (yPix >= top && yPix < rowTop[i] + lineH) { return rowLine[i]; }
+        }
+        return 0 - 1;
+    }
+
+    /// 本帧 `ln` 行绘制位置下方的绝对 y 坐标；
+    /// 该行不在屏幕上时返回 -1。宿主面板（引用
+    /// 列表）从这里向下挂起。
+    int LineBottomY(App app, int ln) {
+        int top = LineTopY(ln);
+        if (top < 0) { return 0 - 1; }
+        return top + Canvas.FontHeight(FontSize(app.theme)) + app.Scale(4);
+    }
+
+    /// 本帧 `ln` 代码行的顶部 y 坐标，未布局时返回 -1。
+    int LineTopY(int ln) {
+        for (int i = 0; i < rowLine.Count; i = i + 1) {
+            if (rowLine[i] == ln) { return rowTop[i]; }
+        }
+        return 0 - 1;
+    }
+
+    /// 根据文本区域内的鼠标位置（像素）放置光标。
+    void CaretFromMouse(App app, Rect area, int gutterW, int fontSize) {
+        int textX = area.x + gutterW + app.theme.paddingSmall;
+        int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
+        int clicked = LineAtY(lineH, app.mouseY);
+        if (clicked < 0) {
+            if (app.mouseY < area.y) { clicked = scrollLine; }
+            else { clicked = scrollLine + VisibleRowCount() - 1; }
+        }
+        if (clicked >= lines.Count) { clicked = lines.Count - 1; }
+        if (clicked < 0) { clicked = 0; }
+        curLine = clicked;
+        curCol = CodeEditor.ColFromX(lines[curLine], app.mouseX - textX, fontSize);
+    }
+
+    /// ---- 多光标 ----
+    /// 清掉全部辅助光标（只留主光标）。
+    void ClearExtraCarets() { carets = new List<Caret>(); }
+
+    /// 在最下方活动光标的下一行添加辅助光标。
+    void AddCaretBelow() {
+        int maxL = curLine;
+        for (int i = 0; i < carets.Count; i = i + 1) { if (carets[i].line > maxL) { maxL = carets[i].line; } }
+        if (maxL + 1 < lines.Count) { carets.Add(new Caret(maxL + 1, curCol)); }
+    }
+
+    /// 在最上方活动光标的上一行添加辅助光标。
+    void AddCaretAbove() {
+        int minL = curLine;
+        for (int i = 0; i < carets.Count; i = i + 1) { if (carets[i].line < minL) { minL = carets[i].line; } }
+        if (minL - 1 >= 0) { carets.Add(new Caret(minL - 1, curCol)); }
+    }
+
+    /// 在主光标和所有辅助光标处插入 `ins`。
+    /// 所有光标分处不同行，各行编辑互不影响。
+    void McInsertStr(string ins) {
+        InsertStr(ins);
+        for (int i = 0; i < carets.Count; i = i + 1) {
+            int L = carets[i].line;
+            if (L >= 0 && L < lines.Count) {
+                int C = carets[i].col;
+                if (C > lines[L].Length) { C = lines[L].Length; }
+                lines[L] = Text.InsertAt(lines[L], C, ins);
+                carets[i].col = C + ins.Length;
+            }
+        }
+    }
+
+    /// 在每个光标处退格。当主光标
+    /// 位于第 0 列时（合并行会改变索引）退化为单光标。
+    void McBackspace() {
+        if (curCol <= 0) { ClearExtraCarets(); SaveUndo(); BackspaceEdit(); return; }
+        SaveUndo();
+        string ln = lines[curLine];
+        int start = Text.PrevCharStart(ln, curCol);
+        lines[curLine] = Text.DeleteBefore(ln, curCol);
+        curCol = start;
+        for (int i = 0; i < carets.Count; i = i + 1) {
+            int L = carets[i].line;
+            int C = carets[i].col;
+            if (L >= 0 && L < lines.Count && C > 0) {
+                int cs = Text.PrevCharStart(lines[L], C);
+                lines[L] = Text.DeleteBefore(lines[L], C);
+                carets[i].col = cs;
+            }
+        }
+    }
+
+    /// 尚无选区时在当前位置埋下选区锚点（拖拽/Shift 移动前调用）。
+    void StartSelection() {
+        if (!selActive) {
+            selAnchorLine = curLine;
+            selAnchorCol = curCol;
+            selActive = true;
+        }
+    }
+
+    /// 选区文本（行间以 '\n' 连接；方向自动归一，无选区为 ""）。
+    string GetSelectedText() {
+        if (!selActive) { return ""; }
+        int sL = selAnchorLine;
+        int sC = selAnchorCol;
+        int eL = curLine;
+        int eC = curCol;
+        if (sL > eL || (sL == eL && sC > eC)) {
+            int tmpL = sL; sL = eL; eL = tmpL;
+            int tmpC = sC; sC = eC; eC = tmpC;
+        }
+        if (sL == eL) {
+            string ln = lines[sL];
+            if (sC > ln.Length) { sC = ln.Length; }
+            if (eC > ln.Length) { eC = ln.Length; }
+            return ln.Substring(sC, eC - sC);
+        }
+        string result = "";
+        string firstLn = lines[sL];
+        if (sC <= firstLn.Length) {
+            result = firstLn.Substring(sC, firstLn.Length - sC);
+        }
+        int mi = sL + 1;
+        while (mi < eL) {
+            result = result + "\n" + lines[mi];
+            mi = mi + 1;
+        }
+        string lastLn = lines[eL];
+        if (eC > lastLn.Length) { eC = lastLn.Length; }
+        result = result + "\n" + lastLn.Substring(0, eC);
+        return result;
+    }
+
+    /// 删除整个选区：光标落在选区起点，选区取消（无选区为空操作）。
+    void DeleteSelection() {
+        if (!selActive) { return; }
+        int sL = selAnchorLine;
+        int sC = selAnchorCol;
+        int eL = curLine;
+        int eC = curCol;
+        if (sL > eL || (sL == eL && sC > eC)) {
+            int tmpL = sL; sL = eL; eL = tmpL;
+            int tmpC = sC; sC = eC; eC = tmpC;
+        }
+        SaveUndo();
+        if (sL == eL) {
+            string ln = lines[sL];
+            if (sC > ln.Length) { sC = ln.Length; }
+            if (eC > ln.Length) { eC = ln.Length; }
+            lines[sL] = ln.Substring(0, sC) + ln.Substring(eC, ln.Length - eC);
+        } else {
+            string firstLn = lines[sL];
+            string lastLn = lines[eL];
+            if (sC > firstLn.Length) { sC = firstLn.Length; }
+            if (eC > lastLn.Length) { eC = lastLn.Length; }
+            string keep = firstLn.Substring(0, sC) + lastLn.Substring(eC, lastLn.Length - eC);
+            lines[sL] = keep;
+            int ri = eL;
+            while (ri > sL) {
+                lines.RemoveAt(ri);
+                ri = ri - 1;
+            }
+        }
+        curLine = sL;
+        curCol = sC;
+        selActive = false;
+    }
+
+    /// 复制选区到系统剪贴板（同时留在内部缓冲）。
+    void CopySelection() {
+        if (!selActive) { return; }
+        clipboard = GetSelectedText();
+        Clipboard.SetText(clipboard);
+    }
+
+    /// 剪切：复制选区后再删除。
+    void CutSelection() {
+        if (!selActive) { return; }
+        clipboard = GetSelectedText();
+        Clipboard.SetText(clipboard);
+        DeleteSelection();
+    }
+
+    /// 粘贴：优先系统剪贴板（可粘其他应用复制的内容），为空时回退
+    /// 编辑器内缓冲；内容经 InsertBlock 插入（替换选区）。
+    void PasteClipboard() {
+        // 优先使用系统剪贴板，使其他应用复制的文本可粘贴进来；
+        // 系统剪贴板为空时回退到编辑器内缓冲区。
+        string os = Clipboard.GetText();
+        if (os.Length > 0) { clipboard = os; }
+        if (clipboard.Length == 0) { return; }
+        InsertBlock(clipboard);
+    }
+
+    /// 在光标处插入可能含多行的文本（替换当前
+    /// 选区），与粘贴 `ins` 完全一致。
+    void InsertBlock(string ins) {
+        if (selActive) { DeleteSelection(); }
+        else { SaveUndo(); }
+        List<string> pLines = CodeEditor.SplitLines(ins);
+        if (pLines.Count == 1) {
+            InsertStr(pLines[0]);
+        } else {
+            string ln = lines[curLine];
+            string left = ln.Substring(0, curCol);
+            string right = "";
+            if (curCol < ln.Length) {
+                right = ln.Substring(curCol, ln.Length - curCol);
+            }
+            lines[curLine] = left + pLines[0];
+            int pi = 1;
+            while (pi < pLines.Count - 1) {
+                lines.Insert(curLine + pi, pLines[pi]);
+                pi = pi + 1;
+            }
+            int lastIdx = pLines.Count - 1;
+            string lastP = pLines[lastIdx];
+            lines.Insert(curLine + lastIdx, lastP + right);
+            curLine = curLine + lastIdx;
+            curCol = lastP.Length;
+        }
+    }
+
+    // ---- 行编辑（右键菜单 / VS 风格命令）----
+
+    /// 删除当前选区；无选区时删除光标处的字符。
+    void DeleteAtCaret() {
+        if (selActive) { DeleteSelection(); }
+        else { SaveUndo(); DeleteEdit(); }
+    }
+
+    /// 在当前行切换行首行注释（本语言的引导符：Zan "// "、
+    /// Lua "-- "、Python "# "），或对选区覆盖的每一行切换。
+    void ToggleComment() {
+        SaveUndo();
+        int a = curLine;
+        int b = curLine;
+        if (selActive) {
+            a = selAnchorLine;
+            b = curLine;
+            if (a > b) { int tmp = a; a = b; b = tmp; }
+        }
+        // 若范围内所有行都已注释则取消注释，否则全部加上注释。
+        string tok = LineComment();
+        int tl = tok.Length;
+        bool allComment = true;
+        int i = a;
+        while (i <= b) {
+            string s = lines[i];
+            string trimmed = CodeEditor.LTrim(s);
+            if (trimmed.Length < tl || trimmed.Substring(0, tl) != tok) {
+                if (trimmed.Length > 0) { allComment = false; }
+            }
+            i = i + 1;
+        }
+        i = a;
+        while (i <= b) {
+            string s = lines[i];
+            if (allComment) {
+                lines[i] = CodeEditor.UncommentTok(s, tok);
+            } else {
+                if (CodeEditor.LTrim(s).Length > 0) {
+                    lines[i] = tok + " " + s;
+                }
+            }
+            i = i + 1;
+        }
+        selActive = false;
+        ClampCol();
+    }
+
+    /// 在当前行正下方复制一行。
+    void DuplicateLine() {
+        SaveUndo();
+        string s = lines[curLine];
+        lines.Insert(curLine + 1, s);
+        curLine = curLine + 1;
+        ClampCol();
+    }
+
+    /// 整行删除当前行。
+    void DeleteLine() {
+        SaveUndo();
+        if (lines.Count <= 1) {
+            lines[0] = "";
+            curLine = 0;
+            curCol = 0;
+            return;
+        }
+        lines.RemoveAt(curLine);
+        if (curLine >= lines.Count) { curLine = lines.Count - 1; }
+        ClampCol();
+    }
+
+    /// 去掉前导空格/制表符。
+    static string LTrim(string s) {
+        int len = s.Length;
+        int i = 0;
+        while (i < len) {
+            int ch = s[i];
+            if (ch == 32 || ch == 9) { i = i + 1; }
+            else { break; }
+        }
+        if (i == 0) { return s; }
+        return s.Substring(i, len - i);
+    }
+
+    /// 删除前导空白后的第一个"// "（或"//"）。
+    static string Uncomment(string s) {
+        return CodeEditor.UncommentTok(s, "//");
+    }
+
+    /// 删除前导空白后的第一个 `tok`（及紧随的一个空格），
+    /// `tok` 是该语言的行注释引导符。
+    static string UncommentTok(string s, string tok) {
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == " " || ch == "\t") { i = i + 1; }
+            else { break; }
+        }
+        string lead = s.Substring(0, i);
+        string rest = s.Substring(i, s.Length - i);
+        int tl = tok.Length;
+        if (rest.Length >= tl && rest.Substring(0, tl) == tok) {
+            rest = rest.Substring(tl, rest.Length - tl);
+            if (rest.Length >= 1 && rest.Substring(0, 1) == " ") {
+                rest = rest.Substring(1, rest.Length - 1);
+            }
+        }
+        return lead + rest;
+    }
+
+    /// 返回并清除右键菜单请求的待处理宿主命令
+    /// （如"find"、"gotoline"）；无命令时返回空字符串。
+    string TakeCommand() {
+        string cmd = ctxCmd;
+        ctxCmd = "";
+        return cmd;
+    }
+
+    /// 本地化标签：键式查找（System.Globalization.Lang），英文原文
+    /// 作键、内置中文为缺省串；语言包未加载时回退缺省串。
+    static string T(string en, string zh) {
+        return Lang.Tr(en, zh);
+    }
+
+    /// 构建右键菜单项。Action 为 0 表示分隔行。
+    static List<ContextMenuItem> BuildCtxMenu() {
+        List<ContextMenuItem> items = new List<ContextMenuItem>{
+            new ContextMenuItem(CodeEditor.T("Cut", "剪切"), "Ctrl+X", 1),
+            new ContextMenuItem(CodeEditor.T("Copy", "复制"), "Ctrl+C", 2),
+            new ContextMenuItem(CodeEditor.T("Paste", "粘贴"), "Ctrl+V", 3),
+            new ContextMenuItem(CodeEditor.T("Delete", "删除"), "Del", 4),
+            new ContextMenuItem("", "", 0),
+            new ContextMenuItem(CodeEditor.T("Select All", "全选"), "Ctrl+A", 5),
+            new ContextMenuItem("", "", 0),
+            new ContextMenuItem(CodeEditor.T("Toggle Comment", "切换注释"), "Ctrl+/", 6),
+            new ContextMenuItem(CodeEditor.T("Duplicate Line", "复制当前行"), "Ctrl+D", 7),
+            new ContextMenuItem(CodeEditor.T("Delete Line", "删除当前行"), "Ctrl+L", 8),
+            new ContextMenuItem("", "", 0),
+            new ContextMenuItem(CodeEditor.T("Add Cursor Above", "在上方添加光标"), "Ctrl+Alt+Up", 13),
+            new ContextMenuItem(CodeEditor.T("Add Cursor Below", "在下方添加光标"), "Ctrl+Alt+Down", 14),
+            new ContextMenuItem("", "", 0),
+            new ContextMenuItem("", "", 0),
+            new ContextMenuItem(CodeEditor.T("Go to Definition", "转到定义"), "F12", 11),
+            new ContextMenuItem(CodeEditor.T("Find All References", "查找所有引用"), "Shift+F12", 12),
+            new ContextMenuItem("", "", 0),
+            new ContextMenuItem(CodeEditor.T("Find...", "查找..."), "Ctrl+F", 9),
+            new ContextMenuItem(CodeEditor.T("Go to Line...", "跳转到行..."), "Ctrl+G", 10) };
+        return items;
+    }
+
+    /// 按 id 执行右键菜单动作（见 BuildCtxMenu）。
+    void RunCtxAction(App app, int act) {
+        if (act == 1) { CutSelection(); CheckErrors(); }
+        else if (act == 2) { CopySelection(); }
+        else if (act == 3) { PasteClipboard(); CheckErrors(); UpdateCompletion(); }
+        else if (act == 4) { DeleteAtCaret(); CheckErrors(); }
+        else if (act == 5) { SelectAll(); }
+        else if (act == 6) { ToggleComment(); CheckErrors(); }
+        else if (act == 7) { DuplicateLine(); CheckErrors(); }
+        else if (act == 8) { DeleteLine(); CheckErrors(); }
+        else if (act == 9) { ctxCmd = "find"; }
+        else if (act == 10) { ctxCmd = "gotoline"; }
+        else if (act == 11) { ctxCmd = "gotodef"; }
+        else if (act == 12) { ctxCmd = "findrefs"; }
+        else if (act == 13) { AddCaretAbove(); }
+        else if (act == 14) { AddCaretBelow(); }
+        else if (act == 20) { ApplyQuickFix(); }
+        ctxOpen = false;
+        app.RequestRedraw();
+    }
+
+    /// 右键菜单当前是否打开。
+    bool CtxMenuOpen() { return ctxOpen; }
+
+    /// 将右键菜单绘制为顶层浮层（限制在整个
+    /// 窗口而非编辑器矩形内），并处理菜单项点击。必须在
+    /// 帧末调用，以免被其他内容覆盖。
+    void RenderCtxMenu(App app) {
+        if (!ctxOpen) { return; }
+        Canvas c = app.canvas;
+        Gui.Theme t = app.theme;
+        EditorPalette pal = EditorPalette.For(t);
+        int fontSize = Style.FontFallback(app, "medium");
+        int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
+        if (lineH < 1) { lineH = 1; }
+
+        List<ContextMenuItem> menuItems = CodeEditor.BuildCtxMenu();
+        // 快速修复：光标所在行使用了
+        // 未导入命名空间的 stdlib 类型时，提示插入缺失的 `using`。
+        string qfNs = QuickFixNs();
+        if (qfNs.Length > 0) {
+            menuItems.Insert(0, new ContextMenuItem("", "", 0));
+            menuItems.Insert(0, new ContextMenuItem(CodeEditor.T("Add using ", "添加 using ") + qfNs + ";", "Ctrl+.", 20));
+        }
+        int itemH = lineH;
+        int sepH = app.Scale(7);
+        int mW = app.Scale(150);
+        for (int wi = 0; wi < menuItems.Count; wi = wi + 1) {
+            ContextMenuItem item = menuItems[wi];
+            if (item.action != 0) {
+                int lw = Canvas.MeasureText(item.label, fontSize)
+                         + Canvas.MeasureText(item.key, fontSize) + app.Scale(44);
+                if (lw > mW) { mW = lw; }
+            }
+        }
+        int mH = app.Scale(6);
+        for (int hi = 0; hi < menuItems.Count; hi = hi + 1) {
+            if (menuItems[hi].action == 0) { mH = mH + sepH; } else { mH = mH + itemH; }
+        }
+
+        int winW = c.Width();
+        int winH = c.Height();
+        int topB = app.titlebarH;
+        int mX = ctxX;
+        int mY = ctxY;
+        if (mX + mW > winW) { mX = winW - mW - app.Scale(4); }
+        if (mY + mH > winH) { mY = winH - mH - app.Scale(4); }
+        if (mX < 0) { mX = 0; }
+        if (mY < topB) { mY = topB; }
+
+        c.FillRoundRect(mX + 2, mY + 2, mW, mH, app.Scale(4), pal.shadow);
+        c.SurfaceRoundRect(mX, mY, mW, mH, app.Scale(4), pal.popupBg, pal.border, 1);
+        app.BlockHitsRect(mX, mY, mW, mH);
+
+        int ry = mY + app.Scale(3);
+        for (int ri = 0; ri < menuItems.Count; ri = ri + 1) {
+            ContextMenuItem item = menuItems[ri];
+            if (item.action == 0) {
+                c.FillRect(mX + app.Scale(6), ry + sepH / 2, mW - app.Scale(12), 1, pal.border);
+                ry = ry + sepH;
+            } else {
+                bool hov = app.mouseX >= mX && app.mouseX < mX + mW
+                           && app.mouseY >= ry && app.mouseY < ry + itemH;
+                int tcol = pal.menuText;
+                if (hov) {
+                    c.FillRect(mX + app.Scale(2), ry, mW - app.Scale(4), itemH, pal.selBg);
+                    tcol = pal.textSel;
+                }
+                int ty = Canvas.CenterTextY(ry, itemH, fontSize);
+                c.DrawText(mX + app.Scale(12), ty, item.label, tcol, fontSize);
+                int kw = Canvas.MeasureText(item.key, fontSize);
+                c.DrawText(mX + mW - kw - app.Scale(10), ty, item.key, pal.muted, fontSize);
+                ry = ry + itemH;
+            }
+        }
+
+        // 左键点击选中菜单项或关闭菜单。长按开菜单的那次
+        // 收尾释放不算：不守卫的话，触摸长按一松手菜单就被
+        // 这次释放原点关闭（本函数读原始事件序，不经
+        // ClickAvailable 的全局守卫）。
+        if (app.EventKind() == 3 && app.window.EventButton() == 0
+            && !app.LongPressFired()) {
+            bool inside = app.mouseX >= mX && app.mouseX < mX + mW
+                          && app.mouseY >= mY && app.mouseY < mY + mH;
+            if (inside) {
+                int cy2 = mY + app.Scale(3);
+                int chosen = 0 - 1;
+                for (int ci = 0; ci < menuItems.Count; ci = ci + 1) {
+                    ContextMenuItem item = menuItems[ci];
+                    int rh = itemH;
+                    if (item.action == 0) { rh = sepH; }
+                    if (item.action != 0 && app.mouseY >= cy2 && app.mouseY < cy2 + rh) {
+                        chosen = item.action;
+                    }
+                    cy2 = cy2 + rh;
+                }
+                if (chosen >= 0) { RunCtxAction(app, chosen); }
+            } else {
+                ctxOpen = false;
+                app.RequestRedraw();
+            }
+        }
+    }
+
+    /// ---- 错误诊断 ----
+    /// 重跑启发式诊断：按行括号缓存做花括号/圆括号配平（多余或缺失
+    /// 的闭合各报一条）、`using` 行缺分号，最后由
+    /// AnalyzeMissingUsings 标记使用了却未导入的 stdlib 类型。
+    void CheckErrors() {
+        errors = new List<Diagnostic>();
+        EnsureLineScan();
+        int braceDepth = 0;
+        int parenDepth = 0;
+        for (int li = 0; li < lines.Count; li = li + 1) {
+            braceDepth = braceDepth + ceBrace[li];
+            parenDepth = parenDepth + ceParen[li];
+            if (braceDepth < 0) {
+                errors.Add(new Diagnostic(li, "Unexpected '}'"));
+                braceDepth = 0;
+            }
+            if (parenDepth < 0) {
+                errors.Add(new Diagnostic(li, "Unexpected ')'"));
+                parenDepth = 0;
+            }
+            if (ceUsingBad[li] == 1 && li != curLine) {
+                errors.Add(new Diagnostic(li, "Missing ';' after using"));
+            }
+        }
+        if (braceDepth > 0) {
+            errors.Add(new Diagnostic(lines.Count - 1, "Missing closing '}'"));
+        }
+        if (parenDepth > 0) {
+            errors.Add(new Diagnostic(lines.Count - 1, "Missing closing ')'"));
+        }
+        // 标记使用了却缺少 `using` 导入的 stdlib 类型。
+        AnalyzeMissingUsings();
+    }
+
+    /// 刷新括号扫描的按行缓存。诊断在每次光标换行时重跑，而整篇
+    /// 逐字符扫描在 30 万行上是百毫秒级；改成只重扫文本真的变了的行
+    /// 后，一次击键只重扫一行。
+    void EnsureLineScan() {
+        if (ceLineSrc == null) {
+            ceLineSrc = new List<string>();
+            ceBrace = new List<int>();
+            ceParen = new List<int>();
+            ceUsingBad = new List<int>();
+        }
+        while (ceLineSrc.Count < lines.Count) {
+            ceLineSrc.Add(null);
+            ceBrace.Add(0);
+            ceParen.Add(0);
+            ceUsingBad.Add(0);
+        }
+        while (ceLineSrc.Count > lines.Count) {
+            int last = ceLineSrc.Count - 1;
+            ceLineSrc.RemoveAt(last);
+            ceBrace.RemoveAt(last);
+            ceParen.RemoveAt(last);
+            ceUsingBad.RemoveAt(last);
+        }
+        for (int li = 0; li < lines.Count; li = li + 1) {
+            if (ceLineSrc[li] != lines[li]) { ScanLineBrackets(li); }
+        }
+    }
+
+    /// 重算一行的括号增量和 using 启发式，写回按行缓存。
+    void ScanLineBrackets(int li) {
+        string ln = lines[li];
+        ceLineSrc[li] = ln;
+        ceBrace[li] = 0;
+        ceParen[li] = 0;
+        ceUsingBad[li] = 0;
+        string tr = ln;
+        // 去掉前导空白
+        int si = 0;
+        int trLen = tr.Length;
+        while (si < trLen) {
+            int sch = tr[si];
+            if (sch == 32 || sch == 9) { si = si + 1; }
+            else { break; }
+        }
+        if (si > 0) { tr = tr.Substring(si, tr.Length - si); }
+        // 跳过空行/注释行
+        if (tr.Length == 0 || tr.Substring(0, 1) == "/" || tr.Substring(0, 1) == "*") {
+            return;
+        }
+        // 逐行检查括号配平
+        // 用字节比较而非 Substring(ci, 1)：此循环会遍历
+        // 文档的每个字符，为每个字节分配
+        // 单字符字符串会拖慢大文件的
+        // 扫描。
+        int brace = 0;
+        int paren = 0;
+        int lnLen = ln.Length;
+        for (int ci = 0; ci < lnLen; ci = ci + 1) {
+            int ch = ln[ci];
+            if (ch == 123) { brace = brace + 1; }
+            else if (ch == 125) { brace = brace - 1; }
+            else if (ch == 40) { paren = paren + 1; }
+            else if (ch == 41) { paren = paren - 1; }
+        }
+        ceBrace[li] = brace;
+        ceParen[li] = paren;
+        // 这里保留的唯一启发式：`using` 指令
+        // 不以 ';' 结尾。通用的“缺分号”猜测
+        // 误报过多（多行调用、
+        // 特性、泛型），早已被禁用；真正的
+        // 诊断来自 Run/Build 后的编译器。
+        if (CodeEditor.StartsWithP(tr, "using ")
+            && tr.Substring(tr.Length - 1, 1) != ";") {
+            ceUsingBad[li] = 1;
+        }
+    }
+}

@@ -1,0 +1,365 @@
+using System;
+using System.Diagnostics;
+using System.Drawing;
+using System.Threading;
+
+namespace System.Input;
+
+/// <summary>
+/// 鼠标输入：位置、移动（可选分步轨迹）、
+/// 点击、拖拽和滚轮。Windows 下通过 SendInput 驱动真实光标
+/// （与物理设备相同的路径，因此在 SetCursorPos 单独使用会被忽略的
+/// 提权/远程会话中也有效）。X11 下走 xdotool（XTEST），Wayland 需
+/// ydotool，macOS 需 cliclick；后端缺失时抛出
+/// PlatformNotSupportedException，而不是默默不发事件。
+///
+///   Mouse.SetPos(100, 100);
+///   Mouse.MoveTo(200, 200, 12);     // 12 步缓动轨迹
+///   Mouse.Click(Mouse.Left());
+///
+/// 按钮常量：<see cref="Left"/>、<see cref="Middle"/>、
+/// <see cref="Right"/>、<see cref="XButton1"/>、<see cref="XButton2"/>。
+/// </summary>
+class Mouse {
+    /// 主（左）按钮。
+    static int Left() { return 0; }
+    /// 中间（滚轮）按钮。
+    static int Middle() { return 1; }
+    /// 次（右）按钮。
+    static int Right() { return 2; }
+    /// 第一个附加按钮（浏览器"后退"）。
+    static int XButton1() { return 3; }
+    /// 第二个附加按钮（浏览器"前进"）。
+    static int XButton2() { return 4; }
+
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "GetCursorPos")]
+    static extern int WinGetCursorPos(nint pt);
+
+    [DllImport("user32", EntryPoint = "SetCursorPos")]
+    static extern int WinSetCursorPos(int x, int y);
+
+    [DllImport("user32", EntryPoint = "SendInput")]
+    static extern int WinSendInput(int count, nint inputs, int cbSize);
+
+    [DllImport("user32", EntryPoint = "GetAsyncKeyState")]
+    static extern short WinGetAsyncKeyState(int vk);
+
+    // MOUSEEVENTF_* 标志位（user32）。
+    /// MOUSEEVENTF_MOVE(0x0001)：相对移动。
+    static int FMove() { return 0x0001; }
+    /// MOUSEEVENTF_LEFTDOWN(0x0002)。
+    static int FLeftDown() { return 0x0002; }
+    /// MOUSEEVENTF_LEFTUP(0x0004)。
+    static int FLeftUp() { return 0x0004; }
+    /// MOUSEEVENTF_RIGHTDOWN(0x0008)。
+    static int FRightDown() { return 0x0008; }
+    /// MOUSEEVENTF_RIGHTUP(0x0010)。
+    static int FRightUp() { return 0x0010; }
+    /// MOUSEEVENTF_MIDDLEDOWN(0x0020)。
+    static int FMiddleDown() { return 0x0020; }
+    /// MOUSEEVENTF_MIDDLEUP(0x0040)。
+    static int FMiddleUp() { return 0x0040; }
+    /// MOUSEEVENTF_XDOWN(0x0080)。
+    static int FXDown() { return 0x0080; }
+    /// MOUSEEVENTF_XUP(0x0100)。
+    static int FXUp() { return 0x0100; }
+    /// MOUSEEVENTF_WHEEL(0x0800)：滚轮滚动。
+    static int FWheel() { return 0x0800; }
+    /// MOUSEEVENTF_ABSOLUTE(0x8000)：绝对坐标。
+    static int FAbsolute() { return 0x8000; }
+
+    // 用于 GetAsyncKeyState 的 VK 码。
+    /// VK_LBUTTON(0x01)。
+    static int VkLeft() { return 0x01; }
+    /// VK_RBUTTON(0x02)。
+    static int VkRight() { return 0x02; }
+    /// VK_MBUTTON(0x04)。
+    static int VkMiddle() { return 0x04; }
+    /// VK_XBUTTON1(0x05)。
+    static int VkX1() { return 0x05; }
+    /// VK_XBUTTON2(0x06)。
+    static int VkX2() { return 0x06; }
+    #endif
+
+    /// <summary>当前光标位置（屏幕坐标）。</summary>
+    static Point GetPos() {
+        #if WINDOWS
+        nint pt = NativeMemory.Alloc(8);
+        WinGetCursorPos(pt);
+        Span<int> p = new Span<int>(pt, 2);
+        int x = p[0];
+        int y = p[1];
+        NativeMemory.Free(pt);
+        return new Point(x, y);
+        #elif MACOS
+        if (!Mouse.HaveCliclick()) { InputTool.Missing("Mouse.GetPos"); }
+        // cliclick p:  "123,456"
+        ProcessResult r = Process.Capture("cliclick p 2>/dev/null");
+        if (!r.Ok() || r.lines.Count == 0) {
+            throw new IOException("cliclick p failed");
+        }
+        List<int> nums = Mouse.Ints(r.lines[0]);
+        if (nums.Count < 2) { throw new IOException("cliclick p gave no point"); }
+        return new Point(nums[0], nums[1]);
+        #else
+        int kind = InputTool.Kind();
+        if (kind != InputTool.Xdotool()) {
+            // ydotool 只能写不能读（uinput 是单向的）
+            InputTool.Missing("Mouse.GetPos");
+        }
+        // xdotool getmouselocation --shell: "X=..\nY=..\nSCREEN=..\nWINDOW=.."
+        ProcessResult r = Process.Capture(
+            "xdotool getmouselocation --shell 2>/dev/null");
+        if (!r.Ok()) { throw new IOException("xdotool getmouselocation failed"); }
+        int x = -1;
+        int y = -1;
+        for (int i = 0; i < r.lines.Count; i = i + 1) {
+            string ln = r.lines[i];
+            if (ln.StartsWith("X=")) { x = Convert.ToInt(ln.Substring(2, ln.Length - 2)); }
+            else if (ln.StartsWith("Y=")) { y = Convert.ToInt(ln.Substring(2, ln.Length - 2)); }
+        }
+        if (x < 0 || y < 0) { throw new IOException("xdotool gave no position"); }
+        return new Point(x, y);
+        #endif
+    }
+
+    /// <summary>将光标移动到绝对屏幕位置。</summary>
+    static void SetPos(int x, int y) {
+        #if WINDOWS
+        WinSetCursorPos(x, y);
+        #else
+        Mouse.Posix("mousemove " + Convert.ToString(x) + " " + Convert.ToString(y),
+                    "m:" + Convert.ToString(x) + "," + Convert.ToString(y),
+                    "Mouse.SetPos");
+        #endif
+    }
+
+    /// <summary>将光标一步移动到 `x`,`y`。</summary>
+    static void MoveTo(int x, int y) {
+        Mouse.MoveTo(x, y, 0);
+    }
+
+    /// <summary>将光标分 `steps` 步插值移动到 `x`,`y`，
+    /// 每步之间短暂休眠。steps 为 0 或 1 时直接跳过去。
+    /// 分步轨迹看起来像人类的拖拽/滑动，而不是瞬间传送，
+    /// 某些目标（游戏、远程桌面会话防护）
+    /// 对此有要求。</summary>
+    static void MoveTo(int x, int y, int steps) {
+        #if WINDOWS
+        if (steps <= 1) {
+            WinSetCursorPos(x, y);
+            return;
+        }
+        Point from = Mouse.GetPos();
+        int i = 1;
+        while (i <= steps) {
+            int px = from.x + (x - from.x) * i / steps;
+            int py = from.y + (y - from.y) * i / steps;
+            WinSetCursorPos(px, py);
+            Thread.Sleep(1);
+            i = i + 1;
+        }
+        #else
+        if (steps <= 1) {
+            Mouse.SetPos(x, y);
+            return;
+        }
+        Point from = Mouse.GetPos();
+        int i = 1;
+        while (i <= steps) {
+            Mouse.SetPos(from.x + (x - from.x) * i / steps,
+                         from.y + (y - from.y) * i / steps);
+            Thread.Sleep(1);
+            i = i + 1;
+        }
+        #endif
+    }
+
+    /// <summary>按下 `button` 不释放。</summary>
+    static void Down(int button) {
+        #if WINDOWS
+        int flags = 0;
+        if (button == 0) { flags = Mouse.FLeftDown(); }
+        else if (button == 1) { flags = Mouse.FMiddleDown(); }
+        else if (button == 2) { flags = Mouse.FRightDown(); }
+        else if (button == 3 || button == 4) { flags = Mouse.FXDown(); }
+        else { throw new ArgumentException("invalid mouse button"); }
+        int data = 0;
+        if (button == 3) { data = 1; }
+        if (button == 4) { data = 2; }
+        Mouse.SendMouse(0, 0, data, flags);
+        #else
+        Mouse.Posix("mousedown " + Convert.ToString(Mouse.XButtonOf(button)),
+                    "dd:" + Mouse.MacButtonOf(button), "Mouse.Down");
+        #endif
+    }
+
+    /// <summary>释放 `button`。</summary>
+    static void Up(int button) {
+        #if WINDOWS
+        int flags = 0;
+        if (button == 0) { flags = Mouse.FLeftUp(); }
+        else if (button == 1) { flags = Mouse.FMiddleUp(); }
+        else if (button == 2) { flags = Mouse.FRightUp(); }
+        else if (button == 3 || button == 4) { flags = Mouse.FXUp(); }
+        else { throw new ArgumentException("invalid mouse button"); }
+        int data = 0;
+        if (button == 3) { data = 1; }
+        if (button == 4) { data = 2; }
+        Mouse.SendMouse(0, 0, data, flags);
+        #else
+        Mouse.Posix("mouseup " + Convert.ToString(Mouse.XButtonOf(button)),
+                    "du:" + Mouse.MacButtonOf(button), "Mouse.Up");
+        #endif
+    }
+
+    /// <summary>在当前位置单击 `button`。</summary>
+    static void Click(int button) {
+        Mouse.Down(button);
+        Mouse.Up(button);
+    }
+
+    /// <summary>在当前位置快速双击。</summary>
+    static void DoubleClick(int button) {
+        Mouse.Click(button);
+        Mouse.Click(button);
+    }
+
+    /// <summary>按住 `button` 从 `fx`,`fy` 拖到 `tx`,`ty`：移动到
+    /// 起点、按下、分步滑动、释放。</summary>
+    static void Drag(int fx, int fy, int tx, int ty) {
+        Mouse.Drag(fx, fy, tx, ty, Mouse.Left(), 16);
+    }
+
+    /// <summary>指定按钮和轨迹步数进行拖拽。</summary>
+    static void Drag(int fx, int fy, int tx, int ty, int button, int steps) {
+        Mouse.SetPos(fx, fy);
+        Mouse.Down(button);
+        Mouse.MoveTo(tx, ty, steps);
+        Mouse.Up(button);
+    }
+
+    /// <summary>滚动滚轮。`delta` 为正向上滚动，为负
+    /// 向下；一档为 120（WHEEL_DELTA），整档需传
+    /// 120 的倍数。</summary>
+    static void Wheel(int delta) {
+        #if WINDOWS
+        Mouse.SendMouse(0, 0, delta, Mouse.FWheel());
+        #else
+        // X11/macOS 没有“滚多少像素”的概念，按 120 一档发档位事件
+        int notches = delta / 120;
+        if (notches == 0 && delta != 0) { notches = delta > 0 ? 1 : -1; }
+        int n = notches < 0 ? 0 - notches : notches;
+        for (int i = 0; i < n; i = i + 1) {
+            Mouse.Posix("click " + (notches > 0 ? "4" : "5"),
+                        notches > 0 ? "w:+1" : "w:-1", "Mouse.Wheel");
+        }
+        #endif
+    }
+
+    /// <summary>当 `button` 被物理按下时返回 true。</summary>
+    static bool IsDown(int button) {
+        #if WINDOWS
+        int vk = 0;
+        if (button == 0) { vk = Mouse.VkLeft(); }
+        else if (button == 1) { vk = Mouse.VkMiddle(); }
+        else if (button == 2) { vk = Mouse.VkRight(); }
+        else if (button == 3) { vk = Mouse.VkX1(); }
+        else if (button == 4) { vk = Mouse.VkX2(); }
+        else { throw new ArgumentException("invalid mouse button"); }
+        return (Mouse.WinGetAsyncKeyState(vk) & 0x8000) != 0;
+        #else
+        // 没有不拓展也不开窗口就能查按钮状态的路子：XQueryPointer 需要
+        // X 连接，System Events 根本不暴露。宁可明确不支持也不猜。
+        throw new PlatformNotSupportedException(
+            "Mouse.IsDown needs a live X11/Quartz event tap, which the "
+            + "command-line injection backends do not provide");
+        #endif
+    }
+
+    #if !WINDOWS
+    /// X11 按钮号（1 左 2 中 3 右，8/9 = 后退/前进）。
+    static int XButtonOf(int button) {
+        if (button == 0) { return 1; }
+        if (button == 1) { return 2; }
+        if (button == 2) { return 3; }
+        if (button == 3) { return 8; }
+        if (button == 4) { return 9; }
+        throw new ArgumentException("invalid mouse button");
+    }
+
+    /// cliclick 的按钮名（只有左/右两个）。
+    static string MacButtonOf(int button) {
+        if (button == 0) { return ""; }
+        if (button == 2) { return "right"; }
+        throw new ArgumentException(
+            "cliclick only injects the left and right mouse buttons");
+    }
+
+    /// 本机是否装有 cliclick（macOS 注入后端）。
+    static bool HaveCliclick() {
+        return Process.Capture("command -v cliclick >/dev/null 2>&1").Ok();
+    }
+
+    /// 将一个动作发给当前平台后端：`xargs` 是 xdotool/ydotool 的参数，
+    /// `mac` 是 cliclick 的命令。两者都只含本文件生成的数字和字面量。
+    static void Posix(string xargs, string mac, string what) {
+        #if MACOS
+        if (!Mouse.HaveCliclick()) { InputTool.Missing(what); }
+        if (!InputTool.Run("cliclick " + mac)) {
+            throw new IOException(what + ": cliclick failed");
+        }
+        #else
+        int kind = InputTool.Kind();
+        if (kind == InputTool.Xdotool()) {
+            if (!InputTool.Run("xdotool " + xargs)) {
+                throw new IOException(what + ": xdotool failed");
+            }
+            return;
+        }
+        InputTool.Missing(what);
+        #endif
+    }
+
+    /// 一行里的十进制整数（用于解析 cliclick 的 "x,y"）。
+    static List<int> Ints(string line) {
+        List<int> outp = new List<int>();
+        int i = 0;
+        while (i < line.Length) {
+            int c = line[i] & 255;
+            if (c >= 48 && c <= 57) {
+                int v = 0;
+                while (i < line.Length && (line[i] & 255) >= 48
+                       && (line[i] & 255) <= 57) {
+                    v = v * 10 + ((line[i] & 255) - 48);
+                    i = i + 1;
+                }
+                outp.Add(v);
+                continue;
+            }
+            i = i + 1;
+        }
+        return outp;
+    }
+    #endif
+
+    #if WINDOWS
+    /// 发送一次鼠标 INPUT 事件（x64 INPUT 布局：4 字节 type + 填充
+    /// + 32 字节 MOUSEINPUT；dwExtraInfo 在偏移 32 处按 ULONG_PTR 对齐）。
+    static void SendMouse(int dx, int dy, int data, int flags) {
+        nint input = NativeMemory.Alloc(40);
+        Span<int> w = new Span<int>(input, 10);
+        w[0] = 0;            // INPUT 类型：鼠标
+        w[2] = dx;           // MOUSEINPUT.dx
+        w[3] = dy;           // MOUSEINPUT.dy
+        w[4] = data;         // MOUSEINPUT.mouseData（滚轮增量 / X 键）
+        w[5] = flags;        // MOUSEINPUT.dwFlags
+        w[6] = 0;            // MOUSEINPUT.time
+        // MOUSEINPUT.dwExtraInfo 位于偏移 32（按 ULONG_PTR 对齐）；
+        // w[8..9] 已为零（NativeMemory.Alloc 会清零）。
+        WinSendInput(1, input, 40);
+        NativeMemory.Free(input);
+    }
+    #endif
+}

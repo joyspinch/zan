@@ -1,0 +1,415 @@
+using System;
+
+namespace Gui;
+
+/// 图标字形以可缩放矢量图元绘制，而非字体字形：
+/// “Segoe MDL2 Assets” 图标字体只存在于 Windows 10+，因此字体路径
+/// 在 macOS/Linux 上会显示不同，在 Win7 上会失效。每个形状都由
+/// Canvas 的线段、矩形、圆和扇形构成，因此图标在每个后端
+/// 上的栅格化结果完全一致。
+///
+/// Canvas.DrawIcon 是入口；请调用它，而不是这些辅助函数。
+class IconVector {
+    /// π 常量（双精度）。
+    static double Pi() { return 3.14159265358979323846; }
+
+    /// 整数绝对值。
+    static int Iabs(int v) {
+        if (v < 0) { return -v; }
+        return v;
+    }
+
+    /// 使用后端原生抗锯齿圆轮廓，不在整数坐标上离散成多边形。
+    static void Circle(Canvas s, int cx, int cy, int radius,
+                       int color, int thickness) {
+        // Preserve centerline radius/width/alpha without truncated vertices
+        // or overlapping individual segment caps.
+        s.DrawCircle(cx, cy, radius, color, thickness);
+    }
+
+    /// 从 (x0,y0) 到 (x1,y1) 的线段，远端带两翼；两翼
+    /// 沿线段所走的轴线两侧展开。
+    static void Arrow(Canvas s, int x0, int y0, int x1, int y1,
+                      int color, int thickness) {
+        s.DrawLine(x0, y0, x1, y1, color, thickness);
+        int dx = x1 - x0;
+        int dy = y1 - y0;
+        int wing = (IconVector.Iabs(dx) + IconVector.Iabs(dy)) / 4;
+        if (wing < 3) { wing = 3; }
+        if (IconVector.Iabs(dx) >= IconVector.Iabs(dy)) {
+            int sign = -1;
+            if (dx >= 0) { sign = 1; }
+            s.DrawLine(x1, y1, x1 - sign * wing, y1 - wing, color, thickness);
+            s.DrawLine(x1, y1, x1 - sign * wing, y1 + wing, color, thickness);
+        } else {
+            int sign = -1;
+            if (dy >= 0) { sign = 1; }
+            s.DrawLine(x1, y1, x1 - wing, y1 - sign * wing, color, thickness);
+            s.DrawLine(x1, y1, x1 + wing, y1 - sign * wing, color, thickness);
+        }
+    }
+
+    /// 五角星的十个交替外/内顶点，从
+    /// 12 点钟方向开始，按 x0,y0,x1,y1,... 交错返回。
+    static List<int> StarPoints(int cx, int cy, int radius) {
+        List<int> pts = new List<int>();
+        for (int i = 0; i < 10; i = i + 1) {
+            double a = -IconVector.Pi() / 2.0
+                     + (double)i * IconVector.Pi() / 5.0;
+            int rr = radius;
+            if (i % 2 == 1) { rr = radius * 2 / 5; }
+            pts.Add(cx + (int)(Math.Cos(a) * (double)rr));
+            pts.Add(cy + (int)(Math.Sin(a) * (double)rr));
+        }
+        return pts;
+    }
+
+    /// 线框五角星：依次连接 StarPoints 的十个顶点。
+    static void Star(Canvas s, int cx, int cy, int radius,
+                     int color, int thickness) {
+        List<int> pts = IconVector.StarPoints(cx, cy, radius);
+        for (int i = 0; i < 10; i = i + 1) {
+            int j = (i + 1) % 10;
+            s.DrawLine(pts[i * 2], pts[i * 2 + 1],
+                       pts[j * 2], pts[j * 2 + 1], color, thickness);
+        }
+    }
+
+    /// 对交错顶点做奇偶规则的点在多边形内测试（射线投射）。
+    static bool PtInPoly(List<int> pts, int n, int x, int y) {
+        bool inside = false;
+        int j = n - 1;
+        for (int i = 0; i < n; i = i + 1) {
+            int xi = pts[i * 2];
+            int yi = pts[i * 2 + 1];
+            int xj = pts[j * 2];
+            int yj = pts[j * 2 + 1];
+            if ((yi > y) != (yj > y)) {
+                if (x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
+                    inside = !inside;
+                }
+            }
+            j = i;
+        }
+        return inside;
+    }
+
+    /// 实心五角星：扫描线填充，每段内部像素
+    /// 输出为一个 1px 高的矩形。
+    static void FillStar(Canvas s, int cx, int cy, int radius, int color) {
+        List<int> pts = IconVector.StarPoints(cx, cy, radius);
+        for (int yy = cy - radius; yy <= cy + radius; yy = yy + 1) {
+            bool run = false;
+            int startx = 0;
+            for (int xx = cx - radius; xx <= cx + radius; xx = xx + 1) {
+                if (IconVector.PtInPoly(pts, 10, xx, yy)) {
+                    if (!run) {
+                        run = true;
+                        startx = xx;
+                    }
+                } else if (run) {
+                    s.FillRect(startx, yy, xx - startx, 1, color);
+                    run = false;
+                }
+            }
+            if (run) {
+                s.FillRect(startx, yy, cx + radius - startx + 1, 1, color);
+            }
+        }
+    }
+
+    /// 在 (x,y) 处的 `box` 大小正方形内绘制 `codepoint` 的字形。
+    /// 未知码点不绘制任何内容。
+    static void Draw(Canvas s, int x, int y, int box, int color, int codepoint) {
+        int size = box;
+        if (size < 8) { size = 8; }
+        int pad = size / 6;
+        int x0 = x + pad;
+        int y0 = y + pad;
+        int x1 = x + size - pad;
+        int y1 = y + size - pad;
+        int cx = (x0 + x1) / 2;
+        int cy = (y0 + y1) / 2;
+        int w = x1 - x0;
+        int h = y1 - y0;
+        int thick = size / 10;
+        if (thick < 1) { thick = 1; }
+        int c = color;
+
+        if (codepoint == 0xE8BB || codepoint == 0xEA39) {
+            // close / error：叉形
+            s.DrawLine(x0, y0, x1, y1, c, thick);
+            s.DrawLine(x1, y0, x0, y1, c, thick);
+        } else if (codepoint == 0xE921 || codepoint == 0xE738) {
+            s.DrawLine(x0, cy, x1, cy, c, thick);
+        } else if (codepoint == 0xE922) {
+            s.DrawRect(x0, y0, w, h, c, thick);
+        } else if (codepoint == 0xE923 || codepoint == 0xE8C8) {
+            s.DrawRect(x0 + pad / 2, y0, w - pad / 2, h - pad / 2, c, thick);
+            s.DrawRect(x0, y0 + pad / 2, w - pad / 2, h - pad / 2, c, thick);
+        } else if (codepoint == 0xE73E || codepoint == 0xE930) {
+            s.DrawLine(x0, cy, cx - pad / 3, y1, c, thick);
+            s.DrawLine(cx - pad / 3, y1, x1, y0, c, thick);
+        } else if (codepoint == 0xE710) {
+            s.DrawLine(x0, cy, x1, cy, c, thick);
+            s.DrawLine(cx, y0, cx, y1, c, thick);
+        } else if (codepoint == 0xE76B) {
+            IconVector.Arrow(s, x1, cy, x0, cy, c, thick);
+        } else if (codepoint == 0xE76C) {
+            IconVector.Arrow(s, x0, cy, x1, cy, c, thick);
+        } else if (codepoint == 0xE70E || codepoint == 0xE898) {
+            IconVector.Arrow(s, cx, y1, cx, y0, c, thick);
+        } else if (codepoint == 0xE70D || codepoint == 0xE896) {
+            IconVector.Arrow(s, cx, y0, cx, y1, c, thick);
+        } else if (codepoint == 0xE721) {
+            IconVector.Circle(s, cx - pad / 2, cy - pad / 2, w / 3, c, thick);
+            s.DrawLine(cx + pad / 2, cy + pad / 2, x1, y1, c, thick);
+        } else if (codepoint == 0xE713 || codepoint == 0xE706) {
+            // settings / tools：轮毂加八个放射状齿
+            IconVector.Circle(s, cx, cy, w / 4, c, thick);
+            for (int i = 0; i < 8; i = i + 1) {
+                double a = IconVector.Pi() * (double)i / 4.0;
+                int ax = cx + (int)(Math.Cos(a) * (double)w / 3.0);
+                int ay = cy + (int)(Math.Sin(a) * (double)h / 3.0);
+                int bx = cx + (int)(Math.Cos(a) * (double)w / 2.0);
+                int by = cy + (int)(Math.Sin(a) * (double)h / 2.0);
+                s.DrawLine(ax, ay, bx, by, c, thick);
+            }
+        } else if (codepoint == 0xE77B) {
+            s.FillCircle(cx, y0 + h / 4, w / 6, c);
+            s.FillSector(cx, y1, 0, w / 2, 270, 450, c);
+        } else if (codepoint == 0xEA8F) {
+            IconVector.Circle(s, cx, cy, w / 3, c, thick);
+            s.FillRect(x0, cy, w, h / 3, c);
+            s.FillCircle(cx, y1, thick, c);
+        } else if (codepoint == 0xE7C3) {
+            s.DrawRect(x0, y0, w, h, c, thick);
+            s.DrawLine(x1 - w / 3, y0, x1, y0 + h / 3, c, thick);
+        } else if (codepoint == 0xE8B7) {
+            s.DrawRect(x0, y0 + h / 4, w, h * 3 / 4, c, thick);
+            s.DrawLine(x0, y0 + h / 4, cx, y0 + h / 4, c, thick);
+            s.DrawLine(x0, y0 + h / 4, x0 + w / 4, y0, c, thick);
+            s.DrawLine(x0 + w / 4, y0, cx, y0, c, thick);
+        } else if (codepoint == 0xE80F) {
+            s.DrawLine(x0, cy, cx, y0, c, thick);
+            s.DrawLine(cx, y0, x1, cy, c, thick);
+            s.DrawLine(x0 + pad / 2, cy - pad / 2, x0 + pad / 2, y1, c, thick);
+            s.DrawLine(x1 - pad / 2, cy - pad / 2, x1 - pad / 2, y1, c, thick);
+            s.DrawLine(x0 + pad / 2, y1, x1 - pad / 2, y1, c, thick);
+        } else if (codepoint == 0xE74D) {
+            s.DrawRect(x0 + pad / 2, y0 + pad, w - pad, h - pad, c, thick);
+            s.DrawLine(x0, y0 + pad / 2, x1, y0 + pad / 2, c, thick);
+            s.DrawLine(cx - pad, y0, cx + pad, y0, c, thick);
+        } else if (codepoint == 0xE7B8) {
+            // archive：带拉槽的有盖箱子
+            s.DrawRect(x0, y0, w, h / 4, c, thick);
+            s.DrawRect(x0 + pad / 2, y0 + h / 4, w - pad, h - h / 4, c, thick);
+            s.DrawLine(cx - w / 6, cy + pad / 2, cx + w / 6, cy + pad / 2, c, thick);
+        } else if (codepoint == 0xE70F) {
+            s.DrawLine(x0, y1, x1, y0, c, thick + 1);
+            s.DrawLine(x0, y1, x0 + pad, y1, c, thick);
+        } else if (codepoint == 0xE946) {
+            IconVector.Circle(s, cx, cy, w / 2, c, thick);
+            s.FillCircle(cx, y0 + h / 4, thick, c);
+            s.DrawLine(cx, cy - pad / 3, cx, y1 - pad / 3, c, thick);
+        } else if (codepoint == 0xE7BA) {
+            s.DrawLine(cx, y0, x0, y1, c, thick);
+            s.DrawLine(x0, y1, x1, y1, c, thick);
+            s.DrawLine(x1, y1, cx, y0, c, thick);
+            s.DrawLine(cx, cy - pad / 2, cx, cy + pad / 2, c, thick);
+            s.FillCircle(cx, y1 - pad / 2, thick, c);
+        } else if (codepoint == 0xE735) {
+            IconVector.FillStar(s, cx, cy, w / 2, c);
+        } else if (codepoint == 0xE734) {
+            IconVector.Star(s, cx, cy, w / 2, c, thick);
+        } else if (codepoint == 0xEB51) {
+            s.DrawLine(x0, cy - pad, cx, y1, c, thick);
+            s.DrawLine(cx, y1, x1, cy - pad, c, thick);
+            IconVector.Circle(s, x0 + w / 4, cy - pad, w / 4, c, thick);
+            IconVector.Circle(s, x1 - w / 4, cy - pad, w / 4, c, thick);
+        } else if (codepoint == 0xE8E1) {
+            s.DrawRect(x0 + w / 4, cy - pad, w * 3 / 4, h / 2 + pad, c, thick);
+            s.DrawLine(x0 + w / 4, cy, x0, cy, c, thick + 1);
+            s.DrawLine(x0, cy, x0, y1, c, thick + 1);
+        } else if (codepoint == 0xE787) {
+            s.DrawRect(x0, y0 + pad / 2, w, h - pad / 2, c, thick);
+            s.DrawLine(x0, y0 + h / 3, x1, y0 + h / 3, c, thick);
+            s.DrawLine(x0 + pad, y0, x0 + pad, y0 + pad, c, thick);
+            s.DrawLine(x1 - pad, y0, x1 - pad, y0 + pad, c, thick);
+        } else if (codepoint == 0xE823) {
+            IconVector.Circle(s, cx, cy, w / 2, c, thick);
+            s.DrawLine(cx, cy, cx, y0 + pad, c, thick);
+            s.DrawLine(cx, cy, x1 - pad, cy, c, thick);
+        } else if (codepoint == 0xEB9F) {
+            s.DrawRect(x0, y0, w, h, c, thick);
+            s.FillCircle(x1 - pad, y0 + pad, thick + 1, c);
+            s.DrawLine(x0 + pad, y1 - pad, cx, cy, c, thick);
+            s.DrawLine(cx, cy, x1 - pad, y1 - pad, c, thick);
+        } else if (codepoint == 0xE72C || codepoint == 0xE7A7
+                   || codepoint == 0xE7A6) {
+            IconVector.Circle(s, cx, cy, w / 2, c, thick);
+            IconVector.Arrow(s, x1, cy, x1 - pad, y0, c, thick);
+        } else if (codepoint == 0xE712) {
+            s.FillCircle(x0 + pad, cy, thick + 1, c);
+            s.FillCircle(cx, cy, thick + 1, c);
+            s.FillCircle(x1 - pad, cy, thick + 1, c);
+        } else if (codepoint == 0xE700) {
+            s.DrawLine(x0, y0 + pad, x1, y0 + pad, c, thick);
+            s.DrawLine(x0, cy, x1, cy, c, thick);
+            s.DrawLine(x0, y1 - pad, x1, y1 - pad, c, thick);
+        } else if (codepoint == 0xE7B3) {
+            s.DrawLine(x0, cy, cx, y0 + pad, c, thick);
+            s.DrawLine(cx, y0 + pad, x1, cy, c, thick);
+            s.DrawLine(x1, cy, cx, y1 - pad, c, thick);
+            s.DrawLine(cx, y1 - pad, x0, cy, c, thick);
+            s.FillCircle(cx, cy, w / 8, c);
+        } else if (codepoint == 0xE72E) {
+            s.DrawRect(x0, cy - pad / 2, w, h / 2 + pad / 2, c, thick);
+            IconVector.Circle(s, cx, cy - pad / 2, w / 4, c, thick);
+        } else if (codepoint == 0xE715) {
+            s.DrawRect(x0, y0, w, h, c, thick);
+            s.DrawLine(x0, y0, cx, cy, c, thick);
+            s.DrawLine(cx, cy, x1, y0, c, thick);
+        } else if (codepoint == 0xE708) {
+            IconVector.Circle(s, cx, cy, w / 2, c, thick);
+            IconVector.Circle(s, cx + pad, cy - pad, w / 2, c, thick);
+        } else if (codepoint == 0xE718 || codepoint == 0xE77A) {
+            s.FillCircle(cx, y0 + h / 3, w / 4, c);
+            s.DrawLine(cx, cy, cx, y1, c, thick);
+        } else if (codepoint == 0xE71C) {
+            s.DrawLine(x0, y0, x1, y0, c, thick);
+            s.DrawLine(x1, y0, cx + pad / 2, cy, c, thick);
+            s.DrawLine(cx + pad / 2, cy, cx + pad / 2, y1, c, thick);
+        } else if (codepoint == 0xE8CB) {
+            IconVector.Arrow(s, x0 + pad, y1, x0 + pad, y0, c, thick);
+            IconVector.Arrow(s, x1 - pad, y0, x1 - pad, y1, c, thick);
+        } else if (codepoint == 0xE80A || codepoint == 0xF0E2
+                   || codepoint == 0xE8A1) {
+            s.DrawRect(x0, y0, w, h, c, thick);
+            s.DrawLine(cx, y0, cx, y1, c, thick);
+            s.DrawLine(x0, cy, x1, cy, c, thick);
+        } else if (codepoint == 0xE768) {
+            s.DrawLine(x0 + pad, y0, x0 + pad, y1, c, thick);
+            s.DrawLine(x0 + pad, y0, x1, cy, c, thick);
+            s.DrawLine(x1, cy, x0 + pad, y1, c, thick);
+        } else if (codepoint == 0xE769) {
+            s.FillRect(x0 + pad, y0, thick * 2, h, c);
+            s.FillRect(x1 - pad - thick * 2, y0, thick * 2, h, c);
+        } else if (codepoint == 0xE71A) {
+            s.FillRect(x0, y0, w, h, c);
+        } else if (codepoint == 0xEBE8) {
+            IconVector.Circle(s, cx, cy, w / 3, c, thick);
+            s.DrawLine(x0, y0, x0 + pad, cy, c, thick);
+            s.DrawLine(x1, y0, x1 - pad, cy, c, thick);
+            s.DrawLine(x0, y1, x0 + pad, cy, c, thick);
+            s.DrawLine(x1, y1, x1 - pad, cy, c, thick);
+        } else if (codepoint == 0xE943) {
+            s.DrawLine(cx - pad, y0, x0, cy, c, thick);
+            s.DrawLine(x0, cy, cx - pad, y1, c, thick);
+            s.DrawLine(cx + pad, y0, x1, cy, c, thick);
+            s.DrawLine(x1, cy, cx + pad, y1, c, thick);
+        } else if (codepoint == 0xE74E) {
+            s.DrawRect(x0, y0, w, h, c, thick);
+            s.DrawRect(x0 + pad, y0, w - 2 * pad, h / 3, c, thick);
+            s.DrawRect(x0 + pad, cy, w - 2 * pad, h / 3, c, thick);
+        } else if (codepoint == 0xE8C6) {
+            s.DrawLine(x0, y0, x1, y1, c, thick);
+            s.DrawLine(x1, y0, x0, y1, c, thick);
+            IconVector.Circle(s, x0 + pad, y1 - pad, pad, c, thick);
+            IconVector.Circle(s, x1 - pad, y1 - pad, pad, c, thick);
+        } else if (codepoint == 0xE77F) {
+            s.DrawRect(x0, y0 + pad, w, h - pad, c, thick);
+            s.DrawRect(cx - pad, y0, pad * 2, pad * 2, c, thick);
+        } else if (codepoint == 0xE8B3) {
+            s.DrawRect(x0, y0, w, h, c, thick);
+            s.DrawRect(x0 + pad, y0 + pad, w - 2 * pad, h - 2 * pad, c, thick);
+        } else if (codepoint == 0xE8D2) {
+            s.DrawLine(x0, y1, cx, y0, c, thick);
+            s.DrawLine(cx, y0, x1, y1, c, thick);
+            s.DrawLine(x0 + pad, cy + pad, x1 - pad, cy + pad, c, thick);
+        } else if (codepoint == 0xE790) {
+            IconVector.Circle(s, cx, cy, w / 2, c, thick);
+            s.FillCircle(cx - pad, cy - pad, thick + 1, c);
+            s.FillCircle(cx + pad, cy - pad, thick + 1, c);
+            s.FillCircle(cx, cy + pad, thick + 1, c);
+        } else if (codepoint == 0xF101) {
+            // 向下箭头
+            s.DrawLine(x0, cy - h / 6, cx, cy + h / 6, c, thick);
+            s.DrawLine(cx, cy + h / 6, x1, cy - h / 6, c, thick);
+        } else if (codepoint == 0xF103) {
+            // 向上箭头
+            s.DrawLine(x0, cy + h / 6, cx, cy - h / 6, c, thick);
+            s.DrawLine(cx, cy - h / 6, x1, cy + h / 6, c, thick);
+        } else if (codepoint == 0xF102) {
+            // 向右箭头
+            s.DrawLine(cx - w / 6, y0, cx + w / 6, cy, c, thick);
+            s.DrawLine(cx + w / 6, cy, cx - w / 6, y1, c, thick);
+        } else if (codepoint == 0xF104) {
+            // 向左箭头
+            s.DrawLine(cx + w / 6, y0, cx - w / 6, cy, c, thick);
+            s.DrawLine(cx - w / 6, cy, cx + w / 6, y1, c, thick);
+        } else if (codepoint == 0xE7C9) {
+            // 抓手/平移：四向箭头
+            IconVector.Arrow(s, cx, cy, cx, y0, c, thick);
+            IconVector.Arrow(s, cx, cy, cx, y1, c, thick);
+            IconVector.Arrow(s, cx, cy, x0, cy, c, thick);
+            IconVector.Arrow(s, cx, cy, x1, cy, c, thick);
+        } else if (codepoint == 0xE8E4 || codepoint == 0xE8E3
+                   || codepoint == 0xE8E2) {
+            // 横向对齐：一条基准边 + 三条长短不一的横条，
+            // 左/中/右分别贴左、居中、贴右。
+            int rows = 3;
+            int rh = h / 5;
+            if (rh < thick) { rh = thick; }
+            List<int> lens = new List<int>{ w, w * 3 / 5, w * 4 / 5 };
+            if (codepoint == 0xE8E4) { s.FillRect(x0, y0, thick, h, c); }
+            else if (codepoint == 0xE8E2) { s.FillRect(x1 - thick, y0, thick, h, c); }
+            else { s.FillRect(cx - thick / 2, y0, thick, h, c); }
+            for (int r = 0; r < rows; r = r + 1) {
+                int lw = lens[r] - thick * 2;
+                if (lw < thick) { lw = thick; }
+                int ry = y0 + r * (h - rh) / 2;
+                int rx = x0 + thick;
+                if (codepoint == 0xE8E2) { rx = x1 - thick - lw; }
+                else if (codepoint == 0xE8E3) { rx = cx - lw / 2; }
+                s.FillRect(rx, ry, lw, rh, c);
+            }
+        } else if (codepoint == 0xF210 || codepoint == 0xF211
+                   || codepoint == 0xF212) {
+            // 纵向对齐（设计器自用码点）：一条基准边 +
+            // 三条竖条，上/中/下分别贴顶、居中、贴底。
+            int cwid = w / 5;
+            if (cwid < thick) { cwid = thick; }
+            List<int> lens2 = new List<int>{ h, h * 3 / 5, h * 4 / 5 };
+            if (codepoint == 0xF210) { s.FillRect(x0, y0, w, thick, c); }
+            else if (codepoint == 0xF212) { s.FillRect(x0, y1 - thick, w, thick, c); }
+            else { s.FillRect(x0, cy - thick / 2, w, thick, c); }
+            for (int r2 = 0; r2 < 3; r2 = r2 + 1) {
+                int lh = lens2[r2] - thick * 2;
+                if (lh < thick) { lh = thick; }
+                int rx2 = x0 + r2 * (w - cwid) / 2;
+                int ry2 = y0 + thick;
+                if (codepoint == 0xF212) { ry2 = y1 - thick - lh; }
+                else if (codepoint == 0xF211) { ry2 = cy - lh / 2; }
+                s.FillRect(rx2, ry2, cwid, lh, c);
+            }
+        } else if (codepoint == 0xE774) {
+            // globe：圆圈 + 赤道 + 经线 + 两条纬线
+            IconVector.Circle(s, cx, cy, w / 2, c, thick);
+            s.DrawLine(x0, cy, x1, cy, c, thick);
+            s.DrawLine(cx, y0, cx, y1, c, thick);
+            s.DrawLine(cx - w / 3, cy - h / 4, cx + w / 3, cy - h / 4, c, thick);
+            s.DrawLine(cx - w / 3, cy + h / 4, cx + w / 3, cy + h / 4, c, thick);
+        } else if (codepoint == 0xE9D2) {
+            s.DrawLine(x0, y1 - h / 6, x0 + w / 3, cy, c, thick);
+            s.DrawLine(x0 + w / 3, cy, cx + w / 6, y0 + h / 6, c, thick);
+            s.DrawLine(cx + w / 6, y0 + h / 6, x1, cy + h / 8, c, thick);
+        } else if (codepoint == 0xE9D3) {
+            int bw = w / 5;
+            if (bw < thick) { bw = thick; }
+            s.FillRect(x0, cy, bw, y1 - cy, c);
+            s.FillRect(cx - bw / 2, y0 + h / 5, bw, y1 - (y0 + h / 5), c);
+            s.FillRect(x1 - bw, y0 + h / 3, bw, y1 - (y0 + h / 3), c);
+        }
+    }
+}

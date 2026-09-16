@@ -1,0 +1,93 @@
+using System;
+using System.Json;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+/// <summary>在写临界区内根据当前文档计算新文档
+/// （id 不存在时为 null）。返回 null 表示保持
+/// 文档不变。</summary>
+delegate JsonValue DocUpdater(JsonValue current);
+
+/// <summary>
+/// 嵌入式文档数据库，存储原生 Zan 值树（JsonValue：
+/// 整数、浮点数、布尔、字符串、嵌套对象、数组）——无 ORM 映射、
+/// 无 SQL 字符串。单文件 + WAL、崩溃安全的原子提交、LRU 页
+/// 缓存，且内存有硬上限。
+///
+///   ZanDatabase db = ZanDatabase.Open("app.zdb");
+///   Collection users = db.GetCollection("users");
+///   JsonValue u = JsonValue.NewObject();
+///   u.Put("name", JsonValue.NewStr("alice"));
+///   u.Put("age", JsonValue.NewNum("30"));
+///   int id = users.Insert(u);
+///   JsonValue back = users.FindById(id);
+///   db.Close();
+/// </summary>
+class ZanDatabase {
+    KvStore kv;
+    AsyncRwLock rw;
+    List<string> colNames;
+    List<Collection> cols;
+    string lastError;
+
+    ZanDatabase() {
+        this.colNames = new List<string>();
+        this.cols = new List<Collection>();
+        this.lastError = "";
+    }
+
+    /// <summary>以默认参数打开（不存在则创建）：256 页缓存、
+    /// 每次提交都 fsync。</summary>
+    static ZanDatabase Open(string path) {
+        return ZanDatabase.Open(path, 256);
+    }
+
+    /// 以显式页缓存容量打开（不存在则创建）；打开失败时
+    /// <see cref="IsOpen"/> 为 false，原因见 <see cref="GetError"/>。
+    static ZanDatabase Open(string path, int cachePages) {
+        ZanDatabase d = new ZanDatabase();
+        d.kv = KvStore.Open(path, cachePages);
+        if (!d.kv.IsOpen()) { d.lastError = d.kv.GetError(); }
+        d.rw = new AsyncRwLock();
+        return d;
+    }
+
+    /// 打开是否成功（失败原因见 <see cref="GetError"/>）。
+    bool IsOpen() { return this.lastError.Length == 0 && this.kv.IsOpen(); }
+
+    /// 打开失败的错误文本；成功时为空串。
+    string GetError() { return this.lastError; }
+
+    /// <summary>fsync 频率：1 = 每次提交，N = 分组提交。</summary>
+    void SetSyncEvery(int n) { this.kv.SetSyncEvery(n); }
+
+    /// <summary>返回指定名称的文档集合（惰性创建）。</summary>
+    Collection GetCollection(string name) {
+        for (int i = 0; i < this.colNames.Count; i = i + 1) {
+            if (this.colNames[i] == name) { return this.cols[i]; }
+        }
+        Collection c = Collection.Attach(this.kv, this.rw, name);
+        this.colNames.Add(name);
+        this.cols.Add(c);
+        return c;
+    }
+
+    /// <summary>直接访问底层的键/值存储。</summary>
+    KvStore Kv() { return this.kv; }
+
+    /// <summary>将后续写入批量合并为一次原子提交。</summary>
+    void Begin() { this.kv.Begin(); }
+
+    /// 提交 <see cref="Begin"/> 以来的全部写入；返回是否成功落盘。
+    bool Commit() { return this.kv.Commit(); }
+
+    /// 将迄今写入的内容强制落盘到稳定存储。
+    void Checkpoint() { this.kv.Checkpoint(); }
+
+    /// 关闭底层存储与读写锁。
+    void Close() {
+        this.kv.Close();
+        this.rw.Close();
+    }
+}

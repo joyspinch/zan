@@ -1,0 +1,3264 @@
+using System;
+using System.Json;
+
+namespace Gui;
+
+/// CSS 声明级联，应用于已解析的 StyleBox（
+/// 皮肤路径，每个控件通过 Style 使用）或 retained-mode Control
+/// （在 UiDoc 构建期间）。
+///
+/// 样式表是 selector -> declaration-block 映射。选择器保留 CSS
+/// 拼写（`button`、`.primary`、`button.primary`、`#save`），并可能带有
+/// `:state` 后缀（`:hover`、`:active`、`:focus`、`:disabled`、`:selected`、
+/// `:checked`）。特异性按 type -> class -> type.class -> id 递增，状态
+/// 规则叠加在基础外观之上，所以 `button:hover` 只需注明
+/// 变化的部分。
+///
+/// 值是真正的 CSS：颜色用 `#rgb / #rrggbb / #aarrggbb / rgb() / rgba() /
+/// hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
+/// `120ms / 0.2s`、`linear-gradient(...)`、`box-shadow: x y blur color`、
+/// `backdrop-filter: blur(20px)`、`transform: translate/scale/rotate`、flex
+/// 布局、排版和 `animation: <name> <dur> <easing>`。
+class StyleSheet {
+    JsonValue rules;
+    /// 解析后保留的 `:root` 自定义属性（`--name` -> 值），这样
+    /// 皮肤除了控件规则外，也能供给语义化 Theme token。
+    JsonValue vars;
+    /// 下次 Apply 在普通选择器之外还要解析的伪状态
+    /// （“hover”、“active”、“focus”、“disabled”；“” = 仅基础外观）。
+    string state;
+
+    // ---- 选择器索引（级联）----
+    // 选择器一次性解析为各组成部分，解析就是真正的匹配
+    // （“这条规则是否适用于这个控件？”），而不是查少数几个
+    // 解析器认为值得尝试的选择器拼写。这正是
+    // 复合选择器（`button.ghost.primary:hover`）能生效，以及
+    // 组件默认外观可以放在样式表而非代码中的原因。
+    List<string> selText;
+    /// 已解析的选择器对象（与 selText/selBlock 对齐）。选择器语法
+    /// （`*`、属性条件、`:not()/:is()`）全在 Selector 里求值，
+    /// 这里不再维护平行的手抄字段。
+    List<Selector> selObjs;
+    int indexedCount;
+    /// 每条规则的声明块，索引与上面的选择器表对齐：匹配后直接取，
+    /// 不再按选择器文本回查 rules（一次首帧解析要按名字查上百次）。
+    List<JsonValue> selBlock;
+    /// 每条规则里 `!important` 那部分声明（无则 null），与 selBlock 对齐。
+    List<JsonValue> selImportant;
+    /// 按类型名分桶的规则下标（升序，因此与 anyType 归并后仍是级联顺序）。
+    /// 一个控件只需看自己类型那一桶加上无类型的那些规则，
+    /// 而不是每次解析都扫全表——冷解析（首帧、换肤）的主要成本在此。
+    Dict<string, List<int>> byType;
+    /// 没有类型选择器的规则下标（`.primary`、`#save`、`::option`）。
+    List<int> anyType;
+
+    /// 解析时被跳过的 at-rule 块数（`@media` / `@keyframes` / …）。
+    /// 跳过是浏览器行为，但"跳过了多少"必须能看见——否则一整块
+    /// 响应式样式消失时，皮肤作者只会以为引擎支持它。
+    int atRulesDropped;
+    /// 被跳过的 at-rule 按名字计数（`media` -> 3），供 Lint 说明丢的是什么。
+    Dict<string, int> atRuleKinds;
+    /// 因 `@supports` 守卫在本引擎上判假而跳过的块数（守卫成立时块会
+    /// 展开，所以这不是"不支持 @supports"，Lint 里与 atRulesDropped 分开报）。
+    int atGuardsSkipped;
+    /// 判假的守卫条件原文计数（`(display: grid)` -> 2）。
+    Dict<string, int> atRuleGuards;
+
+    /// 词法上认不出（选择器含组合器/伪元素等）而被丢弃的规则文本。
+    /// 与 atRulesDropped 一起供 StyleSheet.Lint 报告。
+    List<string> lintDropped;
+    /// 语法接受、但引擎判定永不匹配的选择器（结构性伪类、未知伪类、
+    /// `::before`/`::after`、无法求值的 `:not()`），形如
+    /// `sel  [never: 原因]`。这些以前是静默的——Lint 现在把它们列出来。
+    List<string> lintNever;
+    /// 声明了、但 Decl 一条都没消费掉的规则文本。
+    List<string> lintUnused;
+    /// 值里带了引擎解析不了的长度单位（`em`/`rem`/`pt`/`calc()` 等），
+    /// 会被当裸数字用：形如 `sel  [unit: key: value]`。这是审计里
+    /// "最危险的一类"静默失败，Lint 把它点名。
+    List<string> lintValue;
+    /// 规则里出现了"收了但不生效"的属性（box-sizing / float），
+    /// 形如 `sel  [inert: float]`。
+    List<string> lintInert;
+    /// lintDropped/lintUnused 已收集到的 rules 代数。
+    int lintGen;
+    /// 索引建立时置位：表里存在依赖树上下文的选择器（组合器链或
+    /// 结构性伪类）。这类规则只在 retained 控件树上命中，且命中结果
+    /// 随节点位置变化——Style.Resolve 因此把位置签名加进缓存键。
+    bool relational;
+
+    // ---- @media 规则（运行期按窗口/主题求值）----
+    // 与 rules 分开存：同一选择器可能同时有守卫/无守卫两份声明，
+    // 键控表无法表达；平行表按文档序线性扫，只在 HasMedia 时付出代价。
+    /// 已解析选择器（与 mediaBlocks/mediaConds 对齐）。
+    List<Selector> mediaSels;
+    /// 各条媒体规则的声明块与 !important 部分。
+    List<JsonValue> mediaBlocks;
+    List<JsonValue> mediaImportants;
+    /// 各条媒体规则的守卫条件。
+    List<MediaCond> mediaConds;
+    /// 收到的媒体块数（含内层规则展开前的块数口径不好对齐，
+    /// 这里计"带条件的规则条数"）。
+    int mediaCount;
+
+    /// 构造空表（规则/变量为空 JSON 对象，索引延迟建立）。
+    StyleSheet() {
+        this.rules = JsonValue.NewObject();
+        this.vars = JsonValue.NewObject();
+        this.state = "";
+        this.indexedCount = 0 - 1;
+        this.atRulesDropped = 0;
+        this.atRuleKinds = new Dict<string, int>();
+        this.atGuardsSkipped = 0;
+        this.atRuleGuards = new Dict<string, int>();
+        this.lintGen = 0 - 1;
+    }
+
+    /// 记下一条被跳过的 at-rule（Css 解析器调用）。
+    void NoteAtRule(string name) {
+        this.atRulesDropped = this.atRulesDropped + 1;
+        if (this.atRuleKinds == null) { this.atRuleKinds = new Dict<string, int>(); }
+        int cur = 0;
+        if (this.atRuleKinds.TryGetValue(name, out cur)) {
+            this.atRuleKinds[name] = cur + 1;
+        } else {
+            this.atRuleKinds.Add(name, 1);
+        }
+    }
+
+    /// 记下一条 `@supports` 守卫判假而跳过的块（条件原文作键）。
+    /// 守卫成立时块是会展开的，所以这条不走 NoteAtRule——否则 Lint
+    /// 会把它说成"@supports 不支持"，而作者明明写对了语法。
+    void NoteGuard(string cond) {
+        this.atGuardsSkipped = this.atGuardsSkipped + 1;
+        if (this.atRuleGuards == null) { this.atRuleGuards = new Dict<string, int>(); }
+        string name = Css.Trim(cond);
+        int cur = 0;
+        if (this.atRuleGuards.TryGetValue(name, out cur)) {
+            this.atRuleGuards[name] = cur + 1;
+        } else {
+            this.atRuleGuards.Add(name, 1);
+        }
+    }
+
+    /// 解析以 CSS 文本编写的样式表（见 Css）。皮肤以 `.css` 文件发布，
+    /// 以便在不重新构建应用的情况下编写和替换。
+    static StyleSheet FromCss(string src) {
+        return Css.Parse(src);
+    }
+
+    /// 收一条带媒体条件的规则（Css 解析 @media 时调用）。同一选择器
+    /// 的媒体规则按文档顺序追加（后写的胜出）；选择器解析失败按
+    /// CSS 语义整条丢弃，但同时报进 lintDropped。
+    void AddMediaRule(string sel, JsonValue block, MediaCond cond) {
+        Selector p = Selector.Parse(sel);
+        if (p == null) {
+            if (this.lintDropped == null) { this.lintDropped = new List<string>(); }
+            this.lintDropped.Add(sel);
+            return;
+        }
+        if (p.Relational()) { this.relational = true; }
+        if (this.mediaSels == null) {
+            this.mediaSels = new List<Selector>();
+            this.mediaBlocks = new List<JsonValue>();
+            this.mediaImportants = new List<JsonValue>();
+            this.mediaConds = new List<MediaCond>();
+        }
+        this.mediaSels.Add(p);
+        this.mediaBlocks.Add(block);
+        this.mediaImportants.Add(block.Get("__zan_important"));
+        this.mediaConds.Add(cond);
+        this.mediaCount = this.mediaCount + 1;
+    }
+
+    /// 表里是否有需要运行期求值的媒体规则。
+    bool HasMedia() {
+        return this.mediaSels != null && this.mediaSels.Count > 0;
+    }
+
+    /// 在 ApplyCascade/ApplyImportant 的主循环之后套用媒体规则：
+    /// 守卫成立且选择器命中才生效。媒体规则整体排在常驻规则之后
+    /// （近似文档序，与 @layer 摊平同一档的简化）。
+    void ApplyMedia(StyleBox b, string type, List<string> want, string cls,
+                    string id, string part, int stateBits, Control node,
+                    bool importantPass) {
+        if (this.mediaSels == null) { return; }
+        for (int i = 0; i < this.mediaSels.Count; i = i + 1) {
+            if (!this.mediaConds[i].True(b)) { continue; }
+            if (!this.mediaSels[i].MatchNodeCtx(type, want, cls, id, part,
+                                                stateBits, node)) {
+                continue;
+            }
+            if (importantPass) {
+                JsonValue imp = this.mediaImportants[i];
+                if (imp == null || !imp.IsObject()) { continue; }
+                for (int k = 0; k < imp.Count(); k = k + 1) {
+                    string key = imp.KeyAt(k);
+                    StyleSheet.DeclSource(b, key, StyleSheet.ValStr(imp.ValAt(k)),
+                                          StyleSheet.IsPrescaled(
+                                              this.mediaBlocks[i], key));
+                }
+            } else {
+                this.ApplyDecls(b, this.mediaBlocks[i]);
+            }
+        }
+    }
+
+    /// 将另一张表的规则和自定义属性叠加到当前表上
+    /// （另一张表优先），这样应用样式表可以重新应用
+    /// 到当前激活的皮肤之上，而不会被其替换。
+    void MergeSheet(StyleSheet other) {
+        if (other == null) { return; }
+        for (int i = 0; i < other.rules.Count(); i = i + 1) {
+            Css.MergeInto(this, other.rules.KeyAt(i), other.rules.ValAt(i));
+        }
+        for (int j = 0; j < other.vars.Count(); j = j + 1) {
+            vars.Set(other.vars.KeyAt(j), other.vars.ValAt(j));
+        }
+        this.atRulesDropped = this.atRulesDropped + other.atRulesDropped;
+        if (other.atRuleKinds != null && other.atRuleKinds.Count > 0) {
+            List<string> kinds = other.atRuleKinds.Keys;
+            for (int a = 0; a < kinds.Count; a = a + 1) {
+                string kind = kinds[a];
+                int add = 0;
+                other.atRuleKinds.TryGetValue(kind, out add);
+                int cur = 0;
+                if (this.atRuleKinds.TryGetValue(kind, out cur)) {
+                    this.atRuleKinds[kind] = cur + add;
+                } else {
+                    this.atRuleKinds.Add(kind, add);
+                }
+            }
+        }
+        this.atGuardsSkipped = this.atGuardsSkipped + other.atGuardsSkipped;
+        if (other.atRuleGuards != null && other.atRuleGuards.Count > 0) {
+            List<string> conds = other.atRuleGuards.Keys;
+            for (int c = 0; c < conds.Count; c = c + 1) {
+                string cond = conds[c];
+                int add = 0;
+                other.atRuleGuards.TryGetValue(cond, out add);
+                int cur = 0;
+                if (this.atRuleGuards.TryGetValue(cond, out cur)) {
+                    this.atRuleGuards[cond] = cur + add;
+                } else {
+                    this.atRuleGuards.Add(cond, add);
+                }
+            }
+        }
+        if (other.mediaSels != null && other.mediaSels.Count > 0) {
+            if (this.mediaSels == null) {
+                this.mediaSels = new List<Selector>();
+                this.mediaBlocks = new List<JsonValue>();
+                this.mediaImportants = new List<JsonValue>();
+                this.mediaConds = new List<MediaCond>();
+            }
+            for (int m = 0; m < other.mediaSels.Count; m = m + 1) {
+                this.mediaSels.Add(other.mediaSels[m]);
+                this.mediaBlocks.Add(other.mediaBlocks[m]);
+                this.mediaImportants.Add(other.mediaImportants[m]);
+                this.mediaConds.Add(other.mediaConds[m]);
+            }
+            this.mediaCount = this.mediaCount + other.mediaCount;
+            if (other.relational) { this.relational = true; }
+        }
+        this.indexedCount = 0 - 1;
+    }
+
+    /// 从 JSON 源字符串解析样式表。格式错误 / 非对象的
+    /// 文档会产生空样式表，因此坏文件永远不会中断加载。
+    static StyleSheet FromJson(string src) {
+        StyleSheet s = new StyleSheet();
+        JsonValue v = JsonValue.ParseLenient(src);
+        if (v != null && v.IsObject()) { s.rules = v; }
+        return s;
+    }
+
+    /// 样式表完全没有规则时为 true（应用未加载皮肤）。
+    bool IsEmpty() {
+        return rules == null || rules.Count() == 0;
+    }
+
+    /// 解析/合并这张表时丢掉了什么，人话列表；空 = 全部生效。
+    /// 见 CollectLint 的判定口径。
+    List<string> Audit() {
+        return this.Lint();
+    }
+
+    /// `:root` 自定义属性的值（`Var("--accent")`），不存在时返回“”。
+    string Var(string name) {
+        if (vars == null) { return ""; }
+        JsonValue v = vars.Get(name);
+        if (v == null) { return ""; }
+        return v.AsString("");
+    }
+
+    /// 单个选择器的声明块（选择器不存在时为 null）。
+    JsonValue Block(string selector) {
+        if (rules == null) { return null; }
+        JsonValue block = rules.Get(selector);
+        if (block == null || !block.IsObject()) { return null; }
+        return block;
+    }
+
+    // ---- StyleBox 应用（皮肤路径）----
+
+    /// 将一个选择器的声明叠加到已解析的样式盒上。未知
+    /// 属性在此忽略（它们是控件属性，由
+    /// ApplySelector 处理）。`!important` 的声明放在最后再套一遍，
+    /// 与 StyleSheet.ApplyMatch 的级联顺序一致。
+    void ApplyBox(StyleBox b, string selector) {
+        JsonValue block = this.Block(selector);
+        if (block == null) { return; }
+        for (int i = 0; i < block.Count(); i = i + 1) {
+            string k = block.KeyAt(i);
+            if (k == "__zan_prescaled" || k == "__zan_important") { continue; }
+            JsonValue v = block.ValAt(i);
+            StyleSheet.DeclSource(b, k, StyleSheet.ValStr(v),
+                                  StyleSheet.IsPrescaled(block, k));
+        }
+        JsonValue imp = block.Get("__zan_important");
+        if (imp != null && imp.IsObject()) {
+            for (int j = 0; j < imp.Count(); j = j + 1) {
+                string k = imp.KeyAt(j);
+                StyleSheet.DeclSource(b, k, StyleSheet.ValStr(imp.ValAt(j)),
+                                      StyleSheet.IsPrescaled(block, k));
+            }
+        }
+        StyleSheet.ResolveCurrentColor(b);
+    }
+
+    // ---- 级联 -----
+
+    /// 将匹配控件的每条规则应用到 `b`，最弱的匹配优先，
+    /// 因此最具体的声明胜出。`classes` 是控件的 class
+    /// 列表，`part` 选择 `type::part` 规则（“”表示控件本身），
+    /// `stateBits` 是 Style.S* 掩码。
+    ///
+    /// 排序以状态为主：所有无状态规则先应用（按 CSS
+    /// 特异性：type < class < class chain < id），然后是每个
+    /// 活动状态的规则，因此无论作者把 `:hover` 放在文件
+    /// 何处，它都只需注明变化的部分。
+    void ApplyMatch(StyleBox b, string type, string cls, string id, string part,
+                    int stateBits) {
+        this.ApplyMatchCtx(b, type, cls, id, part, stateBits, null);
+    }
+
+    /// ApplyMatch 的树上下文版本：`node` 是主体控件（retained 树），
+    /// 组合器链与结构性伪类按真实树求值；immediate 路径传 null，
+    /// 这类选择器不命中（规则不丢）。
+    void ApplyMatchCtx(StyleBox b, string type, string cls, string id,
+                       string part, int stateBits, Control node) {
+        this.Index();
+        this.ApplyCascadeCtx(b, type, cls, id, part, stateBits, node);
+        this.ApplyImportantCtx(b, type, cls, id, part, stateBits, node);
+        StyleSheet.ResolveCurrentColor(b);
+    }
+
+    /// 普通声明（不含 `!important`）的级联。
+    void ApplyCascade(StyleBox b, string type, string cls, string id, string part,
+                      int stateBits) {
+        this.ApplyCascadeCtx(b, type, cls, id, part, stateBits, null);
+    }
+
+    void ApplyCascadeCtx(StyleBox b, string type, string cls, string id,
+                         string part, int stateBits, Control node) {
+        List<string> want = Style.Classes(cls);
+        List<int> typed = null;
+        if (type != "") { this.byType.TryGetValue(type, out typed); }
+        int a = 0;
+        int c = 0;
+        bool more = true;
+        while (more) {
+            int ia = 0 - 1;
+            int ic = 0 - 1;
+            if (typed != null && a < typed.Count) { ia = typed[a]; }
+            if (c < anyType.Count) { ic = anyType[c]; }
+            if (ia < 0 && ic < 0) {
+                more = false;
+            } else {
+                int i;
+                if (ic < 0 || (ia >= 0 && ia < ic)) { i = ia; a = a + 1; }
+                else { i = ic; c = c + 1; }
+                if (this.MatchesCtx(i, type, want, id, part, stateBits, cls, node)) {
+                    this.ApplyDecls(b, selBlock[i]);
+                }
+            }
+        }
+        this.ApplyMedia(b, type, want, cls, id, part, stateBits, node, false);
+    }
+
+    /// 把匹配规则里 `!important` 的声明再套一遍。`!important` 的
+    /// 权重高于一切——包括宿主写下的 inline 样式——所以它必须跑在
+    /// 普通级联（以及 inline）之后，而不是像以前那样被剥掉标记、
+    /// 混在普通声明里按顺序碰运气。
+    void ApplyImportant(StyleBox b, string type, string cls, string id,
+                        string part, int stateBits) {
+        this.ApplyImportantCtx(b, type, cls, id, part, stateBits, null);
+    }
+
+    void ApplyImportantCtx(StyleBox b, string type, string cls, string id,
+                           string part, int stateBits, Control node) {
+        List<string> want = Style.Classes(cls);
+        List<int> typed = null;
+        if (type != "") { this.byType.TryGetValue(type, out typed); }
+        int a = 0;
+        int c = 0;
+        bool more = true;
+        while (more) {
+            int ia = 0 - 1;
+            int ic = 0 - 1;
+            if (typed != null && a < typed.Count) { ia = typed[a]; }
+            if (c < anyType.Count) { ic = anyType[c]; }
+            if (ia < 0 && ic < 0) {
+                more = false;
+            } else {
+                int i;
+                if (ic < 0 || (ia >= 0 && ia < ic)) { i = ia; a = a + 1; }
+                else { i = ic; c = c + 1; }
+                if (!this.MatchesCtx(i, type, want, id, part, stateBits, cls,
+                                     node)) {
+                    continue;
+                }
+                JsonValue imp = selImportant[i];
+                if (imp == null || !imp.IsObject()) { continue; }
+                for (int k = 0; k < imp.Count(); k = k + 1) {
+                    string key = imp.KeyAt(k);
+                    StyleSheet.DeclSource(b, key, StyleSheet.ValStr(imp.ValAt(k)),
+                                          StyleSheet.IsPrescaled(selBlock[i], key));
+                }
+            }
+        }
+        this.ApplyMedia(b, type, want, cls, id, part, stateBits, node, true);
+    }
+
+    /// 把已经取到的声明块叠加到样式盒上（`!important` 由
+    /// ApplyImportant 另行处理，这里跳过）。
+    void ApplyDecls(StyleBox b, JsonValue block) {
+        if (block == null) { return; }
+        for (int i = 0; i < block.Count(); i = i + 1) {
+            string k = block.KeyAt(i);
+            if (k == "__zan_prescaled" || k == "__zan_important") { continue; }
+            StyleSheet.DeclSource(b, k, StyleSheet.ValStr(block.ValAt(i)),
+                                  StyleSheet.IsPrescaled(block, k));
+        }
+    }
+
+    /// 规则 `i` 是否选中给定的控件/部件/状态。选择器的全部条件
+    /// （类型/类/id/部件/伪状态/属性/`:not()`）都交给 Selector 求值。
+    bool Matches(int i, string type, List<string> classes, string id,
+                 string part, int stateBits, string cls) {
+        return this.MatchesCtx(i, type, classes, id, part, stateBits, cls, null);
+    }
+
+    /// Matches 的树上下文版本（组合器链/结构性伪类在 retained 树上求值）。
+    bool MatchesCtx(int i, string type, List<string> classes, string id,
+                    string part, int stateBits, string cls, Control node) {
+        return selObjs[i].MatchNodeCtx(type, classes, cls, id, part,
+                                       stateBits, node);
+    }
+
+    /// 表里是否有依赖树上下文的选择器（首次调用建立索引）。
+    bool HasRelational() {
+        this.Index();
+        return this.relational;
+    }
+
+    /// 类名列表中是否含 name。
+    static bool Holds(List<string> list, string name) {
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i] == name) { return true; }
+        }
+        return false;
+    }
+
+    /// 一次性解析每个选择器，并按权重保持规则有序，因此
+    /// 匹配就是对已排序表的扫描。
+    void Index() {
+        if (rules == null) { return; }
+        if (indexedCount == rules.Count()) { return; }
+        selText = new List<string>();
+        selObjs = new List<Selector>();
+        List<int> selSpecs = new List<int>();
+        this.relational = false;
+        int i = 0;
+        while (i < rules.Count()) {
+            string sel = rules.KeyAt(i);
+            i = i + 1;
+            Selector p = Selector.Parse(sel);
+            if (p == null) { continue; }
+            if (p.Relational()) { this.relational = true; }
+            int spec = p.Specificity();
+            // 在权重相同的规则中插入到最后（保持文档顺序）。
+            int at = selSpecs.Count;
+            while (at > 0 && selSpecs[at - 1] > spec) { at = at - 1; }
+            selText.Insert(at, sel);
+            selObjs.Insert(at, p);
+            selSpecs.Insert(at, spec);
+        }
+        // 分桶要等排序完成再做：上面的 Insert 会挪动下标。
+        this.selBlock = new List<JsonValue>();
+        this.selImportant = new List<JsonValue>();
+        this.byType = new Dict<string, List<int>>();
+        this.anyType = new List<int>();
+        for (int k = 0; k < selText.Count; k = k + 1) {
+            JsonValue blk = this.Block(selText[k]);
+            selBlock.Add(blk);
+            selImportant.Add(blk == null ? null : blk.Get("__zan_important"));
+            string ty = selObjs[k].type;
+            if (ty == "") {
+                anyType.Add(k);
+            } else {
+                List<int> bucket;
+                if (!byType.TryGetValue(ty, out bucket)) {
+                    bucket = new List<int>();
+                    byType.Add(ty, bucket);
+                }
+                bucket.Add(k);
+            }
+        }
+        indexedCount = rules.Count();
+    }
+
+    // ---- 诊断（lint）--------------------------------------------------------
+
+    /// 把这张样式表里"写了但没生效"的部分整理成可读报告：
+    ///
+    /// * 被跳过的 at-rule（`@media` 等）——引擎没有媒体查询；
+    /// * 选择器含组合同器/伪元素而被丢弃的规则——引擎的选择器模型
+    ///   只有 `type.class#id::part:state`，没有祖先链；
+    /// * 声明全部不被 Decl 消费的规则（`float`、`text-shadow` 之类
+    ///   拼错或未实现的属性）。
+    ///
+    /// 返回空列表表示这张表里的每一条都真的会生效。皮肤调试时
+    /// 调一次就能把"改了没反应"从猜测变成清单；正常渲染路径不
+    /// 调用它，因此不影响开销。
+    List<string> Lint() {
+        List<string> outR = new List<string>();
+        if (rules == null) { return outR; }
+        this.Index();
+        this.CollectLint();
+        if (atRulesDropped > 0) {
+            outR.Add("dropped " + Convert.ToString(atRulesDropped)
+                     + " at-rule block(s): " + StyleSheet.AtRuleSummary(atRuleKinds)
+                     + " are not supported");
+        }
+        if (atGuardsSkipped > 0) {
+            outR.Add("skipped " + Convert.ToString(atGuardsSkipped)
+                     + " @supports block(s), guard false on this engine: "
+                     + StyleSheet.GuardSummary(atRuleGuards));
+        }
+        for (int i = 0; i < lintDropped.Count; i = i + 1) {
+            outR.Add("selector not modelled, rule ignored: " + lintDropped[i]);
+        }
+        for (int n = 0; n < lintNever.Count; n = n + 1) {
+            outR.Add("selector can never match: " + lintNever[n]);
+        }
+        for (int v = 0; v < lintValue.Count; v = v + 1) {
+            outR.Add("value unit not resolved, used as a bare number: "
+                     + lintValue[v]);
+        }
+        for (int j = 0; j < lintUnused.Count; j = j + 1) {
+            outR.Add("no declaration consumed by the engine: " + lintUnused[j]);
+        }
+        for (int m = 0; m < lintInert.Count; m = m + 1) {
+            outR.Add("accepted but has no effect here: " + lintInert[m]);
+        }
+        int relCount = 0;
+        if (selObjs != null) {
+            for (int r = 0; r < selObjs.Count; r = r + 1) {
+                if (selObjs[r].Relational()) { relCount = relCount + 1; }
+            }
+        }
+        if (relCount > 0) {
+            outR.Add(Convert.ToString(relCount)
+                     + " relational selector(s) (combinator/structural) match"
+                     + " only inside a retained control tree");
+        }
+        return outR;
+    }
+
+    /// 填充 lintDropped / lintUnused（按 rules 代次缓存，Lint 连调免费）。
+    void CollectLint() {
+        if (lintGen == rules.Count()) { return; }
+        lintDropped = new List<string>();
+        lintUnused = new List<string>();
+        lintInert = new List<string>();
+        lintNever = new List<string>();
+        lintValue = new List<string>();
+        // 未能进入选择器索引的规则 = Selector.Parse 返回 null 的那些。
+        // selText 是已索引子集，用一张名字集合反查缺了谁；同时留一份
+        // 选择器对象，好把"永不匹配"的规则连同原因报出来。
+        Dict<string, Selector> indexed = new Dict<string, Selector>();
+        if (selText != null) {
+            for (int s = 0; s < selText.Count; s = s + 1) {
+                if (!indexed.ContainsKey(selText[s])) {
+                    indexed.Add(selText[s], selObjs[s]);
+                }
+            }
+        }
+        for (int i = 0; i < rules.Count(); i = i + 1) {
+            string sel = rules.KeyAt(i);
+            Selector parsed = null;
+            bool hasParsed = indexed.TryGetValue(sel, out parsed);
+            if (!hasParsed) {
+                lintDropped.Add(sel);
+                continue;
+            }
+            if (parsed != null && parsed.never) {
+                lintNever.Add(sel + "  [never: " + parsed.why + "]");
+            }
+            JsonValue blk = rules.ValAt(i);
+            if (blk == null || !blk.IsObject()) { continue; }
+            int consumed = 0;
+            List<string> inert = new List<string>();
+            for (int k = 0; k < blk.Count(); k = k + 1) {
+                string key = blk.KeyAt(k);
+                if (key == "__zan_prescaled" || key == "__zan_important") { continue; }
+                if (StyleSheet.Known(key)) {
+                    consumed = consumed + 1;
+                    if (StyleSheet.ValueUnresolved(key, StyleSheet.ValStr(blk.ValAt(k)))) {
+                        lintValue.Add(sel + "  [" + key + ": "
+                                      + StyleSheet.ValStr(blk.ValAt(k)) + "]");
+                    }
+                } else if (StyleSheet.Inert(key)) { inert.Add(key); }
+            }
+            if (consumed == 0 && inert.Count == 0) { lintUnused.Add(sel); }
+            if (inert.Count > 0) {
+                lintInert.Add(sel + "  [inert: "
+                              + string.Join(", ", inert) + "]");
+            }
+        }
+        lintGen = rules.Count();
+    }
+
+    /// 属性名是否被 Decl 消费（用一次性探针盒判定，与真实的
+    /// 派发走同一条路径，因此新增属性不会和这份清单脱节）。
+    /// 会改到盒子的探针无妨：盒子是新建的，用完即弃。
+    static bool Known(string key) {
+        if (key == "" || key.Substring(0, 1) == "_") { return false; }
+        if (StyleSheet.Inert(key)) { return false; }
+        StyleBox probe = new StyleBox();
+        return StyleSheet.Decl(probe, key, "1");
+    }
+
+    /// `@supports (prop: value)` 的声明测试：引擎认得这条声明即为真。
+    /// 用与真实派发同一条路，所以"支持什么"不会和实现脱节。
+    static bool SupportsDecl(string prop, string val) {
+        string p = StyleSheet.StripVendor(StyleSheet.Lower(StyleSheet.Trim(prop)));
+        if (p == "" || val == "") { return false; }
+        if (p.Length > 2 && p.Substring(0, 2) == "--") { return true; }
+        if (!StyleSheet.GuardValueKnown(p, val)) { return false; }
+        StyleBox probe = new StyleBox();
+        return StyleSheet.Decl(probe, p, val);
+    }
+
+    /// `@supports` 的值级校验。DeclLayout/DeclText 里有一批属性对未知取值
+    /// 静默回落到默认值（`display: grid` 变 block、`position: sticky` 变
+    /// static），若只看"属性认得"就会把假守卫判真：作者写
+    /// `@supports (display: grid) { .g { display: grid } }` 的本意是"不支持
+    /// 就用前面的 flex 兜底"，误判真反而把兜底覆盖成 block 布局。故这些
+    /// 属性按 Decl 里的取值表逐值核对；表外属性不做值级判断（保守回退）。
+    /// 取值表与 DeclLayout/DeclText 同步维护，只影响守卫判断的方向
+    /// （表漏了只会让守卫偏假，不会凭空支持）。
+    static bool GuardValueKnown(string prop, string val) {
+        prop = StyleSheet.StripVendor(StyleSheet.Lower(StyleSheet.Trim(prop)));
+        string v = StyleSheet.Lower(StyleSheet.Trim(val));
+        int sp = Css.IndexFrom(v, " ", 0);
+        if (sp > 0) { v = v.Substring(0, sp); }
+        if (prop == "display") {
+            return v == "block" || v == "inline" || v == "inline-block"
+                || v == "flex" || v == "inline-flex" || v == "none"
+                || v == "flow-root" || v == "grid" || v == "inline-grid";
+        }
+        if (prop == "position") {
+            return v == "static" || v == "relative"
+                || v == "absolute" || v == "fixed";
+        }
+        if (prop == "overflow" || prop == "overflow-x" || prop == "overflow-y") {
+            return v == "visible" || v == "hidden" || v == "clip"
+                || v == "auto" || v == "scroll";
+        }
+        if (prop == "visibility") {
+            return v == "visible" || v == "hidden" || v == "collapse";
+        }
+        if (prop == "flex-direction") {
+            return v == "row" || v == "row-reverse" || v == "column"
+                || v == "col" || v == "column-reverse";
+        }
+        if (prop == "flex-wrap") {
+            return v == "nowrap" || v == "wrap" || v == "wrap-reverse";
+        }
+        if (prop == "align-items") {
+            return v == "flex-start" || v == "start" || v == "top"
+                || v == "center" || v == "flex-end" || v == "end"
+                || v == "bottom" || v == "stretch";
+        }
+        if (prop == "align-self") {
+            return v == "auto" || v == "flex-start" || v == "start"
+                || v == "top" || v == "center" || v == "flex-end"
+                || v == "end" || v == "bottom";
+        }
+        if (prop == "justify-content" || prop == "align-content") {
+            return v == "flex-start" || v == "start" || v == "left"
+                || v == "top" || v == "center" || v == "flex-end"
+                || v == "end" || v == "right" || v == "bottom"
+                || v == "space-between" || v == "space-around"
+                || v == "space-evenly" || v == "stretch";
+        }
+        if (prop == "text-align") {
+            return v == "left" || v == "start" || v == "center"
+                || v == "right" || v == "end";
+        }
+        if (prop == "white-space") {
+            return v == "normal" || v == "nowrap" || v == "pre";
+        }
+        if (prop == "text-transform") {
+            return v == "none" || v == "uppercase" || v == "lowercase";
+        }
+        if (prop == "text-overflow") {
+            return v == "clip" || v == "ellipsis";
+        }
+        return true;
+    }
+
+    /// 被跳过的 at-rule 的可读清单（`@media x3, @keyframes x1`）。
+    static string AtRuleSummary(Dict<string, int> kinds) {
+        if (kinds == null || kinds.Count == 0) { return "@media/@keyframes"; }
+        string outR = "";
+        List<string> ks = kinds.Keys;
+        for (int i = 0; i < ks.Count; i = i + 1) {
+            if (outR != "") { outR = outR + ", "; }
+            int n = 0;
+            kinds.TryGetValue(ks[i], out n);
+            outR = outR + "@" + ks[i] + " x" + Convert.ToString(n);
+        }
+        return outR;
+    }
+
+    /// 判假的 `@supports` 守卫条件计数（`(display: grid) x2`），
+    /// 与 AtRuleSummary 的区别是不加 `@` 前缀（键是条件原文，不是名字）。
+    static string GuardSummary(Dict<string, int> conds) {
+        if (conds == null || conds.Count == 0) { return ""; }
+        string outR = "";
+        List<string> ks = conds.Keys;
+        for (int i = 0; i < ks.Count; i = i + 1) {
+            if (outR != "") { outR = outR + ", "; }
+            int n = 0;
+            conds.TryGetValue(ks[i], out n);
+            outR = outR + ks[i] + " x" + Convert.ToString(n);
+        }
+        return outR;
+    }
+
+    /// 这条声明的值里有没有引擎解析不了、会被当裸数字吞掉的部分。
+    static bool ValueUnresolved(string key, string val) {
+        if (val == "") { return false; }
+        // 图片背景：引擎背景只有颜色/线性渐变，url() 会被当成
+        // 解析不了的颜色静默变 0，点名。
+        if (Css.IndexFrom(StyleSheet.Lower(val), "url(", 0) >= 0
+            && (key == "background" || key == "background-image")) {
+            return true;
+        }
+        // 引擎没有径向/锥形渐变绘制原语，混进停靠点解析会得到
+        // 透明色，点名。
+        string vlo = StyleSheet.Lower(val);
+        if (Css.IndexFrom(vlo, "radial-gradient(", 0) >= 0
+            || Css.IndexFrom(vlo, "conic-gradient(", 0) >= 0) {
+            return true;
+        }
+        if (StyleSheet.HasUnresolvedUnit(val)) { return true; }
+        // `%` 只在少数属性上有语义（width/height 走 widthPm，opacity 走
+        // Perm）；这些属性上的 `%` 是实打实的强转，点名。
+        if (Css.IndexFrom(val, "%", 0) >= 0
+            && StyleSheet.PctCoerced(StyleSheet.Lower(StyleSheet.Trim(key)))) {
+            return true;
+        }
+        return false;
+    }
+
+    /// 该属性上的 `%` 会被当裸数字用（与 width/height 的 widthPm 相对）。
+    static bool PctCoerced(string k) {
+        if (k == "font-size" || k == "font" || k == "line-height"
+            || k == "letter-spacing") {
+            return true;
+        }
+        if (StyleSheet.StartsWith(k, "padding")
+            || StyleSheet.StartsWith(k, "margin")
+            || StyleSheet.StartsWith(k, "gap")) {
+            return true;
+        }
+        if (k == "row-gap" || k == "column-gap") { return true; }
+        if (StyleSheet.StartsWith(k, "border")
+            && Css.IndexFrom(k, "width", 0) >= 0) {
+            return true;
+        }
+        return false;
+    }
+
+    /// 值里是否含引擎不认识的长度单位拼写。px/em/rem/ex/ch/vw/vh/
+    /// vmin/vmax/pt/pc/cm/mm/in/q 与 calc()/min()/max()/clamp() 都有
+    /// 求值器，不再是"会被当裸数字吞掉"的一类；`%` 按属性另有通道。
+    static bool HasUnresolvedUnit(string val) {
+        string s = StyleSheet.Lower(val);
+        // calc()/min()/max()/clamp() 已有求值器，不算"没解析"。
+        if (Css.IndexFrom(s, "repeating-linear-gradient(", 0) >= 0) {
+            return true;
+        }
+        // 颜色（#hex / rgb()/hsl() 族）与 url() 里的数字不是长度，
+        // 不参与单位点名（否则 #00ff00 会被拆成 00 + 单位 ff00）。
+        if (Css.IndexFrom(s, "#", 0) >= 0 || Css.IndexFrom(s, "url(", 0) >= 0
+            || Css.StartsWithStr(s, "rgb(") || Css.StartsWithStr(s, "rgba(")
+            || Css.StartsWithStr(s, "hsl(") || Css.StartsWithStr(s, "hsla(")
+            || Css.StartsWithStr(s, "hwb(") || Css.StartsWithStr(s, "oklab(")
+            || Css.StartsWithStr(s, "oklch(") || Css.StartsWithStr(s, "lab(")
+            || Css.StartsWithStr(s, "lch(")
+            || Css.StartsWithStr(s, "color-mix(")) {
+            return false;
+        }
+        int i = 0;
+        while (i < s.Length) {
+            if (!StyleSheet.Digit(s.Substring(i, 1))) { i = i + 1; continue; }
+            while (i < s.Length) {
+                string c = s.Substring(i, 1);
+                if (StyleSheet.Digit(c) || c == ".") { i = i + 1; }
+                else { break; }
+            }
+            int st = i;
+            while (i < s.Length && StyleSheet.IsAlpha(s.Substring(i, 1))) {
+                i = i + 1;
+            }
+            string u = s.Substring(st, i - st);
+            if (u == "") { continue; }
+            // 长度单位全部有换算；ms/s/deg/turn/fr/hz 是时长/角度/
+            // 频率的单位，各有各的解析通道，都不算"没解析"。
+            if (u != "px" && u != "em" && u != "rem" && u != "ex"
+                && u != "ch" && u != "vw" && u != "vh" && u != "vmin"
+                && u != "vmax" && u != "pt" && u != "pc" && u != "cm"
+                && u != "mm" && u != "in" && u != "q" && u != "ms"
+                && u != "s" && u != "deg" && u != "turn" && u != "fr"
+                && u != "hz" && u != "khz") {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// 单字符是否为 ASCII 字母。
+    static bool IsAlpha(string ch) {
+        if (ch.Length != 1) { return false; }
+        string lo = StyleSheet.Lower(ch);
+        return lo >= "a" && lo <= "z";
+    }
+
+
+    /// 声明值的文本形式（数字转成字符串，因此 JSON 表中的 `radius: 8`
+    /// 行为与 CSS 中的 `radius: 8px` 一致）。
+    static string ValStr(JsonValue v) {
+        if (v == null) { return ""; }
+        if (v.IsNumber()) { return Convert.ToString(v.AsInt(0)); }
+        return v.AsString("");
+    }
+
+    /// 声明 key 的值是否直接来自 `var(--font-size-*)`（主题已按
+    /// DPI/密度缩放，应用样式不得再叠加缩放；见 Css.ParseBlock）。
+    static bool IsPrescaled(JsonValue block, string key) {
+        if (block == null) { return false; }
+        JsonValue source = block.Get("__zan_prescaled");
+        if (source == null || !source.IsObject()) { return false; }
+        JsonValue value = source.Get(key);
+        return value != null && value.AsBool(false);
+    }
+
+    /// 将一条 CSS 声明应用到样式盒。当该
+    /// 属性不是引擎理解的视觉/布局属性时返回 false。
+    static bool Decl(StyleBox b, string key, string val) {
+        string k = StyleSheet.Lower(StyleSheet.Trim(key));
+        string v = StyleSheet.Trim(val);
+        if (k == "" || v == "") { return false; }
+        k = StyleSheet.StripVendor(k);
+        // "收了但不生效"的属性（Inert 清单）在这里就地收下：既不给
+        // 它伪造效果，也不让它漏到 Control.SetProp 变成 class。
+        if (StyleSheet.Inert(k)) { return true; }
+        // currentColor：先把"引用当前前景色"记账进 ccMask，级联
+        // 完成后统一替换（ApplyMatchCtx 尾部）——那时 fg 才是
+        // 最终值。color: currentColor 天然等于保持前景，不需要记。
+        // 嵌在 shorthand 里（`border: 1px solid currentcolor`）时
+        // 记账后继续走原解析，颜色分量解析为 0 由替换补上。
+        string lov = StyleSheet.Lower(v);
+        if (Css.IndexFrom(lov, "currentcolor", 0) >= 0) {
+            int ccb = StyleSheet.CcBits(k);
+            if (ccb != 0) { b.ccMask = b.ccMask | ccb; }
+            if (lov == "currentcolor") { return true; }
+        }
+        if (StyleSheet.DeclFill(b, k, v)) { return true; }
+        if (StyleSheet.DeclText(b, k, v)) { return true; }
+        if (StyleSheet.DeclBorderBox(b, k, v)) { return true; }
+        if (StyleSheet.DeclBoxMetrics(b, k, v)) { return true; }
+        if (StyleSheet.DeclLayout(b, k, v)) { return true; }
+        if (StyleSheet.DeclMotion(b, k, v)) { return true; }
+        return false;
+    }
+
+    /// currentColor 记账位：哪个颜色通道引用了前景色。
+    static int CcBits(string key) {
+        if (key == "background" || key == "background-color"
+            || key == "bg") { return 1; }
+        if (key == "accent-color") { return 2; }
+        if (key == "border-color") { return 4; }
+        if (key == "border-top-color" || key == "border-top") { return 8; }
+        if (key == "border-right-color" || key == "border-right") { return 16; }
+        if (key == "border-bottom-color" || key == "border-bottom") {
+            return 32;
+        }
+        if (key == "border-left-color" || key == "border-left") { return 64; }
+        if (key == "border") { return 8 + 16 + 32 + 64; }
+        if (key == "box-shadow" || key == "shadow") { return 128; }
+        if (key == "text-shadow") { return 256; }
+        return 0;
+    }
+
+    /// 级联完成后把 ccMask 记下的通道替换成最终前景色；fg 未设
+    /// （0）时保持原样，不猜。
+    static void ResolveCurrentColor(StyleBox b) {
+        if (b.ccMask == 0) { return; }
+        int fg = b.fg;
+        if (fg == 0) { return; }
+        if ((b.ccMask & 1) != 0) { b.bg = fg; }
+        if ((b.ccMask & 2) != 0) { b.accent = fg; }
+        if ((b.ccMask & 4) != 0) { b.borderColor = fg; }
+        if ((b.ccMask & 8) != 0) { b.borderTopColor = fg; }
+        if ((b.ccMask & 16) != 0) { b.borderRightColor = fg; }
+        if ((b.ccMask & 32) != 0) { b.borderBottomColor = fg; }
+        if ((b.ccMask & 64) != 0) { b.borderLeftColor = fg; }
+        if ((b.ccMask & 128) != 0) { b.shadow = fg; }
+        if ((b.ccMask & 256) != 0) { b.tsColor = fg; }
+    }
+
+    /// 剥掉厂商前缀：`-webkit-box-shadow` -> `box-shadow`。带前缀的
+    /// 网页 CSS 十分常见（bootstrap 一类语料里 transform/transition/
+    /// box-shadow 几乎都带），而引擎对两者语义一致。自定义属性
+    /// `--x` 与引擎私有拼写 `-zan-*` 不经过这里（后者显式列出）。
+    static string StripVendor(string k) {
+        if (StyleSheet.StartsWith(k, "-webkit-")) { return k.Substring(8); }
+        if (StyleSheet.StartsWith(k, "-moz-")) { return k.Substring(5); }
+        if (StyleSheet.StartsWith(k, "-ms-")) { return k.Substring(4); }
+        if (StyleSheet.StartsWith(k, "-o-")) { return k.Substring(3); }
+        return k;
+    }
+
+    /// 应用一条声明，并按属性类别记录“预缩放来源”位
+    /// （Decl 不认得的属性返回 false）。
+    static bool DeclSource(StyleBox b, string key, string val, bool prescaled) {
+        bool ok = StyleSheet.Decl(b, key, val);
+        if (!ok) { return false; }
+        int source = StyleSheet.SourceFor(key);
+        if (source != 0) { b.SetPrescaled(source, prescaled); }
+        return true;
+    }
+
+    /// 属性对应的预缩放来源类别（StyleBox.Source*），无关属性为 0。
+    static int SourceFor(string key) {
+        string k = StyleSheet.Lower(StyleSheet.Trim(key));
+        if (k == "font-size" || k == "font") {
+            return StyleBox.SourceFont();
+        }
+        if (k == "width" || k == "min-width" || k == "max-width"
+                || k == "flex-basis") {
+            return StyleBox.SourceWidth();
+        }
+        if (k == "height" || k == "min-height" || k == "max-height") {
+            return StyleBox.SourceHeight();
+        }
+        if (k == "gap" || k == "row-gap" || k == "column-gap") {
+            return StyleBox.SourceGap();
+        }
+        if (k == "radius" || k == "border-radius"
+                || k == "border-top-left-radius"
+                || k == "border-top-right-radius"
+                || k == "border-bottom-right-radius"
+                || k == "border-bottom-left-radius") {
+            return StyleBox.SourceRadius();
+        }
+        if (k == "padding" || k == "pad" || k == "padding-left"
+                || k == "padding-top" || k == "padding-right"
+                || k == "padding-bottom" || k == "margin"
+                || k == "margin-left" || k == "margin-top"
+                || k == "margin-right" || k == "margin-bottom") {
+            return StyleBox.SourcePadding();
+        }
+        return 0;
+    }
+
+    /// fill：背景 / 透明度 / 模糊滤镜。
+    static bool DeclFill(StyleBox b, string k, string v) {
+        if (k == "background" || k == "background-color" || k == "bg") {
+            StyleSheet.DeclBackground(b, v);
+            return true;
+        }
+        if (k == "background-image") {
+            StyleSheet.DeclBackground(b, v);
+            return true;
+        }
+        if (k == "opacity") { b.opacity = StyleSheet.Perm(v); return true; }
+        if (k == "backdrop-filter" || k == "filter") {
+            b.blur = StyleSheet.BlurArg(b, v);
+            return true;
+        }
+        return false;
+    }
+
+    /// text：颜色 / 字体 / 对齐 / 变换 / 换行。
+    /// `line-height`：`normal`（未声明态）、长度（px/em/…）、百分比
+    /// 或无单位数字（倍数）。量纲记 lineHeightKind：0 未声明，1 px，
+    /// 2 千分（% 按 n*10，倍数按 n*1000；消费端乘 fontPx / 1000）。
+    static void LineHeightOf(StyleBox b, string v) {
+        string t = StyleSheet.Lower(StyleSheet.Trim(v));
+        if (t == "normal" || t == "") {
+            b.lineHeight = 0;
+            b.lineHeightKind = 0;
+            return;
+        }
+        int n = t.Length;
+        string last = t.Substring(n - 1, 1);
+        if (last == "%") {
+            double d = StyleSheet.ParseDbl(t.Substring(0, n - 1));
+            b.lineHeight = (int)(d * 10.0);
+            b.lineHeightKind = 2;
+            return;
+        }
+        if (Css.IndexFrom("0123456789", last, 0) >= 0) {
+            double d = StyleSheet.ParseDbl(t);
+            b.lineHeight = (int)(d * 1000.0);
+            b.lineHeightKind = 2;
+            return;
+        }
+        b.lineHeight = StyleSheet.Len(b, v);
+        b.lineHeightKind = 1;
+    }
+
+    static bool DeclText(StyleBox b, string k, string v) {
+        if (k == "color") { b.fg = StyleSheet.ParseColor(v); return true; }
+        if (k == "accent-color") { b.accent = StyleSheet.ParseColor(v); return true; }
+        if (k == "font-size" || k == "font") { b.fontPx = StyleSheet.Len(b, v); return true; }
+        if (k == "font-weight") { b.fontWeight = StyleSheet.Weight(v); return true; }
+        if (k == "line-height") { StyleSheet.LineHeightOf(b, v); return true; }
+        if (k == "letter-spacing") { b.letterSpacing = StyleSheet.Len(b, v); return true; }
+        if (k == "text-shadow") { StyleSheet.DeclTextShadow(b, v); return true; }
+        if (k == "text-align") {
+            b.align = 0;
+            if (v == "center") { b.align = 1; }
+            if (v == "right" || v == "end") { b.align = 2; }
+            return true;
+        }
+        if (k == "vertical-align") {
+            // P2：行内对齐通道（baseline 缺省）。valign 的旧映射保留
+            // （历史上该属性曾喂给块级 valign 的控件）。
+            b.valign = 0;
+            b.vaInline = 0;
+            if (v == "middle" || v == "center") { b.valign = 1; b.vaInline = 1; }
+            if (v == "bottom") { b.valign = 2; b.vaInline = 3; }
+            if (v == "top") { b.vaInline = 2; }
+            return true;
+        }
+        if (k == "text-transform") {
+            b.textCase = 0;
+            if (v == "uppercase") { b.textCase = 1; }
+            if (v == "lowercase") { b.textCase = 2; }
+            return true;
+        }
+        if (k == "text-overflow") {
+            b.ellipsis = 0;
+            if (v == "ellipsis") { b.ellipsis = 1; }
+            return true;
+        }
+        if (k == "white-space") {
+            b.nowrap = 0;
+            b.whiteSpace = 0;
+            if (v == "nowrap") { b.nowrap = 1; b.whiteSpace = 1; }
+            else if (v == "pre") { b.nowrap = 1; b.whiteSpace = 2; }
+            else if (v == "pre-wrap") { b.whiteSpace = 3; }
+            return true;
+        }
+        return false;
+    }
+
+    /// border / 圆角 / 阴影。
+    static bool DeclBorderBox(StyleBox b, string k, string v) {
+        if (k == "border") { StyleSheet.DeclBorder(b, v, 0); return true; }
+        if (k == "border-top") { StyleSheet.DeclBorder(b, v, 1); return true; }
+        if (k == "border-right") { StyleSheet.DeclBorder(b, v, 2); return true; }
+        if (k == "border-bottom") { StyleSheet.DeclBorder(b, v, 3); return true; }
+        if (k == "border-left") { StyleSheet.DeclBorder(b, v, 4); return true; }
+        if (k == "border-width") { b.borderW = StyleSheet.Len(b, v); return true; }
+        if (k == "border-color") { b.borderColor = StyleSheet.ParseColor(v); return true; }
+        if (k == "border-top-width") { b.borderTopW = StyleSheet.Len(b, v); return true; }
+        if (k == "border-right-width") { b.borderRightW = StyleSheet.Len(b, v); return true; }
+        if (k == "border-bottom-width") { b.borderBottomW = StyleSheet.Len(b, v); return true; }
+        if (k == "border-left-width") { b.borderLeftW = StyleSheet.Len(b, v); return true; }
+        if (k == "border-top-color") { b.borderTopColor = StyleSheet.ParseColor(v); return true; }
+        if (k == "border-right-color") { b.borderRightColor = StyleSheet.ParseColor(v); return true; }
+        if (k == "border-bottom-color") { b.borderBottomColor = StyleSheet.ParseColor(v); return true; }
+        if (k == "border-left-color") { b.borderLeftColor = StyleSheet.ParseColor(v); return true; }
+        if (k == "border-radius" || k == "radius") {
+            StyleSheet.DeclRadius(b, v);
+            return true;
+        }
+        if (k == "border-top-left-radius") {
+            StyleSheet.CornerRadius(b, 0, StyleSheet.Len(b, v));
+            return true;
+        }
+        if (k == "border-top-right-radius") {
+            StyleSheet.CornerRadius(b, 1, StyleSheet.Len(b, v));
+            return true;
+        }
+        if (k == "border-bottom-right-radius") {
+            StyleSheet.CornerRadius(b, 2, StyleSheet.Len(b, v));
+            return true;
+        }
+        if (k == "border-bottom-left-radius") {
+            StyleSheet.CornerRadius(b, 3, StyleSheet.Len(b, v));
+            return true;
+        }
+        if (k == "box-shadow" || k == "shadow") { StyleSheet.DeclShadow(b, v); return true; }
+        if (k == "border-style") {
+            b.borderStyle = 0;
+            if (v == "dashed" || v == "dotted") { b.borderStyle = 1; }
+            return true;
+        }
+        // 两种没有自有 CSS 拼写的装饰：拟物化
+        // 凸起/内陷边对和跟随光标的 sheen 光泽。
+        if (k == "emboss" || k == "-zan-emboss") {
+            b.emboss = 0;
+            if (v == "raised") { b.emboss = 1; }
+            if (v == "inset") { b.emboss = 2; }
+            return true;
+        }
+        if (k == "specular" || k == "-zan-specular") {
+            b.specular = 0;
+            if (v != "none" && v != "0") { b.specular = 1; }
+            return true;
+        }
+        if (k == "sheen" || k == "-zan-sheen") {
+            StyleSheet.DeclSheen(b, v);
+            return true;
+        }
+        return false;
+    }
+
+    /// 盒子度量：padding / margin / size / gap。
+    static bool DeclBoxMetrics(StyleBox b, string k, string v) {
+        if (k == "padding" || k == "pad") { StyleSheet.DeclSides(b, v, 0); return true; }
+        if (k == "padding-left") { b.padL = StyleSheet.Len(b, v); return true; }
+        if (k == "padding-top") { b.padT = StyleSheet.Len(b, v); return true; }
+        if (k == "padding-right") { b.padR = StyleSheet.Len(b, v); return true; }
+        if (k == "padding-bottom") { b.padB = StyleSheet.Len(b, v); return true; }
+        if (k == "margin") { StyleSheet.DeclSides(b, v, 1); return true; }
+        if (k == "margin-left") { b.marL = StyleSheet.SideVal(b, v, true); return true; }
+        if (k == "margin-top") { b.marT = StyleSheet.SideVal(b, v, true); return true; }
+        if (k == "margin-right") { b.marR = StyleSheet.SideVal(b, v, true); return true; }
+        if (k == "margin-bottom") { b.marB = StyleSheet.SideVal(b, v, true); return true; }
+        if (k == "width") { StyleSheet.DeclMetric(b, 0, v); return true; }
+        if (k == "height") { StyleSheet.DeclMetric(b, 1, v); return true; }
+        if (k == "min-width") { StyleSheet.DeclMetric(b, 2, v); return true; }
+        if (k == "min-height") { StyleSheet.DeclMetric(b, 3, v); return true; }
+        if (k == "max-width") { StyleSheet.DeclMetric(b, 4, v); return true; }
+        if (k == "max-height") { StyleSheet.DeclMetric(b, 5, v); return true; }
+        // `gap: <both>` 或 `gap: <row> <column>`（CSS 简写：第一个值是
+        // 行距）。两个值时同时置上两根轴，`row-gap`/`column-gap`
+        // 仍可在其后单独覆盖。
+        if (k == "gap") {
+            List<string> g = StyleSheet.Tokens(v);
+            if (g.Count == 0) { return true; }
+            b.gap = StyleSheet.Len(b, g[0]);
+            if (g.Count >= 2) {
+                b.rowGap = StyleSheet.Len(b, g[0]);
+                b.colGap = StyleSheet.Len(b, g[1]);
+            }
+            return true;
+        }
+        if (k == "row-gap") { b.rowGap = StyleSheet.Len(b, v); return true; }
+        if (k == "column-gap") { b.colGap = StyleSheet.Len(b, v); return true; }
+        // P4 grid：容器轨道模板存原文（排版时经 CssGrid.ParseTracks 展开
+        // repeat()/minmax()）；条目放置按 CSS 语法折成线号 + span。
+        if (k == "grid-template-columns") { b.gridCols = StyleSheet.Trim(v); return true; }
+        if (k == "grid-template-rows") { b.gridRows = StyleSheet.Trim(v); return true; }
+        if (k == "grid-auto-columns") { b.gridAutoCols = StyleSheet.Trim(v); return true; }
+        if (k == "grid-auto-rows") { b.gridAutoRows = StyleSheet.Trim(v); return true; }
+        if (k == "grid-column" || k == "grid-row") {
+            GridLine gl = CssGrid.ParseLine(v);
+            if (k == "grid-column") {
+                b.gColStart = gl.start; b.gColEnd = gl.end;
+                if (gl.span > 0) { b.gColSpan = gl.span; }
+            } else {
+                b.gRowStart = gl.start; b.gRowEnd = gl.end;
+                if (gl.span > 0) { b.gRowSpan = gl.span; }
+            }
+            return true;
+        }
+        if (k == "grid-column-start" || k == "grid-row-start") {
+            GridLine gl = CssGrid.ParseLine(v);
+            if (k == "grid-column-start") { b.gColStart = gl.start; if (gl.span > 0) { b.gColSpan = gl.span; } }
+            else { b.gRowStart = gl.start; if (gl.span > 0) { b.gRowSpan = gl.span; } }
+            return true;
+        }
+        if (k == "grid-column-end" || k == "grid-row-end") {
+            GridLine gl = CssGrid.ParseLine(v);
+            if (k == "grid-column-end") { b.gColEnd = gl.end; if (gl.span > 0) { b.gColSpan = gl.span; } }
+            else { b.gRowEnd = gl.end; if (gl.span > 0) { b.gRowSpan = gl.span; } }
+            return true;
+        }
+        if (k == "place-items") {
+            List<string> pi = StyleSheet.Tokens(v);
+            b.alignItems = StyleSheet.AlignItemCode(pi[0]);
+            if (pi.Count >= 2) { b.justifyItems = StyleSheet.AlignItemCode(pi[1]); }
+            return true;
+        }
+        if (k == "justify-items") {
+            b.justifyItems = StyleSheet.AlignItemCode(v);
+            return true;
+        }
+        if (k == "columns") { b.columns = StyleSheet.Num(v); return true; }
+        return false;
+    }
+
+    /// 单个盒子度量（0 宽、1 高、2/3 min、4/5 max）：`%` 值保留
+    /// 为包含块的比例（千分数），其余按像素处理。
+    static void DeclMetric(StyleBox b, int which, string v) {
+        string tv = StyleSheet.Lower(StyleSheet.Trim(v));
+        if (tv == "auto") {
+            // `width/height: auto` = 未声明（块流里宽填满、高按内容，
+            // 语义由布局端给出）——保持哨兵 -1，此前 "auto" 会被当
+            // 裸数字静默写成 0。
+            return;
+        }
+        bool pct = StyleSheet.IndexOf(v, "%") >= 0;
+        int n = StyleSheet.Len(b, v);
+        if (pct) { n = n * 10; }
+        if (which == 0) { if (pct) { b.widthPm = n; } else { b.width = n; } }
+        else if (which == 1) { if (pct) { b.heightPm = n; } else { b.height = n; } }
+        else if (which == 2) { if (pct) { b.minWPm = n; } else { b.minW = n; } }
+        else if (which == 3) { if (pct) { b.minHPm = n; } else { b.minH = n; } }
+        else if (which == 4) { if (pct) { b.maxWPm = n; } else { b.maxW = n; } }
+        else { if (pct) { b.maxHPm = n; } else { b.maxH = n; } }
+    }
+
+    /// layout：display / flexbox / position / overflow / visibility / cursor。
+    static bool DeclLayout(StyleBox b, string k, string v) {
+        if (k == "display") {
+            b.display = 0;
+            b.inlineLevel = 0;
+            if (v == "flex") { b.display = 1; }
+            else if (v == "inline-flex") {
+                b.display = 1; b.inlineLevel = 1; b.bfc = 1;
+            }
+            else if (v == "none") { b.display = 2; }
+            else if (v == "block") {
+                // 普通块容器（P1）：与首/尾子 margin 塌陷。
+                b.display = 3;
+            }
+            else if (v == "flow-root") {
+                // flow-root 建立 BFC：不与首尾子塌陷。
+                b.display = 3; b.bfc = 1;
+            }
+            else if (v == "grid") {
+                // 真 grid（P4）：轨道模板排版；容器是天然的分隔
+                // （子项 margin 不与容器塌陷）。
+                b.display = 4; b.bfc = 1;
+            }
+            else if (v == "inline-grid") {
+                b.display = 4; b.inlineLevel = 1; b.bfc = 1;
+            }
+            else if (v == "inline" || v == "inline-block") {
+                // 行内级（P2 行盒；P1 暂按块排）。inline-block 是 BFC。
+                b.display = 3; b.inlineLevel = 1; b.bfc = 1;
+            }
+            else { b.display = 0; }
+            return true;
+        }
+        if (k == "flex-direction") {
+            b.flexDir = 0;
+            if (v == "column" || v == "column-reverse") { b.flexDir = 1; }
+            return true;
+        }
+        if (k == "justify-content") {
+            b.justify = StyleSheet.JustifyCode(v);
+            return true;
+        }
+        if (k == "align-items") {
+            b.alignItems = StyleSheet.AlignItemCode(v);
+            return true;
+        }
+        // `flex-flow: <direction> || <wrap>`——两个值顺序任意，各自
+        // 可省。
+        if (k == "flex-flow") {
+            List<string> ff = StyleSheet.Tokens(v);
+            for (int i = 0; i < ff.Count; i = i + 1) {
+                string t = StyleSheet.Lower(ff[i]);
+                if (t == "row" || t == "row-reverse") { b.flexDir = 0; }
+                else if (t == "column" || t == "col" || t == "column-reverse") {
+                    b.flexDir = 1;
+                } else if (t == "wrap" || t == "wrap-reverse") { b.wrap = 1; }
+                else if (t == "nowrap") { b.wrap = 0; }
+            }
+            return true;
+        }
+        if (k == "flex-wrap") {
+            b.wrap = 0;
+            if (v == "wrap" || v == "wrap-reverse") { b.wrap = 1; }
+            return true;
+        }
+        if (k == "align-content") {
+            b.alignContent = StyleSheet.AlignContentCode(v);
+            return true;
+        }
+        if (k == "align-self") {
+            b.alignSelf = 0;
+            if (v == "auto") { b.alignSelf = 0 - 1; }
+            if (v == "flex-start" || v == "start" || v == "top") { b.alignSelf = 1; }
+            if (v == "center") { b.alignSelf = 2; }
+            if (v == "flex-end" || v == "end" || v == "bottom") { b.alignSelf = 3; }
+            return true;
+        }
+        // `place-content: <align-content> [<justify-content>]`——一个值时
+        // 两根轴取同一个（`place-content: center` 就是整块居中）。
+        if (k == "place-content") {
+            List<string> pc = StyleSheet.Tokens(v);
+            if (pc.Count == 0) { return true; }
+            b.alignContent = StyleSheet.AlignContentCode(StyleSheet.Lower(pc[0]));
+            string j = pc[0];
+            if (pc.Count >= 2) { j = pc[1]; }
+            b.justify = StyleSheet.JustifyCode(StyleSheet.Lower(j));
+            return true;
+        }
+        if (k == "flex") { StyleSheet.DeclFlex(b, v); return true; }
+        if (k == "flex-grow") { b.grow = StyleSheet.Num(v); return true; }
+        if (k == "flex-shrink") { b.shrink = StyleSheet.Num(v); return true; }
+        if (k == "flex-basis") { StyleSheet.DeclBasis(b, v); return true; }
+        if (k == "aspect-ratio") { StyleSheet.DeclAspect(b, v); return true; }
+        if (k == "order") { b.order = StyleSheet.Num(v); return true; }
+        if (k == "position") {
+            b.position = 0;
+            if (v == "relative") { b.position = 1; }
+            if (v == "absolute" || v == "fixed") { b.position = 2; }
+            return true;
+        }
+        if (k == "top") { b.posT = StyleSheet.Len(b, v); return true; }
+        if (k == "right") { b.posR = StyleSheet.Len(b, v); return true; }
+        if (k == "bottom") { b.posB = StyleSheet.Len(b, v); return true; }
+        if (k == "left") { b.posL = StyleSheet.Len(b, v); return true; }
+        // `inset: <all> | <v> <h> | <t> <h> <b> | <t> <r> <b> <l>`
+        // （四边偏移的简写，和 padding 同一套取值规则）。
+        if (k == "inset") {
+            List<string> ins = StyleSheet.Tokens(v);
+            if (ins.Count == 0) { return true; }
+            int t = StyleSheet.Len(b, ins[0]);
+            int r = t;
+            int bo = t;
+            int l = t;
+            if (ins.Count == 2) {
+                r = StyleSheet.Len(b, ins[1]);
+                l = r;
+            } else if (ins.Count == 3) {
+                r = StyleSheet.Len(b, ins[1]);
+                l = r;
+                bo = StyleSheet.Len(b, ins[2]);
+            } else if (ins.Count >= 4) {
+                r = StyleSheet.Len(b, ins[1]);
+                bo = StyleSheet.Len(b, ins[2]);
+                l = StyleSheet.Len(b, ins[3]);
+            }
+            b.posT = t; b.posR = r; b.posB = bo; b.posL = l;
+            return true;
+        }
+        if (k == "overflow" || k == "overflow-y" || k == "overflow-x") {
+            // P6 per-axis 滚动语义：visible 0 / hidden|clip 1 / auto 2 /
+            // scroll 3。shorthand 先双轴复位（CSS：overflow 是双轴
+            // 简写，后声明的长hand覆盖单轴），非 visible 落渲染裁剪位
+            // 与 BFC 位（P1 判据不变）。
+            int ocode = 0;
+            if (v == "hidden" || v == "clip") { ocode = 1; }
+            else if (v == "auto") { ocode = 2; }
+            else if (v == "scroll") { ocode = 3; }
+            if (k == "overflow") {
+                b.overflowX = ocode;
+                b.overflowY = ocode;
+            } else if (k == "overflow-x") {
+                b.overflowX = ocode;
+            } else {
+                b.overflowY = ocode;
+            }
+            b.overflow = (b.overflowX != 0 || b.overflowY != 0) ? 1 : 0;
+            b.overflowCss = (b.overflowX != 0 || b.overflowY != 0) ? 1 : 0;
+            return true;
+        }
+        if (k == "z-index") { b.zIndex = StyleSheet.Num(v); return true; }
+        if (k == "visibility") {
+            b.visible = 1;
+            if (v == "hidden" || v == "collapse") { b.visible = 0; }
+            return true;
+        }
+        if (k == "cursor") { b.cursor = StyleSheet.CursorCode(v); return true; }
+        // box-sizing 真语义（P0）：0 border-box（缺省）= 声明尺寸含
+        // border+padding；1 content-box = 声明尺寸只含内容，布局端
+        // 反推框宽。消费点：Control 的内容框计算与 StyleWidthIn/HeightIn。
+        if (k == "box-sizing") {
+            b.boxSizing = v == "content-box" ? 1 : 0;
+            return true;
+        }
+        // float 真布局（P3 完成绕排；P0 起解析存储）。此前空转是怕
+        // 键名漏到 SetProp 变 class——现在 Decl 消费它，同样不会漏。
+        if (k == "float") {
+            b.floatSide = 0;
+            if (v == "left") { b.floatSide = 1; }
+            else if (v == "right") { b.floatSide = 2; }
+            return true;
+        }
+        if (k == "clear") {
+            b.clearSide = 0;
+            if (v == "left") { b.clearSide = 1; }
+            else if (v == "right") { b.clearSide = 2; }
+            else if (v == "both") { b.clearSide = 3; }
+            return true;
+        }
+        return false;
+    }
+
+    /// 被 Decl 收下、但不会产生任何视觉/布局效果的属性：认它们是
+    /// 为了不让键名漏到 Control.SetProp 变成 class（`float: right`
+    /// 会凭空加一个 `.right` 类），但作者以为写了就有用。
+    /// StyleSheet.Lint 会把它们单独列出来。清单是真实 CSS 属性名的
+    /// 白名单——专有属性名（皮肤作者的 `variant: primary` 一类）
+    /// 仍然走 SetProp 的 prop/class 通道。
+    static bool Inert(string key) {
+        string k = StyleSheet.Lower(StyleSheet.Trim(key));
+        // 字体族/字重族：引擎只有字号与字重，字体名没有注册表可查。
+        if (k == "font-family" || k == "font-style" || k == "font-variant"
+            || k == "font-stretch" || k == "font-kerning"
+            || k == "font-feature-settings" || k == "font-variation-settings"
+            || k == "font-size-adjust" || k == "font-language-override"
+            || k == "font-optical-sizing" || k == "font-palette"
+            || k == "-webkit-font-smoothing" || k == "-moz-osx-font-smoothing") {
+            return true;
+        }
+        // 文本排版细节：换行/断字/装饰（下划线删除线没有绘制原语）。
+        if (k == "text-decoration" || k == "text-decoration-line"
+            || k == "text-decoration-style" || k == "text-decoration-color"
+            || k == "text-decoration-thickness" || k == "text-underline-offset"
+            || k == "text-emphasis" || k == "text-justify" || k == "text-indent"
+            || k == "word-spacing" || k == "word-break" || k == "line-break"
+            || k == "overflow-wrap" || k == "hyphens" || k == "tab-size"
+            || k == "text-rendering" || k == "text-orientation"
+            || k == "user-select" || k == "caret-color") {
+            return true;
+        }
+        // 书写模式/方向：引擎排版只有横向 LTR。
+        if (k == "writing-mode" || k == "direction") { return true; }
+        // 轮廓（第二圈描边）与内容生成。
+        if (k == "outline" || k == "outline-width" || k == "outline-style"
+            || k == "outline-color" || k == "outline-offset"
+            || k == "content" || k == "quotes" || k == "counter-reset"
+            || k == "counter-increment") {
+            return true;
+        }
+        // 列表/表格/替换元素：引擎没有对应绘制面。
+        if (k == "list-style" || k == "list-style-type"
+            || k == "list-style-position" || k == "list-style-image"
+            || k == "table-layout" || k == "border-collapse"
+            || k == "border-spacing" || k == "empty-cells" || k == "caption-side"
+            || k == "object-fit" || k == "object-position"
+            || k == "image-rendering" || k == "image-orientation") {
+            return true;
+        }
+        // 合成/滤镜/裁剪：引擎只有 blur 与 box-shadow。
+        if (k == "mix-blend-mode" || k == "background-blend-mode"
+            || k == "isolation" || k == "clip-path" || k == "mask"
+            || k == "mask-image" || k == "shape-outside" || k == "shape-margin"
+            || k == "will-change" || k == "all" || k == "appearance"
+            || k == "zoom" || k == "resize") {
+            return true;
+        }
+        // 滚动/交互行为：引擎没有滚动链或捕捉点。
+        if (k == "scroll-behavior" || k == "overscroll-behavior"
+            || k == "touch-action" || k == "pointer-events"
+            || k == "scroll-snap-type" || k == "scroll-snap-align"
+            || k == "scroll-margin" || k == "scroll-padding") {
+            return true;
+        }
+        // 背景的图片类附件：引擎背景只有颜色/线性渐变，
+        // 位置/尺寸/平铺对纯色没有意义。
+        if (k == "background-position" || k == "background-size"
+            || k == "background-repeat" || k == "background-attachment"
+            || k == "background-origin" || k == "background-clip"
+            || k == "background-blend") {
+            return true;
+        }
+        // 多列/打印分页的排版量。
+        if (k == "column-width" || k == "column-count" || k == "column-rule"
+            || k == "column-rule-width" || k == "column-rule-style"
+            || k == "column-rule-color" || k == "column-span" || k == "column-fill"
+            || k == "widows" || k == "orphans" || k == "color-scheme"
+            || k == "forced-color-adjust" || k == "print-color-adjust") {
+            return true;
+        }
+        return false;
+    }
+
+    /// `justify-content` 的取值码：0 start，1 center，2 end，
+    /// 3 space-between，4 space-around/evenly。
+    /// 对齐关键词 → alignItems/justifyItems 编码（0 stretch/normal、
+    /// 1 start 系、2 center、3 end 系）；grid 与 flex 共用。
+    static int AlignItemCode(string v) {
+        if (v == "flex-start" || v == "start" || v == "top") { return 1; }
+        if (v == "center") { return 2; }
+        if (v == "flex-end" || v == "end" || v == "bottom") { return 3; }
+        return 0;
+    }
+
+    static int JustifyCode(string v) {
+        if (v == "center") { return 1; }
+        if (v == "flex-end" || v == "end" || v == "right") { return 2; }
+        if (v == "space-between") { return 3; }
+        if (v == "space-around" || v == "space-evenly") { return 4; }
+        return 0;
+    }
+
+    /// `align-content` 的取值码：0 start，1 center，2 end，
+    /// 3 space-between，4 space-around/evenly，5 stretch。
+    static int AlignContentCode(string v) {
+        if (v == "center") { return 1; }
+        if (v == "flex-end" || v == "end" || v == "bottom") { return 2; }
+        if (v == "space-between") { return 3; }
+        if (v == "space-around" || v == "space-evenly") { return 4; }
+        if (v == "stretch") { return 5; }
+        return 0;
+    }
+
+    /// `flex: none | auto | initial | <grow> [<shrink> [<basis>]]`。
+    static void DeclFlex(StyleBox b, string val) {
+        string lo = StyleSheet.Lower(val);
+        if (lo == "none") { b.grow = 0; b.shrink = 0; return; }
+        if (lo == "auto") { b.grow = 1; b.shrink = 1; return; }
+        if (lo == "initial") { b.grow = 0; b.shrink = 1; return; }
+        List<string> toks = StyleSheet.Tokens(val);
+        if (toks.Count == 0) { return; }
+        b.grow = StyleSheet.Num(toks[0]);
+        if (toks.Count >= 2) { b.shrink = StyleSheet.Num(toks[1]); }
+        if (toks.Count >= 3) { StyleSheet.DeclBasis(b, toks[2]); }
+    }
+
+    /// `flex-basis: auto | content | <px> | <pct>`：主轴基准尺寸。
+    /// `auto` 撤销声明，回退到 width/height 或控件的测量偏好。
+    static void DeclBasis(StyleBox b, string val) {
+        string lo = StyleSheet.Lower(val);
+        if (lo == "auto" || lo == "content") {
+            b.basis = 0 - 1;
+            b.basisPm = 0 - 1;
+            return;
+        }
+        int n = StyleSheet.Len(b, val);
+        if (StyleSheet.IndexOf(val, "%") >= 0) {
+            b.basisPm = n * 10;
+            b.basis = 0 - 1;
+        } else {
+            b.basis = n;
+            b.basisPm = 0 - 1;
+        }
+    }
+
+    /// `aspect-ratio: auto | <w> / <h> | <ratio>`，存为千分比
+    /// （`16 / 9` -> 1778）。
+    static void DeclAspect(StyleBox b, string val) {
+        string lo = StyleSheet.Lower(val);
+        if (lo == "auto" || lo == "none") { b.aspect = 0; return; }
+        int slash = StyleSheet.IndexOf(val, "/");
+        if (slash >= 0) {
+            int w = StyleSheet.Num(StyleSheet.Trim(val.Substring(0, slash)));
+            int h = StyleSheet.Num(StyleSheet.Trim(
+                val.Substring(slash + 1, val.Length - slash - 1)));
+            if (h == 0) { b.aspect = 0; return; }
+            b.aspect = w * 1000 / h;
+            return;
+        }
+        b.aspect = StyleSheet.Perm(val);
+    }
+
+    /// motion：transition / transform / animation。
+    static bool DeclMotion(StyleBox b, string k, string v) {
+        if (k == "transition" || k == "transition-duration") {
+            StyleSheet.DeclTransition(b, v);
+            return true;
+        }
+        if (k == "transition-timing-function") {
+            b.easing = StyleSheet.Easing(v);
+            return true;
+        }
+        if (k == "transform") { StyleSheet.DeclTransform(b, v); return true; }
+        // 现代 CSS 里 translate/rotate/scale 也可以脱离 transform 单独
+        // 声明，写起来短得多（`rotate: 90` 而不是 `transform: rotate(90)`）。
+        if (k == "rotate") { b.rotate = StyleSheet.Num(v); return true; }
+        if (k == "scale") { b.scale = StyleSheet.Perm(v); return true; }
+        if (k == "translate") {
+            List<string> t = StyleSheet.Tokens(v);
+            if (t.Count >= 1) { b.tx = StyleSheet.Len(b, t[0]); }
+            if (t.Count >= 2) { b.ty = StyleSheet.Len(b, t[1]); }
+            return true;
+        }
+        if (k == "animation" || k == "animation-name") {
+            StyleSheet.DeclAnimation(b, v);
+            return true;
+        }
+        if (k == "animation-duration") { b.animMs = StyleSheet.Ms(v); return true; }
+        return false;
+    }
+
+    /// `background: <color> | linear-gradient([<dir>,] a, b[, c])`。
+    /// 停靠点上的位置（`#fff 40%`）在解析时被丢掉：运行时的
+    /// `grad_sample` 只采样 0/500/1000 三个位置，任意停靠点
+    /// 没有对应的绘制原语（见 StopColor）。
+    static void DeclBackground(StyleBox b, string val) {
+        string s = val;
+        if (StyleSheet.StartsWith(s, "linear-gradient(")) {
+            int close = StyleSheet.LastIndexOf(s, ")");
+            if (close < 0) { close = s.Length; }
+            string inner = s.Substring(16, close - 16);
+            List<string> parts = Css.SplitTopTrim(inner, ",");
+            List<string> stops = new List<string>();
+            bool leftward = false;
+            int i = 0;
+            while (i < parts.Count) {
+                string p = parts[i];
+                i = i + 1;
+                if (p == "") { continue; }
+                if (StyleSheet.IsLeftward(p)) { leftward = true; }
+                int dir = StyleSheet.GradientDir(p);
+                if (dir >= 0) { b.bgDir = dir; continue; }
+                stops.Add(p);
+            }
+            if (stops.Count >= 2) {
+                b.bg = StyleSheet.ParseColor(StyleSheet.StopColor(stops[0]));
+                if (stops.Count >= 3) {
+                    b.bgVia = StyleSheet.ParseColor(StyleSheet.StopColor(stops[1]));
+                    b.bgTo = StyleSheet.ParseColor(StyleSheet.StopColor(stops[2]));
+                } else {
+                    b.bgVia = 0;
+                    b.bgTo = StyleSheet.ParseColor(StyleSheet.StopColor(stops[1]));
+                }
+                // `to left` / `270deg`：方向码只有"向右"，把两端
+                // 停靠点对调，渲染出来就是向左。
+                if (leftward) {
+                    int cs = b.bg; b.bg = b.bgTo; b.bgTo = cs;
+                }
+                return;
+            }
+        }
+        if (s == "none" || s == "transparent") {
+            b.bg = 0;
+            b.bgTo = 0;
+            b.bgVia = 0;
+            return;
+        }
+        b.bg = StyleSheet.ParseColor(s);
+        b.bgTo = 0;
+        b.bgVia = 0;
+    }
+
+    /// 渐变方向关键字/角度作为 StyleBox.bgDir，当该
+    /// token 是颜色停靠点（color stop）时返回 -1。
+    ///
+    /// 五个方向码（StyleBox.bgDir）：0 向下、1 向右、2 右下、
+    /// 3 向上、4 左下。CSS 的 `to left` 是横向的另一个朝向，没有
+    /// 独立的码——它等价于「向右的渐变把两端调过来」，所以这里
+    /// 返回 1 由 DeclBackground 交换首末停靠点（见那里的 sw）。
+    /// 以前 `to left` 落到 -1，整条 gradient 被当成纯色：背景不是渐变。
+    static int GradientDir(string tok) {
+        string s = StyleSheet.Lower(tok);
+        if (s == "to bottom" || s == "180deg") { return 0; }
+        if (s == "to right" || s == "90deg" || s == "to left"
+            || s == "270deg") { return 1; }
+        if (s == "to bottom right" || s == "135deg" || s == "to right bottom") { return 2; }
+        if (s == "to top" || s == "0deg" || s == "360deg") { return 3; }
+        if (s == "to bottom left" || s == "225deg" || s == "to left bottom") { return 4; }
+        // 任意角度：吸附到最近的支持方向。CSS 角度
+        // 从 12 点位置开始顺时针旋转（0=上、90=右、180=下），
+        // 因此 “165deg”（略偏离正下方）吸附到底部。
+        // 没有这个处理时，角度 token 会被解析为颜色停靠点，
+        // 渐变会从透明的起始色开始。
+        if (StyleSheet.EndsWith(s, "deg")) {
+            int deg = StyleSheet.Num(tok);
+            int d = deg % 360;
+            if (d < 0) { d = d + 360; }
+            int best = 0;
+            int bestDist = 1000;
+            for (int ci = 0; ci < 5; ci = ci + 1) {
+                int a = 0;
+                int dir = 0;
+                if (ci == 0) { a = 180; dir = 0; }      // 底
+                else if (ci == 1) { a = 0; dir = 3; }   // 顶
+                else if (ci == 2) { a = 90; dir = 1; }  // 右
+                else if (ci == 3) { a = 135; dir = 2; } // 右下
+                else { a = 225; dir = 4; }              // 左下
+                int dist = a - d;
+                if (dist < 0) { dist = 0 - dist; }
+                if (dist > 180) { dist = 360 - dist; }
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    best = dir;
+                }
+            }
+            return best;
+        }
+        return 0 - 1;
+    }
+
+    /// 停靠点是不是镜像的横向渐变（`to left` / `270deg`）。
+    static bool IsLeftward(string tok) {
+        string s = StyleSheet.Lower(tok);
+        return s == "to left" || s == "270deg";
+    }
+
+    /// `text-shadow: <dx> <dy> [blur] <color>[, ...]`——只取第一层
+    /// （CSS 里它画在最上面），模糊半径无对应绘制原语、忽略几何
+    /// 只保留偏移；层数 ≥3 且偏移非零、`0` 模糊时按描边处理，
+    /// 这正是 `1px 1px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, …`
+    /// 那圈四向描边的意图。
+    static void DeclTextShadow(StyleBox b, string val) {
+        if (StyleSheet.Lower(StyleSheet.Trim(val)) == "none") {
+            b.tsColor = 0; b.tsDx = 0; b.tsDy = 0; b.tsOutline = 0;
+            return;
+        }
+        List<string> layers = Css.SplitTopTrim(val, ",");
+        List<string> toks = StyleSheet.Tokens(layers[0]);
+        List<int> nums = new List<int>();
+        int col = 0;
+        int i = 0;
+        while (i < toks.Count) {
+            string tk = toks[i];
+            i = i + 1;
+            if (StyleSheet.IsNumeric(tk)) { nums.Add(StyleSheet.Len(b, tk)); continue; }
+            col = StyleSheet.ParseColor(tk);
+        }
+        if (col != 0) { b.tsColor = col; }
+        if (nums.Count >= 1) { b.tsDx = nums[0]; }
+        if (nums.Count >= 2) { b.tsDy = nums[1]; }
+        // ≥3 层、零模糊、非零偏移 = 描边惯用法。
+        if (layers.Count >= 3 && b.tsColor != 0
+            && (b.tsDx != 0 || b.tsDy != 0)) {
+            b.tsOutline = 1;
+        }
+    }
+
+    /// 去掉停靠点的位置（`#fff 40%` -> `#fff`）。
+    static string StopColor(string stop) {
+        string s = StyleSheet.Trim(stop);
+        if (StyleSheet.StartsWith(s, "rgb") || StyleSheet.StartsWith(s, "hsl")) {
+            int close = StyleSheet.IndexOf(s, ")");
+            if (close > 0) { return s.Substring(0, close + 1); }
+            return s;
+        }
+        int sp = StyleSheet.IndexOf(s, " ");
+        if (sp > 0) { return s.Substring(0, sp); }
+        return s;
+    }
+
+    /// `border[-side]: <width> [style] <color>`（顺序任意，宽度可选）。
+    ///
+    /// style 词（`dashed`/`dotted`）以前被 `continue` 掉、不落到任何
+    /// 字段上：`border: 1 dashed var(--border-secondary)` 解析成实线，
+    /// 作者看到的是「虚线写了没反应」。这里把它记进 borderStyle，
+    /// 绘制侧（StyleBox.PaintBorders）已经会据此走 Fx.DashedBorder。
+    static void DeclBorder(StyleBox b, string val, int side) {
+        List<string> toks = StyleSheet.Tokens(val);
+        int w = 1;
+        int col = 0;
+        bool haveW = false;
+        bool haveStyle = false;
+        int style = 0;
+        int i = 0;
+        while (i < toks.Count) {
+            string tk = toks[i];
+            i = i + 1;
+            string lo = StyleSheet.Lower(tk);
+            if (lo == "solid" || lo == "dashed" || lo == "dotted"
+                || lo == "double" || lo == "groove" || lo == "ridge"
+                || lo == "inset" || lo == "outset" || lo == "none") {
+                haveStyle = true;
+                if (lo == "dashed" || lo == "dotted") { style = 1; }
+                if (lo == "none") { w = 0; haveW = true; }
+                continue;
+            }
+            if (StyleSheet.IsNumeric(tk)) {
+                w = StyleSheet.Len(b, tk);
+                haveW = true;
+                continue;
+            }
+            col = StyleSheet.ParseColor(tk);
+        }
+        if (!haveW) { w = 1; }
+        // 只有整盒简写才带 style 语义：`border-top: 1 dashed x` 里
+        // 引擎只画统一虚线框（各边线型没有独立字段），写成整体
+        // 比「悄悄变实线」更接近作者意图。
+        if (haveStyle) { b.borderStyle = style; }
+        if (side == 0) {
+            b.borderW = w;
+            if (col != 0) { b.borderColor = col; }
+            b.borderTopW = 0 - 1; b.borderRightW = 0 - 1;
+            b.borderBottomW = 0 - 1; b.borderLeftW = 0 - 1;
+        } else if (side == 1) {
+            b.borderTopW = w; b.borderTopColor = col;
+        } else if (side == 2) {
+            b.borderRightW = w; b.borderRightColor = col;
+        } else if (side == 3) {
+            b.borderBottomW = w; b.borderBottomColor = col;
+        } else {
+            b.borderLeftW = w; b.borderLeftColor = col;
+        }
+    }
+
+    /// `border-radius: all | tl tr br bl`（`999`/`50%` 将形状完全圆化）。
+    static void DeclRadius(StyleBox b, string val) {
+        List<string> toks = StyleSheet.Tokens(val);
+        if (toks.Count == 0) { return; }
+        if (toks.Count == 1) {
+            b.SetRadius(StyleSheet.Len(b, toks[0]));
+            return;
+        }
+        int tl = StyleSheet.Len(b, toks[0]);
+        int tr = tl;
+        int br = tl;
+        int bl = tl;
+        if (toks.Count == 2) {
+            tr = StyleSheet.Len(b, toks[1]);
+            br = tl;
+            bl = tr;
+        } else if (toks.Count == 3) {
+            tr = StyleSheet.Len(b, toks[1]);
+            br = StyleSheet.Len(b, toks[2]);
+            bl = tr;
+        } else {
+            tr = StyleSheet.Len(b, toks[1]);
+            br = StyleSheet.Len(b, toks[2]);
+            bl = StyleSheet.Len(b, toks[3]);
+        }
+        b.radiusTL = tl; b.radiusTR = tr; b.radiusBR = br; b.radiusBL = bl;
+        int max = tl;
+        if (tr > max) { max = tr; }
+        if (br > max) { max = br; }
+        if (bl > max) { max = bl; }
+        b.radius = max;
+    }
+
+    /// 单个角的圆角（`border-top-left-radius` 等，`which`：0 TL、
+    /// 1 TR、2 BR、3 BL）。
+    ///
+    /// 未被声明过的角先继承当前的 `radius`：StyleBox 用"四个角都
+    /// 未声明"表示全圆角，只写一个角的话另外三个必须落成具体值，
+    /// 否则 Corners() 会把它们当成直角，一条
+    /// `border-top-left-radius: 0` 就会把整个盒子削成方的。
+    static void CornerRadius(StyleBox b, int which, int v) {
+        int fb = b.radius;
+        if (fb < 0) { fb = 0; }
+        if (b.radiusTL < 0) { b.radiusTL = fb; }
+        if (b.radiusTR < 0) { b.radiusTR = fb; }
+        if (b.radiusBR < 0) { b.radiusBR = fb; }
+        if (b.radiusBL < 0) { b.radiusBL = fb; }
+        if (which == 0) { b.radiusTL = v; }
+        else if (which == 1) { b.radiusTR = v; }
+        else if (which == 2) { b.radiusBR = v; }
+        else { b.radiusBL = v; }
+        int max = b.radiusTL;
+        if (b.radiusTR > max) { max = b.radiusTR; }
+        if (b.radiusBR > max) { max = b.radiusBR; }
+        if (b.radiusBL > max) { max = b.radiusBL; }
+        b.radius = max;
+    }
+
+    /// `box-shadow: [inset] <dx> <dy> [blur] <color>`（或仅一个颜色）。
+    static void DeclShadow(StyleBox b, string val) {
+        if (StyleSheet.Lower(val) == "none") {
+            b.shadow = 0;
+            return;
+        }
+        List<string> toks = StyleSheet.Tokens(val);
+        List<int> nums = new List<int>();
+        int col = 0;
+        int i = 0;
+        while (i < toks.Count) {
+            string tk = toks[i];
+            i = i + 1;
+            if (StyleSheet.Lower(tk) == "inset") { b.shadowInset = 1; continue; }
+            if (StyleSheet.IsNumeric(tk)) { nums.Add(StyleSheet.Len(b, tk)); continue; }
+            col = StyleSheet.ParseColor(tk);
+        }
+        if (col != 0) { b.shadow = col; }
+        if (nums.Count >= 2) {
+            b.shadowDx = nums[0];
+            b.shadowDy = nums[1];
+            if (nums.Count >= 3) { b.shadowBlur = nums[2]; }
+        } else if (nums.Count == 1) {
+            b.shadowDy = nums[0];
+        } else if (b.shadowDy == 0) {
+            b.shadowDy = 2;
+        }
+    }
+
+    /// `-zan-sheen: none | <strength> [color]`：玻璃光泽强度（`0.35`、
+    /// `35%` 或千分比 `350`），可选高光颜色（默认白）。绘制由
+    /// StyleBox 统一完成，因此任何画 box 的控件都能被皮肤点亮。
+    static void DeclSheen(StyleBox b, string val) {
+        if (StyleSheet.Lower(val) == "none") {
+            b.sheen = 0;
+            return;
+        }
+        List<string> toks = StyleSheet.Tokens(val);
+        int i = 0;
+        int str = 0 - 1;
+        while (i < toks.Count) {
+            string tk = toks[i];
+            i = i + 1;
+            if (StyleSheet.IsNumeric(tk)) {
+                if (str < 0) { str = StyleSheet.Perm(tk); }
+                continue;
+            }
+            b.sheenColor = StyleSheet.ParseColor(tk);
+        }
+        if (str < 0) { str = 1000; }
+        if (str > 1000) { str = 1000; }
+        b.sheen = str;
+    }
+
+    /// `padding/margin: all | v h | t h b | t r b l`。
+    /// margin/padding 单边值：margin 的 `auto` 记哨兵 -1（布局端做
+    /// 水平居中/贴边），padding 的 `auto` 按 0。
+    static int SideVal(StyleBox b, string tok, bool margin) {
+        if (tok == "auto") { return margin ? 0 - 1 : 0; }
+        return StyleSheet.Len(b, tok);
+    }
+
+    static void DeclSides(StyleBox b, string val, int which) {
+        List<string> toks = StyleSheet.Tokens(val);
+        if (toks.Count == 0) { return; }
+        bool margin = which == 1;
+        int t = StyleSheet.SideVal(b, toks[0], margin);
+        int r = t;
+        int bo = t;
+        int l = t;
+        if (toks.Count == 2) {
+            r = StyleSheet.SideVal(b, toks[1], margin);
+            l = r;
+        } else if (toks.Count == 3) {
+            r = StyleSheet.SideVal(b, toks[1], margin);
+            l = r;
+            bo = StyleSheet.SideVal(b, toks[2], margin);
+        } else if (toks.Count >= 4) {
+            r = StyleSheet.SideVal(b, toks[1], margin);
+            bo = StyleSheet.SideVal(b, toks[2], margin);
+            l = StyleSheet.SideVal(b, toks[3], margin);
+        }
+        if (which == 0) {
+            b.padT = t; b.padR = r; b.padB = bo; b.padL = l;
+        } else {
+            b.marT = t; b.marR = r; b.marB = bo; b.marL = l;
+        }
+    }
+
+    /// `transition: [prop] <duration> [timing]`——这里只有时长和 timing
+    /// 有意义（所有可动画属性一起缓动）。
+    static void DeclTransition(StyleBox b, string val) {
+        List<string> toks = StyleSheet.Tokens(val);
+        int i = 0;
+        while (i < toks.Count) {
+            string tk = toks[i];
+            i = i + 1;
+            if (StyleSheet.IsNumeric(tk)) { b.transitionMs = StyleSheet.Ms(tk); continue; }
+            int e = StyleSheet.Easing(tk);
+            if (e >= 0) { b.easing = e; }
+        }
+    }
+
+    /// `transform: translate(x,y) translateX(x) translateY(y) scale(n) rotate(deg)`。
+    static void DeclTransform(StyleBox b, string val) {
+        string s = val;
+        if (StyleSheet.Lower(s) == "none") {
+            b.tx = 0; b.ty = 0; b.scale = 1000; b.rotate = 0;
+            return;
+        }
+        int i = 0;
+        while (i < s.Length) {
+            int open = Css.IndexFrom(s, "(", i);
+            if (open < 0) { return; }
+            int close = Css.IndexFrom(s, ")", open + 1);
+            if (close < 0) { return; }
+            string name = StyleSheet.Lower(StyleSheet.Trim(s.Substring(i, open - i)));
+            string args = s.Substring(open + 1, close - open - 1);
+            i = close + 1;
+            List<string> a = Css.SplitTrim(args, ",");
+            if (name == "translate") {
+                if (a.Count >= 1) { b.tx = StyleSheet.Len(b, a[0]); }
+                if (a.Count >= 2) { b.ty = StyleSheet.Len(b, a[1]); }
+            } else if (name == "translatex") {
+                if (a.Count >= 1) { b.tx = StyleSheet.Len(b, a[0]); }
+            } else if (name == "translatey") {
+                if (a.Count >= 1) { b.ty = StyleSheet.Len(b, a[0]); }
+            } else if (name == "scale") {
+                if (a.Count >= 1) { b.scale = StyleSheet.Perm(a[0]); }
+            } else if (name == "rotate") {
+                if (a.Count >= 1) { b.rotate = StyleSheet.Num(a[0]); }
+            }
+        }
+    }
+
+    /// `animation: <name> <duration> [timing] [infinite]`。名称映射到
+    /// 内置关键帧（spin、pulse、breath、shimmer、float、glow、aurora、
+    /// motes），由 Fx 绘制。
+    static void DeclAnimation(StyleBox b, string val) {
+        List<string> toks = StyleSheet.Tokens(val);
+        int i = 0;
+        while (i < toks.Count) {
+            string tk = toks[i];
+            i = i + 1;
+            string lo = StyleSheet.Lower(tk);
+            if (lo == "none") { b.anim = 0; continue; }
+            if (lo == "infinite" || lo == "linear" || lo == "ease"
+                || lo == "ease-in" || lo == "ease-out" || lo == "ease-in-out"
+                || lo == "alternate" || lo == "forwards") {
+                int e = StyleSheet.Easing(lo);
+                if (e >= 0) { b.easing = e; }
+                continue;
+            }
+            if (StyleSheet.IsNumeric(tk)) { b.animMs = StyleSheet.Ms(tk); continue; }
+            int kind = Style.AnimKind(lo);
+            if (kind != 0) { b.anim = kind; }
+        }
+    }
+
+    /// 滤镜值中的 `blur(20px)` -> 20（无时为 0）。长度走 Len
+    /// （`blur(0.2em)` 这类也能解析）。
+    static int BlurArg(StyleBox b, string val) {
+        int at = Css.IndexFrom(StyleSheet.Lower(val), "blur(", 0);
+        if (at < 0) { return 0; }
+        int close = Css.IndexFrom(val, ")", at);
+        if (close < 0) { return 0; }
+        return StyleSheet.Len(b, val.Substring(at + 5, close - at - 5));
+    }
+
+    /// 缓动函数名转枚举码：ease/linear/ease-in/ease-out/ease-in-out，
+    /// 不认识返回 -1。
+    static int Easing(string val) {
+        string s = StyleSheet.Lower(val);
+        if (s == "ease") { return 0; }
+        if (s == "linear") { return 1; }
+        if (s == "ease-in") { return 2; }
+        if (s == "ease-out") { return 3; }
+        if (s == "ease-in-out") { return 4; }
+        return 0 - 1;
+    }
+
+    /// 字重关键词转数值：bold=700 / normal=400 / light=300，
+    /// 其余按数字解析。
+    static int Weight(string val) {
+        string s = StyleSheet.Lower(val);
+        if (s == "bold" || s == "bolder") { return 700; }
+        if (s == "normal") { return 400; }
+        if (s == "light" || s == "lighter") { return 300; }
+        return StyleSheet.Num(s);
+    }
+
+    /// cursor 关键词转系统光标码（pointer/text/resize 等，
+    /// 不认识回退箭头）。
+    static int CursorCode(string val) {
+        string s = StyleSheet.Lower(val);
+        if (s == "pointer" || s == "hand" || s == "grab") { return Cursor.Hand(); }
+        if (s == "text") { return Cursor.IBeam(); }
+        if (s == "ew-resize" || s == "col-resize"
+            || s == "e-resize" || s == "w-resize") { return Cursor.ResizeH(); }
+        if (s == "ns-resize" || s == "row-resize"
+            || s == "n-resize" || s == "s-resize") { return Cursor.ResizeV(); }
+        if (s == "grabbing" || s == "zoom-in") { return Cursor.Hand(); }
+        return Cursor.Arrow();
+    }
+
+    // ---- Control 应用（retained mode / UiDoc）----
+
+    /// 将匹配的规则应用到 `c`，按特异性升序（type，然后
+    /// class，然后 id），最具体的选择器胜出。
+    void Apply(Control c, string type, string cls, string id) {
+        ApplySelector(c, type);
+        if (cls != "") { ApplySelector(c, "." + cls); }
+        if (id != "") { ApplySelector(c, "#" + id); }
+        // 状态规则叠加在基础外观之上，因此 `button:hover` 只需
+        // 注明变化的部分。
+        if (state != "") {
+            ApplySelector(c, type + ":" + state);
+            if (cls != "") { ApplySelector(c, "." + cls + ":" + state); }
+            if (id != "") { ApplySelector(c, "#" + id + ":" + state); }
+        }
+        // `!important` 最后再套一遍：它要压过上面全部（以及宿主写下的
+        // inline 样式），所以必须排在整段级联之后，而不是混在普通声明里。
+        ApplyImportantSelector(c, type);
+        if (cls != "") { ApplyImportantSelector(c, "." + cls); }
+        if (id != "") { ApplyImportantSelector(c, "#" + id); }
+        if (state != "") {
+            ApplyImportantSelector(c, type + ":" + state);
+            if (cls != "") { ApplyImportantSelector(c, "." + cls + ":" + state); }
+            if (id != "") { ApplyImportantSelector(c, "#" + id + ":" + state); }
+        }
+    }
+
+    /// 把一个选择器里 `!important` 的声明套到控件上。
+    void ApplyImportantSelector(Control c, string selector) {
+        JsonValue block = this.Block(selector);
+        if (block == null) { return; }
+        JsonValue imp = block.Get("__zan_important");
+        if (imp == null || !imp.IsObject()) { return; }
+        StyleBox box = new StyleBox();
+        bool visual = false;
+        for (int j = 0; j < imp.Count(); j = j + 1) {
+            string k = imp.KeyAt(j);
+            if (StyleSheet.DeclSource(box, k, StyleSheet.ValStr(imp.ValAt(j)),
+                                      StyleSheet.IsPrescaled(block, k))) {
+                visual = true;
+            } else {
+                c.SetProp(k, StyleSheet.Scalar(imp.ValAt(j)));
+            }
+        }
+        if (visual) { StyleSheet.CopyToControl(box, c); }
+    }
+
+    /// 将一个选择器的声明应用到控件：layout 键落在
+    /// 控件自身的字段上，视觉键走共享的 StyleBox 解析器
+    /// （因此 CSS 在 retained 和 immediate 模式下行为一致），其余
+    /// 通过 SetProp 发布给控件。
+    void ApplySelector(Control c, string selector) {
+        JsonValue block = this.Block(selector);
+        if (block == null) { return; }
+        StyleSheet.ApplyBlock(c, block);
+    }
+
+    /// ApplySelector 的主体：一个声明块（JsonValue 对象）落到
+    /// 控件上。选择器路径与内联 style 通道（ApplyInline）共用。
+    static void ApplyBlock(Control c, JsonValue block) {
+        StyleBox box = new StyleBox();
+        bool visual = false;
+        // `!important` 的声明先收进 box、最后套（与 StyleBox 路径同一
+        // 语义），不走 SetProp——否则它们会被当成 class 名加到控件上。
+        JsonValue imp = block.Get("__zan_important");
+        int i = 0;
+        while (i < block.Count()) {
+            string k = block.KeyAt(i);
+            JsonValue v = block.ValAt(i);
+            i = i + 1;
+            if (k == "__zan_prescaled" || k == "__zan_important") { continue; }
+            if (k == "pad" || k == "padding") {
+                c.Pad(StyleSheet.Num(StyleSheet.ValStr(v)));
+                continue;
+            }
+            if (k == "gap") { c.gap = v.AsInt(0); continue; }
+            if (k == "dock") {
+                if (v.IsNumber()) { c.dock = v.AsInt(0); }
+                else { c.dock = StyleSheet.DockValue(v.AsString("")); }
+                continue;
+            }
+            if (k == "x") { c.mx = v.AsInt(0); continue; }
+            if (k == "y") { c.my = v.AsInt(0); continue; }
+            if (k == "width") { c.prefW = StyleSheet.Num(StyleSheet.ValStr(v)); continue; }
+            if (k == "height") { c.prefH = StyleSheet.Num(StyleSheet.ValStr(v)); continue; }
+            if (StyleSheet.DeclSource(box, k, StyleSheet.ValStr(v),
+                                      StyleSheet.IsPrescaled(block, k))) {
+                visual = true;
+                continue;
+            }
+            c.SetProp(k, StyleSheet.Scalar(v));
+        }
+        if (imp != null && imp.IsObject()) {
+            for (int j = 0; j < imp.Count(); j = j + 1) {
+                string k = imp.KeyAt(j);
+                if (StyleSheet.DeclSource(box, k, StyleSheet.ValStr(imp.ValAt(j)),
+                                          StyleSheet.IsPrescaled(block, k))) {
+                    visual = true;
+                }
+            }
+        }
+        if (visual) { StyleSheet.CopyToControl(box, c); }
+    }
+
+    /// 内联 style 声明（style="color:#c00; padding:8px"）落到控件：
+    /// 声明文本交给整块 CSS 解析器（缩写键/颜色/函数/!important 全
+    /// 部复用），再走 ApplyBlock——与选择器路径同一落点语义。
+    /// 内联值是字面量，应用一次即终值，不随主题/皮肤重算，与浏览器
+    /// inline style 同语义；视觉键经 CopyToControl 落 style* 覆盖
+    /// 字段，优先级高于类规则（在每次样式解析的 Inline 覆盖之后）。
+    static void ApplyInline(Control c, string decls) {
+        if (c == null || decls == null) { return; }
+        string s = StyleSheet.Trim(decls);
+        if (s == "") { return; }
+        StyleSheet sheet = Css.Parse(".zan-inline { " + s + " }");
+        JsonValue block = sheet.Block(".zan-inline");
+        if (block != null) { StyleSheet.ApplyBlock(c, block); }
+    }
+
+    /// 复制控件内联携带的视觉属性（Control 只保留
+    /// 一小部分；其余在绘制时存于解析后的 StyleBox 上）。
+    static void CopyToControl(StyleBox b, Control c) {
+        if (b.bg != 0) { c.styleBg = b.bg; }
+        if (b.bgTo != 0) { c.styleBgTo = b.bgTo; }
+        if (b.radius >= 0) { c.styleRadius = b.radius; }
+        if (b.borderColor != 0) { c.styleBorderColor = b.borderColor; }
+        if (b.borderW >= 0) { c.styleBorderWidth = b.borderW; }
+        if (b.shadow != 0) {
+            c.styleShadow = b.shadow;
+            c.styleShadowDy = b.shadowDy;
+            if (c.styleShadowDy == 0) { c.styleShadowDy = 2; }
+        }
+        if (b.fg != 0) { c.styleColor = b.fg; }
+        if (b.fontPx > 0) { c.styleFontPx = b.fontPx; }
+        if (b.transitionMs >= 0) { c.styleTransitionMs = b.transitionMs; }
+    }
+
+    /// 在控件上设置纯色填充或 `linear-gradient(a,b)`。
+    static void ApplyBackground(Control c, string val) {
+        StyleBox b = new StyleBox();
+        StyleSheet.DeclBackground(b, StyleSheet.Trim(val));
+        c.styleBg = b.bg;
+        c.styleBgTo = b.bgTo;
+    }
+
+    /// 解析 `border: <width> <color>`（宽度可选，默认为 1）。
+    static void ApplyBorder(Control c, string val) {
+        StyleBox b = new StyleBox();
+        StyleSheet.DeclBorder(b, StyleSheet.Trim(val), 0);
+        c.styleBorderWidth = b.borderW;
+        c.styleBorderColor = b.borderColor;
+    }
+
+    // ---- 值解析 -----
+
+    /// 将 CSS 颜色解析为打包的 0xAARRGGBB int。接受 `#RGB`、
+    /// `#RRGGBB`、`#RRGGBBAA`、`#AARRGGBB`、`rgb()/rgba()`、`hsl()/hsla()`、
+    /// `0x...`、纯十进制数和 CSS 命名颜色。空值或无法解析的值
+    /// 返回 0（= 未设置），因此坏规则只是什么都不做。
+    static int ParseColor(string val) {
+        string s = StyleSheet.Trim(val);
+        if (s.Length == 0) { return 0; }
+        if (s.Substring(0, 1) == "#") {
+            string h = s.Substring(1, s.Length - 1);
+            if (h.Length == 3) {
+                string r = h.Substring(0, 1);
+                string g = h.Substring(1, 1);
+                string b = h.Substring(2, 1);
+                h = r + r + g + g + b + b;
+            } else if (h.Length == 4) {
+                // #rgba
+                string r = h.Substring(0, 1);
+                string g = h.Substring(1, 1);
+                string b = h.Substring(2, 1);
+                string a = h.Substring(3, 1);
+                h = a + a + r + r + g + g + b + b;
+            }
+            if (h.Length == 6) { h = "FF" + h; }
+            if (h.Length == 8 && StyleSheet.HexDigit(h.Substring(0, 1)) < 0) { return 0; }
+            if (h.Length != 8) { return 0; }
+            return StyleSheet.HexToInt(h);
+        }
+        string lo = StyleSheet.Lower(s);
+        if (StyleSheet.StartsWith(lo, "rgb")) { return StyleSheet.ParseRgb(s); }
+        if (StyleSheet.StartsWith(lo, "hsl")) { return StyleSheet.ParseHsl(s); }
+        if (StyleSheet.StartsWith(lo, "hwb(")) { return StyleSheet.ParseHwb(s); }
+        if (StyleSheet.StartsWith(lo, "oklab(")) {
+            return StyleSheet.ParseOklabLike(s, false);
+        }
+        if (StyleSheet.StartsWith(lo, "oklch(")) {
+            return StyleSheet.ParseOklabLike(s, true);
+        }
+        if (StyleSheet.StartsWith(lo, "lab(")) {
+            return StyleSheet.ParseCielabLike(s, false);
+        }
+        if (StyleSheet.StartsWith(lo, "lch(")) {
+            return StyleSheet.ParseCielabLike(s, true);
+        }
+        if (StyleSheet.StartsWith(lo, "color-mix(")) {
+            return StyleSheet.ParseColorMix(s);
+        }
+        if (lo == "transparent" || lo == "none" || lo == "currentcolor") { return 0; }
+        if (s.Length > 2 && s.Substring(0, 2) == "0x") {
+            return StyleSheet.HexToInt(s.Substring(2, s.Length - 2));
+        }
+        int named = StyleSheet.NamedColor(lo);
+        if (named != 0) { return named; }
+        return StyleSheet.ParseInt(s);
+    }
+
+    /// `rgb(r,g,b)` / `rgba(r,g,b,a)`，也收现代空格语法
+    /// `rgb(0 128 255)` 与斜杠 alpha `rgb(0 128 255 / 50%)`。
+    static int ParseRgb(string val) {
+        List<string> a = StyleSheet.FuncArgs(val);
+        if (a.Count < 3) { return 0; }
+        int r = StyleSheet.Chan(a[0]);
+        int g = StyleSheet.Chan(a[1]);
+        int b = StyleSheet.Chan(a[2]);
+        int al = a.Count >= 4 ? StyleSheet.Alpha255(a[3]) : 255;
+        return StyleSheet.Pack(al, r, g, b);
+    }
+
+    /// 函数式颜色取参：顶层 `/` 之后是 alpha；主串按逗号（旧语法）
+    /// 或空白（现代语法）切分。
+    static List<string> FuncArgs(string val) {
+        int open = StyleSheet.IndexOf(val, "(");
+        int close = StyleSheet.LastIndexOf(val, ")");
+        if (open < 0 || close < open) { return new List<string>(); }
+        string inner = val.Substring(open + 1, close - open - 1);
+        string main = inner;
+        string alpha = "";
+        int slash = Css.IndexFrom(inner, "/", 0);
+        if (slash >= 0) {
+            main = Css.Trim(inner.Substring(0, slash));
+            alpha = Css.Trim(inner.Substring(slash + 1,
+                                             inner.Length - slash - 1));
+        }
+        List<string> outp = new List<string>();
+        List<string> parts = Css.IndexFrom(main, ",", 0) >= 0
+            ? Css.SplitTrim(main, ",")
+            : Css.SplitTopTrim(main, " ");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (parts[i] != "") { outp.Add(parts[i]); }
+        }
+        if (alpha != "") { outp.Add(alpha); }
+        return outp;
+    }
+
+    /// alpha token：`0.5` / `50%` -> 0..255。
+    static int Alpha255(string tok) {
+        if (Css.IndexFrom(tok, "%", 0) >= 0) {
+            return StyleSheet.Perm(tok) * 255 / 1000;
+        }
+        return StyleSheet.Clamp255((int)(StyleSheet.ParseDbl(tok) * 255.0));
+    }
+
+    /// 颜色函数的浮点通道：`50%` -> Perm/pctDiv（oklab 标度 0..1 用
+    /// 1000，lab 标度 0..100 用 10），裸数按十进制浮点。
+    static double DblChan(string tok, double pctDiv) {
+        string t = Css.Trim(tok);
+        if (Css.IndexFrom(t, "%", 0) >= 0) {
+            return StyleSheet.Perm(t) / pctDiv;
+        }
+        return StyleSheet.ParseDbl(t);
+    }
+
+    /// 十进制 token -> double（无指数；色彩换算专用）。
+    static double ParseDbl(string tok) {
+        string t = Css.Trim(tok);
+        if (t == "") { return 0.0; }
+        double sign = 1.0;
+        string c0 = t.Substring(0, 1);
+        if (c0 == "-") {
+            sign = 0.0 - 1.0;
+            t = Css.Trim(t.Substring(1, t.Length - 1));
+        } else if (c0 == "+") {
+            t = Css.Trim(t.Substring(1, t.Length - 1));
+        }
+        double v = 0.0;
+        int i = 0;
+        while (i < t.Length && StyleSheet.Digit(t.Substring(i, 1))) {
+            v = v * 10.0 + StyleSheet.HexToInt(t.Substring(i, 1));
+            i = i + 1;
+        }
+        if (i < t.Length && t.Substring(i, 1) == ".") {
+            i = i + 1;
+            double fr = 1.0;
+            while (i < t.Length && StyleSheet.Digit(t.Substring(i, 1))) {
+                fr = fr / 10.0;
+                v = v + fr * StyleSheet.HexToInt(t.Substring(i, 1));
+                i = i + 1;
+            }
+        }
+        return sign * v;
+    }
+
+    /// 色相 token -> 0..359 度：`210`、`210deg`、`0.5turn`、
+    /// `200grad`、`3.14rad`（浮点解析，支持小数色相）。
+    static int Hue360(string tok) {
+        string lo2 = StyleSheet.Lower(Css.Trim(tok));
+        double v = StyleSheet.ParseDbl(lo2);
+        double deg = v;
+        if (StyleSheet.EndsWith(lo2, "grad")) { deg = v * 0.9; }
+        else if (StyleSheet.EndsWith(lo2, "rad")) { deg = v * 57.2957795; }
+        else if (StyleSheet.EndsWith(lo2, "turn")) { deg = v * 360.0; }
+        int d = (int)deg;
+        d = d % 360;
+        if (d < 0) { d = d + 360; }
+        return d;
+    }
+
+    /// 色环六棱锥：h（度）、c（千分色度）-> 千分制 r,g,b，最大
+    /// 分量恰为 c。hsl 与 hwb 共用。
+    static void Hexcone(int h, int c, out int r, out int g, out int b) {
+        int hp = h * 1000 / 60;
+        int mod2 = hp % 2000;
+        int xm = mod2 - 1000;
+        if (xm < 0) { xm = 0 - xm; }
+        int x = c * (1000 - xm) / 1000;
+        r = 0; g = 0; b = 0;
+        if (h < 60) { r = c; g = x; }
+        else if (h < 120) { r = x; g = c; }
+        else if (h < 180) { g = c; b = x; }
+        else if (h < 240) { g = x; b = c; }
+        else if (h < 300) { r = x; b = c; }
+        else { r = c; b = x; }
+    }
+
+    /// `hsl(h,s%,l%)` / `hsla(...)` / `hsl(120 50% 50% / 30%)`
+    /// 转换为 RGB（整数运算）。
+    static int ParseHsl(string val) {
+        List<string> a = StyleSheet.FuncArgs(val);
+        if (a.Count < 3) { return 0; }
+        int h = StyleSheet.Hue360(a[0]);
+        int sat = StyleSheet.Perm(a[1]);
+        int lit = StyleSheet.Perm(a[2]);
+        int al = a.Count >= 4 ? StyleSheet.Alpha255(a[3]) : 255;
+        // c = (1 - |2l - 1|) * s；所有值均为千分数
+        int d2l = 2 * lit - 1000;
+        if (d2l < 0) { d2l = 0 - d2l; }
+        int chroma = (1000 - d2l) * sat / 1000;
+        int r; int g; int b;
+        StyleSheet.Hexcone(h, chroma, out r, out g, out b);
+        int m = lit - chroma / 2;
+        return StyleSheet.Pack(al, (r + m) * 255 / 1000,
+                               (g + m) * 255 / 1000,
+                               (b + m) * 255 / 1000);
+    }
+
+    /// `hwb(h w% b% [/ a])`：色相纯色按白、黑分量收缩（w+b 超过
+    /// 100% 时按比例归一）。
+    static int ParseHwb(string val) {
+        List<string> a = StyleSheet.FuncArgs(val);
+        if (a.Count < 3) { return 0; }
+        int h = StyleSheet.Hue360(a[0]);
+        int w = StyleSheet.Perm(a[1]);
+        int bk = StyleSheet.Perm(a[2]);
+        int al = a.Count >= 4 ? StyleSheet.Alpha255(a[3]) : 255;
+        int sum = w + bk;
+        if (sum > 1000) {
+            w = w * 1000 / sum;
+            bk = 1000 - w;
+            sum = 1000;
+        }
+        int keep = 1000 - sum;
+        int r; int g; int b;
+        StyleSheet.Hexcone(h, 1000, out r, out g, out b);
+        // 纯色（千分刻度）按 keep 收缩到 255 刻度，再叠白分量；
+        // r*keep*255 最大 1e3*1e3*255 < 2^31，不溢出。
+        return StyleSheet.Pack(al, r * keep * 255 / 1000000 + w * 255 / 1000,
+                               g * keep * 255 / 1000000 + w * 255 / 1000,
+                               b * keep * 255 / 1000000 + w * 255 / 1000);
+    }
+
+    /// `oklab(L a b [/ a])` 与 `oklch(L C H [/ a])`（感知色彩空间，
+    /// Tailwind 一类现代调色板的缺省写法）。
+    static int ParseOklabLike(string val, bool polar) {
+        List<string> a = StyleSheet.FuncArgs(val);
+        if (a.Count < 3) { return 0; }
+        double L = StyleSheet.DblChan(a[0], 1000.0);
+        int alpha = a.Count >= 4 ? StyleSheet.Alpha255(a[3]) : 255;
+        double ax; double bx;
+        if (polar) {
+            double c = StyleSheet.DblChan(a[1], 1000.0);
+            double hd = StyleSheet.Hue360(a[2]);
+            ax = c * StyleSheet.CosD(hd);
+            bx = c * StyleSheet.SinD(hd);
+        } else {
+            ax = StyleSheet.DblChan(a[1], 1000.0);
+            bx = StyleSheet.DblChan(a[2], 1000.0);
+        }
+        return StyleSheet.OklabToRgb(L, ax, bx, alpha);
+    }
+
+    /// OKLab -> 线性 sRGB（Björn Ottosson 的常数）-> gamma 8bit。
+    static int OklabToRgb(double L, double ax, double bx, int alpha) {
+        double l_ = L + 0.3963377774 * ax + 0.2158037573 * bx;
+        double m_ = L - 0.1055613458 * ax - 0.0638541728 * bx;
+        double s_ = L - 0.0894841775 * ax - 1.2914855480 * bx;
+        double l = l_ * l_ * l_;
+        double m = m_ * m_ * m_;
+        double s2 = s_ * s_ * s_;
+        double rl = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s2;
+        double gl = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s2;
+        double bl = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s2;
+        return StyleSheet.Pack(alpha, StyleSheet.Gamma255(rl),
+                               StyleSheet.Gamma255(gl),
+                               StyleSheet.Gamma255(bl));
+    }
+
+    /// `lab(L a b [/ a])` 与 `lch(L C H [/ a])`（CIE Lab，D50 白点）。
+    static int ParseCielabLike(string val, bool polar) {
+        List<string> a = StyleSheet.FuncArgs(val);
+        if (a.Count < 3) { return 0; }
+        double L = StyleSheet.DblChan(a[0], 10.0);
+        int alpha = a.Count >= 4 ? StyleSheet.Alpha255(a[3]) : 255;
+        double ax; double bx;
+        if (polar) {
+            double c = StyleSheet.DblChan(a[1], 10.0);
+            double hd = StyleSheet.Hue360(a[2]);
+            ax = c * StyleSheet.CosD(hd);
+            bx = c * StyleSheet.SinD(hd);
+        } else {
+            ax = StyleSheet.DblChan(a[1], 10.0);
+            bx = StyleSheet.DblChan(a[2], 10.0);
+        }
+        return StyleSheet.LabToRgb(L, ax, bx, alpha);
+    }
+
+    /// CIE Lab(D50) -> XYZ(D50) -> Bradford 适应到 D65 ->
+    /// 线性 sRGB。矩阵常数取自 CSS Color 4 转换样例。
+    static int LabToRgb(double L, double ax, double bx, int alpha) {
+        double e = 216.0 / 24389.0;
+        double k = 24389.0 / 27.0;
+        double fy = (L + 16.0) / 116.0;
+        double fx = fy + ax / 500.0;
+        double fz = fy - bx / 200.0;
+        double fx3 = fx * fx * fx;
+        double fz3 = fz * fz * fz;
+        double fy3 = fy * fy * fy;
+        double xr = fx3 > e ? fx3 : (116.0 * fx - 16.0) / k;
+        double yr = L > k * e ? fy3 : L / k;
+        double zr = fz3 > e ? fz3 : (116.0 * fz - 16.0) / k;
+        double X = xr * 0.96422;
+        double Y = yr;
+        double Z = zr * 0.82521;
+        double xd = 0.9555766 * X - 0.0230393 * Y + 0.0631636 * Z;
+        double yd = -0.0282895 * X + 1.0099416 * Y + 0.0210077 * Z;
+        double zd = 0.0122982 * X - 0.0204830 * Y + 1.3299098 * Z;
+        double rl = 3.2404542 * xd - 1.5371385 * yd - 0.4985314 * zd;
+        double gl = -0.9692660 * xd + 1.8760108 * yd + 0.0415560 * zd;
+        double bl = 0.0556434 * xd - 0.2040259 * yd + 1.0572252 * zd;
+        return StyleSheet.Pack(alpha, StyleSheet.Gamma255(rl),
+                               StyleSheet.Gamma255(gl),
+                               StyleSheet.Gamma255(bl));
+    }
+
+    /// 颜色的一个 8bit 通道：shift 16=r、8=g、0=b。颜色 int 带
+    /// FF alpha 时为负，必须用无符号移位语义（>> 后 & 255）。
+    static int ByteOf(int c, int shift) {
+        return (c >> shift) & 255;
+    }
+
+    /// 线性光分量 -> sRGB gamma -> 0..255。
+    static int Gamma255(double c) {
+        double v;
+        if (c <= 0.0031308) { v = 12.92 * c; }
+        else { v = 1.055 * Math.Pow(c, 1.0 / 2.4) - 0.055; }
+        return StyleSheet.Clamp255((int)Math.Round(v * 255.0));
+    }
+
+    /// 度制余弦：区间归约后五阶泰勒（|误差| < 5e-6，色彩换算足够；
+    /// 运行时没有 Math.Cos/Sin）。
+    static double CosD(double deg) {
+        double x = deg % 360.0;
+        if (x < 0.0) { x = x + 360.0; }
+        double rad = x * 3.14159265358979 / 180.0;
+        double sign = 1.0;
+        if (rad > 3.14159265358979) {
+            rad = 6.28318530717958 - rad;
+        }
+        if (rad > 1.57079632679490) {
+            rad = 3.14159265358979 - rad;
+            sign = 0.0 - sign;
+        }
+        double x2 = rad * rad;
+        return sign * (1.0 - x2 / 2.0 + x2 * x2 / 24.0
+                       - x2 * x2 * x2 / 720.0
+                       + x2 * x2 * x2 * x2 / 40320.0
+                       - x2 * x2 * x2 * x2 * x2 / 3628800.0);
+    }
+
+    /// 度制正弦（cos(x-90) = sin(x)）。
+    static double SinD(double deg) {
+        return CosD(deg - 90.0);
+    }
+
+    /// `color-mix(in <space>, c1 [p1], c2 [p2])`：混合空间按 sRGB
+    /// 近似（感知空间的混合差异对本引擎的用途可忽略）；百分比
+    /// 缺省 50%，两侧和不为 100% 时按比例归一。
+    static int ParseColorMix(string val) {
+        int open = StyleSheet.IndexOf(val, "(");
+        int close = StyleSheet.LastIndexOf(val, ")");
+        if (open < 0 || close < open) { return 0; }
+        List<string> parts = Css.SplitTopTrim(
+            val.Substring(open + 1, close - open - 1), ",");
+        int idx = 0;
+        if (parts.Count > 0
+            && StyleSheet.StartsWith(StyleSheet.Lower(parts[0]), "in ")) {
+            idx = 1;
+        }
+        if (parts.Count - idx < 2) { return 0; }
+        int p1 = 0 - 1; int p2 = 0 - 1;
+        string s1 = StyleSheet.TakePct(parts[idx], out p1);
+        string s2 = StyleSheet.TakePct(parts[idx + 1], out p2);
+        if (p1 < 0) { p1 = 500; }
+        if (p2 < 0) { p2 = 500; }
+        int c1 = StyleSheet.ParseColor(s1);
+        int c2 = StyleSheet.ParseColor(s2);
+        int sum = p1 + p2;
+        if (sum <= 0) { p1 = 500; p2 = 500; sum = 1000; }
+        p1 = p1 * 1000 / sum;
+        p2 = 1000 - p1;
+        int r = (StyleSheet.ByteOf(c1, 16) * p1
+                 + StyleSheet.ByteOf(c2, 16) * p2) / 1000;
+        int g = (StyleSheet.ByteOf(c1, 8) * p1
+                 + StyleSheet.ByteOf(c2, 8) * p2) / 1000;
+        int b = (StyleSheet.ByteOf(c1, 0) * p1
+                 + StyleSheet.ByteOf(c2, 0) * p2) / 1000;
+        int a1 = (c1 >> 24) & 255;
+        int a2 = (c2 >> 24) & 255;
+        int al = (a1 * p1 + a2 * p2) / 1000;
+        return StyleSheet.Pack(al, r, g, b);
+    }
+
+    /// 抽出尾部独立百分比 token（`red 30%` -> "red", 300）；
+    /// 没有时 pct 返回 -1、原串返回。
+    static string TakePct(string s, out int pct) {
+        pct = 0 - 1;
+        string t = Css.Trim(s);
+        int i = t.Length;
+        while (i > 0 && t.Substring(i - 1, 1) != " ") { i = i - 1; }
+        if (i <= 0) { return t; }
+        string tail = Css.Trim(t.Substring(i, t.Length - i));
+        if (StyleSheet.EndsWith(tail, "%") && tail.Length >= 2) {
+            string digits = tail.Substring(0, tail.Length - 1);
+            bool ok = digits.Length > 0;
+            for (int k = 0; k < digits.Length; k = k + 1) {
+                string d = digits.Substring(k, 1);
+                if (!StyleSheet.Digit(d) && d != "."
+                    && d != "-" && d != "+") { ok = false; }
+            }
+            if (ok) {
+                pct = StyleSheet.Perm(tail);
+                return Css.Trim(t.Substring(0, i));
+            }
+        }
+        return t;
+    }
+
+    /// 单个 rgb() 通道：`0..255` 或百分比。
+    static int Chan(string tok) {
+        string s = StyleSheet.Trim(tok);
+        if (StyleSheet.IndexOf(s, "%") >= 0) { return StyleSheet.Perm(s) * 255 / 1000; }
+        return StyleSheet.Clamp255(StyleSheet.Num(s));
+    }
+
+    /// 钳制到 0..255。
+    static int Clamp255(int v) {
+        if (v < 0) { return 0; }
+        if (v > 255) { return 255; }
+        return v;
+    }
+
+    /// 将 a,r,g,b（0..255）打包为 GUI 的有符号 0xAARRGGBB int。
+    static int Pack(int a, int r, int g, int b) {
+        int av = StyleSheet.Clamp255(a);
+        int rv = StyleSheet.Clamp255(r);
+        int gv = StyleSheet.Clamp255(g);
+        int bv = StyleSheet.Clamp255(b);
+        return av * 16777216 + rv * 65536 + gv * 256 + bv;
+    }
+
+    /// 皮肤实际会用到的 CSS 命名颜色（未知时为 0）。
+    /// CSS Color Module Level 4 全部 148 个具名颜色（X11 + CSS
+    /// 扩展）。此前只有 42 个常用名，官方示例用到的 lightskyblue /
+    /// orangered / azure / tomato / peru / chocolate 落空解析成 0——
+    /// 0 在渲染期等于"未着色"，map-HK 的 visualMap 色带因此整图
+    /// 透明（区域全不画），这是 C6 会话查出来的第二处独立缺陷。
+    static int NamedColor(string name) {
+        if (name == "aliceblue") { return StyleSheet.Pack(255, 240, 248, 255); }
+        if (name == "antiquewhite") { return StyleSheet.Pack(255, 250, 235, 215); }
+        if (name == "aqua" || name == "cyan") { return StyleSheet.Pack(255, 0, 255, 255); }
+        if (name == "aquamarine") { return StyleSheet.Pack(255, 127, 255, 212); }
+        if (name == "azure") { return StyleSheet.Pack(255, 240, 255, 255); }
+        if (name == "beige") { return StyleSheet.Pack(255, 245, 245, 220); }
+        if (name == "bisque") { return StyleSheet.Pack(255, 255, 228, 196); }
+        if (name == "black") { return StyleSheet.Pack(255, 0, 0, 0); }
+        if (name == "blanchedalmond") { return StyleSheet.Pack(255, 255, 235, 205); }
+        if (name == "blue") { return StyleSheet.Pack(255, 0, 0, 255); }
+        if (name == "blueviolet") { return StyleSheet.Pack(255, 138, 43, 226); }
+        if (name == "brown") { return StyleSheet.Pack(255, 165, 42, 42); }
+        if (name == "burlywood") { return StyleSheet.Pack(255, 222, 184, 135); }
+        if (name == "cadetblue") { return StyleSheet.Pack(255, 95, 158, 160); }
+        if (name == "chartreuse") { return StyleSheet.Pack(255, 127, 255, 0); }
+        if (name == "chocolate") { return StyleSheet.Pack(255, 210, 105, 30); }
+        if (name == "coral") { return StyleSheet.Pack(255, 255, 127, 80); }
+        if (name == "cornflowerblue") { return StyleSheet.Pack(255, 100, 149, 237); }
+        if (name == "cornsilk") { return StyleSheet.Pack(255, 255, 248, 220); }
+        if (name == "crimson") { return StyleSheet.Pack(255, 220, 20, 60); }
+        if (name == "darkblue") { return StyleSheet.Pack(255, 0, 0, 139); }
+        if (name == "darkcyan") { return StyleSheet.Pack(255, 0, 139, 139); }
+        if (name == "darkgoldenrod") { return StyleSheet.Pack(255, 184, 134, 11); }
+        if (name == "darkgray" || name == "darkgrey") { return StyleSheet.Pack(255, 169, 169, 169); }
+        if (name == "darkgreen") { return StyleSheet.Pack(255, 0, 100, 0); }
+        if (name == "darkkhaki") { return StyleSheet.Pack(255, 189, 183, 107); }
+        if (name == "darkmagenta") { return StyleSheet.Pack(255, 139, 0, 139); }
+        if (name == "darkolivegreen") { return StyleSheet.Pack(255, 85, 107, 47); }
+        if (name == "darkorange") { return StyleSheet.Pack(255, 255, 140, 0); }
+        if (name == "darkorchid") { return StyleSheet.Pack(255, 153, 50, 204); }
+        if (name == "darkred") { return StyleSheet.Pack(255, 139, 0, 0); }
+        if (name == "darksalmon") { return StyleSheet.Pack(255, 233, 150, 122); }
+        if (name == "darkseagreen") { return StyleSheet.Pack(255, 143, 188, 143); }
+        if (name == "darkslateblue") { return StyleSheet.Pack(255, 72, 61, 139); }
+        if (name == "darkslategray" || name == "darkslategrey") { return StyleSheet.Pack(255, 47, 79, 79); }
+        if (name == "darkturquoise") { return StyleSheet.Pack(255, 0, 206, 209); }
+        if (name == "darkviolet") { return StyleSheet.Pack(255, 148, 0, 211); }
+        if (name == "deeppink") { return StyleSheet.Pack(255, 255, 20, 147); }
+        if (name == "deepskyblue") { return StyleSheet.Pack(255, 0, 191, 255); }
+        if (name == "dimgray" || name == "dimgrey") { return StyleSheet.Pack(255, 105, 105, 105); }
+        if (name == "dodgerblue") { return StyleSheet.Pack(255, 30, 144, 255); }
+        if (name == "firebrick") { return StyleSheet.Pack(255, 178, 34, 34); }
+        if (name == "floralwhite") { return StyleSheet.Pack(255, 255, 250, 240); }
+        if (name == "forestgreen") { return StyleSheet.Pack(255, 34, 139, 34); }
+        if (name == "fuchsia" || name == "magenta") { return StyleSheet.Pack(255, 255, 0, 255); }
+        if (name == "gainsboro") { return StyleSheet.Pack(255, 220, 220, 220); }
+        if (name == "ghostwhite") { return StyleSheet.Pack(255, 248, 248, 255); }
+        if (name == "gold") { return StyleSheet.Pack(255, 255, 215, 0); }
+        if (name == "goldenrod") { return StyleSheet.Pack(255, 218, 165, 32); }
+        if (name == "gray" || name == "grey") { return StyleSheet.Pack(255, 128, 128, 128); }
+        if (name == "green") { return StyleSheet.Pack(255, 0, 128, 0); }
+        if (name == "greenyellow") { return StyleSheet.Pack(255, 173, 255, 47); }
+        if (name == "honeydew") { return StyleSheet.Pack(255, 240, 255, 240); }
+        if (name == "hotpink") { return StyleSheet.Pack(255, 255, 105, 180); }
+        if (name == "indianred") { return StyleSheet.Pack(255, 205, 92, 92); }
+        if (name == "indigo") { return StyleSheet.Pack(255, 75, 0, 130); }
+        if (name == "ivory") { return StyleSheet.Pack(255, 255, 255, 240); }
+        if (name == "khaki") { return StyleSheet.Pack(255, 240, 230, 140); }
+        if (name == "lavender") { return StyleSheet.Pack(255, 230, 230, 250); }
+        if (name == "lavenderblush") { return StyleSheet.Pack(255, 255, 240, 245); }
+        if (name == "lawngreen") { return StyleSheet.Pack(255, 124, 252, 0); }
+        if (name == "lemonchiffon") { return StyleSheet.Pack(255, 255, 250, 205); }
+        if (name == "lightblue") { return StyleSheet.Pack(255, 173, 216, 230); }
+        if (name == "lightcoral") { return StyleSheet.Pack(255, 240, 128, 128); }
+        if (name == "lightcyan") { return StyleSheet.Pack(255, 224, 255, 255); }
+        if (name == "lightgoldenrodyellow") { return StyleSheet.Pack(255, 250, 250, 210); }
+        if (name == "lightgray" || name == "lightgrey") { return StyleSheet.Pack(255, 211, 211, 211); }
+        if (name == "lightgreen") { return StyleSheet.Pack(255, 144, 238, 144); }
+        if (name == "lightpink") { return StyleSheet.Pack(255, 255, 182, 193); }
+        if (name == "lightsalmon") { return StyleSheet.Pack(255, 255, 160, 122); }
+        if (name == "lightseagreen") { return StyleSheet.Pack(255, 32, 178, 170); }
+        if (name == "lightskyblue") { return StyleSheet.Pack(255, 135, 206, 250); }
+        if (name == "lightslategray" || name == "lightslategrey") { return StyleSheet.Pack(255, 119, 136, 153); }
+        if (name == "lightsteelblue") { return StyleSheet.Pack(255, 176, 196, 222); }
+        if (name == "lightyellow") { return StyleSheet.Pack(255, 255, 255, 224); }
+        if (name == "lime") { return StyleSheet.Pack(255, 0, 255, 0); }
+        if (name == "limegreen") { return StyleSheet.Pack(255, 50, 205, 50); }
+        if (name == "linen") { return StyleSheet.Pack(255, 250, 240, 230); }
+        if (name == "maroon") { return StyleSheet.Pack(255, 128, 0, 0); }
+        if (name == "mediumaquamarine") { return StyleSheet.Pack(255, 102, 205, 170); }
+        if (name == "mediumblue") { return StyleSheet.Pack(255, 0, 0, 205); }
+        if (name == "mediumorchid") { return StyleSheet.Pack(255, 186, 85, 211); }
+        if (name == "mediumpurple") { return StyleSheet.Pack(255, 147, 112, 219); }
+        if (name == "mediumseagreen") { return StyleSheet.Pack(255, 60, 179, 113); }
+        if (name == "mediumslateblue") { return StyleSheet.Pack(255, 123, 104, 238); }
+        if (name == "mediumspringgreen") { return StyleSheet.Pack(255, 0, 250, 154); }
+        if (name == "mediumturquoise") { return StyleSheet.Pack(255, 72, 209, 204); }
+        if (name == "mediumvioletred") { return StyleSheet.Pack(255, 199, 21, 133); }
+        if (name == "midnightblue") { return StyleSheet.Pack(255, 25, 25, 112); }
+        if (name == "mintcream") { return StyleSheet.Pack(255, 245, 255, 250); }
+        if (name == "mistyrose") { return StyleSheet.Pack(255, 255, 228, 225); }
+        if (name == "moccasin") { return StyleSheet.Pack(255, 255, 228, 181); }
+        if (name == "navajowhite") { return StyleSheet.Pack(255, 255, 222, 173); }
+        if (name == "navy") { return StyleSheet.Pack(255, 0, 0, 128); }
+        if (name == "oldlace") { return StyleSheet.Pack(255, 253, 245, 230); }
+        if (name == "olive") { return StyleSheet.Pack(255, 128, 128, 0); }
+        if (name == "olivedrab") { return StyleSheet.Pack(255, 107, 142, 35); }
+        if (name == "orange") { return StyleSheet.Pack(255, 255, 165, 0); }
+        if (name == "orangered") { return StyleSheet.Pack(255, 255, 69, 0); }
+        if (name == "orchid") { return StyleSheet.Pack(255, 218, 112, 214); }
+        if (name == "palegoldenrod") { return StyleSheet.Pack(255, 238, 232, 170); }
+        if (name == "palegreen") { return StyleSheet.Pack(255, 152, 251, 152); }
+        if (name == "paleturquoise") { return StyleSheet.Pack(255, 175, 238, 238); }
+        if (name == "palevioletred") { return StyleSheet.Pack(255, 219, 112, 147); }
+        if (name == "papayawhip") { return StyleSheet.Pack(255, 255, 239, 213); }
+        if (name == "peachpuff") { return StyleSheet.Pack(255, 255, 218, 185); }
+        if (name == "peru") { return StyleSheet.Pack(255, 205, 133, 63); }
+        if (name == "pink") { return StyleSheet.Pack(255, 255, 192, 203); }
+        if (name == "plum") { return StyleSheet.Pack(255, 221, 160, 221); }
+        if (name == "powderblue") { return StyleSheet.Pack(255, 176, 224, 230); }
+        if (name == "purple") { return StyleSheet.Pack(255, 128, 0, 128); }
+        if (name == "rebeccapurple") { return StyleSheet.Pack(255, 102, 51, 153); }
+        if (name == "red") { return StyleSheet.Pack(255, 255, 0, 0); }
+        if (name == "rosybrown") { return StyleSheet.Pack(255, 188, 143, 143); }
+        if (name == "royalblue") { return StyleSheet.Pack(255, 65, 105, 225); }
+        if (name == "saddlebrown") { return StyleSheet.Pack(255, 139, 69, 19); }
+        if (name == "salmon") { return StyleSheet.Pack(255, 250, 128, 114); }
+        if (name == "sandybrown") { return StyleSheet.Pack(255, 244, 164, 96); }
+        if (name == "seagreen") { return StyleSheet.Pack(255, 46, 139, 87); }
+        if (name == "seashell") { return StyleSheet.Pack(255, 255, 245, 238); }
+        if (name == "sienna") { return StyleSheet.Pack(255, 160, 82, 45); }
+        if (name == "silver") { return StyleSheet.Pack(255, 192, 192, 192); }
+        if (name == "skyblue") { return StyleSheet.Pack(255, 135, 206, 235); }
+        if (name == "slateblue") { return StyleSheet.Pack(255, 106, 90, 205); }
+        if (name == "slategray" || name == "slategrey") { return StyleSheet.Pack(255, 112, 128, 144); }
+        if (name == "snow") { return StyleSheet.Pack(255, 255, 250, 250); }
+        if (name == "springgreen") { return StyleSheet.Pack(255, 0, 255, 127); }
+        if (name == "steelblue") { return StyleSheet.Pack(255, 70, 130, 180); }
+        if (name == "tan") { return StyleSheet.Pack(255, 210, 180, 140); }
+        if (name == "teal") { return StyleSheet.Pack(255, 0, 128, 128); }
+        if (name == "thistle") { return StyleSheet.Pack(255, 216, 191, 216); }
+        if (name == "tomato") { return StyleSheet.Pack(255, 255, 99, 71); }
+        if (name == "turquoise") { return StyleSheet.Pack(255, 64, 224, 208); }
+        if (name == "violet") { return StyleSheet.Pack(255, 238, 130, 238); }
+        if (name == "wheat") { return StyleSheet.Pack(255, 245, 222, 179); }
+        if (name == "white") { return StyleSheet.Pack(255, 255, 255, 255); }
+        if (name == "whitesmoke") { return StyleSheet.Pack(255, 245, 245, 245); }
+        if (name == "yellow") { return StyleSheet.Pack(255, 255, 255, 0); }
+        if (name == "yellowgreen") { return StyleSheet.Pack(255, 154, 205, 50); }
+    }
+
+    /// 将十六进制字符串（最多 8 位）转换为打包 int。最高位为 1
+    /// （alpha >= 0x80）自然产生负数，与 Theme token 一致。
+    static int HexToInt(string h) {
+        int acc = 0;
+        for (int i = 0; i < h.Length; i = i + 1) {
+            int d = StyleSheet.HexDigit(h.Substring(i, 1));
+            if (d < 0) { return 0; }
+            acc = (acc * 16) + d;
+        }
+        return acc;
+    }
+
+    /// 单个十六进制字符的值（0-15），非十六进制时 -1。
+    static int HexDigit(string ch) {
+        if (ch == "0") { return 0; }
+        if (ch == "1") { return 1; }
+        if (ch == "2") { return 2; }
+        if (ch == "3") { return 3; }
+        if (ch == "4") { return 4; }
+        if (ch == "5") { return 5; }
+        if (ch == "6") { return 6; }
+        if (ch == "7") { return 7; }
+        if (ch == "8") { return 8; }
+        if (ch == "9") { return 9; }
+        if (ch == "a" || ch == "A") { return 10; }
+        if (ch == "b" || ch == "B") { return 11; }
+        if (ch == "c" || ch == "C") { return 12; }
+        if (ch == "d" || ch == "D") { return 13; }
+        if (ch == "e" || ch == "E") { return 14; }
+        if (ch == "f" || ch == "F") { return 15; }
+        return -1;
+    }
+
+    /// 字符是否为十进制数字。
+    static bool Digit(string ch) {
+        int d = StyleSheet.HexDigit(ch);
+        return d >= 0 && d <= 9;
+    }
+
+    /// token 读作数字时返回 true（可选符号、十进制、带
+    /// px/ms/s/%/deg 等单位后缀），而非关键字或颜色。
+    static bool IsNumeric(string tok) {
+        string s = StyleSheet.Trim(tok);
+        if (s.Length == 0) { return false; }
+        string first = s.Substring(0, 1);
+        if (first == "-" || first == "+" || first == ".") {
+            if (s.Length < 2) { return false; }
+            return StyleSheet.Digit(s.Substring(1, 1));
+        }
+        return StyleSheet.Digit(first);
+    }
+
+    /// 将 CSS 长度/数字转为 int：感知符号、容忍单位（`12px`、`-4`、
+    /// `1.5rem` -> 1、`200ms`），非数字 token 返回 0。
+    static int Num(string val) {
+        string s = StyleSheet.Trim(val);
+        if (s.Length == 0) { return 0; }
+        int sign = 1;
+        int i = 0;
+        if (s.Substring(0, 1) == "-") { sign = -1; i = 1; }
+        else if (s.Substring(0, 1) == "+") { i = 1; }
+        int acc = 0;
+        bool any = false;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (!StyleSheet.Digit(ch)) { i = s.Length; }
+            else {
+                acc = acc * 10 + StyleSheet.HexDigit(ch);
+                any = true;
+                i = i + 1;
+            }
+        }
+        if (!any) { return 0; }
+        return sign * acc;
+    }
+
+    /// 比例转千分数：`1` / `1.0` -> 1000、`0.5` -> 500、`60%` -> 600、
+    /// `255`（alpha 通道）由调用方保持 255 比例。
+    static int Perm(string val) {
+        string s = StyleSheet.Trim(val);
+        if (s.Length == 0) { return 1000; }
+        if (StyleSheet.IndexOf(s, "%") >= 0) {
+            return StyleSheet.Num(s) * 10;
+        }
+        int dot = StyleSheet.IndexOf(s, ".");
+        if (dot < 0) {
+            int n = StyleSheet.Num(s);
+            if (n <= 1) { return n * 1000; }
+            return n;
+        }
+        int whole = StyleSheet.Num(s.Substring(0, dot));
+        string fracStr = s.Substring(dot + 1, s.Length - dot - 1);
+        int frac = 0;
+        int scale = 100;
+        int i = 0;
+        while (i < fracStr.Length && i < 3) {
+            string ch = fracStr.Substring(i, 1);
+            if (!StyleSheet.Digit(ch)) { i = fracStr.Length; }
+            else {
+                frac = frac + StyleSheet.HexDigit(ch) * scale;
+                scale = scale / 10;
+                i = i + 1;
+            }
+        }
+        int sign = 1;
+        if (whole < 0) { sign = -1; whole = -whole; }
+        return sign * (whole * 1000 + frac);
+    }
+
+    /// CSS 时长（毫秒）：`200`、`200ms`、`0.25s`。
+    static int Ms(string val) {
+        string s = StyleSheet.Trim(val);
+        if (StyleSheet.IndexOf(StyleSheet.Lower(s), "ms") >= 0) {
+            return StyleSheet.Num(s);
+        }
+        if (StyleSheet.IndexOf(StyleSheet.Lower(s), "s") >= 0) {
+            return StyleSheet.Perm(s);
+        }
+        return StyleSheet.Num(s);
+    }
+
+    // ---- 长度与数学（calc 家族）---------------------------------------------
+
+    /// CSS 长度求值，返回 px 整数。单位：px/无单位照旧；em 相对当前
+    /// 有效字号（解析级联里已声明的 font-size，未声明时主题正文）；
+    /// rem 相对根字号；ex/ch 近似半高（0.5em）；pt 按 96dpi 折算；
+    /// vw/vh/vmin/vmax 相对窗口逻辑尺寸；`%` 保持各属性原有语义
+    /// （这里当裸数字返回，声明点的百分比分支不受影响）。
+    /// calc()/min()/max()/clamp() 递归求值（见 CssMath）。
+    static int Len(StyleBox b, string val) {
+        string v = StyleSheet.Trim(val);
+        if (v == "") { return 0; }
+        if (StyleSheet.HasMath(v)) { return StyleSheet.CssMath(b, v); }
+        return StyleSheet.UnitPx(b, v);
+    }
+
+    /// 值里是否带数学函数（calc/min/max/clamp）。
+    static bool HasMath(string v) {
+        string s = StyleSheet.Lower(v);
+        return Css.IndexFrom(s, "calc(", 0) >= 0
+            || Css.IndexFrom(s, "min(", 0) >= 0
+            || Css.IndexFrom(s, "max(", 0) >= 0
+            || Css.IndexFrom(s, "clamp(", 0) >= 0;
+    }
+
+    /// 千分比转 px 的四舍五入。
+    static int Round1000(int perm) {
+        if (perm >= 0) { return (perm + 500) / 1000; }
+        return 0 - ((0 - perm + 500) / 1000);
+    }
+
+    /// 数字文本 -> 千分比整数：`12` -> 12000、`1.5` -> 1500、
+    /// `.5` -> 500、`-2` -> -2000。（不能复用 Perm：它对无小数点的
+    /// 整数按原样返回——那是 alpha 通道的语义，不是长度。）
+    static int NumPerm(string numStr) {
+        string s = numStr;
+        int sign = 1;
+        if (s.Substring(0, 1) == "-") { sign = 0 - 1; s = s.Substring(1, s.Length - 1); }
+        else if (s.Substring(0, 1) == "+") { s = s.Substring(1, s.Length - 1); }
+        int dot = StyleSheet.IndexOf(s, ".");
+        int whole = dot < 0 ? StyleSheet.Num(s) : StyleSheet.Num(
+            s.Substring(0, dot));
+        int frac = 0;
+        int scale = 100;
+        if (dot >= 0) {
+            string fs = s.Substring(dot + 1, s.Length - dot - 1);
+            for (int i = 0; i < fs.Length && i < 3; i = i + 1) {
+                string ch = fs.Substring(i, 1);
+                if (!StyleSheet.Digit(ch)) { break; }
+                frac = frac + StyleSheet.HexDigit(ch) * scale;
+                scale = scale / 10;
+            }
+        }
+        return sign * (whole * 1000 + frac);
+    }
+
+    /// 单个"数字+单位"记号 -> px 整数。未知单位按裸数字处理
+    /// （ValueUnresolved 仍会点名），空数字回退 Num。
+    static int UnitPx(StyleBox b, string tok) {
+        string s = StyleSheet.Trim(tok);
+        if (s.Length == 0) { return 0; }
+        int i = 0;
+        if (s.Substring(0, 1) == "-" || s.Substring(0, 1) == "+") { i = 1; }
+        int st = i;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (StyleSheet.Digit(ch) || ch == ".") { i = i + 1; }
+            else { break; }
+        }
+        string numStr = s.Substring(0, i);
+        string unit = StyleSheet.Lower(s.Substring(i, s.Length - i));
+        if (numStr == "" || numStr == "-" || numStr == "+") {
+            return StyleSheet.Num(s);
+        }
+        int perm = StyleSheet.NumPerm(numStr);
+        if (unit == "" || unit == "px") { return StyleSheet.Round1000(perm); }
+        if (unit == "em") {
+            int font = b.fontPx > 0 ? b.fontPx
+                : (b.envRemPx > 0 ? b.envRemPx : 16);
+            return StyleSheet.Round1000(perm * font);
+        }
+        if (unit == "rem") {
+            int rem = b.envRemPx > 0 ? b.envRemPx : 16;
+            return StyleSheet.Round1000(perm * rem);
+        }
+        if (unit == "ex" || unit == "ch") {
+            int f2 = b.fontPx > 0 ? b.fontPx
+                : (b.envRemPx > 0 ? b.envRemPx : 16);
+            return StyleSheet.Round1000(perm * f2 / 2);
+        }
+        if (unit == "pt") { return StyleSheet.Round1000(perm * 4 / 3); }
+        // 绝对单位按 96dpi 折算：pc = 12pt，in = 96px，
+        // cm = 96/2.54，mm = 1/10 cm，q = 1/40 cm。
+        if (unit == "pc") { return StyleSheet.Round1000(perm * 16); }
+        if (unit == "in") { return StyleSheet.Round1000(perm * 96); }
+        if (unit == "cm") { return StyleSheet.Round1000(perm * 37795 / 1000); }
+        if (unit == "mm") { return StyleSheet.Round1000(perm * 37795 / 10000); }
+        if (unit == "q") { return StyleSheet.Round1000(perm * 37795 / 40000); }
+        if (unit == "vw") {
+            int w = b.envVw > 0 ? b.envVw : 1280;
+            return StyleSheet.Round1000(perm * w / 100);
+        }
+        if (unit == "vh") {
+            int h = b.envVh > 0 ? b.envVh : 720;
+            return StyleSheet.Round1000(perm * h / 100);
+        }
+        if (unit == "vmin" || unit == "vmax") {
+            int w2 = b.envVw > 0 ? b.envVw : 1280;
+            int h2 = b.envVh > 0 ? b.envVh : 720;
+            int base2 = unit == "vmin" ? (w2 < h2 ? w2 : h2) : (w2 > h2 ? w2 : h2);
+            return StyleSheet.Round1000(perm * base2 / 100);
+        }
+        if (unit == "%") {
+            // 长度点的 % 语义属于各声明（widthPm/千分比通道）；
+            // 这里维持"裸数字"的历史行为。
+            return StyleSheet.Round1000(perm);
+        }
+        return StyleSheet.Round1000(perm);
+    }
+
+    /// calc()/min()/max()/clamp() 求值（可嵌套）。叶子单位在 UnitPx
+    /// 折算成 px；`%` 在表达式里按视口宽近似——容器宽度在样式解析期
+    /// （布局之前）不可得，视口是稳定的基准，Lint/审计文档有说明。
+    static int CssMath(StyleBox b, string val) {
+        string v = StyleSheet.Trim(val);
+        string lo = StyleSheet.Lower(v);
+        if (StyleSheet.StartsWith(lo, "clamp(")) {
+            int open = StyleSheet.IndexOf(v, "(");
+            int close = v.Length - 1;
+            while (close > open && v.Substring(close, 1) != ")") { close = close - 1; }
+            List<string> a = Css.SplitTopTrim(
+                v.Substring(open + 1, close - open - 1), ",");
+            if (a.Count < 3) { return 0; }
+            int mn = StyleSheet.CssMath(b, a[0]);
+            int mid = StyleSheet.CssMath(b, a[1]);
+            int mx = StyleSheet.CssMath(b, a[2]);
+            return mn > mx ? mn : (mid < mn ? mn : (mid > mx ? mx : mid));
+        }
+        if (StyleSheet.StartsWith(lo, "min(") || StyleSheet.StartsWith(lo, "max(")) {
+            bool isMin = StyleSheet.StartsWith(lo, "min(");
+            int open2 = StyleSheet.IndexOf(v, "(");
+            int close2 = v.Length - 1;
+            while (close2 > open2 && v.Substring(close2, 1) != ")") { close2 = close2 - 1; }
+            List<string> a2 = Css.SplitTopTrim(
+                v.Substring(open2 + 1, close2 - open2 - 1), ",");
+            if (a2.Count == 0) { return 0; }
+            int best = StyleSheet.CssMath(b, a2[0]);
+            for (int i = 1; i < a2.Count; i = i + 1) {
+                int cur = StyleSheet.CssMath(b, a2[i]);
+                if (isMin ? cur < best : cur > best) { best = cur; }
+            }
+            return best;
+        }
+        // calc(...) 或裸表达式（min/max 的参数可以是 `10px + 2em`）。
+        int op = Css.IndexFrom(lo, "calc(", 0);
+        string expr = op >= 0
+            ? v.Substring(op + 5, v.Length - op - 5) : v;
+        int endI = expr.Length - 1;
+        while (endI >= 0 && expr.Substring(endI, 1) != ")") { endI = endI - 1; }
+        if (endI >= 0 && op >= 0) { expr = expr.Substring(0, endI); }
+        List<string> toks = StyleSheet.MathTokens(expr);
+        MathCursor cur2 = new MathCursor();
+        cur2.toks = toks;
+        cur2.pos = 0;
+        int val2 = StyleSheet.MathExpr(b, cur2);
+        return val2;
+    }
+
+    /// 表达式 token 化：数字+单位、运算符、括号；空白跳过。
+    static List<string> MathTokens(string s) {
+        List<string> outp = new List<string>();
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (Css.Space(ch)) { i = i + 1; continue; }
+            if (ch == "(" || ch == ")" || ch == "+" || ch == "-"
+                || ch == "*" || ch == "/") {
+                outp.Add(ch);
+                i = i + 1;
+                continue;
+            }
+            int st = i;
+            while (i < s.Length) {
+                string c2 = s.Substring(i, 1);
+                if (Css.Space(c2) || c2 == "(" || c2 == ")" || c2 == "+"
+                    || c2 == "-" || c2 == "*" || c2 == "/") {
+                    break;
+                }
+                i = i + 1;
+            }
+            outp.Add(s.Substring(st, i - st));
+        }
+        return outp;
+    }
+
+    /// 加减层：term (('+'|'-') term)*。
+    static int MathExpr(StyleBox b, MathCursor c) {
+        int v = StyleSheet.MathTerm(b, c);
+        while (c.pos < c.toks.Count) {
+            string op = c.toks[c.pos];
+            if (op != "+" && op != "-") { break; }
+            c.pos = c.pos + 1;
+            int r = StyleSheet.MathTerm(b, c);
+            v = op == "+" ? v + r : v - r;
+        }
+        return v;
+    }
+
+    /// 乘除层：factor (('*'|'/') factor)*。除零按 0（坏表达式不炸）。
+    static int MathTerm(StyleBox b, MathCursor c) {
+        int v = StyleSheet.MathFactor(b, c);
+        while (c.pos < c.toks.Count) {
+            string op = c.toks[c.pos];
+            if (op != "*" && op != "/") { break; }
+            c.pos = c.pos + 1;
+            int r = StyleSheet.MathFactor(b, c);
+            if (op == "*") { v = v * r; }
+            else { v = r == 0 ? 0 : v / r; }
+        }
+        return v;
+    }
+
+    /// 因子层：括号表达式 / 一元符号 / 数字+单位。
+    static int MathFactor(StyleBox b, MathCursor c) {
+        if (c.pos >= c.toks.Count) { return 0; }
+        string tok = c.toks[c.pos];
+        if (tok == "(") {
+            c.pos = c.pos + 1;
+            int v = StyleSheet.MathExpr(b, c);
+            if (c.pos < c.toks.Count && c.toks[c.pos] == ")") { c.pos = c.pos + 1; }
+            return v;
+        }
+        if (tok == "-") {
+            c.pos = c.pos + 1;
+            return 0 - StyleSheet.MathFactor(b, c);
+        }
+        if (tok == "+") {
+            c.pos = c.pos + 1;
+            return StyleSheet.MathFactor(b, c);
+        }
+        c.pos = c.pos + 1;
+        return StyleSheet.UnitPx(b, tok);
+    }
+
+    /// 值转整数（透传 Num 解析）。
+    static int ParseInt(string s) {
+        return StyleSheet.Num(s);
+    }
+
+    /// 将值按空白拆分为 token，保持 `fn(a, b)`
+    /// 分组完整，使 `rgba(0,0,0,.4)` 作为一个 token 保留。
+    static List<string> Tokens(string val) {
+        List<string> outp = new List<string>();
+        string cur = "";
+        int depth = 0;
+        int i = 0;
+        while (i < val.Length) {
+            string ch = val.Substring(i, 1);
+            i = i + 1;
+            if (ch == "(") { depth = depth + 1; cur = cur + ch; continue; }
+            if (ch == ")") { depth = depth - 1; cur = cur + ch; continue; }
+            if (depth == 0 && Css.Space(ch)) {
+                if (cur != "") { outp.Add(cur); }
+                cur = "";
+                continue;
+            }
+            cur = cur + ch;
+        }
+        if (cur != "") { outp.Add(cur); }
+        return outp;
+    }
+
+    /// s 是否以 prefix 开头。
+    static bool StartsWith(string s, string prefix) {
+        if (s.Length < prefix.Length) { return false; }
+        return s.Substring(0, prefix.Length) == prefix;
+    }
+
+    /// 子串首次出现位置（无则 -1，转发 Css.IndexFrom）。
+    static int IndexOf(string s, string ch) {
+        return Css.IndexFrom(s, ch, 0);
+    }
+
+    /// s 是否以 suffix 结尾。
+    static bool EndsWith(string s, string suffix) {
+        if (s.Length < suffix.Length) { return false; }
+        return s.Substring(s.Length - suffix.Length, suffix.Length) == suffix;
+    }
+
+    /// 单字符查找（`ch` 只取首字符）。
+    static int LastIndexOf(string s, string ch) {
+        int found = -1;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if (s.Substring(i, 1) == ch) { found = i; }
+        }
+        return found;
+    }
+
+    /// 转小写（属性名/关键字匹配用）。
+    static string Lower(string s) {
+        return s.ToLower();
+    }
+
+    /// 转发 Css.Trim（去两端空白）。
+    static string Trim(string s) {
+        return Css.Trim(s);
+    }
+
+    /// 把停靠名（`top`/`bottom`/`left`/`right`/`fill`）解析为
+    /// Dock 常量。供样式表 / JSON 文档共用。
+    static int DockValue(string text) {
+        if (text == "top" || text == "Top") { return Dock.Top(); }
+        if (text == "bottom" || text == "Bottom") { return Dock.Bottom(); }
+        if (text == "left" || text == "Left") { return Dock.Left(); }
+        if (text == "right" || text == "Right") { return Dock.Right(); }
+        if (text == "fill" || text == "Fill") { return Dock.Fill(); }
+        return Dock.Manual();
+    }
+
+    /// 把标量 JSON 值渲染为 SetProp 期望的文本。
+    static string Scalar(JsonValue v) {
+        if (v.IsString()) { return v.AsString(""); }
+        if (v.IsNumber()) { return v.AsString(""); }
+        if (v.IsBool()) { if (v.AsBool(false)) { return "true"; } return "false"; }
+        return "";
+    }
+}
+
+/// calc()/min()/max()/clamp() 求值游标：token 表 + 当前位置。
+/// MathExpr/MathTerm/MathFactor 递归下降时推进 pos。
+class MathCursor {
+    List<string> toks;
+    int pos;
+}

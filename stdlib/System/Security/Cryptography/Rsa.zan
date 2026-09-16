@@ -1,0 +1,208 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>RSA（RFC 8017 / PKCS#1）：原始公/私钥运算以及 PKCS#1
+/// v1.5 和 OAEP 加密填充。大整数运算来自 BigInt；哈希
+/// （OAEP 的 MGF1 用）来自本命名空间。所有缓冲区都显式携带长度，
+/// 因为 String.Length 基于 strlen，对二进制数据不安全。</summary>
+class Rsa {
+    /// 哈希分发：0=SHA-256，1=SHA-1，2=SM3
+    static int hLen(int algo) { if (algo == 1) { return 20; } return 32; }
+    /// 按算法常量分发到对应摘要函数（0=SHA-256，1=SHA-1，2=SM3）。
+    static byte[] hashOf(int algo, string buf, int len) {
+        if (algo == 1) { return Sha1.Hash(buf, len); }
+        if (algo == 2) { return Sm3.Hash(buf, len); }
+        return Sha256.Hash(buf, len);
+    }
+
+    /// <summary>原始 RSA：base^exp mod n。返回 k 字节大端序缓冲区，
+    /// 其中 k = <paramref name="nLen"/>。</summary>
+    static byte[] ModExp(string msg, int mLen, string n, int nLen, string exp, int eLen) {
+        BigInt m = BigInt.FromBytesBE(msg, mLen);
+        BigInt nn = BigInt.FromBytesBE(n, nLen);
+        BigInt ee = BigInt.FromBytesBE(exp, eLen);
+        BigInt r = BigInt.ModPow(m, ee, nn);
+        return r.ToBytesBE(nLen);
+    }
+
+    /// MGF1 掩码生成（RFC 8017）
+    static byte[] mgf1(string seed, int seedLen, int maskLen, int algo) {
+        int hl = hLen(algo);
+        byte[] mask = new byte[maskLen];
+        int counter = 0; int outPos = 0;
+        while (outPos < maskLen) {
+            byte[] buf = new byte[seedLen + 4];
+             for (int i = 0; i < seedLen; i = i + 1) { buf[i] = seed[i] & 255; }
+            buf[seedLen]   = (counter >> 24) & 255;
+            buf[seedLen+1] = (counter >> 16) & 255;
+            buf[seedLen+2] = (counter >> 8) & 255;
+            buf[seedLen+3] = counter & 255;
+            byte[] h = hashOf(algo, buf, seedLen + 4);
+            for (int j = 0; j < hl && outPos < maskLen; j = j + 1) { mask[outPos] = h[j] & 255; outPos = outPos + 1; }
+            counter = counter + 1;
+        }
+        return mask;
+    }
+
+    /// <summary>RSA-OAEP 加密（RFC 8017 §7.1.1）。<paramref name="seed"/> 必须
+    /// 提供 hLen 个全新随机字节。label 为空。返回 k 字节密文；
+    /// 若消息对 k 而言过长（mLen &gt; k - 2*hLen - 2）或 k 过小
+    /// （k &lt; 2*hLen + 2），返回 null，绝不写入越界。</summary>
+    static byte[] EncryptOaep(string msg, int mLen, string n, int k, string e, int eLen, int algo, string seed) {
+        int hl = hLen(algo);
+        // RFC 8017 §7.1.1 步骤 1 的长度约束：k >= 2*hLen + 2，且
+        // mLen <= k - 2*hLen - 2。否则 dbLen/psEnd 会变负导致越界写。
+        if (k < 2 * hl + 2) { return null; }
+        if (mLen < 0 || mLen > k - 2 * hl - 2) { return null; }
+        if (eLen <= 0 || n == null) { return null; }
+        byte[] lHash = hashOf(algo, "", 0);
+        int dbLen = k - hl - 1;
+        byte[] db = new byte[dbLen];
+        int i = 0;
+        for (; i < hl; i = i + 1) { db[i] = lHash[i] & 255; }
+        // PS 零字节已由 new byte[] 保证，放入 0x01 分隔符
+        int psEnd = dbLen - mLen - 1;
+        db[psEnd] = 1;
+        i = 0;
+        while (i < mLen) { db[psEnd + 1 + i] = msg[i] & 255; i = i + 1; }
+
+        byte[] dbMask = mgf1(seed, hl, dbLen, algo);
+        byte[] maskedDb = new byte[dbLen];
+        i = 0; while (i < dbLen) { maskedDb[i] = (db[i] & 255) ^ (dbMask[i] & 255); i = i + 1; }
+        byte[] seedMask = mgf1(maskedDb, dbLen, hl, algo);
+        byte[] maskedSeed = new byte[hl];
+        i = 0; while (i < hl) { maskedSeed[i] = (seed[i] & 255) ^ (seedMask[i] & 255); i = i + 1; }
+
+        byte[] em = new byte[k];
+        em[0] = 0;
+        i = 0; while (i < hl) { em[1 + i] = maskedSeed[i] & 255; i = i + 1; }
+        i = 0; while (i < dbLen) { em[1 + hl + i] = maskedDb[i] & 255; i = i + 1; }
+
+        return ModExp(em, k, n, k, e, eLen);
+    }
+
+    /// <summary>RSA-OAEP 解密（RFC 8017 §7.1.2）。返回恢复出的消息；
+    /// <paramref name="outLen"/>[0] 接收其长度，编码结构非法（Y!=0、
+    /// lHash 不符、缺 0x01 分隔符、k 过小）时为 -1。所有失败路径走
+    /// 同一条返回，不因错误位置不同而泄露 padding oracle。</summary>
+    static byte[] DecryptOaep(string cph, string n, int k, string d, int dLen, int algo, List<int> outLen) {
+        int hl = hLen(algo);
+        if (k < 2 * hl + 2) { outLen[0] = -1; return null; }
+        byte[] em = ModExp(cph, k, n, k, d, dLen);
+        int dbLen = k - hl - 1;
+        byte[] maskedSeed = new byte[hl];
+        int i = 0; for (; i < hl; i = i + 1) { maskedSeed[i] = em[1 + i] & 255; }
+        byte[] maskedDb = new byte[dbLen];
+        i = 0; while (i < dbLen) { maskedDb[i] = em[1 + hl + i] & 255; i = i + 1; }
+
+        byte[] seedMask = mgf1(maskedDb, dbLen, hl, algo);
+        byte[] seed = new byte[hl];
+        i = 0; while (i < hl) { seed[i] = (maskedSeed[i] & 255) ^ (seedMask[i] & 255); i = i + 1; }
+        byte[] dbMask = mgf1(seed, hl, dbLen, algo);
+        byte[] db = new byte[dbLen];
+        i = 0; while (i < dbLen) { db[i] = (maskedDb[i] & 255) ^ (dbMask[i] & 255); i = i + 1; }
+
+        // 完整校验编码结构（RFC 8017 §7.1.2 步骤 3.g）：Y==0、lHash 相等、
+        // PS 全零后紧跟 0x01。先用常数时间比较校验 Y 与 lHash，再扫描 PS。
+        // PS 必须全零，第一个非零字节必须是 0x01 分隔符，其后即消息。
+        byte[] lHash = hashOf(algo, "", 0);
+        int diff = (em[0] & 255);
+        i = 0;
+        while (i < hl) { diff = diff | ((db[i] & 255) ^ (lHash[i] & 255)); i = i + 1; }
+        // 跳过零字节（PS），定位 0x01 分隔符。
+        int p = hl;
+        while (p < dbLen && (db[p] & 255) == 0) { p = p + 1; }
+        if (p >= dbLen || (db[p] & 255) != 1 || diff != 0) {
+            outLen[0] = -1;
+            return null;
+        }
+        p = p + 1;
+        int mlen = dbLen - p;
+        byte[] outb = new byte[dbLen];
+        for (int j = 0; j < mlen; j = j + 1) { outb[j] = db[p + j] & 255; }
+        outLen[0] = mlen;
+        return outb;
+    }
+
+    /// <summary>RSA PKCS#1 v1.5 type-2 加密。<paramref name="rnd"/> 提供
+    /// 填充串所需的 (k - mLen - 3) 个非零随机字节。若消息过长
+    /// （mLen &gt; k - 11）或随机数不足，返回 null。</summary>
+    static byte[] EncryptPkcs1(string msg, int mLen, string n, int k, string e, int eLen, string rnd) {
+        if (k < 11 || mLen < 0 || mLen > k - 11) { return null; }
+        int psLen = k - mLen - 3;
+        if (rnd == null) { return null; }
+        byte[] em = new byte[k];
+        em[0] = 0; em[1] = 2;
+        int i = 0;
+        for (; i < psLen; i = i + 1) {
+            int b = rnd[i] & 255; if (b == 0) { b = 1; }
+            em[2 + i] = b;
+        }
+        em[2 + psLen] = 0;
+        i = 0; while (i < mLen) { em[3 + psLen + i] = msg[i] & 255; i = i + 1; }
+        return ModExp(em, k, n, k, e, eLen);
+    }
+
+    /// <summary>RSA PKCS#1 v1.5 解密。<paramref name="outLen"/>[0] 接收
+    /// 消息长度（填充错误时为 -1）。</summary>
+    static byte[] DecryptPkcs1(string cph, string n, int k, string d, int dLen, List<int> outLen) {
+        if (k < 11) { outLen[0] = -1; return null; }
+        byte[] em = ModExp(cph, k, n, k, d, dLen);
+        int mlen = -1;
+        byte[] outb = new byte[k];
+        if ((em[0] & 255) == 0 && (em[1] & 255) == 2) {
+            int p = 2;
+            // PS 至少 8 字节且不能为 0x00；定位 0x00 分隔符。
+            while (p < k && (em[p] & 255) != 0) { p = p + 1; }
+            if (p < k && p - 2 >= 8) {
+                p = p + 1;
+                mlen = k - p;
+                 for (int j = 0; j < mlen; j = j + 1) { outb[j] = em[p + j] & 255; }
+            }
+        }
+        outLen[0] = mlen;
+        return outb;
+    }
+
+    /// SHA-256 的 DigestInfo 前缀（RFC 8017 §9.2 注 1）
+    static byte[] sha256DigestInfo() {
+        byte[] di = new byte[19];
+        di[0]=48; di[1]=49; di[2]=48; di[3]=13; di[4]=6; di[5]=9; di[6]=96;
+        di[7]=134; di[8]=72; di[9]=1; di[10]=101; di[11]=3; di[12]=4; di[13]=2;
+        di[14]=1; di[15]=5; di[16]=0; di[17]=4; di[18]=32;
+        return di;
+    }
+
+    /// 将 SHA-256(msg) 按 EMSA-PKCS1-v1_5 编码为 k 字节
+    static byte[] emsaPkcs1Sha256(string msg, int mLen, int k) {
+        byte[] h = Sha256.Hash(msg, mLen);
+        byte[] di = sha256DigestInfo();
+        int tLen = 19 + 32;
+        byte[] em = new byte[k];
+        em[0] = 0; em[1] = 1;
+        int psLen = k - tLen - 3;
+        int i = 0;
+        for (; i < psLen; i = i + 1) { em[2 + i] = 255; }
+        em[2 + psLen] = 0;
+        i = 0; while (i < 19) { em[3 + psLen + i] = di[i] & 255; i = i + 1; }
+        i = 0; while (i < 32) { em[3 + psLen + 19 + i] = h[i] & 255; i = i + 1; }
+        return em;
+    }
+
+    /// <summary>对 SHA-256(msg) 计算 RSASSA-PKCS1-v1_5 签名。返回
+    /// k 字节的签名（k = 模数字节数）。</summary>
+    static byte[] SignPkcs1Sha256(string msg, int mLen, string n, int k, string d, int dLen) {
+        byte[] em = emsaPkcs1Sha256(msg, mLen, k);
+        return ModExp(em, k, n, k, d, dLen);
+    }
+
+    /// <summary>校验 RSASSA-PKCS1-v1_5 SHA-256 签名。</summary>
+    static bool VerifyPkcs1Sha256(string msg, int mLen, string sig, string n, int k, string e, int eLen) {
+        byte[] em2 = ModExp(sig, k, n, k, e, eLen);
+        byte[] em = emsaPkcs1Sha256(msg, mLen, k);
+        int diff = 0;
+        for (int i = 0; i < k; i = i + 1) { diff = diff | ((em[i] & 255) ^ (em2[i] & 255)); }
+        return diff == 0;
+    }
+}

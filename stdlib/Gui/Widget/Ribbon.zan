@@ -1,0 +1,694 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// 单个功能区命令：图标加下方标题。`sep` 在命令后绘制组
+/// 分隔线（用于在视觉上分组相关命令）。
+class RibbonCmd {
+    /// 图标名。
+    string icon;
+    /// 标题。
+    string label;
+    /// 本命令之后画一条组分隔线。
+    bool sep;
+    /// false 时命令变灰绘制、无悬停/手型光标，
+    /// 且不可点击（Render 永不返回其索引）。
+    bool enabled;
+    /// 紧凑命令是纯图标方按钮，宽度为通常的一半：
+    /// 用于开关类（面板可见性、视图选项），它们占用整个
+    /// 带标题槽位太浪费。
+    bool compact;
+    /// 开关类命令的当前态（SetOn 每帧驱动；on 时按按下态着色）。
+    bool on;
+    /// 悬停说明，显示在标题下方；否则只显示标题。
+    string tip;
+
+    /// 构造常规命令（默认可用、非紧凑）。
+    RibbonCmd(string icon, string label) {
+        this.icon = icon;
+        this.label = label;
+        this.sep = false;
+        this.enabled = true;
+        this.compact = false;
+        this.on = false;
+        this.tip = "";
+    }
+
+    /// 设悬停说明（链式）。
+    RibbonCmd SetTip(string text) { tip = text; return this; }
+
+    /// 提示文本：有说明时为「标题\n说明」。
+    string TipText() {
+        if (tip != "") { return label + "\n" + tip; }
+        return label;
+    }
+
+    /// 纯图标开关。`label` 用于提示/无障碍
+    /// 名称；每帧用 SetOn 驱动状态。
+    static RibbonCmd Switch(string icon, string label, bool on) {
+        RibbonCmd r = new RibbonCmd(icon, label);
+        r.compact = true;
+        r.on = on;
+        return r;
+    }
+
+    /// 驱动开关态（紧凑开关命令每帧调用）。
+    void SetOn(bool state) { on = state; }
+
+    /// 构造组尾命令（其后画组分隔线）。
+    static RibbonCmd Group(string icon, string label) {
+        RibbonCmd r = new RibbonCmd(icon, label);
+        r.sep = true;
+        return r;
+    }
+
+    /// 设可用性。
+    void SetEnabled(bool on) { enabled = on; }
+}
+
+/// <summary>
+/// Office 风格功能区：水平条带，含大图标+标题命令
+/// 按钮和可选的分组分隔线。无状态/立即模式——Render
+/// 绘制条带并返回本帧点击命令的索引，
+/// 无则返回 -1。
+///
+///   List&lt;RibbonCmd&gt; cmds = new List&lt;RibbonCmd&gt;();
+///   cmds.Add(RibbonCmd.Group("file", "New"));
+///   cmds.Add(new RibbonCmd("folder", "Open"));
+///   int cmd = Ribbon.Render(app, x, y, w, h, cmds);
+///   if (cmd == 0) { ... }
+/// </summary>
+class Ribbon {
+    /// 功能区条带的默认高度。
+    static int Height(App app) {
+        return app.Scale(72);
+    }
+
+    /// 立即模式渲染整条带（大命令 + 紧凑命令 + 组分隔线）；
+    /// 返回本帧被点击的命令索引，无则 -1。
+    static int Render(App app, int x, int y, int w, int h, List<RibbonCmd> cmds) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int count = cmds.Count;
+        StyleBox surfaceStyle = Style.Part(app, "ribbon", "surface", "",
+                                           "", "", Style.SNormal());
+        StyleBox dividerStyle = Style.Part(app, "ribbon", "divider", "",
+                                            "", "", Style.SNormal());
+        StyleBox hoverStyle = Style.Part(app, "ribbon", "item", "",
+                                         "", "", Style.SHover());
+        StyleBox activeStyle = Style.Part(app, "ribbon", "item", "",
+                                          "", "", Style.SActive());
+        StyleBox textStyle = Style.Part(app, "ribbon", "item", "",
+                                        "", "", Style.SNormal());
+        StyleBox accentStyle = Style.Part(app, "ribbon", "accent", "",
+                                          "", "", Style.SNormal());
+        StyleBox disabledStyle = Style.Part(app, "ribbon", "item", "",
+                                            "", "", Style.SDisabled());
+
+        int firstId = app.focus.AllocId();
+        int i = 1;
+        while (i < count) {
+            app.focus.AllocId();
+            i = i + 1;
+        }
+
+        c.FillRect(x, y, w, h, surfaceStyle.BgOr(0));
+        c.FillRect(x, y + h - 1, w, 1, dividerStyle.BgOr(0));
+
+        int cmdW = app.Scale(60);
+        int iconSize = t.iconSizeLarge;
+        int fontSize = textStyle.FontOr(Style.FontFallback(app, "small"));
+        int cx = x + t.paddingSmall;
+
+        for (int j = 0; j < count; j = j + 1) {
+            RibbonCmd cmd = cmds[j];
+            int id = firstId + j;
+            bool enabled = cmd.enabled;
+            int hv = 0;
+            int pv = 0;
+            int w1 = cmdW;
+            if (cmd.compact) { w1 = app.Scale(34); }
+            int by = y + t.paddingTiny;
+            int bh = h - t.paddingTiny * 2;
+            if (cmd.compact) {
+                bh = app.Scale(34);
+                by = y + (h - bh) / 2;
+            }
+            if (enabled) {
+                hv = Ui.HoverLevelMsIn(app, id, 0, cx, by, w1, bh);
+                pv = Ui.PressLevelMsIn(app, id, 0, cx, by, w1, bh);
+            }
+            if (cmd.on) {
+                c.FillRoundRect(cx, by, w1, bh, t.borderRadiusMedium,
+                                activeStyle.BgOr(0));
+            }
+            if (hv > 0) {
+                c.FillRoundRect(cx, by, w1, bh, t.borderRadiusMedium,
+                                App.ScaleAlpha(hoverStyle.BgOr(0), hv));
+            }
+            if (pv > 0) {
+                c.FillRoundRect(cx, by, w1, bh, t.borderRadiusMedium,
+                                App.ScaleAlpha(activeStyle.BgOr(0), pv));
+            }
+
+            int color = App.LerpColor(textStyle.FgOr(0), accentStyle.FgOr(0), hv);
+            if (cmd.on) { color = accentStyle.FgOr(0); }
+            if (!enabled) { color = disabledStyle.FgOr(0); }
+
+            if (cmd.compact) {
+                c.DrawGlyphIn(cmd.icon, cx, by + (bh - iconSize) / 2, w1,
+                    iconSize, iconSize, color);
+            } else {
+                // 将图标+标题块在按钮内垂直居中，
+                // 而非顶部对齐（图标在标题上方水平居中）。
+                int labelH = Canvas.FontHeight(fontSize);
+                int blockH = iconSize + t.paddingTiny + labelH;
+                int iconY = y + (h - blockH) / 2;
+                c.DrawGlyphIn(cmd.icon, cx, iconY, w1, iconSize, iconSize, color);
+                c.DrawTextCentered(cx, iconY + iconSize + t.paddingTiny, w1, labelH,
+                    cmd.label, color, fontSize);
+            }
+
+            if (enabled) {
+                app.hitTester.RegisterRect(id, cx, by, w1, bh, 0);
+                if (hv >= 900 || Ui.HoldTipIn(app, id, cx, by, w1, bh)) {
+                    Tooltip.RequestBox(app, cx, by, w1, bh, cmd.TipText(),
+                        Tooltip.Bottom(), app.Scale(260));
+                }
+            }
+            cx = cx + w1;
+
+            if (cmd.sep) {
+                int sx = cx + t.paddingTiny;
+                c.FillRect(sx, y + t.paddingSmall, 1, h - t.paddingSmall * 2,
+                           dividerStyle.BgOr(0));
+                cx = sx + t.paddingTiny + 1;
+            }
+        }
+
+        if (app.EventKind() == 3) {
+            int hit = app.ClickTarget();
+            int idx = hit - firstId;
+            if (idx >= 0 && idx < count) { return idx; }
+        }
+        return -1;
+    }
+
+    // ------------------------------------------------------------------
+    // Office 风格标签式功能区：标签条下有命名组条带，
+    // 每组混排大（图标+标题）和小（图标+标签行）
+    // 命令，组标题在其下方。
+    // ------------------------------------------------------------------
+
+    /// 条带底边的 Y，悬停提示锚定于此，使它们全部
+    /// 在功能区下方对齐而非跟随指针。在条带绘制期间设置
+    /// （见 PaintItem）。
+    static int tipBaseY;
+
+    /// 标签条高度。
+    static int TabStripHeight(App app) { return app.Scale(30); }
+
+    /// 标签式功能区总高（标签条 + 条带）。
+    static int HeightTabbed(App app) {
+        return Ribbon.TabStripHeight(app) + app.Scale(96);
+    }
+
+    /// 绘制标签条和活动条带，并返回本帧点击命令的全局索引
+    /// （按顺序跨所有组计数），
+    /// 无则返回 -1。`activeTab` 是双向的。
+    static int RenderTabbed(App app, int x, int y, int w, List<string> tabs,
+                            SignalInt activeTab, List<RibbonGroup> groups) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox stripStyle = Style.Part(app, "ribbon", "strip", "",
+                                         "", "", Style.SNormal());
+        StyleBox tabStyle = Style.Part(app, "ribbon", "tab", "",
+                                       "", "", Style.SNormal());
+        StyleBox tabActiveStyle = Style.Part(app, "ribbon", "tab", "",
+                                             "", "", Style.SActive());
+        StyleBox tabHoverStyle = Style.Part(app, "ribbon", "tab", "",
+                                            "", "", Style.SHover());
+        StyleBox accentStyle = Style.Part(app, "ribbon", "accent", "",
+                                          "", "", Style.SNormal());
+
+        int stripH = Ribbon.TabStripHeight(app);
+        int total = 0;
+        for (int gi = 0; gi < groups.Count; gi = gi + 1) { total = total + groups[gi].items.Count; }
+
+        int stripId = app.focus.AllocId();
+        int ti = 1;
+        while (ti < tabs.Count) { app.focus.AllocId(); ti = ti + 1; }
+        int firstId = app.focus.AllocId();
+        int ii = 1;
+        while (ii < total) { app.focus.AllocId(); ii = ii + 1; }
+
+        // ---- 标签条 ----
+        c.FillRect(x, y, w, stripH, stripStyle.BgOr(0));
+        int active = activeTab.Get();
+        int tx = x + t.paddingSmall;
+        for (int k = 0; k < tabs.Count; k = k + 1) {
+            int tabId = stripId + k;
+            int tw = Canvas.MeasureText(tabs[k],
+                tabStyle.FontOr(Style.FontFallback(app, "medium")))
+                + t.paddingLarge * 2;
+            bool isActive = k == active;
+            int hv = Ui.HoverLevelMsIn(app, tabId, 0, tx, y, tw, stripH);
+            int tc = tabStyle.FgOr(0);
+            if (isActive) {
+                c.FillRect(tx, y, tw, stripH, tabActiveStyle.BgOr(0));
+                c.FillRect(tx, y, tw, app.Scale(2), accentStyle.BgOr(0));
+                tc = tabActiveStyle.FgOr(0);
+            } else if (hv > 0) {
+                c.FillRect(tx, y, tw, stripH,
+                           App.ScaleAlpha(tabHoverStyle.BgOr(0), hv));
+                tc = tabHoverStyle.FgOr(0);
+            }
+            c.DrawTextCentered(tx, y, tw, stripH, tabs[k], tc,
+                tabStyle.FontOr(Style.FontFallback(app, "medium")));
+            app.hitTester.RegisterRect(tabId, tx, y, tw, stripH, 0);
+            if (app.EventKind() == 3
+                && app.ClickTarget() == tabId) {
+                activeTab.Set(k);
+                // 换标签页只改这条功能区（标签条 + 条带），
+                // 因此下一帧裁剪到它，而不是重绘整个窗口。
+                app.NoteDamage(x, y, w, Ribbon.HeightTabbed(app));
+            }
+            tx = tx + tw;
+        }
+
+        // ---- 条带 ----
+        int by = y + stripH;
+        int bh = Ribbon.HeightTabbed(app) - stripH;
+        return Ribbon.Band(app, x, by, w, bh, groups, firstId, 3);
+    }
+
+    /// 无标签页的分组条带：命令按命名组排列、组间竖线分隔，
+    /// 小命令每列堆叠 `rows` 个。给只有一屏命令、不值得
+    /// 分页的宿主用（设计器工具条就是这种）。返回本帧
+    /// 点击命令的全局索引（跨组按顺序计数），无则 -1。
+    /// 分组条带高度（无标签式）。
+    static int HeightGroups(App app) { return app.Scale(76); }
+
+    /// 渲染无标签的分组条带；返回本帧点击命令的全局索引
+    /// （跨组按顺序计数），无则 -1。
+    static int RenderGroups(App app, int x, int y, int w, List<RibbonGroup> groups) {
+        int total = 0;
+        for (int gi = 0; gi < groups.Count; gi = gi + 1) {
+            total = total + groups[gi].items.Count;
+        }
+        if (total <= 0) { return 0 - 1; }
+        int firstId = app.focus.AllocId();
+        int ii = 1;
+        while (ii < total) { app.focus.AllocId(); ii = ii + 1; }
+        return Ribbon.Band(app, x, y, w, Ribbon.HeightGroups(app), groups,
+            firstId, 2);
+    }
+
+    /// 分组命令条带本体，标签式和无标签式功能区共用。
+    /// `rows` 是一列里堆叠多少个小命令。
+    /// 一组小命令的列宽：组内最宽的标签说了算，这样每列的
+    /// 图标和文字都对齐，长标签也不会被邻列压住。
+    static int SmallColW(App app, RibbonGroup grp) {
+        Theme t = app.theme;
+        StyleBox textStyle = Style.Part(app, "ribbon", "item", "",
+                                        "", "", Style.SNormal());
+        int fontSize = textStyle.FontOr(Style.FontFallback(app, "small"));
+        int smallW = app.Scale(72);
+        for (int m = 0; m < grp.items.Count; m = m + 1) {
+            RibbonItem mi = grp.items[m];
+            if (mi.tile || !mi.small) { continue; }
+            int mw = Canvas.MeasureText(mi.label, fontSize)
+                + t.iconSizeSmall + app.Scale(22);
+            if (mi.menu) { mw = mw + app.Scale(10); }
+            if (mw > smallW) { smallW = mw; }
+        }
+        return smallW;
+    }
+
+    /// 条带排完所有分组需要多宽（和 Band 里的列游标算法一致，
+    /// 只量不画）。宿主给的宽度不够时据此收缩排布。
+    static int BandWidth(App app, List<RibbonGroup> groups, int bh, int rows) {
+        Theme t = app.theme;
+        if (rows < 1) { rows = 1; }
+        int titleH = app.Scale(16);
+        int contentH = bh - titleH - t.paddingSmall * 2;
+        int rowH = contentH / rows;
+        int tileW = rowH;
+        int cx = t.paddingSmall;
+        for (int g = 0; g < groups.Count; g = g + 1) {
+            RibbonGroup grp = groups[g];
+            int smallW = Ribbon.SmallColW(app, grp);
+            int sIdx = 0;
+            int curKind = 0 - 1;
+            int curW = 0;
+            for (int j = 0; j < grp.items.Count; j = j + 1) {
+                RibbonItem it = grp.items[j];
+                int kind = 0;
+                if (it.tile) { kind = 2; }
+                else if (it.small) { kind = 1; }
+                if (kind != curKind && sIdx % rows != 0) { cx = cx + curW; sIdx = 0; }
+                curKind = kind;
+                if (kind == 0) {
+                    if (sIdx % rows != 0) { cx = cx + curW; sIdx = 0; }
+                    cx = cx + app.Scale(64);
+                } else {
+                    int colW = smallW;
+                    if (kind == 2) { colW = tileW; }
+                    curW = colW;
+                    sIdx = sIdx + 1;
+                    if (sIdx % rows == 0) { cx = cx + colW; }
+                }
+            }
+            if (sIdx % rows != 0) { cx = cx + curW; }
+            cx = cx + t.paddingSmall * 2 + 1;
+        }
+        return cx + t.paddingSmall;
+    }
+
+    /// 分组条带本体，标签式和无标签式功能区共用；
+    /// 返回本帧点击命令的全局索引，无则 -1。
+    static int Band(App app, int x, int by, int w, int bh, List<RibbonGroup> groups,
+                    int firstId, int rows) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        if (rows < 1) { rows = 1; }
+        StyleBox surfaceStyle = Style.Part(app, "ribbon", "surface", "",
+                                           "", "", Style.SNormal());
+        StyleBox dividerStyle = Style.Part(app, "ribbon", "divider", "",
+                                            "", "", Style.SNormal());
+        StyleBox hoverStyle = Style.Part(app, "ribbon", "item", "",
+                                         "", "", Style.SHover());
+        StyleBox activeStyle = Style.Part(app, "ribbon", "item", "",
+                                          "", "", Style.SActive());
+        StyleBox textStyle = Style.Part(app, "ribbon", "item", "",
+                                        "", "", Style.SNormal());
+        StyleBox mutedStyle = Style.Part(app, "ribbon", "muted", "",
+                                         "", "", Style.SNormal());
+        StyleBox accentStyle = Style.Part(app, "ribbon", "accent", "",
+                                          "", "", Style.SNormal());
+        StyleBox accentHoverStyle = Style.Part(app, "ribbon", "accent", "",
+                                               "", "", Style.SHover());
+        StyleBox disabledStyle = Style.Part(app, "ribbon", "item", "",
+                                            "", "", Style.SDisabled());
+        c.FillRect(x, by, w, bh, surfaceStyle.BgOr(0));
+        c.FillRect(x, by + bh - 1, w, 1, dividerStyle.BgOr(0));
+
+        // 宿主给的宽度放不下时先把带文字的命令收成纯图标格
+        // （标签退到提示气泡里），再不够就裁掉——命令绝不
+        // 画到条带外面去。
+        if (Ribbon.BandWidth(app, groups, bh, rows) > w) {
+            for (int cg = 0; cg < groups.Count; cg = cg + 1) {
+                RibbonGroup cgrp = groups[cg];
+                for (int ci = 0; ci < cgrp.items.Count; ci = ci + 1) {
+                    RibbonItem cit = cgrp.items[ci];
+                    if (cit.small && !cit.tile) { cit.tile = true; }
+                }
+            }
+        }
+        c.PushClip(x, by, w, bh);
+
+        int titleH = app.Scale(16);
+        int contentTop = by + t.paddingSmall;
+        int contentH = bh - titleH - t.paddingSmall * 2;
+
+        int cx = x + t.paddingSmall;
+        int gap = app.Scale(4);
+        Ribbon.tipBaseY = by + bh;
+        int clicked = 0 - 1;
+        int baseIdx = 0;
+        for (int g = 0; g < groups.Count; g = g + 1) {
+            RibbonGroup grp = groups[g];
+            int groupStartX = cx;
+
+            // 三种排布共用一套列游标：小命令是 rows 行的
+            // 标签行列，图标格是 rows 行的方钮列（一列可以
+            // 排好几个），大命令独占整列。换种排布时先把
+            // 没排满的那一列收掉，免得两种宽度叠在一起。
+            int sIdx = 0;
+            int curKind = 0 - 1;
+            int curW = 0;
+            int rowH = contentH / rows;
+            int tileW = rowH;
+            // 一组里的小命令用同一个列宽（组内最宽的
+            // 标签决定），这样每列的图标和文字都对齐，
+            // 长标签也不会被邻列压住。
+            int smallW = Ribbon.SmallColW(app, grp);
+            for (int j = 0; j < grp.items.Count; j = j + 1) {
+                RibbonItem it = grp.items[j];
+                int id = firstId + baseIdx + j;
+                int kind = 0;
+                if (it.tile) { kind = 2; }
+                else if (it.small) { kind = 1; }
+                if (kind != curKind && sIdx % rows != 0) {
+                    cx = cx + curW;
+                    sIdx = 0;
+                }
+                curKind = kind;
+                if (kind == 0) {
+                    if (sIdx % rows != 0) { cx = cx + curW; sIdx = 0; }
+                    int lw = app.Scale(64);
+                    Ribbon.PaintItem(app, id, it, cx, contentTop + gap / 2,
+                        lw - gap, contentH - gap, false, hoverStyle, activeStyle,
+                        textStyle, mutedStyle, accentStyle, accentHoverStyle,
+                        disabledStyle);
+                    if (Ribbon.ItemClicked(app, id, it)) { clicked = baseIdx + j; }
+                    cx = cx + lw;
+                } else {
+                    int colW = smallW;
+                    if (kind == 2) { colW = tileW; }
+                    curW = colW;
+                    int ry = contentTop + (sIdx % rows) * rowH;
+                    Ribbon.PaintItem(app, id, it, cx, ry + gap / 2,
+                        colW - gap, rowH - gap, true, hoverStyle, activeStyle,
+                        textStyle, mutedStyle, accentStyle, accentHoverStyle,
+                        disabledStyle);
+                    if (Ribbon.ItemClicked(app, id, it)) { clicked = baseIdx + j; }
+                    sIdx = sIdx + 1;
+                    if (sIdx % rows == 0) { cx = cx + colW; }
+                }
+            }
+            if (sIdx % rows != 0) { cx = cx + curW; }
+
+            // 组标题 + 尾部分隔线
+            c.DrawTextCentered(groupStartX, by + bh - titleH - t.paddingTiny,
+                cx - groupStartX, titleH, grp.title, mutedStyle.FgOr(0),
+                mutedStyle.FontOr(Style.FontFallback(app, "small")));
+            cx = cx + t.paddingSmall;
+            c.FillRect(cx, by + t.paddingSmall, 1, bh - t.paddingSmall * 2,
+                       dividerStyle.BgOr(0));
+            cx = cx + t.paddingSmall + 1;
+
+            baseIdx = baseIdx + grp.items.Count;
+        }
+        c.PopClip();
+        return clicked;
+    }
+
+    /// 绘制单个命令项（大 / 小行 / 纯图标格三种形态），
+    /// 处理悬停/按下淡变与悬停提示。
+    static void PaintItem(App app, int id, RibbonItem it, int x, int y, int w, int h,
+                          bool small, StyleBox hoverStyle, StyleBox activeStyle,
+                          StyleBox textStyle, StyleBox mutedStyle,
+                          StyleBox accentStyle, StyleBox accentHoverStyle,
+                          StyleBox disabledStyle) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fontSize = textStyle.FontOr(Style.FontFallback(app, "small"));
+        int hv = 0;
+        int pv = 0;
+        if (it.enabled) {
+            hv = Ui.HoverLevelMsIn(app, id, 0, x, y, w, h);
+            pv = Ui.PressLevelMsIn(app, id, 0, x, y, w, h);
+        }
+        if (hv > 0) {
+            c.FillRoundRect(x, y, w, h, t.borderRadiusSmall,
+                            App.ScaleAlpha(hoverStyle.BgOr(0), hv));
+        }
+        if (pv > 0) {
+            c.FillRoundRect(x, y, w, h, t.borderRadiusSmall,
+                            App.ScaleAlpha(activeStyle.BgOr(0), pv));
+        }
+        int color = App.LerpColor(textStyle.FgOr(0), accentStyle.FgOr(0), hv);
+        // 开关靠自身权重而非填充色块表现：目标显示时以强调色点亮，
+        // 隐藏时淡出——一排开关仍是列表形态，
+        // 而非一块色块。
+        if (it.toggle) {
+            int off = mutedStyle.FgOr(0);
+            int on = accentStyle.FgOr(0);
+            if (it.on) {
+                color = App.LerpColor(on, accentHoverStyle.FgOr(0), hv);
+            } else {
+                color = App.LerpColor(off, textStyle.FgOr(0), hv);
+            }
+        }
+        if (!it.enabled) { color = disabledStyle.FgOr(0); }
+
+        if (it.tile) {
+            int isz = t.iconSizeSmall;
+            int aw = 0;
+            if (it.menu) { aw = app.Scale(8); }
+            c.DrawGlyphIn(it.icon, x, y + (h - isz) / 2, w - aw, isz, isz, color);
+            if (it.menu) {
+                c.DrawGlyphIn("chevron-down", x + w - aw, y + (h - isz) / 2, aw,
+                    isz / 2, isz / 2, color);
+            }
+        } else if (small) {
+            int isz = t.iconSizeSmall;
+            int iy = y + (h - isz) / 2;
+            c.DrawGlyphIn(it.icon, x + app.Scale(4), iy, isz, isz, isz, color);
+            int tx = x + app.Scale(4) + isz + t.gapSmall;
+            int ty = Canvas.CenterTextY(y, h, fontSize);
+            c.DrawText(tx, ty, it.label, color, fontSize);
+            if (it.menu) {
+                c.DrawGlyphIn("chevron-down", x + w - app.Scale(10), iy, app.Scale(8),
+                    isz / 2, isz / 2, color);
+            }
+        } else {
+            int isz = t.iconSizeLarge;
+            int labelH = Canvas.FontHeight(fontSize);
+            int blockH = isz + t.paddingTiny + labelH;
+            int iy = y + (h - blockH) / 2;
+            c.DrawGlyphIn(it.icon, x, iy, w, isz, isz, color);
+            c.DrawTextCentered(x, iy + isz + t.paddingTiny, w, labelH, it.label,
+                color, fontSize);
+            if (it.menu) {
+                c.DrawGlyphIn("chevron-down", x, iy + blockH + t.paddingTiny, w,
+                    isz / 2, isz / 2, color);
+            }
+        }
+        if (it.enabled) {
+            app.hitTester.RegisterRect(id, x, y, w, h, 0);
+            // 悬停稳定后才显示提示，避免快速划过一排
+            // 命令时气泡闪烁。宿主在帧末将其绘制在所有内容之上
+            // （Tooltip.Flush）。
+            if (hv >= 900 || Ui.HoldTipIn(app, id, x, y, w, h)) {
+                int tipY = y + h;
+                if (Ribbon.tipBaseY > 0) { tipY = Ribbon.tipBaseY; }
+                Tooltip.Request(x + w / 2, tipY, it.TipText(), Tooltip.Bottom(),
+                    app.Scale(260));
+            }
+        }
+    }
+
+    /// 本帧该命令项是否被点击（禁用项恒 false）。
+    static bool ItemClicked(App app, int id, RibbonItem it) {
+        if (!it.enabled) { return false; }
+        return app.EventKind() == 3
+            && app.ClickTarget() == id;
+    }
+}
+
+/// Office 风格功能区组中的一个命令。`small` 渲染紧凑的
+/// 图标+标签行形式（每列三个堆叠）；否则为大的
+/// 图标+标题按钮。
+class RibbonItem {
+    /// 图标名。
+    string icon;
+    /// 标题 / 标签。
+    string label;
+    /// 紧凑的图标+标签行形式（每列多行堆叠）。
+    bool small;
+    /// 纯图标小方钮，按 Office 的图标格铺排（一列堆叠多个，
+    /// 标签只出现在提示里）。用于同一族的一批命令，
+    /// 例如六个对齐方式。
+    bool tile;
+    /// 画一个下拉箭头（拆分按钮）：宿主自己在点击后弹菜单，
+    /// 功能区只负责表达"这个命令还有下一级"。
+    bool menu;
+    /// 可用性（Disable/SetEnabled 切换）。
+    bool enabled;
+    /// 开关在 `on` 时点亮绘制（强调色填充 + 强调色图标），使一排
+    /// 看起来像一排开关而非一排命令。
+    bool toggle;
+    /// 开关当前态（SetOn 每帧驱动）。
+    bool on;
+    /// 悬停提示；留空时默认取标签。
+    string tip;
+
+    /// 构造大命令（图标+标题）。
+    static RibbonItem Large(string icon, string label) {
+        RibbonItem r = new RibbonItem();
+        r.icon = icon;
+        r.label = label;
+        r.small = false;
+        r.tile = false;
+        r.menu = false;
+        r.enabled = true;
+        r.toggle = false;
+        r.on = false;
+        r.tip = "";
+        return r;
+    }
+
+    /// 构造小命令（图标+标签行）。
+    static RibbonItem Small(string icon, string label) {
+        RibbonItem r = RibbonItem.Large(icon, label);
+        r.small = true;
+        return r;
+    }
+
+    /// 小型开关，例如停靠布局中每个工具面板一个，
+    /// （见 DockHost.AddSwitchGroup）。
+    static RibbonItem Toggle(string icon, string label, bool on) {
+        RibbonItem r = RibbonItem.Small(icon, label);
+        r.toggle = true;
+        r.on = on;
+        return r;
+    }
+
+    /// 纯图标方钮。`label` 只用于提示。
+    static RibbonItem Tile(string icon, string label) {
+        RibbonItem r = RibbonItem.Large(icon, label);
+        r.small = true;
+        r.tile = true;
+        return r;
+    }
+
+    /// 标记为拆分按钮（画下拉箭头，链式）。
+    RibbonItem SetMenu() { menu = true; return this; }
+
+    /// 禁用该命令（链式）。
+    RibbonItem Disable() { enabled = false; return this; }
+
+    /// 设悬停说明（链式）。
+    RibbonItem SetTip(string text) { tip = text; return this; }
+
+    /// 驱动开关态。
+    void SetOn(bool state) { on = state; }
+
+    /// 设可用性。
+    void SetEnabled(bool state) { enabled = state; }
+
+    /// 悬停气泡显示：标题，及下方命令功能的描述
+    /// （仅标题说明不了新信息）。
+    string TipText() {
+        if (tip != "") { return label + "\n" + tip; }
+        return label;
+    }
+}
+
+/// 命名的功能区命令组，绘制为带标题的簇，
+/// 与相邻簇以竖线分隔。
+class RibbonGroup {
+    /// 组标题。
+    string title;
+    /// 组内命令。
+    List<RibbonItem> items;
+
+    /// 构造空组。
+    RibbonGroup(string title) {
+        this.title = title;
+        this.items = new List<RibbonItem>();
+    }
+    /// 从现成的项列表构建组，例如
+    ///   RibbonGroup.Of("File", new List<RibbonItem>{ ..., ... })
+    static RibbonGroup Of(string title, List<RibbonItem> items) {
+        RibbonGroup g = new RibbonGroup(title);
+        g.items = items;
+        return g;
+    }
+
+    /// 追加一个命令（链式）。
+    RibbonGroup Add(RibbonItem it) { items.Add(it); return this; }
+}

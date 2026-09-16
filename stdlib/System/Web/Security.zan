@@ -1,0 +1,213 @@
+using System;
+using System.Security.Cryptography;
+using System.Threading;
+
+namespace System.Web;
+
+/// <summary>The two things the dispatcher asks the application: who a token
+/// belongs to (AuthFn) and whether that principal may run a route action
+/// (PermissionFn).
+///
+/// Both are asynchronous: they run on the request coroutine, so a user store
+/// that is a database or Redis can be awaited instead of blocking the worker.
+/// A resolver that needs no I/O simply never awaits.</summary>
+async delegate string AuthFn(string token);
+async delegate bool PermissionFn(string uid, string action);
+
+/// <summary>
+/// Request-lock registry: the typed replacement for the PHP "接口请求锁" pattern.
+/// A route annotated with [Lock("user")] / [Lock("global")] may only run one
+/// request at a time for the given key; overlapping requests get 429 instead of
+/// racing (double-submit / duplicate-write protection). The HTTP server is a
+/// single-threaded event loop per worker, so a plain in-flight key set is race
+/// free -- no OS mutex needed.
+/// </summary>
+class LockLease {
+    string key;
+    long owner;
+
+    LockLease(string key, long owner) {
+        this.key = key;
+        this.owner = owner;
+    }
+}
+
+/// <summary>
+/// 请求锁的租约表（匿名共享内存）：一个键同一时刻只有一个持有者，拿
+/// 不到租约的请求由调用方回答 429。经 SharedTable.TryAcquireLease 加锁
+/// （30 秒租约窗口）、ReleaseLease 释放；表未就绪的管理器不发放租约。
+/// </summary>
+class LockManager {
+    SharedTable table;
+    long ownerSequence;
+    long leaseMs;
+
+    LockManager() {
+        this.ownerSequence = 0;
+        this.leaseMs = 30000;
+    }
+
+    /// 新建锁表：65536 键位，单列 owner。
+    static SharedTable NewTable() {
+        SharedTable t = new SharedTable("", 65536);
+        t.KeySize(192);
+        t.ColumnInt("owner");
+        return t;
+    }
+
+    /// <summary>Locks in anonymous shared memory this process owns: no name for
+    /// another server on the machine to collide with or reach into, and workers
+    /// get the same leases through <see cref="OsHandle"/> / <see cref="Attach"/>.</summary>
+    static LockManager Owned() {
+        LockManager m = new LockManager();
+        SharedTable t = LockManager.NewTable();
+        if (t.CreateAnonymous()) {
+            t.Label("web request lock");
+            m.table = t;
+        }
+        return m;
+    }
+
+    /// <summary>Locks in the anonymous table another process created and handed
+    /// down. Handle 0 (nothing was handed down) leaves the manager closed, and a
+    /// closed manager grants no lease -- a locked route is refused rather than
+    /// let through unprotected.</summary>
+    static LockManager Attach(long osHandle) {
+        LockManager m = new LockManager();
+        if (osHandle == 0) { return m; }
+        SharedTable t = SharedTable.Attach(osHandle);
+        if (t.IsOpen()) {
+            t.Label("web request lock");
+            m.table = t;
+        }
+        return m;
+    }
+
+    /// <summary>The handle a worker needs to map this manager's table, or 0
+    /// when no table was created.</summary>
+    long OsHandle() {
+        if (this.table == null) { return 0; }
+        return this.table.OsHandle();
+    }
+
+    /// 依 [Lock] 维度构锁键："user" → "u:&lt;principal&gt;:&lt;路由键&gt;"
+    /// （匿名者记 _anon_），"global" → "g:&lt;路由键&gt;"；未声明锁维度
+    /// 返回空串。
+    static string KeyFor(Route route, string principal) {
+        if (route.lockScope == "user") {
+            string who = principal;
+            if (who.Length == 0) { who = "_anon_"; }
+            return "u:" + who + ":" + route.Key();
+        }
+        if (route.lockScope == "global") {
+            return "g:" + route.Key();
+        }
+        return "";
+    }
+
+    /// 取租约：键为空、表未就绪或键已被持有都返回 null。
+    LockLease TryAcquire(string key) {
+        if (key.Length == 0) { return null; }
+        if (this.table == null) { return null; }
+        this.ownerSequence = this.ownerSequence + 1;
+        long owner = this.ownerSequence;
+        if (!this.table.TryAcquireLease(key, owner, -1, this.leaseMs)) {
+            return null;
+        }
+        return new LockLease(key, owner);
+    }
+
+    /// 释放租约（须为本持有者）；lease 为 null 或表未就绪时静默返回。
+    void Release(LockLease lease) {
+        if (lease == null || this.table == null) { return; }
+        this.table.ReleaseLease(lease.key, lease.owner);
+    }
+}
+
+
+/// <summary>
+/// CSRF 防护（opt-in）：double-submit cookie。注册一行：
+///   app.Before(Csrf.Guard);
+///
+/// 语义：
+/// - 安全方法（GET/HEAD/OPTIONS）不拦截；首次访问补发随机 token
+///   cookie（不带 HttpOnly——浏览器脚本必须读它、回显到
+///   X-CSRF-Token 头或 _csrf 表单字段；SameSite=Lax 保留，本身就是
+///   第一道防线）。
+/// - 不安全方法要求 X-CSRF-Token（或 _csrf 字段）与 cookie 逐字节
+///   相等；缺失或不匹配 → 403 并短路（返回 false，路由不再执行）。
+/// - 比较走常时路径（按最大长度累积异或），不因首个差异字节提前
+///   返回。
+/// - token 无状态（16 随机字节的 hex），重启/多 worker 之间均有效，
+///   服务端不需要存储与过期清扫。
+/// - 豁免：自带签名校验的回调路由用 <see cref="Csrf.Skip"/> 登记
+///   前缀。
+/// </summary>
+class Csrf {
+    static string CookieName = "csrf_token";
+    static string HeaderName = "X-CSRF-Token";
+    static string FormName = "_csrf";
+    static List<string> skips;
+
+    /// <summary>登记豁免前缀：路径以其开头即不拦截。用于支付回调、
+    /// webhook 等自带签名校验、调用方不可能持有 cookie 的路由。</summary>
+    static void Skip(string prefix) {
+        if (Csrf.skips == null) { Csrf.skips = new List<string>(); }
+        Csrf.skips.Add(prefix);
+    }
+
+    /// 路径是否命中任一豁免前缀。
+    static bool Skipped(string path) {
+        if (Csrf.skips == null) { return false; }
+        int n = Csrf.skips.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            string p = Csrf.skips[i];
+            if (p.Length > 0 && HttpContext.StartsWith(path, p)) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary>Before 钩子本体。返回 false 表示已写好 403 响应，
+    /// 管线短路。</summary>
+    static bool Guard(HttpContext ctx) {
+        bool safe = ctx.method == "GET" || ctx.method == "HEAD"
+            || ctx.method == "OPTIONS";
+        if (safe) {
+            if (ctx.Cookie(Csrf.CookieName).Length == 0) {
+                ctx.SetCookieJs(Csrf.CookieName, Csrf.NewToken(), 43200);
+            }
+            return true;
+        }
+        if (Csrf.Skipped(ctx.path)) { return true; }
+        string cookie = ctx.Cookie(Csrf.CookieName);
+        string sent = ctx.Header(Csrf.HeaderName);
+        if (sent.Length == 0) { sent = ctx.Form(Csrf.FormName); }
+        if (cookie.Length == 0 || sent.Length == 0
+            || !Csrf.ConstantTimeEquals(cookie, sent)) {
+            ctx.Status(403, "Forbidden");
+            ctx.Text("csrf token missing or invalid");
+            return false;
+        }
+        return true;
+    }
+
+    /// 新 token：16 随机字节的 hex（128 位熵）。
+    static string NewToken() {
+        return Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+    }
+
+    /// 常时比较：按较长一方的长度累积异或，长度不等直接计入差异位，
+    /// 不因首个差异字节提前返回。
+    static bool ConstantTimeEquals(string a, string b) {
+        int la = a.Length;
+        int lb = b.Length;
+        int n = la > lb ? la : lb;
+        int diff = la == lb ? 0 : 1;
+        for (int i = 0; i < n; i = i + 1) {
+            int x = i < la ? a[i] & 255 : 0;
+            int y = i < lb ? b[i] & 255 : 0;
+            diff = diff | (x ^ y);
+        }
+        return diff == 0;
+    }
+}

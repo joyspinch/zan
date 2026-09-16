@@ -1,0 +1,388 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Hmi;
+
+/// <summary>
+/// 屏幕数字键盘（on-screen numeric keypad）：工控机多为触摸屏、
+/// 无实体键盘，改设定值靠它。键盘自己维护输入缓冲，确认时把
+/// 缓冲按位号的刻度换算成原始计数写入。
+///
+///   NumPad kp = new NumPad();
+///   kp.Target(spTag);                 // 确认写入该位号
+///   kp.Enter += () => { ... };        // 也可自己接管
+/// </summary>
+class NumPad : Control {
+    /// 输入缓冲（显示文本，尚未按位号刻度换算）。
+    SignalString entry;
+    /// 确认（ENT）时写入的目标位号；null = 无目标，结果留在缓冲。
+    IoTag target;
+    /// 命中 id 块：0..11 数字/小数点/退格，12 +/-，13 CLR，14 ENT，
+    /// 15 保留给 On.Fire。
+    int baseId;
+    /// 允许输入负号与小数点。
+    bool allowSign;
+    /// 允许输入小数点；整个缓冲只允许一个小数点。
+    bool allowDot;
+    /// 确认（ENT）时触发。
+    UiEvent Enter;
+    /// 取消（ESC）时触发。
+    UiEvent Cancel;
+
+    /// 默认设计期构造：允许负号与小数点，无目标位号。
+    NumPad() {
+        this.InitControl("numPad", 0);
+        entry = new SignalString("");
+        target = null;
+        baseId = WidgetId.Block(16);
+        allowSign = true;
+        allowDot = true;
+        wiresOwnEvents = true;
+        Enter = new UiEvent();
+        Cancel = new UiEvent();
+    }
+
+    /// 输入缓冲的信号访问器。
+    SignalString Entry() { return entry; }
+    /// 当前缓冲文本。
+    string Text() { return entry.Get(); }
+    /// 覆盖缓冲文本（不触发 Enter）。
+    void SetText(string s) { entry.Set(s); }
+    /// 清空缓冲。
+    void Clear() { entry.Set(""); }
+
+    /// 确认时写入的位号（同时把它的当前值预置进缓冲）。
+    NumPad Target(IoTag t) {
+        target = t;
+        entry.Set(t.Text());
+        return this;
+    }
+
+    /// 控件类型标识（序列化/设计器用）。
+    override string Kind() { return "NumPad"; }
+
+    /// 覆写：公共事件之外提供 "Enter" 与 "Cancel"。
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Enter");
+        e.Add("Cancel");
+        return e;
+    }
+
+    /// 覆写："Enter"/"Cancel" 挂对应事件，其余按名称走通用路由。
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Enter") { Enter.Add(a); return; }
+        if (evt == "Cancel") { Cancel.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    /// 覆写：返回设计器属性清单（输入缓冲 / 允许负号 / 允许小数点）。
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec v = PropSpec.Text("value", "Entry");
+        v.sstr = entry;
+        ps.Add(v);
+        PropSpec sg = PropSpec.Bool("sign", "Allow sign");
+        sg.flag = allowSign;
+        ps.Add(sg);
+        PropSpec dt = PropSpec.Bool("dot", "Allow decimal point");
+        dt.flag = allowDot;
+        ps.Add(dt);
+        return ps;
+    }
+
+    /// 覆写：固定首选尺寸 200 x 260（逻辑 px）。
+    override void OnMeasure(App app) {
+        prefW = app.Scale(200);
+        prefH = app.Scale(260);
+    }
+
+    /// 第 i 个键的文字（4 行 x 3 列）。
+    string KeyAt(int i) {
+        List<string> keys = new List<string>{ "7", "8", "9",
+                                              "4", "5", "6",
+                                              "1", "2", "3",
+                                              "0", ".", "←" };
+        return keys[i];
+    }
+
+    /// 覆写：画输入显示屏、4x3 数字键盘与 +/-、CLR、ENT 底行。
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = Style.FontFallback(app, "large");
+        int rad = t.borderRadiusMedium;
+        c.FillRoundRect(bx, by, bw, bh, rad, Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BgOr(0));
+        c.DrawRoundRect(bx, by, bw, bh, rad, Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BorderOr(0), 1);
+
+        int pad = app.Scale(8);
+        int dispH = t.heightLarge;
+        c.FillRoundRect(bx + pad, by + pad, bw - pad * 2, dispH,
+                        t.borderRadiusSmall, App.Darken(Style.Part(app, "hmi", "track", "", "", "", Style.SNormal()).BgOr(0), 20));
+        string shown = entry.Get();
+        if (shown == "") { shown = "0"; }
+        c.DrawText(bx + pad * 2, by + pad + dispH / 2 - Canvas.FontHeight(fs) / 2,
+                   shown, Style.Part(app, "hmi", "value", "", "", "", Style.SNormal()).FgOr(0), fs);
+        if (target != null && target.Unit() != "") {
+            int fsS = Style.FontFallback(app, "small");
+            string u = target.Unit();
+            c.DrawText(bx + bw - pad * 2 - Canvas.MeasureText(u, fsS),
+                       by + pad + dispH / 2 - Canvas.FontHeight(fsS) / 2,
+                       u, Style.Part(app, "hmi", "hint", "", "", "", Style.SNormal()).FgOr(0), fsS);
+        }
+
+        int gy = by + pad + dispH + pad;
+        int gh = bh - (gy - by) - pad;
+        int rowH = (gh - app.Scale(4) * 4) / 5;
+        int colW = (bw - pad * 2 - app.Scale(4) * 2) / 3;
+        for (int i = 0; i < 12; i = i + 1) {
+            int r = i / 3;
+            int cc = i - r * 3;
+            int kx = bx + pad + cc * (colW + app.Scale(4));
+            int ky = gy + r * (rowH + app.Scale(4));
+            string label = this.KeyAt(i);
+            if (label == "." && !allowDot) { continue; }
+            this.PaintKey(app, baseId + i, kx, ky, colW, rowH, label,
+                          Style.Part(app, "hmi", "track", "", "", "", Style.SNormal()).BgOr(0), Style.Part(app, "hmi", "value", "", "", "", Style.SNormal()).FgOr(0));
+        }
+
+        // 底行：正负号 / 清零 / 确认。
+        int by2 = gy + 4 * (rowH + app.Scale(4));
+        int signW = colW;
+        if (allowSign) {
+            this.PaintKey(app, baseId + 12, bx + pad, by2, signW, rowH,
+                          "+/-", Style.Part(app, "hmi", "track", "", "", "", Style.SNormal()).BgOr(0), Style.Part(app, "hmi", "value", "", "", "", Style.SNormal()).FgOr(0));
+        }
+        this.PaintKey(app, baseId + 13, bx + pad + colW + app.Scale(4), by2,
+                      colW, rowH, "CLR", Style.Part(app, "hmi", "track", "", "", "", Style.SNormal()).BgOr(0), Style.Part(app, "hmi", "status", "", "warning", "", Style.SNormal()).BgOr(0));
+        this.PaintKey(app, baseId + 14,
+                      bx + pad + (colW + app.Scale(4)) * 2, by2, colW, rowH,
+                      "ENT", Style.Part(app, "hmi", "accent", "", "", "", Style.SNormal()).BgOr(0), Style.Part(app, "hmi", "accent", "", "", "", Style.SNormal()).FgOr(0));
+        On.Fire(app, baseId + 15);
+    }
+
+    /// 画一枚按键（含悬停/按下反馈与点击命中注册）。
+    void PaintKey(App app, int id, int x, int y, int w, int h, string label,
+                  int bg, int fg) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int hv = Ui.HoverLevelMsIn(app, id, 0, x, y, w, h);
+        int fill = App.LerpColor(bg, Style.Part(app, "hmi", "track", "", "", "", Style.SHover()).BgOr(0), hv);
+        if (Ui.PressedDown(app, id)) { fill = App.Darken(fill, 12); }
+        c.FillRoundRect(x, y, w, h, t.borderRadiusSmall, fill);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusSmall, Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BorderOr(0), 1);
+        c.DrawTextCentered(x, y, w, h, label, fg, Style.FontFallback(app, "large"));
+        app.hitTester.RegisterRect(id, x, y, w, h, 0);
+        if (Ui.Clicked(app, id)) {
+            this.Press(label);
+            app.RequestRedraw();
+        }
+    }
+
+    /// 处理一次按键，`label` 即键面文字。
+    void Press(string label) {
+        string s = entry.Get();
+        if (label == "ENT") {
+            this.Commit();
+            Enter.Raise();
+            return;
+        }
+        if (label == "CLR") {
+            entry.Set("");
+            return;
+        }
+        if (label == "←") {
+            if (s.Length > 0) { entry.Set(s.Substring(0, s.Length - 1)); }
+            return;
+        }
+        if (label == "+/-") {
+            if (s.Length > 0 && s.Substring(0, 1) == "-") {
+                entry.Set(s.Substring(1, s.Length - 1));
+            } else {
+                entry.Set("-" + s);
+            }
+            return;
+        }
+        if (label == ".") {
+            if (!allowDot || s.IndexOf(".") >= 0) { return; }
+            if (s == "") { entry.Set("0."); return; }
+            entry.Set(s + ".");
+            return;
+        }
+        entry.Set(s + label);
+    }
+
+    /// 把输入缓冲按目标位号的刻度换算并写入。没有目标位号时
+    /// 只保留缓冲，由宿主自行读取。
+    void Commit() {
+        if (target == null) { return; }
+        target.SetRaw(NumPad.Parse(entry.Get(), target.Scale()));
+    }
+
+    /// "12.34" + scale=100 -> 1234。多余的小数位截断，缺位补零。
+    static int Parse(string s, int scale) {
+        if (scale < 1) { scale = 1; }
+        bool neg = false;
+        string body = s;
+        if (body.Length > 0 && body.Substring(0, 1) == "-") {
+            neg = true;
+            body = body.Substring(1, body.Length - 1);
+        }
+        int dot = body.IndexOf(".");
+        string whole = body;
+        string frac = "";
+        if (dot >= 0) {
+            whole = body.Substring(0, dot);
+            frac = body.Substring(dot + 1, body.Length - dot - 1);
+        }
+        if (whole == "") { whole = "0"; }
+        int digits = IoTag.Digits(scale);
+        while (frac.Length < digits) { frac = frac + "0"; }
+        if (frac.Length > digits) { frac = frac.Substring(0, digits); }
+        int v = Convert.ToInt32(whole) * scale;
+        if (digits > 0 && frac != "") { v = v + Convert.ToInt32(frac); }
+        if (neg) { v = 0 - v; }
+        return v;
+    }
+}
+
+/// <summary>
+/// 设备状态卡（device card）：设备名 + 状态灯 + 几个关键数值，
+/// 用于设备总览页的卡片网格。状态 0 停机 / 1 运行 / 2 报警 /
+/// 3 故障 / 4 离线，与 Led 的状态取值一致。
+///
+///   DeviceCard c = new DeviceCard("1# 压缩机");
+///   c.Row("电流", currentTag);
+///   c.Row("排气压力", pressTag);
+/// </summary>
+class DeviceCard : Control {
+    /// 设备名（卡片左上标题）。
+    string title;
+    /// 设备状态（0 停机 / 1 运行 / 2 报警 / 3 故障 / 4 离线）。
+    SignalInt state;
+    /// 数据行名称，与 rowTags 按下标一一对应。
+    List<string> rowNames;
+    /// 数据行位号，与 rowNames 按下标一一对应。
+    List<IoTag> rowTags;
+    /// 整卡命中 id（点击时触发 Click）。
+    int wid;
+    /// 卡片被点击时触发（一般用于打开设备详情）。
+    UiEvent Click;
+
+    /// Placeable from the designer, which builds every control with no
+    /// arguments and then applies the design's properties.
+    DeviceCard() : this("") { }
+
+    /// 以设备名构造空卡片（数据行经 Row 追加）。
+    DeviceCard(string name) {
+        this.InitControl("deviceCard", 0);
+        title = name;
+        state = new SignalInt(0);
+        rowNames = new List<string>();
+        rowTags = new List<IoTag>();
+        wid = WidgetId.Next();
+        wiresOwnEvents = true;
+        Click = new UiEvent();
+    }
+
+    /// 设备状态信号访问器。
+    SignalInt State() { return state; }
+    /// 写入设备状态（取值见类注释）。
+    void Set(int st) { state.Set(st); }
+    /// 数据行数。
+    int RowCount() { return rowNames.Count; }
+
+    /// 追加一行"名称 : 数值"。
+    DeviceCard Row(string label, IoTag t) {
+        rowNames.Add(label);
+        rowTags.Add(t);
+        return this;
+    }
+
+    /// 控件类型标识（序列化/设计器用）。
+    override string Kind() { return "DeviceCard"; }
+
+    /// 覆写：仅公共事件（点击语义走 Click）。
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        return e;
+    }
+
+    /// 覆写：返回设计器属性清单（设备名 / 状态信号）。
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec ti = PropSpec.Text("label", "Title");
+        ti.str = title;
+        ps.Add(ti);
+        PropSpec st = PropSpec.Int("state", "State");
+        st.snum = state;
+        ps.Add(st);
+        return ps;
+    }
+
+    /// 状态文字。
+    static string TextOf(int st) {
+        if (st == 1) { return "运行"; }
+        if (st == 2) { return "报警"; }
+        if (st == 3) { return "故障"; }
+        if (st == 4) { return "离线"; }
+        return "停机";
+    }
+
+    /// 覆写：首选高度 = 标题行 + 数据行数 x 行高 + 边距。
+    override void OnMeasure(App app) {
+        prefW = app.Scale(240);
+        prefH = app.theme.heightLarge
+                + app.Scale(22) * rowNames.Count + app.Scale(24);
+    }
+
+    /// 覆写：画设备名、状态芯片、左侧状态色条与数据行，整卡可点击。
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int rad = t.borderRadiusMedium;
+        int st = state.Get();
+        int col = Led.ColorOf(app, st);
+        int hv = Ui.HoverLevelMsIn(app, wid, 0, bx, by, bw, bh);
+        c.FillRoundRect(bx, by, bw, bh, rad,
+                        App.LerpColor(Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BgOr(0), Style.Part(app, "hmi", "track", "", "", "", Style.SHover()).BgOr(0), hv));
+        c.DrawRoundRect(bx, by, bw, bh, rad, Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BorderOr(0), 1);
+        // 左侧状态色条，远距离一眼看出设备状态。
+        c.FillRect(bx, by + rad, app.Scale(4), bh - rad * 2, col);
+
+        int pad = app.Scale(10);
+        int fsT = Style.FontFallback(app, "medium");
+        int fs = Style.FontFallback(app, "small");
+        c.DrawText(bx + pad + app.Scale(4), by + pad, title, Style.Part(app, "hmi", "value", "", "", "", Style.SNormal()).FgOr(0), fsT);
+        string sTxt = DeviceCard.TextOf(st);
+        int chipW = Canvas.MeasureText(sTxt, fs) + app.Scale(16);
+        int chipH = Canvas.FontHeight(fs) + app.Scale(6);
+        int chipX = bx + bw - pad - chipW;
+        c.FillRoundRect(chipX, by + pad, chipW, chipH, chipH / 2,
+                        App.LerpColor(Style.Part(app, "hmi", "track", "", "", "", Style.SNormal()).BgOr(0), col, 35));
+        c.DrawTextCentered(chipX, by + pad, chipW, chipH, sTxt, col, fs);
+
+        int y = by + pad + chipH + app.Scale(8);
+        for (int i = 0; i < rowNames.Count; i = i + 1) {
+            if (y + app.Scale(18) > by + bh) { break; }
+            IoTag tg = rowTags[i];
+            c.DrawText(bx + pad + app.Scale(4), y, rowNames[i],
+                       Style.Part(app, "hmi", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+            string val = tg.TextWithUnit();
+            if (!tg.IsGood()) { val = "----"; }
+            int vw = Canvas.MeasureText(val, fs);
+            int vc = Style.Part(app, "hmi", "value", "", "", "", Style.SNormal()).FgOr(0);
+            if (tg.Alarm() != 0) { vc = Style.Part(app, "hmi", "status", "", "error", "", Style.SNormal()).BgOr(0); }
+            c.DrawText(bx + bw - pad - vw, y, val, vc, fs);
+            y = y + app.Scale(20);
+        }
+
+        app.hitTester.RegisterRect(wid, bx, by, bw, bh, 0);
+        if (Ui.Clicked(app, wid)) {
+            Click.Raise();
+            app.RequestRedraw();
+        }
+        On.Fire(app, wid);
+    }
+}

@@ -1,0 +1,2156 @@
+using System;
+using Gui;
+
+namespace Gui.Component.CodeEditor;
+
+/// CodeEditor 分部：自动补全弹窗、符号索引和
+/// 感知 using 的补全引擎（成员/类型/标识符建议）。
+partial class CodeEditor {
+    // ---- 自动补全 ----
+
+    /// 列表 `xs` 已包含 `v` 时返回 true。
+    static bool Has(List<string> xs, string v) {
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            if (xs[i] == v) { return true; }
+        }
+        return false;
+    }
+
+    /// `s` 以 `pre` 开头时返回 true。按字节比：扫描路径会对每行
+    /// 调用它，而 Substring 要为每次测试分配一个字符串。
+    static bool StartsWithP(string s, string pre) {
+        int n = pre.Length;
+        if (n > s.Length) { return false; }
+        for (int i = 0; i < n; i = i + 1) {
+            if (s[i] != pre[i]) { return false; }
+        }
+        return true;
+    }
+
+    /// 把语言关键字追加到 `outk`。
+    static void KeywordList(List<string> outk) {
+        string kws = "using namespace class struct enum interface static extern void int string bool float double char long short byte uint new return if else while for foreach do in break continue true false null this base public private protected internal override virtual abstract sealed const readonly var switch case default try catch finally throw is as typeof sizeof ref out params get set operator async await yield from where select orderby group join let into ascending descending on equals when and or not with record init required global file scoped allows value partial event delegate fixed lock checked unchecked unsafe stackalloc nameof";
+        string cur = "";
+        int n = kws.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            string ch = kws.Substring(i, 1);
+            if (ch == " ") {
+                if (cur.Length > 0) { outk.Add(cur); cur = ""; }
+            } else {
+                cur = cur + ch;
+            }
+        }
+        if (cur.Length > 0) { outk.Add(cur); }
+    }
+
+    /// 追加常用标准库类型和成员用于补全。
+    static void StdlibList(List<string> outk) {
+        string types = "Console List Dictionary StringBuilder String Math File Directory Path Environment Process Convert Array DateTime TimeSpan Task Thread App Canvas Theme Rect Button Label Input Panel Split Modal TreeView CodeEditor Ribbon Icon SignalInt SignalBool SignalString Window TreeNode RibbonCmd HitRegion Point Size";
+        string methods = "WriteLine ReadLine Write ToString Add Remove RemoveAt Insert IndexOf Contains Count Length Clear Sort Reverse Join Split Substring Replace Trim StartsWith EndsWith ToUpper ToLower Format Concat Exists ReadAllText WriteAllText CreateDirectory GetFiles GetDirectories Append AppendLine Max Min Abs Round Sqrt Floor Ceiling Pow Parse TryParse GetText LoadText Render Create SetText";
+        string snippets = "Program Main InitializeComponent EventArgs Dispose Override";
+        string all = types + " " + methods + " " + snippets;
+        string cur = "";
+        int n = all.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            string ch = all.Substring(i, 1);
+            if (ch == " ") {
+                if (cur.Length > 0 && !CodeEditor.Has(outk, cur)) { outk.Add(cur); cur = ""; }
+            } else {
+                cur = cur + ch;
+            }
+        }
+        if (cur.Length > 0 && !CodeEditor.Has(outk, cur)) { outk.Add(cur); }
+    }
+
+    /// 收集缓冲区中出现的唯一标识符 token（长度 >= 2），
+    /// 使编辑器能补全用户已输入过的符号。
+    static void CollectWords(List<string> ls, List<string> outw) {
+        CodeEditor.CollectWordsRange(ls, 0, ls.Count, outw);
+    }
+
+    /// 同上，但只扫描 [from, to) 区间。两处写法差异都是为了让代价
+    /// 与规模无关：逐字节推进并且整词只分配一次字符串（原来每个字符
+    /// 一个 Substring 再逐字符拼接），去重走哈希表（原来对已收集的词
+    /// 线性查找，于是一次收集是 词数×字符数 的平方级）。
+    static void CollectWordsRange(List<string> ls, int from, int to,
+                                  List<string> outw) {
+        Dict<string, bool> seen = new Dict<string, bool>();
+        for (int i = 0; i < outw.Count; i = i + 1) {
+            if (!seen.ContainsKey(outw[i])) { seen.Add(outw[i], true); }
+        }
+        if (from < 0) { from = 0; }
+        if (to > ls.Count) { to = ls.Count; }
+        for (int li = from; li < to; li = li + 1) {
+            string line = ls[li];
+            int n = line.Length;
+            int i = 0;
+            while (i < n) {
+                int ch = line[i];
+                bool digit = ch >= 48 && ch <= 57;
+                if (CodeEditor.IdentByte(ch) && !digit) {
+                    int s = i;
+                    while (i < n && CodeEditor.IdentByte(line[i])) { i = i + 1; }
+                    if (i - s >= 2) {
+                        string w = line.Substring(s, i - s);
+                        if (!seen.ContainsKey(w)) {
+                            seen.Add(w, true);
+                            outw.Add(w);
+                        }
+                    }
+                } else {
+                    i = i + 1;
+                }
+            }
+        }
+    }
+
+    /// 通过应用当前种类过滤器，从 acAllItems/acAllKinds 重建可见的
+    /// acItems/acKinds，然后更新弹窗激活状态。
+    void ApplyKindFilter() {
+        acItems = new List<string>();
+        acKinds = new List<string>();
+        int i = 0;
+        for (; i < acAllItems.Count; i = i + 1) {
+            string k = "";
+            if (i < acAllKinds.Count) { k = acAllKinds[i]; }
+            if (acFilter == "" || acFilter == k) {
+                acItems.Add(acAllItems[i]);
+                acKinds.Add(k);
+            }
+        }
+        if (acItems.Count == 0 && acAllItems.Count > 0) {
+            // 用户保留的种类过滤器对正在输入的字词没有候选项，
+            // 保留它只会显示空弹窗（且 Enter/Tab
+            // 会接受并不存在的行），因此丢弃该过滤器。
+            acFilter = "";
+            i = 0;
+            while (i < acAllItems.Count) {
+                acItems.Add(acAllItems[i]);
+                if (i < acAllKinds.Count) { acKinds.Add(acAllKinds[i]); }
+                else { acKinds.Add("W"); }
+                i = i + 1;
+            }
+        }
+        if (acItems.Count > 0) {
+            acActive = true;
+            if (acSel >= acItems.Count) { acSel = acItems.Count - 1; }
+            if (acSel < 0) { acSel = 0; }
+        } else {
+            acActive = false;
+            acFilter = "";
+        }
+    }
+
+    /// 未过滤的候选列表至少包含一个
+    /// 指定种类条目时返回 true（用于灰显不可用的过滤按钮）。
+    bool HasKind(string kind) {
+        for (int i = 0; i < acAllKinds.Count; i = i + 1) {
+            if (acAllKinds[i] == kind) { return true; }
+        }
+        return false;
+    }
+
+    /// 根据光标左侧紧邻的字词重新计算补全弹窗；
+    /// 无前缀或无候选项时关闭弹窗。
+    /// `cand` 对输入 `pfx` 的相关度，不匹配时为 -1。
+    /// 越高越好。排序遵循 VS 风格补全的隐含顺序：
+    /// 大小写精确前缀 > 不区分大小写前缀 >
+    /// 驼峰首字母缩写（`rdal` -> `ReadAllLines`）> 普通
+    /// 子序列（`rdll` -> `ReadAllLines`）；并列时更短者胜出，
+    /// 因此前缀 `add` 时 `Add` 排在 `AddRange` 之前。
+    static int MatchScore(string cand, string pfx) {
+        if (pfx.Length == 0) { return 1; }
+        if (cand.Length < pfx.Length) { return 0 - 1; }
+        int bonus = 0 - cand.Length;
+        if (cand.StartsWith(pfx)) { return 4000 + bonus; }
+        if (CodeEditor.StartsWithI(cand, pfx)) { return 3000 + bonus; }
+        if (CodeEditor.HumpMatch(cand, pfx)) { return 2000 + bonus; }
+        if (CodeEditor.SubseqMatchI(cand, pfx)) { return 1000 + bonus; }
+        return 0 - 1;
+    }
+
+    /// `pfx` 拼出 `cand` 的大写字母（加首字符）时返回 true：
+    /// `rdal` 和 `RAL` 都能匹配 `ReadAllLines`。
+    static bool HumpMatch(string cand, string pfx) {
+        int pi = 0;
+        int n = cand.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int ch = cand[i];
+            bool hump = (i == 0 || (ch >= 65 && ch <= 90)) && ch != 95;
+            if (hump) {
+                if (CodeEditor.LowerByte(ch) != CodeEditor.LowerByte(pfx[pi])) {
+                    return false;
+                }
+                pi = pi + 1;
+                if (pi >= pfx.Length) { return true; }
+            }
+        }
+        return false;
+    }
+
+    /// `pfx` 的每个字符按顺序出现在 `cand` 中时返回 true，
+    /// 忽略大小写。
+    static bool SubseqMatchI(string cand, string pfx) {
+        int pi = 0;
+        for (int ci = 0; pi < pfx.Length && ci < cand.Length; ci = ci + 1) {
+            if (CodeEditor.LowerByte(cand[ci]) == CodeEditor.LowerByte(pfx[pi])) {
+                pi = pi + 1;
+            }
+        }
+        return pi >= pfx.Length;
+    }
+
+    /// 两个单字符字符串的不区分大小写比较。
+    static bool EqI(string a, string b) {
+        return CodeEditor.StartsWithI(a, b) && a.Length == b.Length;
+    }
+
+    /// 按相关度降序原地排序候选/种类列表。
+    static void SortByScore(List<string> items, List<string> kinds, List<int> scores) {
+        int i = 1;
+        while (i < items.Count) {
+            string it = items[i];
+            string kd = kinds[i];
+            int sc = scores[i];
+            int j = i - 1;
+            while (j >= 0 && scores[j] < sc) {
+                items[j + 1] = items[j];
+                kinds[j + 1] = kinds[j];
+                scores[j + 1] = scores[j];
+                j = j - 1;
+            }
+            items[j + 1] = it;
+            kinds[j + 1] = kd;
+            scores[j + 1] = sc;
+            i = i + 1;
+        }
+    }
+
+    /// 按相关度降序保留最好的 `limit` 个候选。弹窗只显示前几十个，而
+    /// 一次击键的候选可能上千：对全部候选做插入排序是平方级的，这里
+    /// 只维护一个长度有界的有序前缀，代价降到 候选数×limit。
+    /// 与 SortByScore 一样是稳定的（同分保持收集顺序）。
+    static void SortByScoreTop(List<string> items, List<string> kinds,
+                               List<int> scores, int limit) {
+        List<string> ti = new List<string>();
+        List<string> tk = new List<string>();
+        List<int> ts = new List<int>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            int sc = scores[i];
+            if (ts.Count >= limit && sc <= ts[ts.Count - 1]) { continue; }
+            ti.Add(items[i]);
+            tk.Add(kinds[i]);
+            ts.Add(sc);
+            int j = ts.Count - 2;
+            while (j >= 0 && ts[j] < sc) {
+                ti[j + 1] = ti[j];
+                tk[j + 1] = tk[j];
+                ts[j + 1] = ts[j];
+                j = j - 1;
+            }
+            ti[j + 1] = items[i];
+            tk[j + 1] = kinds[i];
+            ts[j + 1] = sc;
+            if (ts.Count > limit) {
+                ti.RemoveAt(ti.Count - 1);
+                tk.RemoveAt(tk.Count - 1);
+                ts.RemoveAt(ts.Count - 1);
+            }
+        }
+        items.Clear();
+        kinds.Clear();
+        scores.Clear();
+        for (int k = 0; k < ti.Count; k = k + 1) {
+            items.Add(ti[k]);
+            kinds.Add(tk[k]);
+            scores.Add(ts[k]);
+        }
+    }
+
+    /// 显式打开补全（Ctrl+Space），列出作用域内所有内容，
+    /// 即使尚未输入前缀。
+    void ForceCompletion() {
+        acDot = false;
+        acActive = true;
+        acForced = true;
+        UpdateCompletion();
+        acForced = false;
+    }
+
+    /// 重算补全候选：点号模式按已输前缀过滤完整成员列表；常规模式
+    /// 收集光标前的字词前缀，把基础候选表（特性上下文只给
+    /// DllImport/StructLayout）与周边词按匹配度打分合并，排序后截断
+    /// 前 60 条再套种类过滤。无候选时收起弹窗。
+    void UpdateCompletion() {
+        string idrest = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string ln = lines[curLine];
+
+        // 若处于点号模式，按输入的前缀过滤完整成员列表
+        if (acDot) {
+            if (acStart > curCol || acStart < 0) { acActive = false; acDot = false; return; }
+            string prefix = ln.Substring(acStart, curCol - acStart);
+            acAllItems = new List<string>();
+            acAllKinds = new List<string>();
+            List<int> dscores = new List<int>();
+            for (int fi = 0; fi < acFull.Count; fi = fi + 1) {
+                int sc = CodeEditor.MatchScore(acFull[fi], prefix);
+                if (sc >= 0) {
+                    acAllItems.Add(acFull[fi]);
+                    acAllKinds.Add(CodeEditor.MemberKind(acFull[fi]));
+                    dscores.Add(sc);
+                }
+            }
+            CodeEditor.SortByScore(acAllItems, acAllKinds, dscores);
+            if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
+            acSel = 0;
+            ApplyKindFilter();
+            return;
+        }
+
+        // 常规字词补全
+        int st = curCol;
+        while (st > 0) {
+            string ch = ln.Substring(st - 1, 1);
+            if (CodeEditor.InSet(idrest, ch)) { st = st - 1; }
+            else { break; }
+        }
+        acStart = st;
+        string pfx = ln.Substring(st, curCol - st);
+        if (pfx.Length < 1 && !acForced) { acActive = false; return; }
+
+        List<string> cand;
+        List<string> candKinds;
+        List<string> words = new List<string>();
+        if (InAttributeContext()) {
+            // 在 `[ ... ]` 内：这里只有真正的特性。编译器
+            // 只识别 DllImport 和 StructLayout（见 parser.c）。
+            cand = new List<string>();
+            candKinds = new List<string>();
+            CodeEditor.AddKindWords(cand, candKinds, "DllImport StructLayout", "M");
+        } else {
+            EnsureCandBase();
+            cand = cbItems;
+            candKinds = cbKinds;
+            int radius = CodeEditor.WordScanRadius();
+            CodeEditor.CollectWordsRange(lines, curLine - radius,
+                                         curLine + radius, words);
+        }
+        acAllItems = new List<string>();
+        acAllKinds = new List<string>();
+        List<int> scores = new List<int>();
+        Dict<string, bool> taken = new Dict<string, bool>();
+        ScoreCandidates(cand, candKinds, "W", pfx, taken, scores);
+        ScoreCandidates(words, null, "W", pfx, taken, scores);
+        if (acAllItems.Count == 0) { acActive = false; return; }
+        // 排序后保留最优的少数：按收集顺序截断会
+        // 在明显候选项扫描较晚时将其丢弃。
+        CodeEditor.SortByScoreTop(acAllItems, acAllKinds, scores, 60);
+        acSel = 0;
+        ApplyKindFilter();
+    }
+
+    /// 把 `items` 中匹配 `pfx` 的候选追加到弹窗列表，`taken` 跟踪已入选的
+    /// 词（多个来源会给出同一个名字）。`kinds` 为 null 时统一用 `defKind`。
+    void ScoreCandidates(List<string> items, List<string> kinds, string defKind,
+                         string pfx, Dict<string, bool> taken, List<int> scores) {
+        for (int i = 0; i < items.Count; i = i + 1) {
+            string w = items[i];
+            int sc = CodeEditor.MatchScore(w, pfx);
+            if (w != pfx && sc >= 0 && !taken.ContainsKey(w)) {
+                taken.Add(w, true);
+                acAllItems.Add(w);
+                if (kinds != null && i < kinds.Count) { acAllKinds.Add(kinds[i]); }
+                else { acAllKinds.Add(defKind); }
+                scores.Add(sc);
+            }
+        }
+    }
+
+    /// 补全候选中与光标位置无关的那一半：代码片段、关键字、标准库、
+    /// 项目类型与成员。它只在项目扫描或缓冲区类型表变化时才会变，而
+    /// 重建一次要走遍上千个类型和成员，因此跨击键复用。
+    void EnsureCandBase() {
+        EnsureProjectScan();
+        EnsureBufTypes();
+        if (cbItems != null && cbGen == candBaseGen) { return; }
+        cbItems = new List<string>();
+        cbKinds = new List<string>();
+        CodeEditor.SnippetListK(cbItems, cbKinds);
+        CodeEditor.KeywordListK(cbItems, cbKinds);
+        AddStdlibCandidates(cbItems, cbKinds);
+        AddProjectCandidates(cbItems, cbKinds);
+        cbGen = candBaseGen;
+    }
+
+    /// 成员名的启发式种类标签：camelCase → 字段，已知名词 →
+    /// 属性，*Changed/*Click → 事件，否则为方法。
+    static string MemberKind(string name) {
+        if (name.Length == 0) { return "M"; }
+        string lower = "abcdefghijklmnopqrstuvwxyz";
+        if (CodeEditor.InSet(lower, name.Substring(0, 1))) { return "F"; }
+        if (CodeEditor.Find(name, "Changed") >= 0 || CodeEditor.Find(name, "Click") >= 0) { return "E"; }
+        string props = " Count Length Keys Values Now Today UtcNow Year Month Day Hour Minute Second DayOfWeek DayOfYear Ticks PI E Capacity Empty Chars ForegroundColor BackgroundColor ResetColor Title WindowWidth WindowHeight ExitCode HasExited Id ProcessName StandardOutput StandardError StandardInput NewLine MachineName UserName OSVersion ProcessorCount TickCount StackTrace CommandLine CurrentDirectory Is64BitOperatingSystem DirectorySeparatorChar AltDirectorySeparatorChar ";
+        if (CodeEditor.Find(props, " " + name + " ") >= 0) { return "P"; }
+        return "M";
+    }
+
+    /// `w` 是看似调用的控制流关键字时返回 true。
+    static bool IsControlWord(string w) {
+        string ctrl = " if for while switch catch foreach using lock return sizeof typeof new ";
+        return CodeEditor.Find(ctrl, " " + w + " ") >= 0;
+    }
+
+    /// `trimmed` 中 `at` 位置之前声明的标识符（`at` 是其后的
+    /// '(' 或 '{' 的位置）；没有或前面无内容时返回 ""
+    /// —— 声明前总有类型或修饰符，
+    /// 这正是它与调用或裸代码块的区别。
+    static string DeclIdentBefore(string trimmed, int at) {
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int e = at;
+        while (e > 0) {
+            string ch = trimmed.Substring(e - 1, 1);
+            if (CodeEditor.InSet(idset, ch)) { e = e - 1; }
+            else { break; }
+        }
+        string name = trimmed.Substring(e, at - e);
+        if (name.Length == 0 || e == 0) { return ""; }
+        if (CodeEditor.IsControlWord(name)) { return ""; }
+        return name;
+    }
+
+    /// `line` 声明的属性名（如 `public int page { get; set; } = 1;`），未声明则返回 ""
+    /// 访问器是区分属性与类型声明
+    /// 或普通代码块的关键：'{' 前的头部不含 '('（那是
+    /// 方法或控制语句）、不含 '='（赋值）也不含 '['
+    /// （索引器），花括号内是 get / set。
+    static string PropNameAt(string trimmed) {
+        int bo = CodeEditor.Find(trimmed, "{");
+        if (bo <= 0) { return ""; }
+        string head = trimmed.Substring(0, bo);
+        if (CodeEditor.Find(head, "(") >= 0) { return ""; }
+        if (CodeEditor.Find(head, "=") >= 0) { return ""; }
+        if (CodeEditor.Find(head, "[") >= 0) { return ""; }
+        if (CodeEditor.Find(head, ":") >= 0) { return ""; }
+        string body = trimmed.Substring(bo + 1, trimmed.Length - bo - 1);
+        if (CodeEditor.Find(body, "get") < 0
+            && CodeEditor.Find(body, "set") < 0) {
+            return "";
+        }
+        int he = bo;
+        while (he > 0) {
+            string ch = trimmed.Substring(he - 1, 1);
+            if (ch != " " && ch != "\t") { break; }
+            he = he - 1;
+        }
+        string name = CodeEditor.DeclIdentBefore(trimmed, he);
+        if (name.Length == 0) { return ""; }
+        string before = CodeEditor.TrimStr(
+            trimmed.Substring(0, he - name.Length));
+        if (before.Length == 0) { return ""; }
+        // 名称之前的内容必须以类型或修饰符结尾。`} else {`
+        // 以花括号结尾，其内部可能有 "set"（如 "settings.Save()"），
+        // 这就是代码块被误判为属性的原因。
+        string tail = before.Substring(before.Length - 1, 1);
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        if (!CodeEditor.InSet(idset, tail) && tail != ">" && tail != "]"
+            && tail != "?") {
+            return "";
+        }
+        // `class A { get; }` 不是属性，且类型名已由
+        // 大纲而非引用计数报告。
+        string types = " class struct interface enum namespace ";
+        if (CodeEditor.Find(types, " " + before + " ") >= 0) { return ""; }
+        return name;
+    }
+
+    /// 若 `line` 声明了成员则返回其名称，否则返回 ""。
+    /// 方法是标识符后跟参数列表，其匹配的 ')'
+    /// 后跟方法体的 '{'，且不是控制语句；
+    /// 属性是标识符后跟 get / set 访问器。
+    static string DeclNameAt(string line) {
+        string trimmed = CodeEditor.TrimStr(line);
+        if (trimmed.Length == 0) { return ""; }
+        // 必须包含一个 '('，其匹配的 ')' 后跟方法体的 '{'。
+        // 方法体可能在同一行结束 —— 像 `WebApp Views(string d) { views = d; return this; }`
+        // 这样的单行访问器同样是声明，
+        // 与花括号结束行尾的声明无异。
+        // 先判断属性：其初始化器可能包含该行唯一的
+        // 圆括号（如 `{ get; set; } = new List<T>();`），方法路径
+        // 会误将其读作参数列表。
+        string prop = CodeEditor.PropNameAt(trimmed);
+        if (prop.Length > 0) { return prop; }
+        int paren = CodeEditor.Find(trimmed, "(");
+        if (paren <= 0) { return ""; }
+        int depth = 0;
+        int close = 0 - 1;
+        int ci = paren;
+        while (ci < trimmed.Length) {
+            string ch = trimmed.Substring(ci, 1);
+            if (ch == "(") { depth = depth + 1; }
+            else if (ch == ")") {
+                depth = depth - 1;
+                if (depth == 0) { close = ci; break; }
+            }
+            ci = ci + 1;
+        }
+        if (close < 0) { return ""; }
+        int bo = close + 1;
+        while (bo < trimmed.Length) {
+            string ch = trimmed.Substring(bo, 1);
+            if (ch != " " && ch != "\t") { break; }
+            bo = bo + 1;
+        }
+        if (bo >= trimmed.Length || trimmed.Substring(bo, 1) != "{") { return ""; }
+        // 拒绝明显的非声明：参数列表前有赋值。
+        string dhead = trimmed.Substring(0, paren);
+        if (CodeEditor.Find(dhead, "=") >= 0) { return ""; }
+        return CodeEditor.DeclIdentBefore(trimmed, paren);
+    }
+
+    /// `line` 中注释与字符串/字符字面量被抹除后的版本（长度
+    /// 不变，偏移仍可映射回原文），扫描因此永远不会
+    /// 匹配到注释文字或字面量中的名称。
+    static string StripCode(string line) {
+        // 绝大多数行既无字面量也无注释：先按字节看一眼，那样的行
+        // 原串就是结果，不必逐字符重建一份。扫描把整个
+        // 项目的每一行都过一遍，这里的分配量就是总体开销。
+        bool plain = true;
+        for (int s = 0; s < line.Length; s = s + 1) {
+            int b = line[s];
+            if (b == 34 || b == 39 || b == 47) { plain = false; break; }
+        }
+        if (plain) { return line; }
+        string outp = "";
+        int i = 0;
+        bool inStr = false;
+        bool inChr = false;
+        while (i < line.Length) {
+            string ch = line.Substring(i, 1);
+            if (inStr || inChr) {
+                outp = outp + " ";
+                if (ch == "\\" && i + 1 < line.Length) {
+                    outp = outp + " ";
+                    i = i + 2;
+                    continue;
+                }
+                if (inStr && ch == "\"") { inStr = false; }
+                if (inChr && ch == "'") { inChr = false; }
+                i = i + 1;
+                continue;
+            }
+            if (ch == "/" && i + 1 < line.Length && line.Substring(i + 1, 1) == "/") {
+                while (i < line.Length) { outp = outp + " "; i = i + 1; }
+                return outp;
+            }
+            if (ch == "\"") { inStr = true; outp = outp + " "; i = i + 1; continue; }
+            if (ch == "'") { inChr = true; outp = outp + " "; i = i + 1; continue; }
+            outp = outp + ch;
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// `code` 中从 `from` 起 `name` 第一个调用点的偏移，
+    /// 无则 -1。调用点是后跟 `(` 的整词出现，这正是
+    /// 真实引用与命名实参（`Upload = true`）、
+    /// 类型名（`class Index`）或同名成员声明的区别。
+    static int FindCallSite(string code, string name, int from) {
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int at = from;
+        while (true) {
+            int p = CodeEditor.FindFrom(code, name, at);
+            if (p < 0) { return -1; }
+            at = p + name.Length;
+            bool word = true;
+            if (p > 0 && CodeEditor.InSet(idset, code.Substring(p - 1, 1))) { word = false; }
+            if (at < code.Length && CodeEditor.InSet(idset, code.Substring(at, 1))) { word = false; }
+            if (word) {
+                int q = at;
+                while (q < code.Length && code.Substring(q, 1) == " ") { q = q + 1; }
+                if (q < code.Length && code.Substring(q, 1) == "(") { return p; }
+            }
+        }
+    }
+
+    /// 统计 `name` 在 `declLine` 上的声明（及其他同名声明）之外的
+    /// 调用点数量，给定 `outLines` 时把每处
+    /// 行号追加到其中。
+    int ScanRefs(string name, int declLine, List<int> outLines) {
+        // 成员的引用应通过其所属类型到达。仅按名称
+        // 时，`WebApp.Create` 的列表曾包含其他所有类型的 `Create`。
+        EnsureRefIndex();
+        string owner = "";
+        if (declLine >= 0 && declLine < refIdx.owners.Count) {
+            owner = refIdx.owners[declLine];
+        }
+        if (owner.Length > 0) {
+            return CodeEditor.CountMemberRefsPre(refIdx, name, owner, outLines);
+        }
+        int total = 0;
+        for (int li = 0; li < lines.Count && li < refIdx.stripped.Count;
+             li = li + 1) {
+            if (li != declLine && refIdx.decls[li] != name) {
+                string s = refIdx.stripped[li];
+                int from = 0;
+                while (true) {
+                    int p = CodeEditor.FindCallSite(s, name, from);
+                    if (p < 0) { break; }
+                    from = p + name.Length;
+                    total = total + 1;
+                    if (outLines != null) { outLines.Add(li); }
+                }
+            }
+        }
+        return total;
+    }
+
+    /// 本缓冲区声明的成员的跨文件调用点计数，
+    /// 以 "Owner.member" 为键。一次性遍历其他项目源码构建
+    /// —— 每个声明只拆分一次 —— 并保留到宿主重新提供
+    /// 源码或加载其他文件为止。
+    void EnsureExternRefs() { StepExternRefs(0); }
+
+    /// 当前缓冲区的扫描索引，按 TextStamp() 记忆。跳转、CodeLens
+    /// 和引用列表都靠它，而它与被查的成员无关：一屏几十个声明
+    /// 各自重建一份时，单个声明的统计就要 50 ms。
+    void EnsureRefIndex() {
+        int stamp = TextStamp();
+        if (refIdx != null && refStamp == stamp) { return; }
+        refIdx = CeFileIndex.Of(lines);
+        refStamp = stamp;
+    }
+
+    /// 开始一轮跨文件统计：收集本缓冲区的声明，计数清零。
+    void BeginExternRefs() {
+        extRefDirty = false;
+        extRefKeys = new List<string>();
+        extRefVals = new List<int>();
+        extRefDeclOwner = new List<string>();
+        extRefDeclName = new List<string>();
+        // 上一轮可能停在某个文件中间，那份进度对新一轮无效。
+        extRefFileIdx = null;
+        extRefDeclAt = 0;
+        extRefOwnerCur = "";
+        extRefFamily = null;
+        extRefRecvs = null;
+        EnsureRefIndex();
+        for (int li = 0; li < refIdx.decls.Count; li = li + 1) {
+            string dn = refIdx.decls[li];
+            if (dn.Length == 0) { continue; }
+            if (li >= refIdx.owners.Count || refIdx.owners[li].Length == 0) {
+                continue;
+            }
+            string key = refIdx.owners[li] + "." + dn;
+            if (CodeEditor.Has(extRefKeys, key)) { continue; }
+            extRefKeys.Add(key);
+            extRefVals.Add(0);
+            extRefDeclOwner.Add(refIdx.owners[li]);
+            extRefDeclName.Add(dn);
+        }
+        extRefAt = 0;
+        if (extRefDeclName.Count == 0) { extRefAt = 0 - 1; }
+    }
+
+    /// 跨文件统计推进至多 `kbBudget` KB 的扫描量（一个声明扫一个
+    /// 文件即该文件的字节数），<=0 表示一口气做完。一口气做完
+    /// 意味着打开文件后的第一帧要扫完整个项目：实测本 IDE 工程
+    /// 3 s，更大的工程两分钟。因此绘制路径只给预算，进度
+    /// （文件下标、声明下标、当前文件的索引与接收者）留在帧之间；
+    /// 未算完时 CodeLens 先不显示数字，靠 lensPending 请求的重绘
+    /// 接着算下一批。预算按字节而非文件计，一个大文件也不会
+    /// 独占一帧。
+    void StepExternRefs(int kbBudget) {
+        if (extRefDirty) { BeginExternRefs(); }
+        if (extRefAt < 0) { return; }
+        int spent = 0;
+        while (extRefAt < projFileSrc.Count) {
+            string body = projFileSrc[extRefAt];
+            int kb = body.Length / 1024 + 1;
+            if (extRefFileIdx == null) {
+                if (kbBudget > 0 && spent >= kbBudget) { return; }
+                extRefFileIdx = CeFileIndex.OfText(body);
+                extRefDeclAt = 0;
+                extRefOwnerCur = "";
+                extRefFamily = null;
+                extRefRecvs = null;
+                // 建索引要拆行、抹除、划分 owner、逐行取声明名。
+                spent = spent + kb * 4;
+            }
+            while (extRefDeclAt < extRefDeclName.Count) {
+                if (kbBudget > 0 && spent >= kbBudget) { return; }
+                // 同一声明类型的接收者在一个文件里只收集一次
+                // （声明按行序归类，同类型的连成一段）。
+                if (extRefFamily == null
+                    || extRefDeclOwner[extRefDeclAt] != extRefOwnerCur) {
+                    extRefOwnerCur = extRefDeclOwner[extRefDeclAt];
+                    extRefFamily = new List<string>();
+                    extRefRecvs = new List<string>();
+                    CodeEditor.MemberRecvsPre(extRefFileIdx.stripped,
+                        extRefOwnerCur, extRefFamily, extRefRecvs);
+                    // 收集接收者要为类型家族的每个成员扫一遍本文件。
+                    spent = spent + kb * extRefFamily.Count;
+                }
+                extRefVals[extRefDeclAt] = extRefVals[extRefDeclAt]
+                    + CodeEditor.CountMemberRefsWith(extRefFileIdx,
+                        extRefFamily, extRefRecvs,
+                        extRefDeclName[extRefDeclAt], null);
+                extRefDeclAt = extRefDeclAt + 1;
+                spent = spent + kb;
+            }
+            extRefAt = extRefAt + 1;
+            extRefFileIdx = null;
+        }
+        extRefAt = 0 - 1;
+        extRefFileIdx = null;
+    }
+
+    /// 本缓冲区之外 `owner.member` 的调用点数（未知为 0）；跨文件
+    /// 统计尚未算完时返回 -1。
+    int ExternRefCount(string owner, string member) {
+        // 一次最多扫 512 KB 源码（实测约 4 ms）；一帧里绘制路径
+        // 至多取 lensBudget 个计数，因此一帧的统计开销有上限。
+        StepExternRefs(512);
+        if (extRefAt >= 0) { return 0 - 1; }
+        string key = owner + "." + member;
+        for (int i = 0; i < extRefKeys.Count; i = i + 1) {
+            if (extRefKeys[i] == key) { return extRefVals[i]; }
+        }
+        return 0;
+    }
+
+    /// CodeLens 显示的计数：本缓冲区内的使用数加
+    /// 项目其他文件中的。只统计缓冲区时，调用方在其他文件的方法
+    /// 会显示 "0 references"，而这正是
+    /// 项目对外暴露内容的常态。
+    /// 跨文件统计还没算完时返回 -1，与预算耗尽同义：调用方
+    /// 不绘制未统计完的数字。
+    int LensRefCount(string name, int declLine) {
+        EnsureRefIndex();
+        string owner = "";
+        if (declLine >= 0 && declLine < refIdx.owners.Count) {
+            owner = refIdx.owners[declLine];
+        }
+        if (owner.Length == 0) { return ScanRefs(name, declLine, null); }
+        // 先推进跨文件统计：没算完就不必扫本缓冲区，
+        // 这一帧的数字反正画不出来。
+        int ext = ExternRefCount(owner, name);
+        if (ext < 0) { return 0 - 1; }
+        return ScanRefs(name, declLine, null) + ext;
+    }
+
+    /// LensRefCount() 按成员名记忆化，每帧至多重算 `lensBudget`
+    /// 个成员。预算耗尽时返回记忆的计数，
+    /// 连过期值都没有则返回 -1，调用方不绘制
+    /// 未经统计的数字。
+    int LensRefCountBudgeted(string name, int declLine) {
+        int at = 0 - 1;
+        for (int k = 0; k < lensKeys.Count; k = k + 1) {
+            if (lensKeys[k] == name) { at = k; break; }
+        }
+        if (at >= 0 && lensFresh[at] == 1) { return lensVals[at]; }
+        if (lensBudget <= 0) {
+            if (at >= 0) { return lensVals[at]; }
+            lensPending = true;
+            return 0 - 1;
+        }
+        lensBudget = lensBudget - 1;
+        int v = LensRefCount(name, declLine);
+        // 跨文件统计还在分批推进：本帧没有可写入的计数，
+        // 保留上次的值（或先不画），下一帧接着算。
+        if (v < 0) {
+            lensPending = true;
+            if (at >= 0) { return lensVals[at]; }
+            return 0 - 1;
+        }
+        if (at >= 0) {
+            lensVals[at] = v;
+            lensFresh[at] = 1;
+            return v;
+        }
+        // 浏览大型项目时记忆表不能无界增长。
+        if (lensKeys.Count >= 512) {
+            lensKeys = new List<string>();
+            lensVals = new List<int>();
+            lensFresh = new List<int>();
+        }
+        lensKeys.Add(name);
+        lensVals.Add(v);
+        lensFresh.Add(1);
+        return v;
+    }
+
+    /// 开启一帧的 CodeLens 预算，缓冲区变化时
+    /// 使记忆过期。指纹在此只取一次，因为 TextStamp() 会遍历
+    /// 每一行，而一屏可容纳数十个声明。
+    ///
+    /// 重算等待输入停止：每次击键都会使
+    /// 所有计数失效，每帧统计两个也要各遍历
+    /// 整个缓冲区。缓冲区静置片刻前，面板显示
+    /// 上次的计数，即一次击键前的值。
+    void BeginLensFrame(App app) {
+        lensPending = false;
+        int stamp = TextStamp();
+        if (lensStamp != stamp) {
+            lensStamp = stamp;
+            lensQuietMs = app.nowMs;
+            for (int i = 0; i < lensFresh.Count; i = i + 1) { lensFresh[i] = 0; }
+        }
+        if (app.nowMs - lensQuietMs < 250) {
+            lensBudget = 0;
+            app.RequestRedraw();
+        } else {
+            lensBudget = 2;
+        }
+    }
+
+    /// 本帧有 CodeLens 计数未统计时返回 true，调用方
+    /// 据此请求再算一次。
+    bool LensPending() { return lensPending; }
+
+    /// 把光标移到 `declLine` 之后 `name` 的下一个调用点
+    /// （循环回绕）并选中。没有则不做任何事。
+    void JumpToNextRef(string name, int declLine) {
+        int total = lines.Count;
+        int li = declLine + 1;
+        for (int scanned = 0; scanned < total; scanned = scanned + 1) {
+            if (li >= lines.Count) { li = 0; }
+            if (li != declLine && CodeEditor.DeclNameAt(lines[li]) != name) {
+                int p = CodeEditor.FindCallSite(CodeEditor.StripCode(lines[li]), name, 0);
+                if (p >= 0) {
+                    ClearExtraCarets();
+                    selActive = true;
+                    selAnchorLine = li; selAnchorCol = p;
+                    curLine = li; curCol = p + name.Length;
+                    return;
+                }
+            }
+            li = li + 1;
+        }
+    }
+
+    /// 收集 `name` 每个调用点的行号（排除其在 `declLine` 上的
+    /// 声明），按文件顺序存入 `outLines`。
+    void CollectRefs(string name, int declLine, List<int> outLines) {
+        ScanRefs(name, declLine, outLines);
+    }
+
+    /// 把光标移到 `targetLine` 上 `name` 的第一个调用点并
+    /// 选中（供引用列表弹窗使用）。
+    void JumpToRefLine(string name, int targetLine) {
+        if (targetLine < 0 || targetLine >= lines.Count) { return; }
+        int p = CodeEditor.FindCallSite(
+            CodeEditor.StripCode(lines[targetLine]), name, 0);
+        if (p < 0) { return; }
+        ClearExtraCarets();
+        selActive = true;
+        selAnchorLine = targetLine; selAnchorCol = p;
+        curLine = targetLine; curCol = p + name.Length;
+        if (curLine < scrollLine || curLine >= scrollLine + 4) {
+            scrollLine = curLine - 4;
+            if (scrollLine < 0) { scrollLine = 0; }
+        }
+    }
+
+    /// `s` 中从 `start` 起 `sub` 首次出现的索引，无则 -1。
+    /// 先比首字节再逐字节比，不为每个位置切一个子串。
+    static int FindFrom(string s, string sub, int start) {
+        int m = sub.Length;
+        if (m == 0) { return start; }
+        int limit = s.Length - m;
+        int i = start;
+        if (i < 0) { i = 0; }
+        int first = sub[0];
+        while (i <= limit) {
+            if (s[i] == first) {
+                int k = 1;
+                while (k < m && s[i + k] == sub[k]) { k = k + 1; }
+                if (k == m) { return i; }
+            }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// 去除 `s` 首尾的空格和制表符。整个编辑器的扫描都逐行调用它，
+    /// 因此按字节定界，且无需裁剪时直接返回原串（不分配）。
+    static string TrimStr(string s) {
+        int len = s.Length;
+        int a = 0;
+        while (a < len) {
+            int ch = s[a];
+            if (ch == 32 || ch == 9) { a = a + 1; }
+            else { break; }
+        }
+        int b = len;
+        while (b > a) {
+            int ch = s[b - 1];
+            if (ch == 32 || ch == 9 || ch == 13) { b = b - 1; }
+            else { break; }
+        }
+        if (a == 0 && b == len) { return s; }
+        return s.Substring(a, b - a);
+    }
+
+    /// 返回鼠标指针下的标识符，没有则 ""。
+    string WordAtMouse(App app, Rect area, int gutterW, int fontSize) {
+        int textX = area.x + gutterW + app.theme.paddingSmall;
+        if (app.mouseX < textX || app.mouseX >= area.x + area.width) { return ""; }
+        if (app.mouseY < area.y || app.mouseY >= area.y + area.height) { return ""; }
+        int ln = LineAtY(Canvas.FontHeight(fontSize) + app.Scale(4), app.mouseY);
+        if (ln < 0 || ln >= lines.Count) { return ""; }
+        string s = lines[ln];
+        int col = CodeEditor.ColFromX(s, app.mouseX - textX, fontSize);
+        if (col < 0 || col > s.Length) { return ""; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int a = col;
+        while (a > 0 && CodeEditor.InSet(idset, s.Substring(a - 1, 1))) { a = a - 1; }
+        int b = col;
+        while (b < s.Length && CodeEditor.InSet(idset, s.Substring(b, 1))) { b = b + 1; }
+        if (b <= a) { return ""; }
+        return s.Substring(a, b - a);
+    }
+
+    /// 关键字候选（种类统一 "K"）。
+    static void KeywordListK(List<string> outk, List<string> kinds) {
+        List<string> tmp = new List<string>();
+        CodeEditor.KeywordList(tmp);
+        for (int i = 0; i < tmp.Count; i = i + 1) {
+            outk.Add(tmp[i]);
+            kinds.Add("K");
+        }
+    }
+
+    /// 收集整份行列表的词（种类统一 "W"）。
+    static void CollectWordsK(List<string> ls, List<string> outw, List<string> kinds) {
+        CodeEditor.CollectWordsRangeK(ls, 0, ls.Count, outw, kinds);
+    }
+
+    /// 收集 [from, to) 行范围内的词，缺的种类位补 "W"。
+    static void CollectWordsRangeK(List<string> ls, int from, int to,
+                                   List<string> outw, List<string> kinds) {
+        CodeEditor.CollectWordsRange(ls, from, to, outw);
+        while (kinds.Count < outw.Count) { kinds.Add("W"); }
+    }
+
+    /// 词补全向光标上下各看多少行。整篇扫描会让每次击键的代价随文件
+    /// 规模增长（30 万行时是秒级），而窗口外的符号本来就由项目扫描、
+    /// 缓冲区类型表和符号索引提供，这里只补“刚写过的局部标识符”。
+    static int WordScanRadius() { return 1200; }
+
+    /// ASCII 大写字母折叠为小写，其余字节原样返回。
+    static int LowerByte(int b) {
+        if (b >= 65 && b <= 90) { return b + 32; }
+        return b;
+    }
+
+    /// 不区分大小写的 StartsWith 检查（按字节；匹配函数会对每个候选
+    /// 逐字符调用，为每个字符分配字符串太贵）。
+    static bool StartsWithI(string s, string pre) {
+        if (pre.Length > s.Length) { return false; }
+        for (int i = 0; i < pre.Length; i = i + 1) {
+            if (CodeEditor.LowerByte(s[i]) != CodeEditor.LowerByte(pre[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// 用选中的候选项替换正在输入的字词。`viaTab`
+    /// 为 true 且候选项为代码片段时展开其模板。
+    void AcceptCompletion(bool viaTab) {
+        if (!acActive) { return; }
+        if (acSel < 0 || acSel >= acItems.Count) { acActive = false; return; }
+        string ln = lines[curLine];
+        string chosen = acItems[acSel];
+        string chosenKind = "";
+        if (acSel < acKinds.Count) { chosenKind = acKinds[acSel]; }
+        if (viaTab && chosenKind == "S") { SaveUndo(); ExpandSnippet(chosen); return; }
+        string left = Text.Left(ln, acStart);
+        string right = Text.Right(ln, curCol);
+        lines[curLine] = left + chosen + right;
+        curCol = acStart + chosen.Length;
+        acActive = false;
+        acDot = false;
+        acFilter = "";
+    }
+
+    /// 紧挨 `dotPos` 处点号之前书写的接收者表达式：
+    /// `WebApp.Create` 中的 `WebApp`、`app.MaxBody` 中的 `app`，以及链中调用自身的
+    /// 接收者（`items.Where(x).Select` -> `items`，因为调用的
+    /// 实参列表会整体跳过）。没有则返回空。
+    string ReceiverBefore(string ln, int dotPos) {
+        string idchars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int pos = dotPos;
+        if (pos > 0 && ln.Substring(pos - 1, 1) == ")") {
+            int depth = 1;
+            pos = pos - 1;
+            while (pos > 0 && depth > 0) {
+                pos = pos - 1;
+                string pc = ln.Substring(pos, 1);
+                if (pc == ")") { depth = depth + 1; }
+                else if (pc == "(") { depth = depth - 1; }
+            }
+        }
+        int end = pos;
+        while (pos > 0) {
+            string pc = ln.Substring(pos - 1, 1);
+            if (CodeEditor.InSet(idchars, pc)) { pos = pos - 1; }
+            else { break; }
+        }
+        string word = ln.Substring(pos, end - pos);
+        if (word.Length > 0) { return word; }
+        // 前面只有点号（跨行断开的链式调用后的 `.Select`）：
+        // 回退到该点号之前的片段。
+        if (pos > 0 && ln.Substring(pos - 1, 1) == ".") {
+            int oEnd = pos - 1;
+            int oStart = oEnd;
+            while (oStart > 0) {
+                string pc = ln.Substring(oStart - 1, 1);
+                if (CodeEditor.InSet(idchars, pc)) { oStart = oStart - 1; }
+                else { break; }
+            }
+            return ln.Substring(oStart, oEnd - oStart);
+        }
+        return "";
+    }
+
+    /// 声明光标下成员的类型，通过其前面的接收者解析：
+    /// `WebApp.Create` 和 `app.MaxBody`（`app` 声明为 `WebApp`）都得到 `WebApp`，
+    /// 成员为继承所得时则得到基类型。
+    /// 符号不是成员访问或接收者无法解析时返回空，
+    /// 调用方随后回退为仅按名称搜索。
+    /// 这使转到定义 / 查找引用不会命中
+    /// 无关类型的同名成员。
+    string OwnerTypeAtCaret() {
+        if (curLine < 0 || curLine >= lines.Count) { return ""; }
+        string s = lines[curLine];
+        int col = curCol;
+        if (col >= s.Length) { col = s.Length - 1; }
+        if (col < 0) { return ""; }
+        if (!CodeEditor.IsIdentChar(s.Substring(col, 1))) { return ""; }
+        int a = col;
+        while (a > 0 && CodeEditor.IsIdentChar(s.Substring(a - 1, 1))) { a = a - 1; }
+        if (a == 0 || s.Substring(a - 1, 1) != ".") { return ""; }
+        string member = CodeEditor.WordAt(s, col);
+        string recv = ReceiverBefore(s, a - 1);
+        if (recv.Length == 0) { return ""; }
+        string t = CodeEditor.NormalizeStdlibType(recv);
+        if (!CodeEditor.HasSymbolType(t) && !IsProjectType(t)) {
+            // 不是类型名，则是值：取其声明类型。
+            string vt = ResolveVarType(recv);
+            if (vt.Length == 0) { return ""; }
+            t = CodeEditor.NormalizeStdlibType(vt);
+        }
+        string decl = CodeEditor.SymbolDeclaringType(t, member);
+        if (decl.Length > 0) { return decl; }
+        return t;
+    }
+
+    /// 光标正位于其声明上的成员所属的类型，
+    /// 使从声明发起的查找引用也限定在该类型内。
+    /// 光标不在成员声明上时返回 ""。
+    string EnclosingTypeOfCaretDecl() {
+        if (curLine < 0 || curLine >= lines.Count) { return ""; }
+        string w = WordAtCaret();
+        if (w.Length == 0) { return ""; }
+        if (!CodeEditor.IsMemberDeclOf(lines[curLine], w)) { return ""; }
+        return CodeEditor.EnclosingTypeAt(lines, curLine);
+    }
+
+    /// 用户输入 '.' 时触发。查看点号前的字词并
+    /// 建议该类型的已知成员，或链式调用的返回类型。
+    void DotCompletion() {
+        string ln = lines[curLine];
+        int dotPos = curCol - 1;
+        if (dotPos < 0) { acActive = false; return; }
+
+        // 在 `using X.` 指令中，补全子命名空间而非成员。
+        if (CodeEditor.StartsWithP(CodeEditor.TrimStr(ln), "using ")) {
+            UsingDotCompletion();
+            return;
+        }
+
+        // 基于识别出的类型构建成员列表
+        acStart = curCol;
+        acFull = new List<string>();
+        acDot = true;
+
+        // 解析接收者类型，然后只列出该类型的真实成员。
+        // 优先级：硬编码 stdlib 静态类型 -> 用户/项目类型 ->
+        // 局部变量声明类型 -> 通用对象成员。
+        // 对无法解析的接收者，绝不臆测地罗列字符串/集合/LINQ 辅助方法
+        // （那会产出虚假的 `Utils.OrderByDescending`）。
+        string recv = ReceiverBefore(ln, dotPos);
+        string norm = CodeEditor.NormalizeStdlibType(recv);
+        if (CodeEditor.IsKnownStdlibType(norm)) {
+            // 接收者就是类型本身，只能访问其静态成员。
+            CodeEditor.AddMembersIn(acFull, norm, 1);
+            if (CodeEditor.IsCollectionType(norm) && UsesLinq()) { CodeEditor.AddLinqMembers(acFull); }
+        } else {
+            List<string> mem = new List<string>();
+            bool found = FindTypeMembers(recv, mem);
+            bool coll = false;
+            if (!found) {
+                string vt = ResolveVarType(recv);
+                if (vt.Length > 0) {
+                    string nvt = CodeEditor.NormalizeStdlibType(vt);
+                    if (CodeEditor.IsKnownStdlibType(nvt)) {
+                        // 接收者是值：列出其实例成员。
+                        CodeEditor.AddMembersIn(acFull, nvt, 0);
+                        found = true;
+                        if (CodeEditor.IsCollectionType(nvt)) { coll = true; }
+                    } else if (FindTypeMembers(vt, mem)) {
+                        found = true;
+                    }
+                }
+            }
+            if (found) {
+                for (int mi = 0; mi < mem.Count; mi = mi + 1) {
+                    if (!CodeEditor.Has(acFull, mem[mi])) { acFull.Add(mem[mi]); }
+                }
+                if (coll && UsesLinq()) { CodeEditor.AddLinqMembers(acFull); }
+                // 所有对象都继承的通用成员。
+                if (!CodeEditor.Has(acFull, "ToString")) { acFull.Add("ToString"); }
+                if (!CodeEditor.Has(acFull, "Equals")) { acFull.Add("Equals"); }
+                if (!CodeEditor.Has(acFull, "GetHashCode")) { acFull.Add("GetHashCode"); }
+                if (!CodeEditor.Has(acFull, "GetType")) { acFull.Add("GetType"); }
+            } else {
+                acFull.Add("ToString"); acFull.Add("Equals");
+                acFull.Add("GetHashCode"); acFull.Add("GetType");
+            }
+        }
+
+        acFilter = "";
+        acAllItems = new List<string>();
+        acAllKinds = new List<string>();
+        for (int fi = 0; fi < acFull.Count; fi = fi + 1) {
+            acAllItems.Add(acFull[fi]);
+            acAllKinds.Add(CodeEditor.MemberKind(acFull[fi]));
+        }
+        if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
+        acSel = 0;
+        ApplyKindFilter();
+    }
+
+    /// `using X.` 指令的命名空间补全：列出已输入前缀的
+    /// 子命名空间（如 `using System.` -> Data、
+    /// Net、IO、Text 等）。源自 stdlib 命名空间目录，
+    /// 绝不臆造成员，也绝不落入类型成员路径。
+    void UsingDotCompletion() {
+        string ln = lines[curLine];
+        int dotPos = curCol - 1;
+        string nsset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.";
+        int s = dotPos;
+        while (s > 0 && CodeEditor.InSet(nsset, ln.Substring(s - 1, 1))) { s = s - 1; }
+        string prefix = ln.Substring(s, dotPos - s);
+        while (prefix.Length > 0 && prefix.Substring(prefix.Length - 1, 1) == ".") {
+            prefix = prefix.Substring(0, prefix.Length - 1);
+        }
+        acStart = curCol;
+        acDot = true;
+        acFull = new List<string>();
+        List<string> kids = new List<string>();
+        CodeEditor.ChildNamespaces(prefix, kids);
+        for (int ki = 0; ki < kids.Count; ki = ki + 1) { acFull.Add(kids[ki]); }
+        acFilter = "";
+        acAllItems = new List<string>();
+        acAllKinds = new List<string>();
+        for (int fi = 0; fi < acFull.Count; fi = fi + 1) {
+            acAllItems.Add(acFull[fi]);
+            acAllKinds.Add("M");
+        }
+        if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
+        acSel = 0;
+        ApplyKindFilter();
+    }
+
+    /// 把 `prefix` 去重后的下一段子命名空间追加到 `out2`，
+    /// 来自 stdlib 目录（如前缀 "System.Data" -> Orm、Sqlite、
+    /// Postgres）。
+    static void ChildNamespaces(string prefix, List<string> out2) {
+        string data = CodeEditor.StdlibNsData();
+        string pre = prefix + ".";
+        string cur = "";
+        for (int i = 0; i <= data.Length; i = i + 1) {
+            string ch = "";
+            if (i < data.Length) { ch = data.Substring(i, 1); }
+            if (ch == ";" || i == data.Length) {
+                string key = cur;
+                int eq = CodeEditor.Find(cur, "=");
+                if (eq > 0) { key = cur.Substring(0, eq); }
+                if (key.Length > pre.Length && CodeEditor.StartsWithP(key, pre)) {
+                    string rest = key.Substring(pre.Length, key.Length - pre.Length);
+                    string seg = rest;
+                    int dotp = CodeEditor.Find(rest, ".");
+                    if (dotp > 0) { seg = rest.Substring(0, dotp); }
+                    if (seg.Length > 0 && !CodeEditor.Has(out2, seg)) { out2.Add(seg); }
+                }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+        }
+    }
+
+    /// 通过一种接收者可访问的 `typeName` 成员：
+    /// `wantStatic` 为 1 表示类型本身（`WebApp.`），0 表示值（`app.`）。
+    /// 索引未描述的内容回退到 AddMembers，
+    /// 其手写表不区分静态/实例。
+    static void AddMembersIn(List<string> out2, string typeName, int wantStatic) {
+        if (!CodeEditor.HasSymbolType(typeName)) {
+            CodeEditor.AddMembers(out2, typeName);
+            return;
+        }
+        CodeEditor.SymbolMembersIn(typeName, out2, wantStatic);
+        if (wantStatic != 1) { CodeEditor.SymbolExtensionsFor(typeName, out2); }
+        if (out2.Count > 0) { return; }
+        // 内置类型目录按类型而非按成员标记静态性，
+        // 因此内置类型在请求的上下文中可能没有任何成员。
+        // 索引拥有的任何内容都胜过空弹窗。
+        CodeEditor.SymbolMembersIn(typeName, out2, 0 - 1);
+        CodeEditor.SymbolExtensionsFor(typeName, out2);
+    }
+
+    /// 为已知类型填充成员列表。
+    static void AddMembers(List<string> out2, string typeName) {
+        // 编译器生成的索引优先：它列出编译器
+        // 真正拥有的成员，而下面的表已与其脱节。它们保留为
+        // 尚未建立索引的工作区的回退方案。
+        if (CodeEditor.HasSymbolType(typeName)) {
+            CodeEditor.SymbolMembers(typeName, out2);
+            CodeEditor.SymbolExtensionsFor(typeName, out2);
+            return;
+        }
+        if (typeName == "Console") {
+            out2.Add("WriteLine"); out2.Add("ReadLine"); out2.Add("Write");
+            out2.Add("Clear"); out2.Add("ReadKey"); out2.Add("SetCursorPosition");
+            out2.Add("ForegroundColor"); out2.Add("BackgroundColor"); out2.Add("ResetColor");
+            out2.Add("Title"); out2.Add("WindowWidth"); out2.Add("WindowHeight");
+            out2.Add("Beep"); out2.Add("Error"); out2.Add("Out"); out2.Add("In");
+        } else if (typeName == "Math") {
+            out2.Add("Max"); out2.Add("Min"); out2.Add("Abs"); out2.Add("Sqrt");
+            out2.Add("Round"); out2.Add("Floor"); out2.Add("Ceiling"); out2.Add("Pow");
+            out2.Add("Log"); out2.Add("Log10"); out2.Add("Sin"); out2.Add("Cos");
+            out2.Add("Tan"); out2.Add("Atan"); out2.Add("Atan2"); out2.Add("Exp");
+            out2.Add("Sign"); out2.Add("Truncate"); out2.Add("Clamp");
+            out2.Add("PI"); out2.Add("E");
+        } else if (typeName == "File") {
+            out2.Add("ReadAllText"); out2.Add("WriteAllText"); out2.Add("ReadAllLines");
+            out2.Add("WriteAllLines"); out2.Add("AppendAllText"); out2.Add("Exists");
+            out2.Add("Delete"); out2.Add("Copy"); out2.Add("Move"); out2.Add("Create");
+            out2.Add("Open"); out2.Add("OpenRead"); out2.Add("OpenWrite");
+            out2.Add("ReadAllBytes"); out2.Add("WriteAllBytes"); out2.Add("GetCreationTime");
+            out2.Add("GetLastWriteTime"); out2.Add("SetAttributes");
+        } else if (typeName == "Directory") {
+            out2.Add("Exists"); out2.Add("CreateDirectory"); out2.Add("Delete");
+            out2.Add("GetFiles"); out2.Add("GetDirectories"); out2.Add("Move");
+            out2.Add("GetCurrentDirectory"); out2.Add("SetCurrentDirectory");
+            out2.Add("EnumerateFiles"); out2.Add("EnumerateDirectories");
+            out2.Add("GetParent"); out2.Add("GetDirectoryRoot");
+        } else if (typeName == "Path") {
+            out2.Add("GetFileName"); out2.Add("GetDirectoryName"); out2.Add("GetExtension");
+            out2.Add("Combine"); out2.Add("GetFullPath"); out2.Add("GetTempPath");
+            out2.Add("GetTempFileName"); out2.Add("ChangeExtension");
+            out2.Add("GetFileNameWithoutExtension"); out2.Add("HasExtension");
+            out2.Add("IsPathRooted"); out2.Add("GetPathRoot");
+            out2.Add("DirectorySeparatorChar"); out2.Add("AltDirectorySeparatorChar");
+        } else if (typeName == "Convert") {
+            out2.Add("ToString"); out2.Add("ToInt32"); out2.Add("ToInt64");
+            out2.Add("ToDouble"); out2.Add("ToSingle"); out2.Add("ToBoolean");
+            out2.Add("ToByte"); out2.Add("ToChar"); out2.Add("ToDateTime");
+            out2.Add("ToDecimal"); out2.Add("ToUInt32"); out2.Add("ToUInt64");
+            out2.Add("FromBase64String"); out2.Add("ToBase64String");
+            out2.Add("ChangeType");
+        } else if (typeName == "Environment") {
+            out2.Add("GetEnvironmentVariable"); out2.Add("SetEnvironmentVariable");
+            out2.Add("CurrentDirectory"); out2.Add("NewLine");
+            out2.Add("MachineName"); out2.Add("UserName"); out2.Add("OSVersion");
+            out2.Add("ProcessorCount"); out2.Add("TickCount"); out2.Add("StackTrace");
+            out2.Add("CommandLine"); out2.Add("Exit"); out2.Add("FailFast");
+            out2.Add("GetCommandLineArgs"); out2.Add("Is64BitOperatingSystem");
+        } else if (typeName == "string") {
+            out2.Add("Length"); out2.Add("Substring"); out2.Add("IndexOf");
+            out2.Add("LastIndexOf"); out2.Add("Contains"); out2.Add("StartsWith");
+            out2.Add("EndsWith"); out2.Add("Replace"); out2.Add("Trim");
+            out2.Add("TrimStart"); out2.Add("TrimEnd"); out2.Add("ToUpper");
+            out2.Add("ToLower"); out2.Add("Split"); out2.Add("Join");
+            out2.Add("Insert"); out2.Add("Remove"); out2.Add("PadLeft");
+            out2.Add("PadRight"); out2.Add("Format"); out2.Add("Concat");
+            out2.Add("IsNullOrEmpty"); out2.Add("IsNullOrWhiteSpace");
+            out2.Add("Equals"); out2.Add("CompareTo"); out2.Add("ToCharArray");
+            out2.Add("Chars"); out2.Add("Empty");
+        } else if (typeName == "List") {
+            out2.Add("Add"); out2.Add("Insert"); out2.Add("Remove"); out2.Add("RemoveAt");
+            out2.Add("RemoveAll"); out2.Add("Clear"); out2.Add("Count");
+            out2.Add("Contains"); out2.Add("IndexOf"); out2.Add("LastIndexOf");
+            out2.Add("Sort"); out2.Add("Reverse"); out2.Add("ToArray");
+            out2.Add("Find"); out2.Add("FindAll"); out2.Add("FindIndex");
+            out2.Add("Exists"); out2.Add("ForEach"); out2.Add("AddRange");
+            out2.Add("GetRange"); out2.Add("CopyTo"); out2.Add("BinarySearch");
+            out2.Add("ToArray");
+            // 注意：LINQ 链式方法（Where/Select/OrderBy…）有意
+            // 不在此添加。它们仅在 `using System.Linq;` 下存在，
+            // 由 DotCompletion 在该 using 存在时通过 AddLinqMembers() 追加，
+            // 自定义类型因此绝不会意外看到它们。
+        } else if (typeName == "Dictionary") {
+            out2.Add("Add"); out2.Add("Remove"); out2.Add("Clear"); out2.Add("Count");
+            out2.Add("ContainsKey"); out2.Add("ContainsValue"); out2.Add("TryGetValue");
+            out2.Add("Keys"); out2.Add("Values"); out2.Add("GetEnumerator");
+        } else if (typeName == "StringBuilder") {
+            out2.Add("Append"); out2.Add("AppendLine"); out2.Add("AppendFormat");
+            out2.Add("Insert"); out2.Add("Remove"); out2.Add("Replace");
+            out2.Add("Clear"); out2.Add("ToString"); out2.Add("Length");
+            out2.Add("Capacity"); out2.Add("EnsureCapacity");
+        } else if (typeName == "DateTime") {
+            out2.Add("Now"); out2.Add("Today"); out2.Add("UtcNow");
+            out2.Add("Year"); out2.Add("Month"); out2.Add("Day");
+            out2.Add("Hour"); out2.Add("Minute"); out2.Add("Second");
+            out2.Add("DayOfWeek"); out2.Add("DayOfYear"); out2.Add("Ticks");
+            out2.Add("AddDays"); out2.Add("AddHours"); out2.Add("AddMinutes");
+            out2.Add("AddSeconds"); out2.Add("AddMonths"); out2.Add("AddYears");
+            out2.Add("ToString"); out2.Add("ToShortDateString"); out2.Add("ToLongDateString");
+            out2.Add("Parse"); out2.Add("TryParse"); out2.Add("Compare");
+        } else if (typeName == "Array") {
+            out2.Add("Length"); out2.Add("Sort"); out2.Add("Reverse");
+            out2.Add("IndexOf"); out2.Add("Copy"); out2.Add("Clear");
+            out2.Add("Resize"); out2.Add("Find"); out2.Add("FindAll");
+            out2.Add("Exists"); out2.Add("ForEach"); out2.Add("ConvertAll");
+        } else if (typeName == "Process") {
+            out2.Add("Start"); out2.Add("Kill"); out2.Add("WaitForExit");
+            out2.Add("RunCapture"); out2.Add("ExitCode"); out2.Add("HasExited");
+            out2.Add("Id"); out2.Add("ProcessName"); out2.Add("GetCurrentProcess");
+            out2.Add("GetProcesses"); out2.Add("GetProcessesByName");
+            out2.Add("StandardOutput"); out2.Add("StandardError"); out2.Add("StandardInput");
+        } else if (typeName == "App") {
+            out2.Add("CreateDark"); out2.Add("Create"); out2.Add("Show");
+            out2.Add("BeginFrame"); out2.Add("PresentFrame"); out2.Add("RenderChrome");
+            out2.Add("ProcessEvent"); out2.Add("RequestRedraw"); out2.Add("Scale");
+            out2.Add("isRunning"); out2.Add("needsRedraw"); out2.Add("canvas");
+            out2.Add("theme"); out2.Add("window"); out2.Add("titlebarH");
+            out2.Add("mouseX"); out2.Add("mouseY"); out2.Add("focus");
+            out2.Add("hitTester"); out2.Add("ApplyEvent"); out2.Add("WindowHandle");
+            out2.Add("CaptureWheel");
+        } else if (typeName == "Canvas") {
+            out2.Add("DrawText"); out2.Add("FillRect"); out2.Add("DrawRect");
+            out2.Add("FillRoundRect"); out2.Add("Width"); out2.Add("Height");
+            out2.Add("MeasureText"); out2.Add("FontHeight"); out2.Add("Create");
+            out2.Add("Destroy"); out2.Add("DrawLine"); out2.Add("DrawCircle");
+            out2.Add("FillCircle"); out2.Add("SetClip"); out2.Add("ResetClip");
+        } else if (typeName == "Theme") {
+            out2.Add("bgPrimary"); out2.Add("bgSecondary"); out2.Add("bgTertiary");
+            out2.Add("bgHover"); out2.Add("bgActive"); out2.Add("textPrimary");
+            out2.Add("textSecondary"); out2.Add("textTertiary"); out2.Add("primary");
+            out2.Add("error"); out2.Add("warning"); out2.Add("success");
+            out2.Add("divider"); out2.Add("borderPrimary"); out2.Add("borderRadiusMedium");
+            out2.Add("borderRadiusSmall"); out2.Add("fontSizeSmall"); out2.Add("fontSizeMedium");
+            out2.Add("fontSizeLarge"); out2.Add("iconSizeLarge"); out2.Add("paddingSmall");
+            out2.Add("paddingMedium"); out2.Add("paddingLarge"); out2.Add("paddingTiny");
+            out2.Add("gapMedium"); out2.Add("heightMedium");
+        } else if (typeName == "Window") {
+            out2.Add("EventKind"); out2.Add("EventKeyCode"); out2.Add("EventX");
+            out2.Add("EventY"); out2.Add("PollEvent"); out2.Add("WaitEvent");
+            out2.Add("GetWidth"); out2.Add("GetHeight"); out2.Add("Close");
+            out2.Add("SetCursor"); out2.Add("GetTickMs"); out2.Add("SleepMs");
+        } else if (typeName == "LayoutKind") {
+            // [StructLayout(LayoutKind.Sequential)] —— FFI/封送特性
+            // 唯一使用的真实成员。
+            out2.Add("Sequential"); out2.Add("Explicit"); out2.Add("Auto");
+        } else {
+            // 未知 / 无法解析的接收者：只列出普遍可用的
+            // 对象成员。我们故意不猜测字符串 / 集合 /
+            // LINQ 辅助方法，因为那样会显示类型可能没有的
+            // 方法（如 `Utils.OrderByDescending`）。DotCompletion 按名称/using 解析用户和
+            // stdlib 类型，仅在对接收者一无所知时才
+            // 回退到这里。
+            out2.Add("ToString"); out2.Add("Equals");
+            out2.Add("GetHashCode"); out2.Add("GetType");
+        }
+    }
+
+    /// 追加 LINQ 查询运算符方法。仅当文件导入 `using System.Linq;` 时
+    /// 为集合接收者调用。
+    static void AddLinqMembers(List<string> out2) {
+        out2.Add("Where"); out2.Add("Select"); out2.Add("SelectMany");
+        out2.Add("OrderBy"); out2.Add("OrderByDescending"); out2.Add("ThenBy");
+        out2.Add("ThenByDescending"); out2.Add("GroupBy"); out2.Add("First");
+        out2.Add("FirstOrDefault"); out2.Add("Last"); out2.Add("LastOrDefault");
+        out2.Add("Single"); out2.Add("SingleOrDefault"); out2.Add("Any");
+        out2.Add("All"); out2.Add("Count"); out2.Add("Sum"); out2.Add("Average");
+        out2.Add("Min"); out2.Add("Max"); out2.Add("Take"); out2.Add("Skip");
+        out2.Add("TakeWhile"); out2.Add("SkipWhile"); out2.Add("Distinct");
+        out2.Add("Concat"); out2.Add("Union"); out2.Add("Intersect"); out2.Add("Except");
+        out2.Add("Reverse"); out2.Add("ToList"); out2.Add("ToArray");
+        out2.Add("ToDictionary"); out2.Add("Aggregate"); out2.Add("Zip");
+        out2.Add("Append"); out2.Add("Prepend"); out2.Add("OfType"); out2.Add("Cast");
+    }
+
+    // ============================================================
+    //  符号索引与感知 using 的精确补全
+    // ============================================================
+
+    /// 把空格分隔的字符串拆分为 token 追加到 `out2`。
+    static void AddWords(List<string> out2, string s) {
+        string cur = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == " ") { if (cur.Length > 0) { out2.Add(cur); cur = ""; } }
+            else { cur = cur + ch; }
+        }
+        if (cur.Length > 0) { out2.Add(cur); }
+    }
+
+    /// 把 `s` 中每个空格分隔的 token 追加到 `cand`（种类 `kind`），
+    /// 跳过已存在的重复项。
+    static void AddKindWords(List<string> cand, List<string> kinds, string s, string kind) {
+        List<string> tmp = new List<string>();
+        CodeEditor.AddWords(tmp, s);
+        for (int i = 0; i < tmp.Count; i = i + 1) {
+            if (!CodeEditor.Has(cand, tmp[i])) { cand.Add(tmp[i]); kinds.Add(kind); }
+        }
+    }
+
+    /// 从去除首尾空白的行中剥离开头的声明修饰符（public/static/…），
+    /// 返回剩余部分（如从 "public class Foo {" 得 "class Foo {"）。
+    static string StripModifiers(string trimmed) {
+        string mods = " public private protected internal static abstract sealed partial file virtual override readonly const async unsafe extern new ";
+        string s = trimmed;
+        while (true) {
+            int sp = CodeEditor.Find(s, " ");
+            if (sp <= 0) { break; }
+            string first = s.Substring(0, sp);
+            if (CodeEditor.Find(mods, " " + first + " ") >= 0) {
+                s = CodeEditor.LTrim(s.Substring(sp, s.Length - sp));
+            } else { break; }
+        }
+        return s;
+    }
+
+    /// 若 `trimmed` 声明了 class/struct/enum/interface 则返回其名称，
+    /// 否则 ""。
+    static string TypeDeclName(string trimmed) {
+        string s = CodeEditor.StripModifiers(trimmed);
+        string kw = "";
+        if (CodeEditor.StartsWithP(s, "class ")) { kw = "class "; }
+        else if (CodeEditor.StartsWithP(s, "struct ")) { kw = "struct "; }
+        else if (CodeEditor.StartsWithP(s, "enum ")) { kw = "enum "; }
+        else if (CodeEditor.StartsWithP(s, "interface ")) { kw = "interface "; }
+        else { return ""; }
+        string rest = CodeEditor.LTrim(s.Substring(kw.Length, s.Length - kw.Length));
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string name = "";
+        int i = 0;
+        while (i < rest.Length) {
+            string ch = rest.Substring(i, 1);
+            if (CodeEditor.InSet(idset, ch)) { name = name + ch; i = i + 1; }
+            else { break; }
+        }
+        return name;
+    }
+
+    /// 当 `head`（后跟 `(` 的名称之前的文本）
+    /// 可以是声明的返回类型而非接收者表达式时返回 true。
+    /// 像 `app.MaxBody(x);` 这样的调用前面有 `app.`，因此不能
+    /// 将其报告为 `MaxBody` 的声明。
+    static bool DeclHeadOk(string head) {
+        string h = head;
+        while (h.Length > 0) {
+            string last = h.Substring(h.Length - 1, 1);
+            if (last != " " && last != "\t") { break; }
+            h = h.Substring(0, h.Length - 1);
+        }
+        if (h.Length == 0) { return false; }
+        // 类型 token 必须与名称以空白分隔……
+        if (h.Length == head.Length) { return false; }
+        // ……且不能以成员访问或运算符结尾。
+        string ok = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_>]";
+        return CodeEditor.InSet(ok, h.Substring(h.Length - 1, 1));
+    }
+
+    /// 若 `trimmed` 是直接成员声明（方法 / 字段 / 属性）
+    /// 则返回成员名，否则 ""。
+    static string MemberDeclName(string trimmed) {
+        string s = CodeEditor.StripModifiers(trimmed);
+        if (s.Length == 0) { return ""; }
+        string f = s.Substring(0, 1);
+        if (f == "/" || f == "*" || f == "#" || f == "@" || f == "[" || f == "}" || f == "{") { return ""; }
+        if (CodeEditor.TypeDeclName(trimmed).Length > 0) { return ""; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        // 方法：标识符后紧跟 '('。
+        int paren = CodeEditor.Find(s, "(");
+        if (paren > 0) {
+            int e = paren;
+            while (e > 0 && CodeEditor.InSet(idset, s.Substring(e - 1, 1))) { e = e - 1; }
+            string mname = s.Substring(e, paren - e);
+            if (mname.Length == 0) { return ""; }
+            if (e == 0) { return ""; }
+            if (CodeEditor.IsControlWord(mname)) { return ""; }
+            return mname;
+        }
+        // 字段 / 属性："Type name;"、"Type name =" 或 "Type name {"。
+        int term = -1;
+        for (int ti = 0; ti < s.Length; ti = ti + 1) {
+            string ch = s.Substring(ti, 1);
+            if (ch == ";" || ch == "=" || ch == "{") { term = ti; break; }
+        }
+        if (term < 0) { return ""; }
+        string head = CodeEditor.TrimStr(s.Substring(0, term));
+        int b = head.Length;
+        while (b > 0 && !CodeEditor.InSet(idset, head.Substring(b - 1, 1))) { b = b - 1; }
+        int a = b;
+        while (a > 0 && CodeEditor.InSet(idset, head.Substring(a - 1, 1))) { a = a - 1; }
+        if (b <= a) { return ""; }
+        string name = head.Substring(a, b - a);
+        string before = CodeEditor.TrimStr(head.Substring(0, a));
+        if (before.Length == 0) { return ""; }        // 前面需要有类型 token
+        if (CodeEditor.IsControlWord(name)) { return ""; }
+        string digits = "0123456789";
+        if (CodeEditor.InSet(digits, name.Substring(0, 1))) { return ""; }
+        return name;
+    }
+
+    /// 扫描 `src` 中每个 class/struct/enum 声明，把每个类型名
+    /// 追加到 `names`，其空格分隔的直接成员名追加到 `membersJoined`。
+    static void ScanTypesInto(string src, List<string> names, List<string> membersJoined) {
+        CodeEditor.ScanTypeLinesInto(CodeEditor.SplitLines(src), names, membersJoined);
+    }
+
+    /// 同上，但直接吃行表：编辑器自己的缓冲区本来就是行表，
+    /// 先 GetText() 拼成一个整文档字符串再 SplitLines() 拆回去，在 30 万行
+    /// 上就是每次重扫都要分配十兆级的字符串。
+    static void ScanTypeLinesInto(List<string> ls, List<string> names,
+                                  List<string> membersJoined) {
+        int i = 0;
+        while (i < ls.Count) {
+            string tr = CodeEditor.TrimStr(ls[i]);
+            string tname = CodeEditor.TypeDeclName(tr);
+            if (tname.Length > 0) {
+                List<string> members = new List<string>();
+                Dict<string, bool> seen = new Dict<string, bool>();
+                int depth = 0;
+                bool started = false;
+                int j = i;
+                while (j < ls.Count) {
+                    string lj = ls[j];
+                    if (started && depth == 1 && j != i) {
+                        string mn = CodeEditor.MemberDeclName(CodeEditor.TrimStr(lj));
+                        if (mn.Length > 0 && !seen.ContainsKey(mn)) {
+                            seen.Add(mn, true);
+                            members.Add(mn);
+                        }
+                    }
+                    int n = lj.Length;
+                    for (int k = 0; k < n; k = k + 1) {
+                        int ch = lj[k];
+                        if (ch == 123) { depth = depth + 1; started = true; }
+                        else if (ch == 125) { depth = depth - 1; }
+                    }
+                    j = j + 1;
+                    if (started && depth <= 0) { break; }
+                }
+                names.Add(tname);
+                membersJoined.Add(String.Join(" ", members));
+                i = j;
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+
+    /// 宿主 IDE 钩子：提供所有其他项目文件的源码，使
+    /// 编辑器能解析跨文件类型（如 utils.zan 中的 `Utils` 类）。
+    void SetProjectFiles(List<string> contents) {
+        projFileSrc = contents;
+        projScanDirty = true;
+        extRefDirty = true;
+    }
+
+    /// 若 SetProjectFiles() 留下待处理的跨文件类型扫描
+    /// 则执行之。由补全路径惰性调用，使切换标签页
+    /// 本身保持低成本。
+    void EnsureProjectScan() {
+        if (!projScanDirty) { return; }
+        projScanDirty = false;
+        candBaseGen = candBaseGen + 1;
+        projTypes = new List<ProjType>();
+        for (int i = 0; i < projFileSrc.Count; i = i + 1) {
+            List<string> tn = new List<string>();
+            List<string> tm = new List<string>();
+            CodeEditor.ScanTypesInto(projFileSrc[i], tn, tm);
+            for (int k = 0; k < tn.Count; k = k + 1) {
+                string mm = "";
+                if (k < tm.Count) { mm = tm[k]; }
+                projTypes.Add(new ProjType(tn[k], mm));
+            }
+        }
+    }
+
+    /// 项目类型列表包含名为 `name` 的类型时返回 true。
+    static bool HasProjType(List<ProjType> ps, string name) {
+        for (int i = 0; i < ps.Count; i = i + 1) {
+            if (ps[i].name == name) { return true; }
+        }
+        return false;
+    }
+
+    /// 收集当前缓冲区 `using` 行导入的命名空间。
+    void ParseUsingsInto(List<string> outNs) {
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string tr = CodeEditor.TrimStr(lines[i]);
+            if (CodeEditor.StartsWithP(tr, "using ")) {
+                string rest = CodeEditor.LTrim(tr.Substring(6, tr.Length - 6));
+                if (CodeEditor.StartsWithP(rest, "static ")) {
+                    rest = CodeEditor.LTrim(rest.Substring(7, rest.Length - 7));
+                }
+                string ns = "";
+                for (int j = 0; j < rest.Length; j = j + 1) {
+                    string ch = rest.Substring(j, 1);
+                    if (ch == ";" || ch == "=" || ch == " ") { break; }
+                    ns = ns + ch;
+                }
+                if (ns.Length > 0 && !CodeEditor.Has(outNs, ns)) { outNs.Add(ns); }
+            }
+        }
+    }
+
+    /// 当前缓冲区声明的命名空间（`namespace X;`），无则 ""。
+    string FileNamespace() {
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string tr = CodeEditor.TrimStr(lines[i]);
+            if (CodeEditor.StartsWithP(tr, "namespace ")) {
+                string rest = CodeEditor.LTrim(tr.Substring(10, tr.Length - 10));
+                string ns = "";
+                for (int j = 0; j < rest.Length; j = j + 1) {
+                    string ch = rest.Substring(j, 1);
+                    if (ch == ";" || ch == " " || ch == "{") { break; }
+                    ns = ns + ch;
+                }
+                return ns;
+            }
+        }
+        return "";
+    }
+
+    /// 命名空间 `ns` 在当前缓冲区可见时返回 true：通过
+    /// `using` 导入，或是文件自身命名空间（的祖先）。
+    bool NsVisible(string ns) {
+        List<string> u = new List<string>();
+        ParseUsingsInto(u);
+        if (CodeEditor.Has(u, ns)) { return true; }
+        string fn = FileNamespace();
+        if (fn.Length > 0) {
+            if (fn == ns) { return true; }
+            if (fn.Length > ns.Length && CodeEditor.StartsWithP(fn, ns + ".")) { return true; }
+        }
+        return false;
+    }
+
+    /// 文件导入 System.Linq 时返回 true（控制 LINQ 查询运算符）。
+    bool UsesLinq() {
+        List<string> u = new List<string>();
+        ParseUsingsInto(u);
+        return CodeEditor.Has(u, "System.Linq");
+    }
+
+    /// 编辑器拥有硬编码成员数据的 stdlib 类型。
+    static bool IsKnownStdlibType(string name) {
+        if (CodeEditor.HasSymbolType(name)) { return true; }
+        string known = " Console Math File Directory Path Convert Environment string List Dictionary StringBuilder DateTime Array Process App Canvas Theme Window LayoutKind ";
+        return CodeEditor.Find(known, " " + name + " ") >= 0;
+    }
+
+    /// 规范化类型名以便成员查找（String -> string）。
+    static string NormalizeStdlibType(string name) {
+        if (name == "String") { return "string"; }
+        return name;
+    }
+
+    /// 对在 System.Linq 下暴露 LINQ 的内置集合类型返回 true。
+    static bool IsCollectionType(string name) {
+        return name == "List" || name == "Array" || name == "Dictionary";
+    }
+
+    /// 完整的命名空间 -> 类型目录，用于把作用域内的 stdlib 类型加入
+    /// 补全。每行一个条目："Namespace=Type Type Type"。
+    static string StdlibNsData() {
+        return "System.IO=File Directory Path;"
+            + "System.Text=Encoding;"
+            + "System.Json=JsonBuilder JsonParser;"
+            + "System.Threading=Thread Mutex Semaphore Stopwatch Channel AtomicInt SharedTable;"
+            + "System.Net.Sockets=Socket AsyncSocket TcpListener TcpClient UdpClient;"
+            + "System.Net.Http=HttpClient HttpRequest HttpResponse HttpServer HttpRouter;"
+            + "System.Net.WebSocket=WebSocketClient WsFrame WsOpcode;"
+            + "System.Net.Mqtt=MqttClient MqttPacketType MqttQos;"
+            + "System.Net=IPAddress Worker Connection;"
+            + "System.Data.Orm=Model ModelQuery ModelRow ModelUpdate ModelDelete Migration QueryBuilder;"
+            + "System.Data.Sqlite=SqliteConnection;"
+            + "System.Data.Postgres=PgConnection;"
+            + "System.Data=DbConnection DbProvider DbResult;"
+            + "System.Diagnostics=Process;"
+            + "System.Drawing=Graphics Bitmap Font Rectangle;"
+            + "Platform=Posix Runtime Win32;"
+            + "Gui=App Canvas Theme Window Icon Text Stack Ui SignalInt SignalBool SignalString FocusManager HitRegion HitTester Clipboard Keys Modifiers Cursor Insets FlexNode FlexStyle;"
+            + "Gui.Widget=Avatar Badge Breadcrumb Button Card Carousel Chart Checkbox CodeEditor Collapse DataTable Dialog Divider Drawer Dropdown Empty FloatButton Input Label ListView Menu Message Modal Notification Pagination Panel Popover Progress Radio Rate Result Ribbon RibbonCmd Scrollbar Skeleton Slider Spin Split Statistic Steps Switch Table Tabs Tag Timeline Tooltip TreeNode TreeView Typography Wizard;"
+            + "System.Windows.Forms=MessageBox TextBox;";
+    }
+
+    /// 把命名空间 `ns` 中声明的类型名追加到 `out2`。
+    static void StdlibTypesForNs(string ns, List<string> out2) {
+        string data = CodeEditor.StdlibNsData();
+        string cur = "";
+        for (int i = 0; i <= data.Length; i = i + 1) {
+            string ch = "";
+            if (i < data.Length) { ch = data.Substring(i, 1); }
+            if (ch == ";" || i == data.Length) {
+                int eq = CodeEditor.Find(cur, "=");
+                if (eq > 0) {
+                    string key = cur.Substring(0, eq);
+                    if (key == ns) {
+                        CodeEditor.AddWords(out2, cur.Substring(eq + 1, cur.Length - eq - 1));
+                    }
+                }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+        }
+    }
+
+    static List<string> nsTypeNames;
+    static List<string> nsTypeNs;
+
+    /// Builds the name -> namespace table once. It used to be rebuilt as a
+    /// dozen packed strings on every lookup, and the lookup runs for every
+    /// capitalised identifier in the buffer each time the diagnostics rerun.
+    static void EnsureNsTable() {
+        if (CodeEditor.nsTypeNames != null) { return; }
+        List<string> names = new List<string>();
+        List<string> nss = new List<string>();
+        CodeEditor.AddNsGroup(names, nss, "System.IO", "File Directory Path");
+        CodeEditor.AddNsGroup(names, nss, "System.Diagnostics", "Process");
+        CodeEditor.AddNsGroup(names, nss, "System.Text", "Encoding");
+        CodeEditor.AddNsGroup(names, nss, "System.Json", "JsonBuilder JsonParser");
+        CodeEditor.AddNsGroup(names, nss, "System.Threading",
+            "Thread Mutex Semaphore Stopwatch AtomicInt SharedTable");
+        CodeEditor.AddNsGroup(names, nss, "System.Net.Sockets",
+            "Socket TcpListener TcpClient UdpClient AsyncSocket");
+        CodeEditor.AddNsGroup(names, nss, "System.Net.Http",
+            "HttpClient HttpRequest HttpResponse HttpServer HttpRouter");
+        CodeEditor.AddNsGroup(names, nss, "System.Net.WebSocket",
+            "WebSocketClient");
+        CodeEditor.AddNsGroup(names, nss, "System.Data", "DbConnection DbResult");
+        CodeEditor.AddNsGroup(names, nss, "System.Data.Orm", "QueryBuilder");
+        CodeEditor.AddNsGroup(names, nss, "Gui", "App Canvas Theme");
+        CodeEditor.AddNsGroup(names, nss, "Gui.Widget",
+            "CodeEditor TreeView Ribbon Modal DataTable Dropdown Carousel Pagination");
+        CodeEditor.nsTypeNs = nss;
+        CodeEditor.nsTypeNames = names;
+    }
+
+    /// Appends every space-separated name in `words` with namespace `ns`.
+    static void AddNsGroup(List<string> names, List<string> nss, string ns,
+                           string words) {
+        int i = 0;
+        int n = words.Length;
+        while (i < n) {
+            while (i < n && words[i] == 32) { i = i + 1; }
+            int s2 = i;
+            while (i < n && words[i] != 32) { i = i + 1; }
+            if (i > s2) {
+                names.Add(words.Substring(s2, i - s2));
+                nss.Add(ns);
+            }
+        }
+    }
+
+    /// 使用 stdlib 类型 `name` 必须导入的命名空间，
+    /// `name` 是内置 / 有歧义 / 非 stdlib 类型时返回 ""。刻意只收录
+    /// 独特无歧义的名称，使缺失 using 的诊断绝不
+    /// 误报在用户自己的标识符上。
+    static string NsForStdlibType(string name) {
+        CodeEditor.EnsureNsTable();
+        List<string> names = CodeEditor.nsTypeNames;
+        List<string> nss = CodeEditor.nsTypeNs;
+        for (int i = 0; i < names.Count; i = i + 1) {
+            if (names[i] == name) { return nss[i]; }
+        }
+        return "";
+    }
+
+    /// `name` 是项目（其他文件）或
+    /// 当前缓冲区中声明的类型时返回 true。
+    bool IsProjectType(string name) {
+        EnsureProjectScan();
+        if (CodeEditor.HasProjType(projTypes, name)) { return true; }
+        EnsureBufTypes();
+        return CodeEditor.Has(muTypeNames, name);
+    }
+
+    /// 查找用户类型 `typeName` 的声明成员（先项目文件，后
+    /// 当前缓冲区）。找到时返回 true 并填充 `outMem`。
+    bool FindTypeMembers(string typeName, List<string> outMem) {
+        EnsureProjectScan();
+        for (int i = 0; i < projTypes.Count; i = i + 1) {
+            if (projTypes[i].name == typeName) {
+                CodeEditor.AddWords(outMem, projTypes[i].members);
+                return true;
+            }
+        }
+        EnsureBufTypes();
+        List<string> tn = muTypeNames;
+        List<string> tm = muTypeMembers;
+        for (int j = 0; j < tn.Count; j = j + 1) {
+            if (tn[j] == typeName) {
+                CodeEditor.AddWords(outMem, tm[j]);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// 尽力解析局部变量的声明类型：扫描
+    /// 缓冲区中的 `Type name` 声明。返回基础类型（剥离泛型），
+    /// 无则 ""。
+    string ResolveVarType(string name) {
+        if (name.Length == 0) { return ""; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        for (int li = 0; li < lines.Count; li = li + 1) {
+            string s = CodeEditor.TrimStr(lines[li]);
+            int from = 0;
+            while (true) {
+                int p = CodeEditor.FindFrom(s, name, from);
+                if (p < 0) { break; }
+                bool lok = (p > 0 && s.Substring(p - 1, 1) == " ");
+                int rp = p + name.Length;
+                bool rok = false;
+                if (rp < s.Length) {
+                    string rc = s.Substring(rp, 1);
+                    if (rc == " " || rc == "=" || rc == ";") { rok = true; }
+                }
+                if (lok && rok) {
+                    // `name` 紧邻之前的 token 必须是类型引用
+                    int te = p - 1;
+                    while (te > 0 && s.Substring(te - 1, 1) == " ") { te = te - 1; }
+                    int ts = te;
+                    while (ts > 0 && CodeEditor.InSet(idset, s.Substring(ts - 1, 1))) { ts = ts - 1; }
+                    // 允许类型后带泛型实参列表：List<int>
+                    int gts = ts;
+                    if (te > ts) {
+                        string tok = s.Substring(ts, te - ts);
+                        // 若名称 token 前一个字符是 '>' 则剥离泛型收尾
+                        string typeTok = tok;
+                        int lt = CodeEditor.Find(typeTok, "<");
+                        if (lt > 0) { typeTok = typeTok.Substring(0, lt); }
+                        if (typeTok.Length > 0 && !CodeEditor.IsControlWord(typeTok)
+                            && !CodeEditor.StartsWithP(typeTok, "return")) {
+                            string firstc = typeTok.Substring(0, 1);
+                            string digits = "0123456789";
+                            if (!CodeEditor.InSet(digits, firstc)) { return typeTok; }
+                        }
+                    }
+                }
+                from = p + name.Length;
+            }
+        }
+        return "";
+    }
+
+    /// 把作用域内的 stdlib 类型名加入补全：始终包含内置类型，
+    /// 加上每个已导入（或自身）命名空间的类型，以及仅当
+    /// 导入 System.Linq 时的 LINQ 运算符。
+    void AddStdlibCandidates(List<string> cand, List<string> kinds) {
+        CodeEditor.AddKindWords(cand, kinds,
+            "Console Math Convert Environment String Array List Dictionary StringBuilder DateTime TimeSpan Task Object Exception Tuple Random", "T");
+        List<string> ns = new List<string>();
+        ParseUsingsInto(ns);
+        string fn = FileNamespace();
+        if (fn.Length > 0 && !CodeEditor.Has(ns, fn)) { ns.Add(fn); }
+        for (int i = 0; i < ns.Count; i = i + 1) {
+            List<string> types = new List<string>();
+            CodeEditor.StdlibTypesForNs(ns[i], types);
+            for (int j = 0; j < types.Count; j = j + 1) {
+                if (!CodeEditor.Has(cand, types[j])) { cand.Add(types[j]); kinds.Add("T"); }
+            }
+        }
+        if (UsesLinq()) {
+            List<string> linq = new List<string>();
+            CodeEditor.AddLinqMembers(linq);
+            for (int k = 0; k < linq.Count; k = k + 1) {
+                if (!CodeEditor.Has(cand, linq[k])) { cand.Add(linq[k]); kinds.Add("M"); }
+            }
+        }
+    }
+
+    /// 已在候选表里的词的哈希集。项目类型和成员动辄上千，逐个对
+    /// 候选表线性查重会把一次补全变成平方级。
+    static Dict<string, bool> SeenOf(List<string> cand) {
+        Dict<string, bool> seen = new Dict<string, bool>();
+        for (int i = 0; i < cand.Count; i = i + 1) {
+            if (!seen.ContainsKey(cand[i])) { seen.Add(cand[i], true); }
+        }
+        return seen;
+    }
+
+    /// 词去重后追加进候选表（空词与已存在的词跳过）。
+    static void AddCand(List<string> cand, List<string> kinds,
+                        Dict<string, bool> seen, string w, string kind) {
+        if (w.Length == 0 || seen.ContainsKey(w)) { return; }
+        seen.Add(w, true);
+        cand.Add(w);
+        kinds.Add(kind);
+    }
+
+    /// 把项目声明的类型（及其成员）加入补全。
+    void AddProjectCandidates(List<string> cand, List<string> kinds) {
+        EnsureProjectScan();
+        Dict<string, bool> seen = CodeEditor.SeenOf(cand);
+        for (int i = 0; i < projTypes.Count; i = i + 1) {
+            CodeEditor.AddCand(cand, kinds, seen, projTypes[i].name, "T");
+            List<string> mem = new List<string>();
+            CodeEditor.AddWords(mem, projTypes[i].members);
+            for (int j = 0; j < mem.Count; j = j + 1) {
+                CodeEditor.AddCand(cand, kinds, seen, mem[j], "M");
+            }
+        }
+        EnsureBufTypes();
+        List<string> tn = muTypeNames;
+        List<string> tm = muTypeMembers;
+        for (int a = 0; a < tn.Count; a = a + 1) {
+            CodeEditor.AddCand(cand, kinds, seen, tn[a], "T");
+            List<string> mem2 = new List<string>();
+            CodeEditor.AddWords(mem2, tm[a]);
+            for (int b = 0; b < mem2.Count; b = b + 1) {
+                CodeEditor.AddCand(cand, kinds, seen, mem2[b], "M");
+            }
+        }
+    }
+
+    /// 当 (curLine 行、curCol 之前) 正在输入的字词位于
+    /// 特性括号内时返回 true —— 即该行上最近的未匹配 '[' 在它之前。
+    bool InAttributeContext() {
+        if (curLine < 0 || curLine >= lines.Count) { return false; }
+        string s = lines[curLine];
+        int i = curCol - 1;
+        if (i >= s.Length) { i = s.Length - 1; }
+        while (i >= 0) {
+            string ch = s.Substring(i, 1);
+            if (ch == "[") { return true; }
+            if (ch == "]") { return false; }
+            i = i - 1;
+        }
+        return false;
+    }
+
+    /// 扫描缓冲区中使用 `using X;` 类型却缺少所需导入之处，
+    /// 为每个出错行记录诊断 + 快速修复。
+    /// 当前缓冲区声明的类型名（及其成员）。补全与诊断每次击键、
+    /// 每次光标移动都要用到它，而重扫是一整篇解析，因此只在结构
+    /// 真的变了时重扫（见 BufTypesStructuralChange）。
+    void EnsureBufTypes() {
+        if (muTypeNames != null && !BufTypesStructuralChange()) { return; }
+        muTypeNames = new List<string>();
+        muTypeMembers = new List<string>();
+        CodeEditor.ScanTypeLinesInto(lines, muTypeNames, muTypeMembers);
+        candBaseGen = candBaseGen + 1;
+        btLineSrc = new List<string>();
+        for (int i = 0; i < lines.Count; i = i + 1) { btLineSrc.Add(lines[i]); }
+    }
+
+    /// 自上次扫描以来，缓冲区里发生了能改变类型表的变化时返回 true。
+    /// 类型表只取决于声明行和花括号层次，所以在方法体里敲一个字
+    /// （最常见的编辑）不必重扫：只有声明形状或花括号变了才算数。
+    bool BufTypesStructuralChange() {
+        if (btLineSrc == null || btLineSrc.Count != lines.Count) { return true; }
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string now = lines[i];
+            string was = btLineSrc[i];
+            if (now == was) { continue; }
+            if (CodeEditor.BraceKey(now) != CodeEditor.BraceKey(was)) { return true; }
+            string trNow = CodeEditor.TrimStr(now);
+            string trWas = CodeEditor.TrimStr(was);
+            if (CodeEditor.TypeDeclName(trNow) != CodeEditor.TypeDeclName(trWas)) { return true; }
+            if (CodeEditor.MemberDeclName(trNow) != CodeEditor.MemberDeclName(trWas)) { return true; }
+            btLineSrc[i] = now;
+        }
+        return false;
+    }
+
+    /// 一行里 '{' 与 '}' 的个数，合成一个可比较的键。
+    static int BraceKey(string s) {
+        int open = 0;
+        int close = 0;
+        int n = s.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int ch = s[i];
+            if (ch == 123) { open = open + 1; }
+            else if (ch == 125) { close = close + 1; }
+        }
+        return open * 1048576 + close;
+    }
+
+    /// 对构成标识符的字节（ASCII 字母、数字、
+    /// 下划线）返回 true。用字节测试替代 InSet(str, Substring(p, 1))，后者
+    /// 会为文档中每个字符分配字符串并重扫 63 字符集合，
+    /// 开销很大。
+    static bool IdentByte(int b) {
+        if (b >= 97 && b <= 122) { return true; }
+        if (b >= 65 && b <= 90) { return true; }
+        if (b >= 48 && b <= 57) { return true; }
+        return b == 95;
+    }
+
+    /// Missing-`using` diagnostics for the whole buffer. The scan walks every
+    /// character of every line, so it is cached twice over: once per line (a
+    /// line whose text is unchanged reuses its result, so typing rescans one
+    /// line) and once per buffer (the caller reruns this on every caret line
+    /// change, and an unchanged buffer answers from the cache).
+    void AnalyzeMissingUsings() {
+        // Fast path: no line changed since the last scan, so nothing outside
+        // the buffer can have changed the answer either -- replay the cache
+        // without reparsing the imports or rescanning a character.
+        if (ReplayMissingUsings()) { return; }
+        EnsureProjectScan();
+        List<string> usings = new List<string>();
+        ParseUsingsInto(usings);
+        string fileNs = FileNamespace();
+        EnsureBufTypes();
+        // Everything outside the line itself that the answer depends on. A
+        // change here (a new using, a type declared elsewhere) drops the
+        // per-line cache.
+        string ctx = fileNs + "|" + string.Join(",", usings) + "|"
+            + Convert.ToString(muTypeNames.Count) + ":"
+            + Convert.ToString(projTypes.Count);
+        if (muCtx != ctx || muLineSrc == null) {
+            muCtx = ctx;
+            muLineSrc = new List<string>();
+            muLineNs = new List<string>();
+            muLineWord = new List<string>();
+        }
+        fixes = new List<QuickFix>();
+        List<string> tn = muTypeNames;
+        int li = 0;
+        while (li < lines.Count) {
+            while (muLineSrc.Count <= li) {
+                muLineSrc.Add(null);
+                muLineNs.Add("");
+                muLineWord.Add("");
+            }
+            if (muLineSrc[li] != lines[li]) {
+                ScanLineMissingUsing(li, usings, fileNs, tn);
+            }
+            if (muLineNs[li].Length > 0) {
+                errors.Add(new Diagnostic(li, "'" + muLineWord[li]
+                    + "' needs 'using " + muLineNs[li] + ";'"));
+                fixes.Add(new QuickFix(li, muLineNs[li]));
+            }
+            li = li + 1;
+        }
+        while (muLineSrc.Count > lines.Count) {
+            muLineSrc.RemoveAt(muLineSrc.Count - 1);
+            muLineNs.RemoveAt(muLineNs.Count - 1);
+            muLineWord.RemoveAt(muLineWord.Count - 1);
+        }
+        muStamp = TextStamp();
+    }
+
+    /// Rebuilds the diagnostics and quick fixes from the per-line cache when
+    /// every line still holds the text it was scanned from. Returns false
+    /// when the buffer moved on and a real scan is needed.
+    bool ReplayMissingUsings() {
+        if (muLineSrc == null || muLineSrc.Count != lines.Count) { return false; }
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (muLineSrc[i] != lines[i]) { return false; }
+        }
+        fixes = new List<QuickFix>();
+        for (int j = 0; j < lines.Count; j = j + 1) {
+            if (muLineNs[j].Length > 0) {
+                errors.Add(new Diagnostic(j, "'" + muLineWord[j]
+                    + "' needs 'using " + muLineNs[j] + ";'"));
+                fixes.Add(new QuickFix(j, muLineNs[j]));
+            }
+        }
+        return true;
+    }
+
+    /// Scans one line for the first stdlib type used without its `using` and
+    /// records the answer (namespace + type name, both "" for none) in the
+    /// per-line cache.
+    void ScanLineMissingUsing(int li, List<string> usings, string fileNs,
+                              List<string> tn) {
+        muLineSrc[li] = lines[li];
+        muLineNs[li] = "";
+        muLineWord[li] = "";
+        string tr = CodeEditor.TrimStr(lines[li]);
+        if (tr.Length == 0 || tr.Substring(0, 1) == "/" || tr.Substring(0, 1) == "*"
+            || CodeEditor.StartsWithP(tr, "using ") || CodeEditor.StartsWithP(tr, "namespace ")) {
+            return;
+        }
+        string ln = lines[li];
+        int p = 0;
+        int n = ln.Length;
+        while (p < n) {
+            if (CodeEditor.IdentByte(ln[p])) {
+                int s2 = p;
+                while (p < n && CodeEditor.IdentByte(ln[p])) { p = p + 1; }
+                bool dotAfter = (p < n && ln[p] == 46);
+                bool dotBefore = (s2 > 0 && ln[s2 - 1] == 46);
+                int first = ln[s2];
+                bool cap = (first >= 65 && first <= 90);
+                if (dotAfter && !dotBefore && cap) {
+                    string w = ln.Substring(s2, p - s2);
+                    string ns = CodeEditor.NsForStdlibType(w);
+                    if (ns.Length > 0) {
+                        bool imported = CodeEditor.Has(usings, ns);
+                        if (!imported && fileNs.Length > 0) {
+                            if (fileNs == ns) { imported = true; }
+                            else if (fileNs.Length > ns.Length && CodeEditor.StartsWithP(fileNs, ns + ".")) { imported = true; }
+                        }
+                        bool userType = CodeEditor.Has(tn, w) || CodeEditor.HasProjType(projTypes, w);
+                        if (!imported && !userType) {
+                            muLineNs[li] = ns;
+                            muLineWord[li] = w;
+                            return;
+                        }
+                    }
+                }
+            } else {
+                p = p + 1;
+            }
+        }
+    }
+
+    /// 缺失 using 的快速修复会为光标行添加的命名空间，无则 ""。
+    string QuickFixNs() {
+        for (int i = 0; i < fixes.Count; i = i + 1) {
+            if (fixes[i].line == curLine) { return fixes[i].ns; }
+        }
+        return "";
+    }
+
+    /// 光标行存在缺失 using 的快速修复时返回 true。
+    bool HasQuickFix() { return QuickFixNs().Length > 0; }
+
+    /// 在最后一个现有 using 之后（或顶部）插入 `using ns;`，
+    /// 除非已存在。
+    void AddUsing(string ns) {
+        if (ns.Length == 0) { return; }
+        List<string> cur = new List<string>();
+        ParseUsingsInto(cur);
+        if (CodeEditor.Has(cur, ns)) { return; }
+        int lastUsing = -1;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (CodeEditor.StartsWithP(CodeEditor.TrimStr(lines[i]), "using ")) { lastUsing = i; }
+        }
+        SaveUndo();
+        int at = 0;
+        if (lastUsing >= 0) { at = lastUsing + 1; }
+        lines.Insert(at, "using " + ns + ";");
+        if (at <= curLine) { curLine = curLine + 1; }
+        lastDiagLine = -1;
+        CheckErrors();
+    }
+
+    /// 若有则对光标行应用缺失 using 的快速修复。
+    void ApplyQuickFix() {
+        AddUsing(QuickFixNs());
+    }
+}

@@ -1,0 +1,329 @@
+using System;
+using System.Json;
+
+namespace System.Data.ZanDb;
+
+/// <summary>返回 true 时保留该文档。</summary>
+delegate bool DocPredicate(JsonValue doc);
+
+/// <summary>从文档中提取整数排序键。</summary>
+delegate int DocIntKey(JsonValue doc);
+
+/// <summary>从文档中提取字符串排序键。</summary>
+delegate string DocStrKey(JsonValue doc);
+
+/// <summary>待处理的等值约束（field == val），在字段未被索引加速时
+/// 作为过滤器应用。用一个实体而非并行的
+/// 字段/值列表。</summary>
+class EqFilter {
+    string field;
+    string val;
+
+    /// 私有构造；经 <see cref="DocQuery.WhereEq"/> 创建。
+    EqFilter(string field, string val) {
+        this.field = field;
+        this.val = val;
+    }
+}
+
+/// <summary>
+/// 针对 <see cref="Collection"/> 的流畅 LINQ 风格查询：类型安全的 lambda
+/// 谓词、索引加速的等值比较、O(n log n) 归并排序、
+/// Skip/Take 分页。求值推迟到 ToList/First/Count 时才进行。
+///
+///   List&lt;JsonValue&gt; adults = users.Query()
+///       .WhereEq("city", "北京")                       // uses 索引 若存在
+///       .Where((JsonValue u) => u.Int("age", 0) >= 18) // lambda filter
+///       .OrderByInt((JsonValue u) => u.Int("age", 0))
+///       .Take(10)
+///       .ToList();
+/// </summary>
+class DocQuery {
+    Collection col;
+    List<DocPredicate> preds;
+    List<EqFilter> eqFilters;
+    string idxField;
+    string idxValue;
+    bool hasIdxEq;
+    bool sortInt;
+    bool sortStr;
+    bool sortDesc;
+    DocIntKey intKey;
+    DocStrKey strKey;
+    int skipN;
+    int takeN;
+
+    /// 私有构造；统一经 <see cref="Of"/> 创建。
+    DocQuery() {
+        this.preds = new List<DocPredicate>();
+        this.eqFilters = new List<EqFilter>();
+        this.idxField = "";
+        this.idxValue = "";
+        this.hasIdxEq = false;
+        this.sortInt = false;
+        this.sortStr = false;
+        this.sortDesc = false;
+        this.skipN = 0;
+        this.takeN = 0;
+    }
+
+    /// 为集合创建一个空查询。
+    static DocQuery Of(Collection col) {
+        DocQuery q = new DocQuery();
+        q.col = col;
+        return q;
+    }
+
+    /// <summary>Lambda 过滤器；多次调用彼此 AND。</summary>
+    DocQuery Where(DocPredicate pred) {
+        this.preds.Add(pred);
+        return this;
+    }
+
+    /// <summary>字段等值约束（字符串形式）。当字段有
+    /// 二级索引时，候选集来自索引而非
+    /// 全表扫描；否则作为过滤器应用。</summary>
+    DocQuery WhereEq(string field, string val) {
+        if (!this.hasIdxEq && this.col.HasIndex(field)) {
+            this.hasIdxEq = true;
+            this.idxField = field;
+            this.idxValue = val;
+            return this;
+        }
+        this.eqFilters.Add(new EqFilter(field, val));
+        return this;
+    }
+
+    /// <summary>字段的整数等值约束。</summary>
+    DocQuery WhereEqInt(string field, int val) {
+        return WhereEq(field, Convert.ToString(val));
+    }
+
+    /// 按整数键升序排序（再次调用覆盖先前排序设置）。
+    DocQuery OrderByInt(DocIntKey key) {
+        this.sortInt = true;
+        this.sortStr = false;
+        this.sortDesc = false;
+        this.intKey = key;
+        return this;
+    }
+
+    /// 按整数键降序排序。
+    DocQuery OrderByIntDesc(DocIntKey key) {
+        OrderByInt(key);
+        this.sortDesc = true;
+        return this;
+    }
+
+    /// 按字符串键升序排序。
+    DocQuery OrderByStr(DocStrKey key) {
+        this.sortStr = true;
+        this.sortInt = false;
+        this.sortDesc = false;
+        this.strKey = key;
+        return this;
+    }
+
+    /// 按字符串键降序排序。
+    DocQuery OrderByStrDesc(DocStrKey key) {
+        OrderByStr(key);
+        this.sortDesc = true;
+        return this;
+    }
+
+    /// 跳过前 n 条（分页）。
+    DocQuery Skip(int n) {
+        this.skipN = n;
+        return this;
+    }
+
+    /// 最多返回 n 条（0 = 不限）。
+    DocQuery Take(int n) {
+        this.takeN = n;
+        return this;
+    }
+
+    // ===== 执行 =====
+
+    /// 候选集：有索引等值用索引；否则用第一个等值约束做字段扫描
+    /// 缩小范围；再否则取整个集合。
+    List<JsonValue> Candidates() {
+        if (this.hasIdxEq) {
+            return this.col.FindByIndex(this.idxField, this.idxValue);
+        }
+        if (this.eqFilters.Count > 0) {
+            // 扫描时用第一个等值约束缩小范围：集合
+            // 只从每条记录中读取该字段，并且只解码
+            // 匹配项。其余过滤器仍在幸存者上运行。
+            EqFilter f = this.eqFilters[0];
+            return this.col.FindByFieldScan(f.field, f.val);
+        }
+        return this.col.FindAll();
+    }
+
+    /// 检查余下的等值约束与 lambda 过滤器
+    /// （首个等值约束已由 <see cref="Candidates"/> 的扫描应用）。
+    bool MatchesRest(JsonValue d) {
+        int i = 1;
+        while (i < this.eqFilters.Count) {
+            EqFilter f = this.eqFilters[i];
+            JsonValue v = d.Get(f.field);
+            if (v == null) { return false; }
+            if (v.AsString("") != f.val) { return false; }
+            i = i + 1;
+        }
+        foreach (DocPredicate p in this.preds) {
+            if (!p(d)) { return false; }
+        }
+        return true;
+    }
+
+    /// <summary>当候选集已经应用了第一个等值
+    /// 过滤器时为 true，重复检查将浪费工作。</summary>
+    bool EqAppliedByScan() {
+        return !this.hasIdxEq && this.eqFilters.Count > 0;
+    }
+
+    /// 检查全部等值约束与 lambda 过滤器。
+    bool Matches(JsonValue d) {
+        foreach (EqFilter f in this.eqFilters) {
+            JsonValue v = d.Get(f.field);
+            if (v == null) { return false; }
+            if (v.AsString("") != f.val) { return false; }
+        }
+        foreach (DocPredicate p in this.preds) {
+            if (!p(d)) { return false; }
+        }
+        return true;
+    }
+
+    /// <summary>对预计算的键做自底向上归并排序：O(n log n)，稳定。</summary>
+    void SortDocs(List<JsonValue> docs) {
+        int n = docs.Count;
+        if (n < 2) { return; }
+        List<int> ik = new List<int>();
+        List<string> sk = new List<string>();
+        int i = 0;
+        for (; i < n; i = i + 1) {
+            if (this.sortInt) { ik.Add(this.intKey(docs[i])); sk.Add(""); }
+            else { sk.Add(this.strKey(docs[i])); ik.Add(0); }
+        }
+        List<JsonValue> tmpD = new List<JsonValue>();
+        List<int> tmpI = new List<int>();
+        List<string> tmpS = new List<string>();
+        i = 0;
+        while (i < n) {
+            tmpD.Add(docs[i]);
+            tmpI.Add(0);
+            tmpS.Add("");
+            i = i + 1;
+        }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                int hi = lo + width * 2;
+                if (mid > n) { mid = n; }
+                if (hi > n) { hi = n; }
+                int a = lo;
+                int b = mid;
+                int t = lo;
+                while (a < mid || b < hi) {
+                    bool takeA = false;
+                    if (b >= hi) { takeA = true; }
+                    else if (a < mid) {
+                        if (this.sortInt) { takeA = ik[a] <= ik[b]; }
+                        else { takeA = BTree.Compare(sk[a], sk[b]) <= 0; }
+                    }
+                    if (takeA) {
+                        tmpD[t] = docs[a]; tmpI[t] = ik[a]; tmpS[t] = sk[a];
+                        a = a + 1;
+                    } else {
+                        tmpD[t] = docs[b]; tmpI[t] = ik[b]; tmpS[t] = sk[b];
+                        b = b + 1;
+                    }
+                    t = t + 1;
+                }
+                lo = hi;
+            }
+            i = 0;
+            while (i < n) {
+                docs[i] = tmpD[i];
+                ik[i] = tmpI[i];
+                sk[i] = tmpS[i];
+                i = i + 1;
+            }
+            width = width * 2;
+        }
+    }
+
+    /// <summary>执行查询并具体化匹配的文档。</summary>
+    List<JsonValue> ToList() {
+        List<JsonValue> cand = Candidates();
+        bool scanned = EqAppliedByScan();
+        List<JsonValue> matched = new List<JsonValue>();
+        for (int i = 0; i < cand.Count; i = i + 1) {
+            bool keep = false;
+            if (scanned) { keep = MatchesRest(cand[i]); }
+            else { keep = Matches(cand[i]); }
+            if (keep) { matched.Add(cand[i]); }
+        }
+        if (this.sortInt || this.sortStr) {
+            SortDocs(matched);
+            if (this.sortDesc) {
+                List<JsonValue> rev = new List<JsonValue>();
+                int r = matched.Count - 1;
+                while (r >= 0) {
+                    rev.Add(matched[r]);
+                    r = r - 1;
+                }
+                matched = rev;
+            }
+        }
+        if (this.skipN > 0 || this.takeN > 0) {
+            List<JsonValue> page = new List<JsonValue>();
+            int p = this.skipN;
+            while (p < matched.Count) {
+                if (this.takeN > 0 && page.Count >= this.takeN) { break; }
+                page.Add(matched[p]);
+                p = p + 1;
+            }
+            return page;
+        }
+        return matched;
+    }
+
+    /// <summary>返回第一个匹配项，没有则返回 null。</summary>
+    JsonValue First() {
+        List<JsonValue> r = Take(1).ToList();
+        if (r.Count > 0) { return r[0]; }
+        return null;
+    }
+
+    /// <summary>匹配数量（不应用排序/分页）。只有单个等值约束
+    /// 时无需具体化任何文档即可计数——字段已索引时
+    /// 用索引键，否则从每条记录读取
+    /// 一个字段来计数。</summary>
+    int Count() {
+        if (this.preds.Count == 0) {
+            if (this.hasIdxEq && this.eqFilters.Count == 0) {
+                return this.col.CountByField(this.idxField, this.idxValue);
+            }
+            if (!this.hasIdxEq && this.eqFilters.Count == 1) {
+                EqFilter only = this.eqFilters[0];
+                return this.col.CountByField(only.field, only.val);
+            }
+        }
+        List<JsonValue> cand = Candidates();
+        bool scanned = EqAppliedByScan();
+        int n = 0;
+        for (int i = 0; i < cand.Count; i = i + 1) {
+            bool keep = false;
+            if (scanned) { keep = MatchesRest(cand[i]); }
+            else { keep = Matches(cand[i]); }
+            if (keep) { n = n + 1; }
+        }
+        return n;
+    }
+}

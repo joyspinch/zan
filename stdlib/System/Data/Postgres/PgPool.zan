@@ -1,0 +1,133 @@
+using System;
+using System.Data;
+using System.Threading;
+
+namespace System.Data.Postgres;
+
+/// <summary>
+/// 面向 <see cref="PgConnection"/> 的协程化连接池。
+///
+/// 契约与 <see cref="DbPool"/> 相同——惰性增长至 <c>maxSize</c>，
+/// 用事件驱动 <see cref="Gate"/> 等待而非轮询，驱逐失效
+/// 连接——但它是类型化的，协程查询 API（<c>QueryAsync</c>、
+/// <c>ExecuteAsync</c>、<c>QueryParamsAsync</c>）仍然可用。连接
+/// 使用非阻塞 libpq 握手建立，因此无论扩容
+/// 连接池还是查询都不会阻塞工作线程。
+///
+/// 用法：
+///   PgPool pool = new PgPool("127.0.0.1", 5432, "app", "postgres", "secret", 8);
+///   PgConnection db = await pool.AcquireAsync();
+///   DbResult r = await db.QueryAsync("SELECT 1");
+///   pool.Release(db);
+///   pool.Close();
+/// </summary>
+class PgPool {
+    string conninfo;
+    PoolCore<PgConnection> core;
+
+    PgPool(string conninfo, int maxSize) {
+        this.conninfo = conninfo;
+        this.core = new PoolCore<PgConnection>(maxSize);
+    }
+
+    /// 以主机/端口/库/用户/密码构造连接池（内部拼成 conninfo）。
+    PgPool(string host, int port, string database, string user,
+            string password, int maxSize) : this(
+                "host=" + host + " port=" + Convert.ToString(port)
+                + " dbname=" + database + " user=" + user
+                + " password=" + password, maxSize) {
+    }
+
+    /// 新建一条物理连接（池扩容时由 AcquireAsync 调用）；失败返回 null。
+    async PgConnection OpenOne() {
+        return await PgConnection.OpenAsync(this.conninfo);
+    }
+
+    /// <summary>借出连接：优先复用空闲连接，
+    /// 未达上限则新建，否则挂起协程直到有连接被归还。饱和等待有
+    /// 硬上限（见 <see cref="PoolWait"/>）：超时返回 null，绝不定死。
+    /// 连接池关闭后返回 null。</summary>
+    async PgConnection AcquireAsync() {
+        PoolWait wait = new PoolWait();
+        while (true) {
+            if (this.core.IsClosed()) {
+                return null;
+            }
+            PgConnection pooled = this.core.TakeIdle();
+            while (pooled != null) {
+                // 连接在停泊期间可能失效（服务器重启、空闲
+                // 超时）：将其驱逐，为等待者腾出槽位。
+                if (pooled.IsConnected()) {
+                    return pooled;
+                }
+                this.core.Drop(pooled);
+                pooled = this.core.TakeIdle();
+            }
+            // 上一次建连失败后退避：后端不可达时，若每次获取都重试建连，
+            // 失败本身就成了每请求的固定开销（失败的本地 open 也要约
+            // 125us），足以让命中路由的吞吐掉一个数量级。
+            if (this.core.OpenBlocked()) {
+                return null;
+            }
+            if (this.core.TryReserve()) {
+                PgConnection opened = await this.OpenOne();
+                if (opened == null || !opened.IsConnected()) {
+                    this.core.NoteOpenFailed();
+                    this.core.UndoReserve();
+                    return null;
+                }
+                this.core.NoteOpenOk();
+                this.core.Borrow(opened);
+                return opened;
+            }
+            // 连接池已满：交给共享的有界等待（见 PoolWait），
+            // 预算耗尽以 null 快速失败。
+            if (!await this.core.WaitForRelease(wait)) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>将连接归还连接池。已损坏或 Close() 之后的
+    /// 连接会被关闭销毁而不入池。</summary>
+    void Release(PgConnection c) {
+        if (c == null) {
+            return;
+        }
+        if (this.core.IsClosed() || !c.IsConnected()) {
+            c.Close();
+            this.core.Drop(c);
+            return;
+        }
+        this.core.Pool(c);
+    }
+
+    /// <summary>空闲（已入池、立即可用）连接数。</summary>
+    int IdleCount() {
+        return this.core.IdleCount();
+    }
+
+    /// <summary>存活连接总数（空闲 + 借出）。</summary>
+    int LiveCount() {
+        return this.core.LiveCount();
+    }
+
+    /// <summary>当前停泊等待连接的协程数。</summary>
+    int WaitingCount() {
+        return this.core.WaitingCount();
+    }
+
+    /// <summary>关闭所有空闲连接并标记连接池已关闭。仍
+    /// 被借出的连接在归还时关闭。</summary>
+    void Close() {
+        this.core.MarkClosed();
+        PgConnection c = this.core.TakeIdle();
+        while (c != null) {
+            c.Close();
+            this.core.Drop(c);
+            c = this.core.TakeIdle();
+        }
+        this.core.WakeAll();
+    }
+}

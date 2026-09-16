@@ -1,0 +1,266 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Tls;
+
+namespace System.Net.Https;
+
+/// <summary>
+/// 基于协程的 HTTPS（HTTP/1.1 over TLS）服务器。编程模型与
+/// <see cref="HttpServer"/> 相同，每个连接通过
+/// <see cref="TlsStream"/>（OpenSSL）进行 TLS 加密。
+///
+/// 用法：
+///   HttpsServer server = HttpsServer.Create("0.0.0.0", 8443,
+///                                           "cert.pem", "key.pem");
+///   server.OnRequest(HandleRequest);
+///   await server.Start();
+/// </summary>
+class HttpsServer {
+    TcpListener listener;
+    TlsContext tls;
+    string host;
+    int port;
+    bool running;
+    int activeConnections;
+    int maxConnections;
+    int maxRequestBytes;
+    int maxHeaderBytes;
+    int requestTimeoutMs;
+    HttpRequestHandler requestHandler;
+
+    /// <summary>私有构造：默认限额与 30 秒超时；用 <see cref="Create"/> 创建。</summary>
+    HttpsServer(string host, int port) {
+        this.host = host;
+        this.port = port;
+        this.running = false;
+        this.activeConnections = 0;
+        this.maxConnections = 10000;
+        this.maxRequestBytes = 1048576;
+        this.maxHeaderBytes = 16384;
+        this.requestTimeoutMs = 30000;
+        this.requestHandler = null;
+        this.tls = null;
+    }
+
+    /// <summary>从 PEM 证书链与 PEM 私钥创建 HTTPS 服务器；
+    /// 证书/私钥无法加载时返回 null。
+    /// </summary>
+    static HttpsServer Create(string host, int port, string certFile, string keyFile) {
+        HttpsServer server = new HttpsServer(host, port);
+        server.tls = TlsContext.CreateServer(certFile, keyFile);
+        if (server.tls == null) {
+            return null;
+        }
+        return server;
+    }
+
+    /// <summary>设置单个请求的最大可接受大小（字节），
+    /// （请求头 + 请求体）。</summary>
+    HttpsServer SetMaxRequestBytes(int bytes) {
+        this.maxRequestBytes = bytes;
+        return this;
+    }
+
+    /// <summary>设置请求头块的最大字节数，超过则返回 431。</summary>
+    HttpsServer SetMaxHeaderBytes(int bytes) {
+        this.maxHeaderBytes = bytes;
+        return this;
+    }
+
+    /// <summary>设置读取请求头和请求体的截止时间（毫秒）。
+    /// 0 表示禁用。默认 30 秒。</summary>
+    HttpsServer SetTimeout(int ms) {
+        this.requestTimeoutMs = ms;
+        return this;
+    }
+
+    /// <summary>注册每个传入请求都会调用的处理器。</summary>
+    HttpsServer OnRequest(HttpRequestHandler handler) {
+        this.requestHandler = handler;
+        return this;
+    }
+
+    /// <summary>启动 HTTPS 服务器事件循环。持续运行，在协程上
+    /// 接受并处理连接。</summary>
+    async void Start() {
+        Socket.Initialize();
+        this.listener = new TcpListener(this.host, this.port);
+        this.listener.Start();
+        this.running = true;
+
+        while (this.running) {
+            nint clientSock = await this.listener.AcceptAsync();
+            if (clientSock >= 0) {
+                if (this.activeConnections >= this.maxConnections) {
+                    // 与 HttpServer 同闸：TLS 连接各持 SSL/BIO 与缓冲，
+                    // 超限连接直接挂断，不为它做握手/堆协程。
+                    Socket.Close(clientSock);
+                    continue;
+                }
+                this.activeConnections = this.activeConnections + 1;
+                Task.Spawn(HandleConnection(clientSock));
+            }
+        }
+    }
+
+    /// <summary>设置最大并发连接数；超过上限的连接立即关闭（回 503 之前
+    /// 不做 TLS 握手——每个 TLS 连接都持有 SSL/BIO 与缓冲，必须像
+    /// HttpServer 一样设闸）。</summary>
+    HttpsServer SetMaxConnections(int max) {
+        this.maxConnections = max;
+        return this;
+    }
+
+    /// <summary>停止接受新连接：关闭监听套接字让挂起在
+    /// AcceptAsync 上的协程立即返回（只置 running 标志要等到
+    /// 下一条连接到达才会生效）。已建立的连接自然收尾。</summary>
+    void Stop() {
+        this.running = false;
+        if (this.listener != null) {
+            this.listener.Stop();
+        }
+    }
+
+    /// <summary>对一个客户端连接执行 TLS 握手，随后用与
+    /// <see cref="HttpServer.HandleConnection"/> 相同的帧解析
+    /// 服务其上的 HTTP/1.1 请求（支持 keep-alive 与流水线）。</summary>
+    async void HandleConnection(nint clientSock) {
+        // 握手/服务过程中任何一步抛出异常（处理器、TLS 层）都会跳过
+        // 顺序清理，泄漏 fd、TlsStream、framer 缓冲、deadline 槽位与
+        // 连接计数——计数不归还会让服务器在语义满载后拒绝一切新连接。
+        // 释放统一交给 finally，正常与异常路径共用。
+        this.activeConnections = this.activeConnections + 1;
+        try {
+            await this.HandleConnectionInner(clientSock);
+        } finally {
+            this.activeConnections = this.activeConnections - 1;
+        }
+    }
+
+    /// <summary>HandleConnection 的服务体；计数归还见 HandleConnection 的 finally。</summary>
+    async void HandleConnectionInner(nint clientSock) {
+        Socket.SetNonBlocking(clientSock);
+        // 握手阶段受同一个请求超时约束：沉默的对端不能借固定 30 秒
+        // 握手窗口绕过 SetTimeout。
+        TlsStream stream;
+        if (this.requestTimeoutMs > 0) {
+            stream = await TlsStream.AcceptAsync(this.tls, clientSock,
+                this.requestTimeoutMs);
+        } else {
+            stream = await TlsStream.AcceptAsync(this.tls, clientSock);
+        }
+        if (stream == null) {
+            Socket.Close(clientSock);
+            return;
+        }
+
+        // deadline/framer/stream 的释放交给下面的 try/finally；此前的
+        // 顺序清理会被任何异常（处理器抛出等）跳过。
+        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
+        bool keepAlive = true;
+        // 与明文 HTTP 用同一个拆包器（字节源换成 TLS 记录层）：跨包
+        // 头部/正文、流水线、含 NUL 的二进制正文、分块编码的定界规则
+        // 因此只有一份实现。
+        HttpFramer framer = HttpFramer.CreateTls(stream);
+        int reject = 0;
+
+        try {
+            while (keepAlive) {
+                int headerEnd = await framer.ReadHead(this.maxHeaderBytes);
+                if (headerEnd == -431) { reject = 431; break; }
+                if (headerEnd <= 0) { keepAlive = false; break; }
+
+                HttpRequest request = HttpRequest.Parse(framer.Head(headerEnd),
+                                                       headerEnd);
+                // 定界失败（Content-Length 溢出/重复不一致、非数字、
+                // 未实现的 Transfer-Encoding 等）→ 拒绝，不切分正文。
+                if (request.parseStatus != 0) {
+                    reject = request.parseStatus;
+                    break;
+                }
+                int bodyLen = request.contentLength;
+                if (bodyLen < 0) { bodyLen = 0; }
+                if (headerEnd + bodyLen > this.maxRequestBytes) { reject = 413; break; }
+                HttpDeadline.Touch(watch, this.requestTimeoutMs);
+                int bodyStatus = await framer.ReadBody(request,
+                    this.maxRequestBytes - headerEnd);
+                if (bodyStatus > 0) { reject = bodyStatus; break; }
+                if (bodyStatus < 0) { keepAlive = false; break; }
+                framer.Consume(framer.RequestBytes());
+                keepAlive = request.keepAlive;
+
+                HttpDeadline.Touch(watch, this.requestTimeoutMs);
+                HttpResponse response = await ProcessRequest(request);
+                response = response.SetKeepAlive(keepAlive);
+
+                // 与明文 HTTP 相同的二进制正文处理：SendAsync 按 strlen 定长，
+                // 正文里的 NUL 会把响应截断。二进制正文用 BuildHeaders +
+                // bodyBytes 按显式字节数分块发送（Content-Length 与发送长度
+                // 同取自 BodyLength）；ToStr 按长度复制，NUL 原样加密上线。
+                if (response.IsBinary()) {
+                    string head = response.BuildHeaders();
+                    int _h2 = await stream.SendAsync(head, head.Length);
+                    int blen = response.BodyLength();
+                    int off = 0;
+                    while (blen - off > 0) {
+                        int chunk = blen - off;
+                        if (chunk > 16384) { chunk = 16384; }
+                        string part = response.bodyBytes.ToStr(off, chunk);
+                        int _b2 = await stream.SendAsync(part, chunk);
+                        off = off + chunk;
+                    }
+                } else {
+                    string responseData = response.Build();
+                    int _sent = await stream.SendAsync(responseData,
+                                                      responseData.Length);
+                }
+                response.Dispose();
+                response = null;
+
+                if (!keepAlive) {
+                    break;
+                }
+            }
+
+            if (reject == 431) {
+                HttpResponse tooLarge = HttpResponse.WithStatus(431, "Request Header Fields Too Large", "header block exceeds limit");
+                tooLarge = tooLarge.SetKeepAlive(false);
+                string data = tooLarge.Build();
+                int _s = await stream.SendAsync(data, data.Length);
+            } else if (reject == 413) {
+                HttpResponse tooLarge = HttpResponse.WithStatus(413, "Payload Too Large", "request exceeds limit");
+                tooLarge = tooLarge.SetKeepAlive(false);
+                string data = tooLarge.Build();
+                int _s = await stream.SendAsync(data, data.Length);
+            } else if (reject == 400) {
+                // 定界冲突/畸形长度：请求走私拒绝，必须关闭连接。
+                HttpResponse bad = HttpResponse.WithStatus(400, "Bad Request",
+                    "malformed request framing");
+                bad = bad.SetKeepAlive(false);
+                string data = bad.Build();
+                int _b = await stream.SendAsync(data, data.Length);
+            } else if (reject == 501) {
+                HttpResponse nai = HttpResponse.WithStatus(501, "Not Implemented",
+                    "Transfer-Encoding is not supported");
+                nai = nai.SetKeepAlive(false);
+                string data = nai.Build();
+                int _n = await stream.SendAsync(data, data.Length);
+            }
+        } finally {
+            HttpDeadline.Disarm(watch);
+            framer.Dispose();
+            stream.Close();
+            Socket.Close(clientSock);
+        }
+    }
+
+    /// <summary>分发到 OnRequest 注册的处理器；未注册时返回占位页。</summary>
+    async HttpResponse ProcessRequest(HttpRequest request) {
+        HttpRequestHandler handler = this.requestHandler;
+        if (handler != null) {
+            return await handler(request);
+        }
+        return HttpResponse.Ok("<h1>Zan HTTPS Server</h1><p>Override ProcessRequest to handle routes.</p>");
+    }
+}

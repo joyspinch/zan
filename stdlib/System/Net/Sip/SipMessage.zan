@@ -1,0 +1,172 @@
+using System;
+
+namespace System.Net.Sip;
+
+/// <summary>
+/// 单条 SIP 消息（RFC 3261）：请求或响应、头部、可选正文。
+/// 这只是文本模型——事务/重传在
+/// SipClient 中，媒体（RTP/SDP 协商）不在范围内。
+/// </summary>
+class SipMessage {
+    bool isRequest;
+    string method;      // 请求："REGISTER"、"OPTIONS"、"INVITE" 等
+    string uri;         // 请求目标
+    int status;         // 响应：200、401、486 等
+    string reason;      // 响应原因短语
+    List<string> headerNames;
+    List<string> headerValues;
+    string body;
+
+    /// <summary>私有构造：空消息，由 <see cref="Request"/> / <see cref="Parse"/> 填充。</summary>
+    SipMessage() {
+        this.isRequest = false;
+        this.method = "";
+        this.uri = "";
+        this.status = 0;
+        this.reason = "";
+        this.headerNames = new List<string>();
+        this.headerValues = new List<string>();
+        this.body = "";
+    }
+
+    /// <summary>创建请求消息。</summary>
+    static SipMessage Request(string method, string uri) {
+        SipMessage m = new SipMessage();
+        m.isRequest = true;
+        m.method = method;
+        m.uri = uri;
+        return m;
+    }
+
+    /// <summary>添加头部（追加；SIP 允许重复，如 Via）。</summary>
+    SipMessage Add(string name, string headerValue) {
+        this.headerNames.Add(name);
+        this.headerValues.Add(headerValue);
+        return this;
+    }
+
+    /// <summary>头部（名称不区分大小写）的第一个值，没有则返回 ""。</summary>
+    string Header(string name) {
+        for (int i = 0; i < this.headerNames.Count; i = i + 1) {
+            if (SipMessage.NameEq(this.headerNames[i], name)) {
+                return this.headerValues[i];
+            }
+        }
+        return "";
+    }
+
+    /// <summary>头部名 ASCII 大小写不敏感相等比较。</summary>
+    static bool NameEq(string a, string b) {
+        if (a.Length != b.Length) { return false; }
+        for (int i = 0; i < a.Length; i = i + 1) {
+            int ca = a[i] & 255;
+            int cb = b[i] & 255;
+            if (ca >= 65 && ca <= 90) { ca = ca + 32; }
+            if (cb >= 65 && cb <= 90) { cb = cb + 32; }
+            if (ca != cb) { return false; }
+        }
+        return true;
+    }
+
+    /// <summary>序列化为线上形式（头部 + CRLF CRLF + 正文）。
+    /// Content-Length 自动生成。</summary>
+    string Serialize() {
+        StringBuilder sb = new StringBuilder();
+        if (this.isRequest) {
+            sb.Append(this.method);
+            sb.Append(" ");
+            sb.Append(this.uri);
+            sb.Append(" SIP/2.0\r\n");
+        } else {
+            sb.Append("SIP/2.0 ");
+            sb.Append(Convert.ToString(this.status));
+            sb.Append(" ");
+            sb.Append(this.reason);
+            sb.Append("\r\n");
+        }
+        for (int i = 0; i < this.headerNames.Count; i = i + 1) {
+            sb.Append(this.headerNames[i]);
+            sb.Append(": ");
+            sb.Append(this.headerValues[i]);
+            sb.Append("\r\n");
+        }
+        sb.Append("Content-Length: ");
+        sb.Append(Convert.ToString(this.body.Length));
+        sb.Append("\r\n\r\n");
+        sb.Append(this.body);
+        return sb.ToString();
+    }
+
+    /// <summary>解析线上消息；起始行不是 SIP 时返回 null。</summary>
+    static SipMessage Parse(string data) {
+        int lineEnd = SipMessage.FindCrlf(data, 0);
+        if (lineEnd < 0) { return null; }
+        string start = data.Substring(0, lineEnd);
+        SipMessage m = new SipMessage();
+        if (start.StartsWith("SIP/2.0 ")) {
+            m.isRequest = false;
+            // "SIP/2.0 200 OK"
+            string rest = start.Substring(8, start.Length - 8);
+            int sp = rest.IndexOf(" ");
+            if (sp < 0) {
+                m.status = Convert.ToInt32(rest);
+            } else {
+                m.status = Convert.ToInt32(rest.Substring(0, sp));
+                m.reason = rest.Substring(sp + 1, rest.Length - sp - 1);
+            }
+        } else {
+            // "OPTIONS sip:host SIP/2.0"
+            int sp1 = start.IndexOf(" ");
+            if (sp1 < 0) { return null; }
+            int sp2 = SipMessage.FindChar(start, 32, sp1 + 1);
+            if (sp2 < 0) { return null; }
+            if (!start.Substring(sp2 + 1, start.Length - sp2 - 1).StartsWith("SIP/2.0")) {
+                return null;
+            }
+            m.isRequest = true;
+            m.method = start.Substring(0, sp1);
+            m.uri = start.Substring(sp1 + 1, sp2 - sp1 - 1);
+        }
+        int pos = lineEnd + 2;
+        while (pos < data.Length) {
+            int e = SipMessage.FindCrlf(data, pos);
+            if (e < 0) { break; }
+            if (e == pos) {                       // 空行：正文紧随其后
+                m.body = data.Substring(pos + 2, data.Length - pos - 2);
+                break;
+            }
+            string line = data.Substring(pos, e - pos);
+            int colon = line.IndexOf(":");
+            if (colon > 0) {
+                string name = line.Substring(0, colon).Trim();
+                string val = line.Substring(colon + 1, line.Length - colon - 1).Trim();
+                m.headerNames.Add(name);
+                m.headerValues.Add(val);
+            }
+            pos = e + 2;
+        }
+        return m;
+    }
+
+    /// <summary>从 <paramref name="from"/> 起第一个字节 <paramref name="c"/> 的下标，
+    /// 不存在时返回 -1。</summary>
+    static int FindChar(string s, int c, int from) {
+        int i = from;
+        while (i < s.Length) {
+            if ((s[i] & 255) == c) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// <summary>从 <paramref name="from"/> 起第一个 CRLF 的下标，
+    /// 不存在时返回 -1。</summary>
+    static int FindCrlf(string s, int from) {
+        int i = from;
+        while (i + 1 < s.Length) {
+            if ((s[i] & 255) == 13 && (s[i + 1] & 255) == 10) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+}

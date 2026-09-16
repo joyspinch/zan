@@ -1,0 +1,302 @@
+using System;
+
+namespace System.Diagnostics;
+
+/// <summary>
+/// 当前进程的身份与权限状态，以及 UAC 提权启动。
+///
+/// Windows 上映射到进程 token API（提权检查、SID 查询、
+/// 特权启用、“runas”提权）；POSIX 上映射到 euid/root
+/// 检查与数字 uid。提权启动（RunAs / RunAsWait）在 Linux 上走
+/// polkit 的 pkexec，在 macOS 上走 osascript 的
+/// "with administrator privileges"；找不到提权工具时返回
+/// false / -1。EnablePrivilege 无 POSIX 对应物，仍抛出
+/// PlatformNotSupportedException，而不是静默失败。
+/// </summary>
+class Privileges {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetCurrentProcess")]
+    static extern nint WinGetCurrentProcess();
+
+    [DllImport("kernel32", EntryPoint = "OpenProcessToken")]
+    static extern int WinOpenProcessToken(nint proc, int access, nint token);
+
+    [DllImport("advapi32", EntryPoint = "GetTokenInformation")]
+    static extern int WinGetTokenInformation(nint token, int cls, nint info,
+                                             int infoLen, nint retLen);
+
+    [DllImport("advapi32", EntryPoint = "GetUserNameW")]
+    static extern int WinGetUserNameW(nint buf, nint size);
+
+    [DllImport("advapi32", EntryPoint = "LookupPrivilegeValueW")]
+    static extern int WinLookupPrivilegeValueW(nint system, nint name, nint luid);
+
+    [DllImport("advapi32", EntryPoint = "AdjustTokenPrivileges")]
+    static extern int WinAdjustTokenPrivileges(nint token, int disableAll,
+                                               nint newState, int bufLen,
+                                               nint prev, nint retLen);
+
+    [DllImport("advapi32", EntryPoint = "ConvertSidToStringSidW")]
+    static extern int WinConvertSidToStringSidW(nint sid, nint str);
+
+    [DllImport("advapi32", EntryPoint = "LocalFree")]
+    static extern nint WinLocalFree(nint mem);
+
+    [DllImport("kernel32", EntryPoint = "GetLastError")]
+    static extern int WinGetLastError();
+
+    [DllImport("shell32", EntryPoint = "ShellExecuteExW")]
+    static extern int WinShellExecuteExW(nint sei);
+
+    [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
+    static extern int WinWaitForSingleObject(nint handle, int ms);
+
+    [DllImport("kernel32", EntryPoint = "GetExitCodeProcess")]
+    static extern int WinGetExitCodeProcess(nint proc, nint code);
+
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    static extern int WinCloseHandle(nint handle);
+
+    /// 以请求的访问权限打开当前进程的 token；失败返回 0。
+    static nint OpenToken(int access) {
+        nint slot = NativeMemory.Alloc(8);
+        new Span<nint>(slot, 1)[0] = 0;
+        if (Privileges.WinOpenProcessToken(Privileges.WinGetCurrentProcess(),
+                                           access, slot) == 0) {
+            NativeMemory.Free(slot);
+            return 0;
+        }
+        nint h = new Span<nint>(slot, 1)[0];
+        NativeMemory.Free(slot);
+        return h;
+    }
+    #else
+    [DllImport("crt", EntryPoint = "geteuid")]
+    static extern int GetEuid();
+    #endif
+
+    /// <summary>当前进程以提权 token 运行时返回 true
+    /// （Windows：token 已提权；POSIX：euid == 0）。</summary>
+    static bool IsAdmin() {
+        #if WINDOWS
+        nint token = Privileges.OpenToken(0x0008 /*TOKEN_QUERY*/);
+        if (token == 0) { return false; }
+        nint info = NativeMemory.Alloc(8);
+        nint ret = NativeMemory.Alloc(4);
+        bool elevated = false;
+        if (Privileges.WinGetTokenInformation(token, 20 /*TokenElevation*/,
+                                              info, 8, ret) != 0) {
+            elevated = new Span<int>(info, 2)[0] != 0;
+        }
+        NativeMemory.Free(info);
+        NativeMemory.Free(ret);
+        Privileges.WinCloseHandle(token);
+        return elevated;
+        #else
+        return Privileges.GetEuid() == 0;
+        #endif
+    }
+
+    /// <summary>运行本进程的用户名（Windows 账户名；
+    /// POSIX：USER 环境变量）。未知时返回 ""。</summary>
+    static string UserName() {
+        #if WINDOWS
+        nint buf = NativeMemory.Alloc(256 * 2 + 2);
+        nint size = NativeMemory.Alloc(4);
+        new Span<int>(size, 1)[0] = 256;
+        string name = "";
+        if (Privileges.WinGetUserNameW(buf, size) != 0) {
+            name = Wide.Read(buf);
+        }
+        NativeMemory.Free(buf);
+        NativeMemory.Free(size);
+        return name;
+        #else
+        return Interop.EnvVar("USER");
+        #endif
+    }
+
+    /// <summary>当前用户的稳定标识：Windows 上为 SID 字符串
+    /// （"S-1-5-21-..."），POSIX 上为数字 uid 字符串。Windows 打开
+    /// token 失败时返回 ""。</summary>
+    static string UserSid() {
+        #if WINDOWS
+        nint token = Privileges.OpenToken(0x0008 /*TOKEN_QUERY*/);
+        if (token == 0) { return ""; }
+        nint info = NativeMemory.Alloc(256);
+        nint ret = NativeMemory.Alloc(4);
+        string sid = "";
+        if (Privileges.WinGetTokenInformation(token, 1 /*TokenUser*/,
+                                              info, 256, ret) != 0) {
+            // TOKEN_USER: { SID_AND_ATTRIBUTES { PSID Sid; DWORD Attr } }
+            nint psid = new Span<nint>(info, 32)[0];
+            nint str = NativeMemory.Alloc(8);
+            new Span<nint>(str, 1)[0] = 0;
+            if (Privileges.WinConvertSidToStringSidW(psid, str) != 0) {
+                nint pstr = new Span<nint>(str, 1)[0];
+                sid = Wide.Read(pstr);
+                Privileges.WinLocalFree(pstr);
+            }
+            NativeMemory.Free(str);
+        }
+        NativeMemory.Free(info);
+        NativeMemory.Free(ret);
+        Privileges.WinCloseHandle(token);
+        return sid;
+        #else
+        return Convert.ToString(Privileges.GetEuid());
+        #endif
+    }
+
+    /// <summary>在当前进程 token 上启用指定特权（如 "SeDebugPrivilege"）。
+    /// 特权成功启用时返回 true。仅 Windows；
+    /// POSIX 抛出 PlatformNotSupportedException。</summary>
+    static bool EnablePrivilege(string name) {
+        #if WINDOWS
+        nint token = Privileges.OpenToken(0x0020 /*TOKEN_ADJUST_PRIVILEGES*/);
+        if (token == 0) { return false; }
+        nint wname = Wide.Of(name);
+        nint luid = NativeMemory.Alloc(8);
+        bool ok = false;
+        if (Privileges.WinLookupPrivilegeValueW(0, wname, luid) != 0) {
+            // TOKEN_PRIVILEGES: count@0 (4), pad(4), Luid@8, Attributes@16
+            nint tp = NativeMemory.Alloc(32);
+            new Span<int>(tp, 8)[0] = 1;
+            new Span<long>(tp + 8, 2)[0] = new Span<long>(luid, 1)[0];
+            new Span<int>(tp + 16, 4)[0] = 0x00000002;   // SE_PRIVILEGE_ENABLED
+            int r = Privileges.WinAdjustTokenPrivileges(token, 0, tp, 0, 0, 0);
+            ok = (r != 0) &&
+                 (Privileges.WinGetLastError() == 0 /*ERROR_SUCCESS*/);
+            NativeMemory.Free(tp);
+        }
+        NativeMemory.Free(luid);
+        Wide.Free(wname);
+        Privileges.WinCloseHandle(token);
+        return ok;
+        #else
+        throw new PlatformNotSupportedException(
+            "Privileges.EnablePrivilege is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>以提权方式启动 `file`：Windows 弹 UAC 提示，Linux
+    /// 走 pkexec（由 polkit 代理弹框），macOS 走 osascript 的管理员
+    /// 提示。启动被接受时返回 true；用户拒绝或系统没有提权工具
+    /// 时返回 false。</summary>
+    /// <remarks>会调 shell；切勿传入不可信的 args（注入风险）。</remarks>
+    static bool RunAs(string file, string args) {
+        #if WINDOWS
+        return Privileges.ShellElevated(file, args, false) >= 0;
+        #else
+        string cmd = Privileges.ElevateCommand(file, args);
+        if (cmd == "") { return false; }
+        return Process.RunDetached(cmd) == 0;
+        #endif
+    }
+
+    /// <summary>以提权方式启动 `file` 并等待退出，返回
+    /// 其退出码（启动失败、被拒绝或本机无提权工具时为 -1）。
+    /// Linux 上 pkexec 的 126/127（拒绝/找不到程序）也统一报 -1，
+    /// 不会与子进程自身退出码混淆。</summary>
+    static int RunAsWait(string file, string args) {
+        #if WINDOWS
+        return Privileges.ShellElevated(file, args, true);
+        #else
+        string cmd = Privileges.ElevateCommand(file, args);
+        if (cmd == "") { return 0 - 1; }
+        ProcessResult r = Process.Capture(cmd);
+        // pkexec 用 126/127 表示“被拒绝 / 找不到程序”，与子进程
+        // 自己的退出码无关，这里统一报 -1。
+        if (r.exitCode == 126 || r.exitCode == 127) { return 0 - 1; }
+        return r.exitCode;
+        #endif
+    }
+
+    #if !WINDOWS
+    /// <summary>拼提权命令：macOS 用 osascript（AppleScript 字符串
+    /// 已做 \\ 与 " 转义），Linux 已是 root 时直接执行、否则用 pkexec，
+    /// 本机没有可用提权工具时返回 ""。</summary>
+    static string ElevateCommand(string file, string args) {
+        if (file == "") { return ""; }
+        string target = Privileges.ShellQuote(file);
+        if (args != "") { target = target + " " + args; }
+        #if MACOS
+        if (!Privileges.HasTool("osascript")) { return ""; }
+        // AppleScript 字符串里的 \ 和 " 需要转义，外层再用单引号
+        // 交给 shell。
+        string script = "do shell script \""
+            + target.Replace("\\", "\\\\").Replace("\"", "\\\"")
+            + "\" with administrator privileges";
+        return "osascript -e " + Privileges.ShellQuote(script);
+        #else
+        // 已经是 root 时无需提权；否则用 polkit 的 pkexec（由
+        // 桌面的 polkit 代理弹权限对话框）。
+        if (Privileges.IsAdmin()) { return target; }
+        if (Privileges.HasTool("pkexec")) { return "pkexec " + target; }
+        return "";
+        #endif
+    }
+
+    /// <summary>检测本机是否装有指定命令行工具（POSIX 专用，
+    /// command -v 探测）。</summary>
+    static bool HasTool(string name) {
+        ProcessResult r = Process.Capture(
+            "command -v " + Privileges.ShellQuote(name));
+        return r.exitCode == 0;
+    }
+
+    /// <summary>单引号引用：串内的 ' 拆成 '\\'' 以保持字面量（POSIX
+    /// shell 语义）。</summary>
+    static string ShellQuote(string s) {
+        return "'" + s.Replace("'", "'\\''") + "'";
+    }
+    #endif
+
+    #if WINDOWS
+    /// <summary>以 runas 动词和 SEE_MASK_NOCLOSEPROCESS 调用
+    /// ShellExecuteExW。`wait` 为 true 时阻塞并返回子进程退出码；
+    /// 否则成功时返回 0，ShellExecuteExW 失败返回 -1。</summary>
+    static int ShellElevated(string file, string args, bool wait) {
+        // SHELLEXECUTEINFOW (x64, 112 bytes): cbSize@0 fMask@4 hwnd@8
+        // verb@16 file@24 params@32 dir@40 nShow@48 hInst@56 idList@64
+        // class@72 hkey@80 hotkey@88 hIcon/hMonitor@96 hProcess@104
+        nint sei = NativeMemory.Alloc(112);
+        Span<long> zero = new Span<long>(sei, 14);
+        for (int zi = 0; zi < 14; zi = zi + 1) { zero[zi] = 0; }
+        new Span<int>(sei, 28)[0] = 112;              // cbSize
+        new Span<int>(sei, 28)[1] = 0x440;            // SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI
+        nint wverb = Wide.Of("runas");
+        nint wfile = Wide.Of(file);
+        nint wargs = Wide.Of(args);
+        nint wdir = Wide.Of("");
+        new Span<nint>(sei + 16, 12)[0] = wverb;
+        new Span<nint>(sei + 24, 11)[0] = wfile;
+        new Span<nint>(sei + 32, 10)[0] = wargs;
+        new Span<nint>(sei + 40, 9)[0] = wdir;
+        new Span<int>(sei + 48, 16)[0] = 1;           // SW_SHOWNORMAL
+        int code = -1;
+        if (Privileges.WinShellExecuteExW(sei) != 0) {
+            nint hProc = new Span<nint>(sei + 104, 1)[0];
+            if (hProc != 0) {
+                if (wait) {
+                    Privileges.WinWaitForSingleObject(hProc, 0x7FFFFFFF);
+                    nint exit = NativeMemory.Alloc(4);
+                    new Span<int>(exit, 1)[0] = 0;
+                    Privileges.WinGetExitCodeProcess(hProc, exit);
+                    code = new Span<int>(exit, 1)[0];
+                    NativeMemory.Free(exit);
+                } else {
+                    code = 0;
+                }
+                Privileges.WinCloseHandle(hProc);
+            }
+        }
+        NativeMemory.Free(sei);
+        Wide.Free(wdir);
+        Wide.Free(wargs);
+        Wide.Free(wfile);
+        Wide.Free(wverb);
+        return code;
+    }
+    #endif
+}

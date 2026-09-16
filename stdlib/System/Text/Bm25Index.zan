@@ -1,0 +1,259 @@
+using System;
+
+namespace System.Text;
+
+/// <summary>索引内的一篇文档：id、词频表与总词元长度。</summary>
+class Bm25Document {
+    /// 文档 id（调用方指定）。
+    int id;
+    /// 词元 -> 词频。
+    Dictionary<string, int> terms;
+    /// 词元总数（词频之和），BM25 长度归一用。
+    int length;
+
+    /// 构造文档记录。
+    Bm25Document(int id, Dictionary<string, int> terms, int length) {
+        this.id = id;
+        this.terms = terms;
+        this.length = length;
+    }
+}
+
+/// <summary>一次命中的内部记分记录。</summary>
+class Bm25Hit {
+    /// 文档 id。
+    int id;
+    /// BM25 分数。
+    double score;
+
+    /// 构造命中记录。
+    Bm25Hit(int id, double score) {
+        this.id = id;
+        this.score = score;
+    }
+}
+
+/// <summary>
+/// 一个轻量的内存 BM25（Best Matching 25）文本索引。文档按
+/// 分词（转小写、按非字母数字字符切分），并对照查询
+/// 用标准参数 k1=1.2、b=0.75 打分；返回结果
+/// 为按分数降序排列的文档 id。
+///
+///   Bm25Index idx = new Bm25Index();
+///   idx.Add(1, "the quick brown fox jumps");
+///   idx.Add(2, "lazy dog sleeps all day");
+///   List<int> hits = idx.Search("quick fox");   // [1]
+///
+/// 纯算法实现，无平台依赖；按 IDE 级语料规模设计
+/// （数千文档、小词元）——每次查询都会扫描全部文档。
+/// </summary>
+class Bm25Index {
+    /// 全部已索引文档。
+    List<Bm25Document> documents = new List<Bm25Document>();
+    /// 词元 -> 含它的文档数（文档频率）。
+    Dictionary<string, int> df = new Dictionary<string, int>();
+    /// 全部文档的词元长度之和。
+    int totalLen;
+    /// BM25 饱和参数 k1（1.2）。
+    double k1;
+    /// BM25 长度归一参数 b（0.75）。
+    double b;
+
+    /// 创建空索引，参数取标准值 k1=1.2、b=0.75。
+    Bm25Index() {
+        this.k1 = 1.2;
+        this.b = 0.75;
+        this.totalLen = 0;
+    }
+    /// <summary>添加文档。重复添加同一 id 会替换其内容。</summary>
+    void Add(int docId, string text) {
+        Dictionary<string, int> terms = Bm25Index.Tokenize(text);
+        int len = 0;
+        List<string> keys = terms.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            int f = terms[keys[i]];
+            len = len + f;
+        }
+        // 就地替换已存在的 id。
+        int pos = -1;
+        for (int j = 0; j < documents.Count; j = j + 1) {
+            if (documents[j].id == docId) { pos = j; }
+        }
+        if (pos >= 0) {
+            // 从 df 和总计数中减去旧文档。
+            List<string> old = documents[pos].terms.Keys;
+            for (int k = 0; k < old.Count; k = k + 1) {
+                DecDf(old[k]);
+            }
+            totalLen = totalLen - documents[pos].length;
+            documents[pos].terms = terms;
+            documents[pos].length = len;
+        } else {
+            documents.Add(new Bm25Document(docId, terms, len));
+        }
+        totalLen = totalLen + len;
+        // 统计每个词元的文档频率。
+        for (int k = 0; k < keys.Count; k = k + 1) {
+            IncDf(keys[k]);
+        }
+    }
+
+    /// <summary>删除一个文档 id；不存在时不作任何操作。</summary>
+    void Remove(int docId) {
+        int pos = -1;
+        for (int j = 0; j < documents.Count; j = j + 1) {
+            if (documents[j].id == docId) { pos = j; }
+        }
+        if (pos < 0) { return; }
+        List<string> old = documents[pos].terms.Keys;
+        for (int k = 0; k < old.Count; k = k + 1) {
+            DecDf(old[k]);
+        }
+        totalLen = totalLen - documents[pos].length;
+        documents.RemoveAt(pos);
+    }
+
+    /// <summary>已索引的文档数量。</summary>
+    int Count() { return documents.Count; }
+
+    /// <summary>对所有文档按 `query` 打分；分数非零的 id 才会被返回，
+    /// 分数从高到低。空查询返回空结果。</summary>
+    List<int> Search(string query) {
+        List<string> terms = Bm25Index.UniqueTerms(query);
+        List<int> results = new List<int>();
+        if (terms.Count == 0 || documents.Count == 0) { return results; }
+        double avgdl = (double)totalLen / (double)documents.Count;
+        int n = documents.Count;
+        List<Bm25Hit> hits = new List<Bm25Hit>();
+        for (int d = 0; d < documents.Count; d = d + 1) {
+            Bm25Document document = documents[d];
+            double score = 0.0;
+            for (int t = 0; t < terms.Count; t = t + 1) {
+                string term = terms[t];
+                int tf = 0;
+                Dictionary<string, int> dt = document.terms;
+                List<string> dk = dt.Keys;
+                for (int ki = 0; ki < dk.Count; ki = ki + 1) {
+                    if (dk[ki] == term) { tf = dt[term]; }
+                }
+                if (tf > 0) {
+                    int docFreq = DfOf(term);
+                    double idf = Math.Log(1.0 + ((double)(n - docFreq) + 0.5)
+                                                 / ((double)docFreq + 0.5));
+                    double denom = (double)tf
+                        + k1 * (1.0 - b
+                        + b * (double)document.length / avgdl);
+                    score = score + idf * (double)tf * (k1 + 1.0) / denom;
+                }
+            }
+            if (score > 0.0) {
+                // 按分数降序插入排序（同分时保持稳定）。
+                Bm25Hit hit = new Bm25Hit(document.id, score);
+                int ins = hits.Count;
+                hits.Add(hit);
+                while (ins > 0 && hits[ins - 1].score < score) {
+                    hits[ins] = hits[ins - 1];
+                    ins = ins - 1;
+                }
+                hits[ins] = hit;
+            }
+        }
+        for (int r = 0; r < hits.Count; r = r + 1) {
+            results.Add(hits[r].id);
+        }
+        return results;
+    }
+
+    // ---- 辅助 ----
+
+    /// 分词：转小写、按非字母数字字符切分，返回词元 -> 词频。
+    static Dictionary<string, int> Tokenize(string text) {
+        Dictionary<string, int> terms = new Dictionary<string, int>();
+        StringBuilder tok = new StringBuilder();
+        for (int i = 0; i < text.Length; i = i + 1) {
+            string ch = text.Substring(i, 1).ToLower();
+            int c = ch[0] & 255;
+            bool alnum = (c >= 97 && c <= 122) || (c >= 48 && c <= 57);
+            if (alnum) {
+                tok.Append(ch);
+            } else if (tok.ToString().Length > 0) {
+                Bm25Index.AddTerm(terms, tok.ToString());
+                tok = new StringBuilder();
+            }
+        }
+        if (tok.ToString().Length > 0) { Bm25Index.AddTerm(terms, tok.ToString()); }
+        return terms;
+    }
+
+    /// 查询分词并去重（保持首次出现顺序）。
+    static List<string> UniqueTerms(string query) {
+        List<string> terms = new List<string>();
+        Dictionary<string, int> seen = new Dictionary<string, int>();
+        Dictionary<string, int> all = Bm25Index.Tokenize(query);
+        List<string> keys = all.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string k = keys[i];
+            if (Bm25Index.GetSeen(seen, k) == 0) {
+                terms.Add(k);
+                seen[k] = 1;
+            }
+        }
+        return terms;
+    }
+
+    /// seen 字典的取值，缺失为 0。
+    static int GetSeen(Dictionary<string, int> seen, string key) {
+        List<string> keys = seen.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (keys[i] == key) { return seen[key]; }
+        }
+        return 0;
+    }
+
+    /// 词频表累加一次该词元。
+    static void AddTerm(Dictionary<string, int> terms, string term) {
+        List<string> keys = terms.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (keys[i] == term) {
+                terms[term] = terms[term] + 1;
+                return;
+            }
+        }
+        terms[term] = 1;
+    }
+
+    /// 词元的文档频率，缺失为 0。
+    int DfOf(string term) {
+        List<string> keys = df.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (keys[i] == term) { return df[term]; }
+        }
+        return 0;
+    }
+
+    /// 文档频率 +1（不存在则置 1）。
+    void IncDf(string term) {
+        List<string> keys = df.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (keys[i] == term) {
+                df[term] = df[term] + 1;
+                return;
+            }
+        }
+        df[term] = 1;
+    }
+
+    /// 文档频率 -1，减到 0 时移除。
+    void DecDf(string term) {
+        List<string> keys = df.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (keys[i] == term) {
+                int v = df[term] - 1;
+                if (v <= 0) { df.Remove(term); }
+                else { df[term] = v; }
+                return;
+            }
+        }
+    }
+}
+

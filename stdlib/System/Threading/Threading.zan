@@ -1,0 +1,1111 @@
+using System;
+
+namespace System.Threading;
+
+/// <summary>
+/// 无参数的线程入口点。可赋值 lambda、静态方法组或实例方法
+/// 组：<c>Thread.Start(() =&gt; { ... })</c>、<c>Thread.Start(Worker)</c>
+/// 或 <c>Thread.Start(new Job(1).Run)</c>。
+/// </summary>
+delegate void ThreadStart();
+
+/// <summary>
+/// 跨平台线程与同步原语。
+/// Windows 上使用 Win32 API，POSIX（Linux/macOS）上使用 libc 中的 pthreads。
+/// </summary>
+class Thread {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "Sleep")]
+    static extern void PlatSleep(int milliseconds);
+    #else
+    [DllImport("crt", EntryPoint = "usleep")]
+    static extern int PlatUsleep(int microseconds);
+    #endif
+
+    [DllImport("crt", EntryPoint = "zan_thread_start")]
+    static extern int PlatThreadStart(ThreadStart body);
+
+    [DllImport("crt", EntryPoint = "zan_thread_current_id")]
+    static extern long PlatCurrentThreadId();
+
+    /// <summary>
+    /// 在新的分离后台线程上运行 <paramref name="body"/> 并
+    /// 立即返回。静态方法组、实例方法组（接收者随闭包记录
+    /// 一起保留）与捕获 lambda 都可以；启动后不要再改
+    /// body 捕获到的可变状态，用原子操作或 App.Post 把结果
+    /// 安全地交回另一线程。线程成功启动返回 true。
+    /// </summary>
+    static bool Start(ThreadStart body) {
+        return Thread.PlatThreadStart(body) != 0;
+    }
+
+    /// <summary>让当前线程休眠指定的毫秒数。</summary>
+    static void Sleep(int milliseconds) {
+        #if WINDOWS
+        PlatSleep(milliseconds);
+        #else
+        PlatUsleep(milliseconds * 1000);
+        #endif
+    }
+
+    /// <summary>获取当前线程的 ID——同一进程内所有线程互不相同
+    /// （Windows 的 GetCurrentThreadId、Linux 的 TID、
+    /// macOS 的 pthread_threadid_np，由运行时 shim
+    /// zan_thread_current_id 统一提供）。此前 POSIX 分支
+    /// 误用 getpid()，让每个线程都拿到进程 ID，
+    /// 导致 Gui.Reactive.Dispatcher 把后台线程误判为
+    /// UI 线程而直接执行 GUI 操作。</summary>
+    static long CurrentId() {
+        return PlatCurrentThreadId();
+    }
+
+    /// <summary>异步休眠（Sleep 的包装）。</summary>
+    static void SleepAsync(int milliseconds) {
+        Sleep(milliseconds);
+    }
+}
+
+/// <summary>
+/// 用于线程同步的跨平台互斥锁。
+/// </summary>
+class Mutex {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "CreateMutexA")]
+    static extern nint WinCreateMutex(nint secAttrs, int initialOwner, string name);
+
+    [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
+    static extern int WinWaitForSingleObject(nint handle, int milliseconds);
+
+    [DllImport("kernel32", EntryPoint = "ReleaseMutex")]
+    static extern int WinReleaseMutex(nint handle);
+
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    static extern int WinCloseHandle(nint handle);
+    #else
+    /* The pthread mutex lives in a 64-byte calloc'd block; the block address
+     * travels as an nint so the whole Mutex API shares one handle type with
+     * the Windows branch (callers hold nint on every platform). */
+    [DllImport("crt", EntryPoint = "calloc")]
+    static extern nint PthreadCalloc(long count, long size);
+
+    [DllImport("crt", EntryPoint = "free")]
+    static extern void PthreadFree(nint ptr);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_init")]
+    static extern int PthreadMutexInit(nint mutex, nint attr);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_lock")]
+    static extern int PthreadMutexLock(nint mutex);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_unlock")]
+    static extern int PthreadMutexUnlock(nint mutex);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_destroy")]
+    static extern int PthreadMutexDestroy(nint mutex);
+    #endif
+
+    #if WINDOWS
+    /// 创建 Win32 互斥锁句柄（匿名，非初始占有）。
+    static nint Create() {
+        return WinCreateMutex(0, 0, "");
+    }
+
+    /// 无限阻塞加锁（配对 Unlock）。
+    static void Lock(nint handle) {
+        WinWaitForSingleObject(handle, -1);
+    }
+
+    /// 解锁。
+    static void Unlock(nint handle) {
+        WinReleaseMutex(handle);
+    }
+
+    /// 销毁并关闭句柄。
+    static void Destroy(nint handle) {
+        WinCloseHandle(handle);
+    }
+    #else
+    /// 创建 POSIX 互斥锁；句柄是内联存放 pthread_mutex_t 的
+    /// 64 字节块的地址。
+    static nint Create() {
+        nint mtx = PthreadCalloc(1, 64);
+        PthreadMutexInit(mtx, 0);
+        return mtx;
+    }
+
+    /// 无限阻塞加锁（配对 Unlock）。
+    static void Lock(nint handle) {
+        PthreadMutexLock(handle);
+    }
+
+    /// 解锁。
+    static void Unlock(nint handle) {
+        PthreadMutexUnlock(handle);
+    }
+
+    /// 销毁并释放内存。
+    static void Destroy(nint handle) {
+        PthreadMutexDestroy(handle);
+        PthreadFree(handle);
+    }
+    #endif
+}
+
+/// <summary>
+/// 跨平台信号量。
+/// </summary>
+class Semaphore {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "CreateSemaphoreA")]
+    static extern nint WinCreateSemaphore(nint secAttrs, int initialCount, int maxCount, string name);
+
+    [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
+    static extern int WinWaitForSingleObject(nint handle, int milliseconds);
+
+    [DllImport("kernel32", EntryPoint = "ReleaseSemaphore")]
+    static extern int WinReleaseSemaphore(nint handle, int releaseCount, nint prevCount);
+
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    static extern int WinCloseHandle(nint handle);
+    #elif MACOS
+    // macOS 没有未命名的 POSIX 信号量（sem_init 会设置 ENOSYS 并返回
+    // -1），因此改用 GCD dispatch 信号量。不透明的 dispatch_semaphore_t
+    // 指针以字符串句柄形式承载，与下方 Linux 的 sem_t*
+    // 约定一致。dispatch_* 位于 libSystem，由 -lc 解析。
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_create")]
+    static extern string MacSemCreate(int initValue);
+
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_wait")]
+    static extern int MacSemWait(string sem, long timeout);
+
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_signal")]
+    static extern int MacSemSignal(string sem);
+
+    [DllImport("crt", EntryPoint = "dispatch_release")]
+    static extern void MacSemRelease(string sem);
+
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_wait")]
+    static extern int MacSemWaitUntil(string sem, long deadline);
+
+    [DllImport("crt", EntryPoint = "dispatch_time")]
+    static extern long MacDispatchTime(long baseTime, long deltaNs);
+    #else
+    [DllImport("crt", EntryPoint = "calloc")]
+    static extern string SemCalloc(long count, long size);
+
+    [DllImport("crt", EntryPoint = "free")]
+    static extern void SemFree(string ptr);
+
+    [DllImport("crt", EntryPoint = "sem_init")]
+    static extern int SemInit(string sem, int pshared, int initValue);
+
+    [DllImport("crt", EntryPoint = "sem_wait")]
+    static extern int SemWait(string sem);
+
+    [DllImport("crt", EntryPoint = "sem_post")]
+    static extern int SemPost(string sem);
+
+    [DllImport("crt", EntryPoint = "sem_destroy")]
+    static extern int SemDestroy(string sem);
+
+    [DllImport("crt", EntryPoint = "sem_timedwait")]
+    static extern int SemTimedWait(string sem, nint absTime);
+
+    [DllImport("crt", EntryPoint = "clock_gettime")]
+    static extern int SemClockGettime(int clkId, nint tp);
+    #endif
+
+    #if WINDOWS
+    /// 创建信号量：initialCount 初始许可，maxCount 上限。
+    static nint Create(int initialCount, int maxCount) {
+        return WinCreateSemaphore(0, initialCount, maxCount, "");
+    }
+
+    /// 无限阻塞获取一个许可（配对 Release）。
+    static void Wait(nint handle) {
+        WinWaitForSingleObject(handle, -1);
+    }
+
+    /// <summary>最多等待 `timeoutMs` 毫秒获取一个许可。
+    /// 获取到返回 true；超时返回 false（此时不消耗许可）。
+    /// 负超时无限等待，0 则轮询。</summary>
+    static bool WaitFor(nint handle, int timeoutMs) {
+        return WinWaitForSingleObject(handle, timeoutMs) == 0;
+    }
+
+    /// 归还一个许可（超过 maxCount 时失败）。
+    static void Release(nint handle) {
+        WinReleaseSemaphore(handle, 1, 0);
+    }
+
+    /// 销毁并关闭句柄。
+    static void Destroy(nint handle) {
+        WinCloseHandle(handle);
+    }
+    #elif MACOS
+    /// 创建 GCD 信号量：initialCount 初始许可（maxCount 由 dispatch
+    /// 信号量语义忽略，仅为 API 对齐）。
+    static string Create(int initialCount, int maxCount) {
+        return MacSemCreate(initialCount);
+    }
+
+    /// 无限阻塞获取一个许可（配对 Release）。
+    static void Wait(string handle) {
+        MacSemWait(handle, -1);   // -1 表示 DISPATCH_TIME_FOREVER
+    }
+
+    /// 限时获取：获取到返回 true；超时返回 false（不消耗许可）。
+    /// 负超时无限等待。
+    static bool WaitFor(string handle, int timeoutMs) {
+        if (timeoutMs < 0) {
+            MacSemWait(handle, -1);
+            return true;
+        }
+        // dispatch_time(DISPATCH_TIME_NOW, delta) 以纳秒为单位。
+        long deadline = MacDispatchTime(0, (long)timeoutMs * 1000000);
+        return MacSemWaitUntil(handle, deadline) == 0;
+    }
+
+    /// 归还一个许可。
+    static void Release(string handle) {
+        MacSemSignal(handle);
+    }
+
+    /// 释放 dispatch 信号量。
+    static void Destroy(string handle) {
+        MacSemRelease(handle);
+    }
+    #else
+    /// 创建 POSIX 信号量：initialCount 初始许可（maxCount 由
+    /// sem_t 语义忽略，仅为 API 对齐）。
+    static string Create(int initialCount, int maxCount) {
+        string sem = SemCalloc(1, 64);
+        SemInit(sem, 0, initialCount);
+        return sem;
+    }
+
+    /// 无限阻塞获取一个许可（配对 Release）。
+    static void Wait(string handle) {
+        SemWait(handle);
+    }
+
+    /// 限时获取：获取到返回 true；超时返回 false（不消耗许可）。
+    /// 负超时无限等待。sem_timedwait 接受 ABSOLUTE CLOCK_REALTIME
+    /// 绝对截止时间，因此需读时钟再加上超时。
+    static bool WaitFor(string handle, int timeoutMs) {
+        if (timeoutMs < 0) {
+            SemWait(handle);
+            return true;
+        }
+        // sem_timedwait 接受 ABSOLUTE CLOCK_REALTIME 绝对截止时间，因此需读取
+        // 时钟再加上超时，而不是传入一个时长。
+        nint ts = NativeMemory.Alloc(16);
+        SemClockGettime(0, ts);
+        Span<long> f = new Span<long>(ts, 2);
+        long ns = f[1] + (long)timeoutMs * 1000000;
+        f[0] = f[0] + ns / 1000000000;
+        f[1] = ns % 1000000000;
+        int r = SemTimedWait(handle, ts);
+        NativeMemory.Free(ts);
+        return r == 0;
+    }
+
+    /// 归还一个许可。
+    static void Release(string handle) {
+        SemPost(handle);
+    }
+
+    /// 销毁并释放内存。
+    static void Destroy(string handle) {
+        SemDestroy(handle);
+        SemFree(handle);
+    }
+    #endif
+}
+
+/* 这里曾有第二个 `Stopwatch` 类（静态单调时钟：GetMicroseconds /
+ * GetMilliseconds），与 `System.Stopwatch`（原 System.Diagnostics）同名。
+ * 两者按 using 顺序各被一半调用方看见，而这一份还在用 B2 本应清零的
+ * `calloc`-as-string 手工拼 timespec 字节。两个静态方法已并入
+ * `stdlib/System/Stopwatch.zan`（高分辨率 QPC / clock_gettime 源，先除后乘
+ * 避免溢出），此处删除。调用方都带 `using System;`，写法不变。 */
+
+/// <summary>
+/// 用于 worker 线程间共享的顺序一致 64 位整数。
+/// </summary>
+class AtomicInt {
+    nint handle;
+
+    [DllImport("crt", EntryPoint = "zan_atomic_int_create")]
+    static extern nint NativeCreate(long initialValue);
+
+    [DllImport("crt", EntryPoint = "zan_atomic_int_destroy")]
+    static extern void NativeDestroy(nint handle);
+
+    [DllImport("crt", EntryPoint = "zan_atomic_int_load")]
+    static extern long NativeLoad(nint handle);
+
+    [DllImport("crt", EntryPoint = "zan_atomic_int_store")]
+    static extern void NativeStore(nint handle, long newValue);
+
+    [DllImport("crt", EntryPoint = "zan_atomic_int_exchange")]
+    static extern long NativeExchange(nint handle, long newValue);
+
+    [DllImport("crt", EntryPoint = "zan_atomic_int_compare_exchange")]
+    static extern long NativeCompareExchange(nint handle, long expected, long desired);
+
+    [DllImport("crt", EntryPoint = "zan_atomic_int_add")]
+    static extern long NativeAdd(nint handle, long delta);
+
+    /// 创建初始值为 initialValue 的原子整数。
+    AtomicInt(long initialValue) {
+        this.handle = NativeCreate(initialValue);
+    }
+
+    /// 析构时销毁底层原子变量。
+    ~AtomicInt() {
+        if (this.handle != 0) {
+            NativeDestroy(this.handle);
+            this.handle = 0;
+        }
+    }
+
+    /// 底层句柄是否创建成功（0 = 无效）。
+    bool IsValid() {
+        return this.handle != 0;
+    }
+
+    /// 顺序一致读取当前值。
+    long Load() {
+        return NativeLoad(this.handle);
+    }
+
+    /// 顺序一致写入新值。
+    void Store(long newValue) {
+        NativeStore(this.handle, newValue);
+    }
+
+    /// 原子换入新值，返回旧值。
+    long Exchange(long newValue) {
+        return NativeExchange(this.handle, newValue);
+    }
+
+    /// 当前值 == expected 时换入 desired；返回旧值（== expected
+    /// 表示成功）。
+    long CompareExchange(long expected, long desired) {
+        return NativeCompareExchange(this.handle, expected, desired);
+    }
+
+    /// 原子加 delta，返回加后的新值。
+    long Add(long delta) {
+        return NativeAdd(this.handle, delta);
+    }
+
+    /// 原子 +1，返回新值。
+    long Increment() {
+        return NativeAdd(this.handle, 1);
+    }
+
+    /// 原子 -1，返回新值。
+    long Decrement() {
+        return NativeAdd(this.handle, -1);
+    }
+}
+
+/// <summary>
+/// 由命名共享内存支持的固定容量、固定模式的哈希表。
+/// 每个操作在线程与进程间都是原子的。
+/// </summary>
+class SharedTable {
+    nint handle;
+    string tableName;
+    int tableCapacity;
+    int tableKeySize;
+    string tableSchema;
+    string tableLabel;
+
+    // Every table this process has mapped, by handle, so the server can report
+    // what shared memory it is holding. Only the handle is kept: holding the
+    // object would keep the mapping alive for the life of the process.
+    static List<string> openLabels = null;
+    static List<nint> openHandles = null;
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_create")]
+    static extern nint NativeCreate(string name, int capacity, int keySize, string schema);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_open")]
+    static extern nint NativeOpen(string name);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_create_anon")]
+    static extern nint NativeCreateAnon(int capacity, int keySize, string schema);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_handle")]
+    static extern long NativeOsHandle(nint handle);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_attach")]
+    static extern nint NativeAttach(long osHandle);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_close")]
+    static extern void NativeClose(nint handle);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_destroy")]
+    static extern int NativeDestroy(nint handle);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_set_int")]
+    static extern int NativeSetInt(nint handle, string key, string column, long newValue);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_get_int")]
+    static extern long NativeGetInt(nint handle, string key, string column);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_set_float")]
+    static extern int NativeSetFloat(nint handle, string key, string column, double newValue);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_get_float")]
+    static extern double NativeGetFloat(nint handle, string key, string column);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_set_string")]
+    static extern int NativeSetString(nint handle, string key, string column, string newValue);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_get_string")]
+    static extern string NativeGetString(nint handle, string key, string column);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_increment")]
+    static extern long NativeIncrement(nint handle, string key, string column, long delta);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_expire")]
+    static extern int NativeExpire(nint handle, string key, long ttlMs);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_expire_at")]
+    static extern int NativeExpireAt(nint handle, string key, long unixMs);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_expires_at")]
+    static extern long NativeExpiresAt(nint handle, string key);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_purge_expired")]
+    static extern long NativePurgeExpired(nint handle, long nowMs);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_rate_allow")]
+    static extern int NativeRateAllow(
+        nint handle, string key, long nowMs, long windowMs, long limit);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_lock_acquire")]
+    static extern int NativeLockAcquire(
+        nint handle, string key, long owner, long nowMs, long leaseMs);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_lock_release")]
+    static extern int NativeLockRelease(nint handle, string key, long owner);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_delete")]
+    static extern int NativeDelete(nint handle, string key);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_exists")]
+    static extern int NativeExists(nint handle, string key);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_count")]
+    static extern long NativeCount(nint handle);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_clear")]
+    static extern void NativeClear(nint handle);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_hash")]
+    static extern long NativeHash(string text);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_stat")]
+    static extern long NativeStat(nint handle, int what);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_set_int_at")]
+    static extern int NativeSetIntAt(nint handle, long keyHash, string column, long newValue);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_get_int_at")]
+    static extern long NativeGetIntAt(nint handle, long keyHash, string column);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_increment_at")]
+    static extern long NativeIncrementAt(nint handle, long keyHash, string column, long delta);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_extreme_at")]
+    static extern long NativeExtremeAt(
+        nint handle, long keyHash, string column, long newValue, long keepLarger);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_set_string_at")]
+    static extern int NativeSetStringAt(nint handle, long keyHash, string column, string newValue);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_get_string_at")]
+    static extern string NativeGetStringAt(nint handle, long keyHash, string column);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_match_at")]
+    static extern int NativeMatchAt(nint handle, long keyHash, string column, string text);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_exists_at")]
+    static extern int NativeExistsAt(nint handle, long keyHash);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_delete_at")]
+    static extern int NativeDeleteAt(nint handle, long keyHash);
+
+    /// 创建一张未打开的表对象；随后用 KeySize/Column* 声明结构，
+    /// 再 Create/Open。
+    SharedTable(string name, int capacity) {
+        this.handle = 0;
+        this.tableName = name;
+        this.tableCapacity = capacity;
+        this.tableKeySize = 64;
+        this.tableSchema = "";
+        this.tableLabel = name;
+    }
+
+    /// <summary>给这张表一个便于识别的名字，用于状态输出。匿名表没有
+    /// 名字，不设置就显示为 "(anonymous)"。</summary>
+    void Label(string text) {
+        this.tableLabel = text;
+        if (this.handle != 0) {
+            Track(this);
+        }
+    }
+
+    /// 把已打开的表登记进本进程的打开表列表（Create/Open/Attach/Label
+    /// 都会走到；重复登记只更新标签）。
+    static void Track(SharedTable table) {
+        if (table.handle == 0) { return; }
+        if (SharedTable.openHandles == null) {
+            SharedTable.openHandles = new List<nint>();
+            SharedTable.openLabels = new List<string>();
+        }
+        string label = table.tableLabel;
+        if (label == "") { label = "(anonymous)"; }
+        for (int i = 0; i < SharedTable.openHandles.Count; i = i + 1) {
+            if (SharedTable.openHandles[i] == table.handle) {
+                SharedTable.openLabels[i] = label;
+                return;
+            }
+        }
+        SharedTable.openHandles.Add(table.handle);
+        SharedTable.openLabels.Add(label);
+    }
+
+    /// 把句柄从本进程的打开表列表移除。
+    static void Untrack(nint handle) {
+        if (SharedTable.openHandles == null) { return; }
+        for (int i = 0; i < SharedTable.openHandles.Count; i = i + 1) {
+            if (SharedTable.openHandles[i] == handle) {
+                SharedTable.openHandles.RemoveAt(i);
+                SharedTable.openLabels.RemoveAt(i);
+                return;
+            }
+        }
+    }
+
+    /// 析构兜底：未显式 Close 时在此关闭映射；正常路径仍应显式 Close。
+    ~SharedTable() {
+        Close();
+    }
+
+    /// 键的最大字节数（Create 前设置；默认 64）。
+    void KeySize(int size) {
+        this.tableKeySize = size;
+    }
+
+    /// 声明一个整型列（Create 前调用）。
+    void ColumnInt(string name) {
+        this.tableSchema = this.tableSchema + "i:" + name + ";";
+    }
+
+    /// 声明一个浮点列（Create 前调用）。
+    void ColumnFloat(string name) {
+        this.tableSchema = this.tableSchema + "f:" + name + ";";
+    }
+
+    /// 声明一个定长字符串列，`size` 为最大字节数（Create 前调用）。
+    void ColumnString(string name, int size) {
+        this.tableSchema = this.tableSchema + "s:" +
+            Convert.ToString(size) + ":" + name + ";";
+    }
+
+    /// 按已声明的名字/容量/键宽/列结构创建共享表。
+    bool Create() {
+        if (this.handle != 0) {
+            return false;
+        }
+        this.handle = NativeCreate(
+            this.tableName, this.tableCapacity, this.tableKeySize, this.tableSchema);
+        Track(this);
+        return this.handle != 0;
+    }
+
+    /// 打开本机上一张按名字创建的共享表（先 Create 成功的另一
+    /// 进程/本进程再打开）。失败时返回未打开的表（IsOpen()=false）。
+    static SharedTable Open(string name) {
+        SharedTable table = new SharedTable(name, 1);
+        table.handle = NativeOpen(name);
+        Track(table);
+        return table;
+    }
+
+    /// <summary>建一张匿名表：不占用任何全局命名空间，机器上的其它程序
+    /// 既打不开也读不到，也不会在文件系统里留下东西——最后一个引用消失
+    /// （包括进程被强杀）内核就回收。子进程要用它，只能由建表的进程把
+    /// OsHandle() 传下去（子进程继承该句柄/描述符），再用 Attach() 映射
+    /// 同一块内存，就像 fork 出来的那样。
+    ///
+    /// 因此必须在派生子进程之前建好：之后才建的表，已有的子进程拿不到。</summary>
+    bool CreateAnonymous() {
+        if (this.handle != 0) {
+            return false;
+        }
+        this.handle = NativeCreateAnon(
+            this.tableCapacity, this.tableKeySize, this.tableSchema);
+        Track(this);
+        return this.handle != 0;
+    }
+
+    /// <summary>匿名表要交给子进程的句柄（POSIX 是文件描述符，Windows 是
+    /// 可继承 HANDLE）。按名字建的表返回 0：它本来就按名字打开。</summary>
+    long OsHandle() {
+        return NativeOsHandle(this.handle);
+    }
+
+    /// <summary>子进程侧：映射父进程建好并继承下来的匿名表。表的结构写在
+    /// 内存自身的头部，所以不用重复声明列；句柄不是一张本版本的表时返回
+    /// 未打开的表。</summary>
+    static SharedTable Attach(long osHandle) {
+        SharedTable table = new SharedTable("", 1);
+        table.handle = NativeAttach(osHandle);
+        Track(table);
+        return table;
+    }
+
+    /// 表是否已成功创建/打开/附加。
+    bool IsOpen() {
+        return this.handle != 0;
+    }
+
+    /// 关闭本进程的映射；底层具名表仍然存在，其他进程不受影响。
+    void Close() {
+        if (this.handle != 0) {
+            nint current = this.handle;
+            this.handle = 0;
+            Untrack(current);
+            NativeClose(current);
+        }
+    }
+
+    /// 关闭并销毁底层具名表（匿名表随引用消失，无需 Destroy）。
+    bool Destroy() {
+        if (this.handle == 0) {
+            return false;
+        }
+        nint current = this.handle;
+        this.handle = 0;
+        Untrack(current);
+        return NativeDestroy(current) != 0;
+    }
+
+    /// 写整型列；键或列不存在时返回 false。
+    bool SetInt(string key, string column, long newValue) {
+        return NativeSetInt(this.handle, key, column, newValue) != 0;
+    }
+
+    /// 读整型列；键不存在返回 0。
+    long GetInt(string key, string column) {
+        return NativeGetInt(this.handle, key, column);
+    }
+
+    /// 写浮点列。
+    bool SetFloat(string key, string column, double newValue) {
+        return NativeSetFloat(this.handle, key, column, newValue) != 0;
+    }
+
+    /// 读浮点列。
+    double GetFloat(string key, string column) {
+        return NativeGetFloat(this.handle, key, column);
+    }
+
+    /// 写字符串列。
+    bool SetString(string key, string column, string newValue) {
+        return NativeSetString(this.handle, key, column, newValue) != 0;
+    }
+
+    /// 读字符串列；键不存在返回 ""。
+    string GetString(string key, string column) {
+        string text = NativeGetString(this.handle, key, column);
+        return text.Substring(0, text.Length);
+    }
+
+    /// 原子加 delta（跨线程/进程），返回加后的新值。
+    long Increment(string key, string column, long delta) {
+        return NativeIncrement(this.handle, key, column, delta);
+    }
+
+    /// 原子减 delta（Increment 的取负快捷方式）。
+    long Decrement(string key, string column, long delta) {
+        return NativeIncrement(this.handle, key, column, -delta);
+    }
+
+    /// 给键设置 TTL：ttlMs 毫秒后过期。
+    bool Expire(string key, long ttlMs) {
+        return NativeExpire(this.handle, key, ttlMs) != 0;
+    }
+
+    /// 给键设置绝对过期时间（Unix 毫秒）。
+    bool ExpireAt(string key, long unixMs) {
+        return NativeExpireAt(this.handle, key, unixMs) != 0;
+    }
+
+    /// 移除键的过期时间（永不过期）。
+    bool Persist(string key) {
+        return NativeExpireAt(this.handle, key, 0) != 0;
+    }
+
+    /// 键的绝对过期时间（Unix 毫秒；无 TTL = 0）。
+    long ExpiresAt(string key) {
+        return NativeExpiresAt(this.handle, key);
+    }
+
+    /// 清理此刻已过期的键，返回清理的行数。
+    long PurgeExpired(long nowMs) {
+        return NativePurgeExpired(this.handle, nowMs);
+    }
+
+    /// 固定窗口限流：`windowMs` 窗口内第 limit+1 次起拒绝。
+    /// 允许返回 true（并计数）。跨进程原子。
+    bool RateAllow(string key, long nowMs, long windowMs, long limit) {
+        return NativeRateAllow(this.handle, key, nowMs, windowMs, limit) != 0;
+    }
+
+    /// 尝试获取键上的租约锁：`leaseMs` 内不续租自动过期。
+    /// owner 用于归属校验（谁加的锁谁解）。
+    bool TryAcquireLease(string key, long owner, long nowMs, long leaseMs) {
+        return NativeLockAcquire(this.handle, key, owner, nowMs, leaseMs) != 0;
+    }
+
+    /// 释放 owner 持有的租约锁。
+    bool ReleaseLease(string key, long owner) {
+        return NativeLockRelease(this.handle, key, owner) != 0;
+    }
+
+    /// 删除键。
+    bool Delete(string key) {
+        return NativeDelete(this.handle, key) != 0;
+    }
+
+    /// 键是否存在。
+    bool Exists(string key) {
+        return NativeExists(this.handle, key) != 0;
+    }
+
+    /// 当前行数。
+    int Count() {
+        return (int)NativeCount(this.handle);
+    }
+
+    /// 清空所有行（保留结构与容量）。
+    void Clear() {
+        NativeClear(this.handle);
+    }
+
+    // ---- 内存占用 ----
+    //
+    // 表在创建时就按容量预留了整块映射，但一页只有在有行落在上面时
+    // 才会真正进入物理内存。因此「预留」远大于「占用」是正常的：
+    // 报告内存时必须用 Resident，而不是 Reserved。
+
+    /// Stat 项：整块映射的预留大小（字节）。
+    static int STAT_RESERVED = 0;
+    /// Stat 项：本进程驻留物理内存的部分（字节），不支持时为 -1。
+    static int STAT_RESIDENT = 1;
+    /// Stat 项：表的行容量（向上取整到 2 的幂）。
+    static int STAT_CAPACITY = 2;
+    /// Stat 项：当前行数。
+    static int STAT_COUNT = 3;
+    /// Stat 项：每行字节数（键 + 各列 + 行头）。
+    static int STAT_ROW_STRIDE = 4;
+    /// Stat 项：键的最大字节数。
+    static int STAT_KEY_SIZE = 5;
+    /// Stat 项：列数。
+    static int STAT_COLUMNS = 6;
+
+    /// <summary>整块映射的大小（预留的虚拟地址空间，不是内存占用）。</summary>
+    long ReservedBytes() {
+        return NativeStat(this.handle, SharedTable.STAT_RESERVED);
+    }
+
+    /// <summary>本进程真正驻留在物理内存中的部分；平台不支持时为 -1。</summary>
+    long ResidentBytes() {
+        return NativeStat(this.handle, SharedTable.STAT_RESIDENT);
+    }
+
+    /// <summary>表能容纳的行数（向上取整到 2 的幂）。</summary>
+    int Capacity() {
+        return (int)NativeStat(this.handle, SharedTable.STAT_CAPACITY);
+    }
+
+    /// <summary>每行占用的字节数（键 + 各列 + 行头）。</summary>
+    int RowStride() {
+        return (int)NativeStat(this.handle, SharedTable.STAT_ROW_STRIDE);
+    }
+
+    /// <summary>键的最大字节数。</summary>
+    int KeyBytes() {
+        return (int)NativeStat(this.handle, SharedTable.STAT_KEY_SIZE);
+    }
+
+    /// 列数。
+    int ColumnCount() {
+        return (int)NativeStat(this.handle, SharedTable.STAT_COLUMNS);
+    }
+
+    // ---- 本进程映射的所有表 ----
+
+    /// <summary>本进程当前映射着的共享表数量。</summary>
+    static int OpenCount() {
+        if (SharedTable.openHandles == null) { return 0; }
+        return SharedTable.openHandles.Count;
+    }
+
+    /// 第 `index` 张表的标签（Label() 设置的名字）。
+    static string OpenLabel(int index) {
+        if (SharedTable.openLabels == null) { return ""; }
+        if (index < 0 || index >= SharedTable.openLabels.Count) { return ""; }
+        return SharedTable.openLabels[index];
+    }
+
+    /// <summary>第 `index` 张表的某项统计，取值见 STAT_* 常量。</summary>
+    static long OpenStat(int index, int what) {
+        if (SharedTable.openHandles == null) { return 0; }
+        if (index < 0 || index >= SharedTable.openHandles.Count) { return 0; }
+        return NativeStat(SharedTable.openHandles[index], what);
+    }
+
+    /// 左对齐补空格到 width 宽，再追加一个空格作列间隔。
+    static string StatPad(string s, int width) {
+        string t = s;
+        while (t.Length < width) { t = t + " "; }
+        return t + " ";
+    }
+
+    /// 字节数的人类可读形式（B/KB/MB，整除截断）；负数返回 "n/a"。
+    static string StatBytes(long bytes) {
+        if (bytes < 0) { return "n/a"; }
+        if (bytes < 1024) { return Convert.ToString(bytes) + "B"; }
+        if (bytes < 1048576) {
+            return Convert.ToString(bytes / 1024) + "KB";
+        }
+        return Convert.ToString(bytes / 1048576) + "MB";
+    }
+
+    /// <summary>本进程所有共享表的一张文本表格：行数、每行大小、预留的
+    /// 映射大小，以及真正驻留在内存中的部分。</summary>
+    static string StatusText() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(StatPad("shared table", 24) + StatPad("rows", 16)
+            + StatPad("row size", 10) + StatPad("reserved", 12)
+            + "in memory\n");
+        int n = SharedTable.OpenCount();
+        if (n == 0) {
+            sb.Append("(none)\n");
+            return sb.ToString();
+        }
+        long totalReserved = 0;
+        long totalResident = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            long reserved = SharedTable.OpenStat(i, SharedTable.STAT_RESERVED);
+            long resident = SharedTable.OpenStat(i, SharedTable.STAT_RESIDENT);
+            totalReserved = totalReserved + reserved;
+            if (resident > 0) { totalResident = totalResident + resident; }
+            string rows = Convert.ToString(
+                    SharedTable.OpenStat(i, SharedTable.STAT_COUNT))
+                + "/" + Convert.ToString(
+                    SharedTable.OpenStat(i, SharedTable.STAT_CAPACITY));
+            sb.Append(StatPad(SharedTable.OpenLabel(i), 24)
+                + StatPad(rows, 16)
+                + StatPad(Convert.ToString(
+                    SharedTable.OpenStat(i, SharedTable.STAT_ROW_STRIDE)), 10)
+                + StatPad(SharedTable.StatBytes(reserved), 12)
+                + SharedTable.StatBytes(resident) + "\n");
+        }
+        sb.Append(StatPad("total", 24) + StatPad("", 16) + StatPad("", 10)
+            + StatPad(SharedTable.StatBytes(totalReserved), 12)
+            + SharedTable.StatBytes(totalResident) + "\n");
+        return sb.ToString();
+    }
+
+    // ---- 按预计算哈希寻址的行 ----
+    //
+    // 请求处理器只需哈希一次键（如 "GET_/user/list"），并将该值
+    // 传给其接触的每个表，这样键永远不会被格式化成
+    // 字符串，也不比较任何键字节。行随后仅由哈希标识：
+    // 使用表时要么按键要么按哈希，不可混用；若冲突可能造成危险，
+    // 就把原始文本保留在一个列中。
+
+    /// <summary>用与表相同的方式哈希键（FNV-1a，64 位）。</summary>
+    static long Hash(string text) {
+        return NativeHash(text);
+    }
+
+    /// 按哈希写整型列。
+    bool SetIntAt(long keyHash, string column, long newValue) {
+        return NativeSetIntAt(this.handle, keyHash, column, newValue) != 0;
+    }
+
+    /// 按哈希读整型列。
+    long GetIntAt(long keyHash, string column) {
+        return NativeGetIntAt(this.handle, keyHash, column);
+    }
+
+    /// 按哈希原子加 delta。
+    long IncrementAt(long keyHash, string column, long delta) {
+        return NativeIncrementAt(this.handle, keyHash, column, delta);
+    }
+
+    /// <summary>若 `newValue` 小于当前值则存入（0 视为未设置），
+    /// 一步原子完成。用于记录“目前最快响应”。</summary>
+    long MinAt(long keyHash, string column, long newValue) {
+        return NativeExtremeAt(this.handle, keyHash, column, newValue, 0);
+    }
+
+    /// <summary>若 `newValue` 大于当前值则存入，
+    /// 一步原子完成。用于记录“目前最慢响应”。</summary>
+    long MaxAt(long keyHash, string column, long newValue) {
+        return NativeExtremeAt(this.handle, keyHash, column, newValue, 1);
+    }
+
+    /// 按哈希写字符串列。
+    bool SetStringAt(long keyHash, string column, string newValue) {
+        return NativeSetStringAt(this.handle, keyHash, column, newValue) != 0;
+    }
+
+    /// 按哈希读字符串列。
+    string GetStringAt(long keyHash, string column) {
+        string text = NativeGetStringAt(this.handle, keyHash, column);
+        return text.Substring(0, text.Length);
+    }
+
+    /// <summary>判断某字符串列是否等于 `text`，不把
+    /// 存储的字节复制出来。否则每次查找校验键的原始文本都会
+    /// 为每次调用分配一个字符串。</summary>
+    bool MatchAt(long keyHash, string column, string text) {
+        return NativeMatchAt(this.handle, keyHash, column, text) != 0;
+    }
+
+    /// 哈希寻址的键是否存在。
+    bool ExistsAt(long keyHash) {
+        return NativeExistsAt(this.handle, keyHash) != 0;
+    }
+
+    /// 删除哈希寻址的键。
+    bool DeleteAt(long keyHash) {
+        return NativeDeleteAt(this.handle, keyHash) != 0;
+    }
+}
+
+/// <summary>
+/// 用于协程间通信的协程感知 channel。
+/// 平台无关（纯 Zan 实现）。容量为 0 表示无界；
+/// 正容量表示有界缓冲；<see cref="CreateUnbuffered"/>
+/// 创建容量为 1 的 channel（阻塞当且仅当缓冲已满）。
+/// </summary>
+class Channel {
+    List<string> buffer;
+    int capacity;
+    bool closed;
+    int sendWaiters;
+    int recvWaiters;
+    Gate sendGate;
+    Gate recvGate;
+    nint lockHandle;
+
+    /// 创建指定容量的 channel（容量语义见类注释：0 无界，
+    /// 正值有界，1 即 CreateUnbuffered）。
+    Channel(int capacity) {
+        this.buffer = new List<string>();
+        this.capacity = capacity;
+        this.closed = false;
+        this.sendWaiters = 0;
+        this.recvWaiters = 0;
+        this.sendGate = new Gate();
+        this.recvGate = new Gate();
+        this.lockHandle = Mutex.Create();
+    }
+
+    /// <summary>创建无缓冲 channel。</summary>
+    static Channel CreateUnbuffered() {
+        return new Channel(1);
+    }
+
+    /// <summary>向 channel 发送一个值（满时阻塞）。
+    /// 已关闭的 channel 上发送会被忽略。</summary>
+    async void Send(string item) {
+        Mutex.Lock(this.lockHandle);
+        while (!this.closed && this.capacity > 0
+               && this.buffer.Count >= this.capacity) {
+            this.sendWaiters = this.sendWaiters + 1;
+            Mutex.Unlock(this.lockHandle);
+            await this.sendGate.Wait();
+            Mutex.Lock(this.lockHandle);
+            this.sendWaiters = this.sendWaiters - 1;
+        }
+        if (this.closed) {
+            Mutex.Unlock(this.lockHandle);
+            return;
+        }
+        this.buffer.Add(item);
+        Mutex.Unlock(this.lockHandle);
+        this.recvGate.Signal();
+    }
+
+    /// <summary>从 channel 接收一个值（空时阻塞）。
+    /// 关闭并取空后返回空字符串。</summary>
+    async string Receive() {
+        Mutex.Lock(this.lockHandle);
+        while (!this.closed && this.buffer.Count == 0) {
+            this.recvWaiters = this.recvWaiters + 1;
+            Mutex.Unlock(this.lockHandle);
+            await this.recvGate.Wait();
+            Mutex.Lock(this.lockHandle);
+            this.recvWaiters = this.recvWaiters - 1;
+        }
+        if (this.closed && this.buffer.Count == 0) {
+            Mutex.Unlock(this.lockHandle);
+            return "";
+        }
+        string val = this.buffer[0];
+        this.buffer.RemoveAt(0);
+        Mutex.Unlock(this.lockHandle);
+        this.sendGate.Signal();
+        return val;
+    }
+
+    /// <summary>关闭 channel，唤醒所有阻塞的
+    /// 发送方和接收方。</summary>
+    void Close() {
+        Mutex.Lock(this.lockHandle);
+        this.closed = true;
+        int sw = this.sendWaiters;
+        int rw = this.recvWaiters;
+        Mutex.Unlock(this.lockHandle);
+        int i = 0;
+        while (i < sw) {
+            this.sendGate.Signal();
+            i = i + 1;
+        }
+        i = 0;
+        while (i < rw) {
+            this.recvGate.Signal();
+            i = i + 1;
+        }
+    }
+
+    /// <summary>channel 已关闭时返回 true。</summary>
+    bool IsClosed() {
+        Mutex.Lock(this.lockHandle);
+        bool v = this.closed;
+        Mutex.Unlock(this.lockHandle);
+        return v;
+    }
+
+    /// <summary>返回当前缓冲条目数。</summary>
+    int Count() {
+        Mutex.Lock(this.lockHandle);
+        int v = this.buffer.Count;
+        Mutex.Unlock(this.lockHandle);
+        return v;
+    }
+}

@@ -1,0 +1,460 @@
+using System;
+using System.IO;
+
+namespace System.Web;
+
+/// <summary>
+/// Named values for a render: string variables plus named lists of row maps
+/// (for {{#each}} blocks).
+/// </summary>
+/// <summary>具名行集合：一个 {{#each}} 列表的数据源。</summary>
+class RowList {
+    string name;
+    List<StrMap> rows;
+
+    RowList(string name) {
+        this.name = name;
+        this.rows = new List<StrMap>();
+    }
+}
+
+/// <summary>
+/// 一次渲染的命名值集合：字符串变量（{{name}}）加具名行列表
+/// （{{#each name}}）。
+/// </summary>
+class ViewData {
+    StrMap vars;
+    List<RowList> lists;
+
+    ViewData() {
+        this.vars = new StrMap();
+        this.lists = new List<RowList>();
+    }
+
+    /// 设置字符串变量（可链式）。
+    ViewData Set(string key, string val) { this.vars.Set(key, val); return this; }
+
+    /// 新增具名行列表并返回其行（直接追加行即为填充数据）。
+    List<StrMap> AddList(string name) {
+        RowList rl = new RowList(name);
+        this.lists.Add(rl);
+        return rl.rows;
+    }
+
+    /// 取具名行列表；没有则 null。
+    List<StrMap> ListOf(string name) {
+        for (int i = 0; i < this.lists.Count; i = i + 1) {
+            if (this.lists[i].name == name) { return this.lists[i].rows; }
+        }
+        return null;
+    }
+}
+
+/// <summary>
+/// One node of a compiled template: templates are parsed once (View.LoadDir)
+/// into a tree, so rendering is a walk that only appends -- no scanning for
+/// tags and no substring copies on the request path.
+/// </summary>
+class VNode {
+    // 0 literal, 1 escaped variable, 2 raw variable, 3 #if, 4 #each,
+    // 5 {{content}} (layout hole, or same-named variable when resolvable
+    // and no hole fill is in progress -- see Emit)
+    int kind;
+    string text;        // literal text, or the variable/list name
+    List<VNode> body;   // children of #if / #each
+    List<VNode> elseBody; // kind==3: children after a same-level {{else}}
+
+    VNode(int kind, string text) {
+        this.kind = kind;
+        this.text = text;
+        this.body = null;
+        this.elseBody = null;
+    }
+}
+
+/// <summary>
+/// In-memory template engine. All templates under the views directory are
+/// read from disk and compiled ONCE at startup (View.LoadDir) and rendered
+/// from memory afterwards -- request handling never touches the filesystem
+/// nor re-parses the template text, mirroring the "templates live in memory"
+/// design of the original swoole framework.
+///
+/// Syntax:
+///   {{name}}                  HTML-escaped variable
+///   {{{name}}}                raw (unescaped) variable
+///   {{#if name}}...{{/if}}    emitted when var is non-empty and not "0"
+///   {{#if name}}...{{else}}...{{/if}}   else branch when var is falsy
+///   {{#each name}}...{{/each}} repeated per row; {{key}} reads row fields
+///   layout.html + {{content}} wraps every RenderPage() body
+/// </summary>
+class View {
+    Dictionary<string, List<VNode>> compiled;  // name -> parsed template
+    string dir;
+    bool devReload;        // dev only: re-read templates on each render
+
+    View() {
+        this.compiled = new Dictionary<string, List<VNode>>();
+        this.dir = "";
+        this.devReload = false;
+    }
+
+    /// <summary>Loads every .html under `dir` (recursively) into memory,
+    /// keyed by file name without extension. Views live next to their
+    /// controller as <c>&lt;Module&gt;/View/&lt;Controller&gt;.&lt;Action&gt;.html</c>,
+    /// so the key matches the "&lt;Module&gt;.&lt;Controller&gt;.&lt;Action&gt;"
+    /// view id the router injects into each controller instance (the view
+    /// follows the controller, mirroring the reference project layout).</summary>
+    static View LoadDir(string dir) {
+        View v = new View();
+        v.dir = dir;
+        v.LoadAll();
+        return v;
+    }
+
+    /// 清缓存并重读视图目录下全部模板（devReload 打开时每次渲染前调用）。
+    void LoadAll() {
+        this.compiled = new Dictionary<string, List<VNode>>();
+        this.LoadRec(this.dir, "");
+    }
+
+    /// Store a template under `key`, compiled once so renders never re-parse.
+    void Put(string key, string body) {
+        List<VNode> nodes = View.Compile(body);
+        if (this.compiled.ContainsKey(key)) {
+            this.compiled[key] = nodes;
+        } else {
+            this.compiled.Add(key, nodes);
+        }
+    }
+
+    /// Recursively load templates, keying each by its module-qualified path so
+    /// that same-named controllers in different modules don't collide. A file
+    /// <Module>/View/<Controller>.<Action>.html becomes the key
+    /// "<Module>.<Controller>.<Action>" (the "View" path segment is skipped),
+    /// which matches the key the compiler-generated router injects via
+    /// __SetView. layout.html stays reachable under the bare "layout" key.
+    void LoadRec(string d, string prefix) {
+        if (!Directory.Exists(d)) { return; }
+        List<string> files = Directory.GetFiles(d);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string fn = files[i];
+            if (fn.Length > 5 && fn.Substring(fn.Length - 5, 5) == ".html") {
+                string stem = fn.Substring(0, fn.Length - 5);
+                string body = File.ReadAllText(d + "/" + fn);
+                this.Put(prefix + stem, body);
+                // Only a root-level layout.html (no module prefix) becomes the
+                // global fallback -- a per-module one (e.g. "Admin.layout")
+                // stays scoped to that module so it doesn't clobber others.
+                if (stem == "layout" && prefix.Length == 0) { this.Put("layout", body); }
+            }
+        }
+        List<string> dirs = Directory.GetDirectories(d);
+        for (int j = 0; j < dirs.Count; j = j + 1) {
+            string sub = dirs[j];
+            if (sub == "View") {
+                this.LoadRec(d + "/" + sub, prefix);
+            } else {
+                this.LoadRec(d + "/" + sub, prefix + sub + ".");
+            }
+        }
+    }
+
+    /// <summary>Renders a template by name from the in-memory cache.</summary>
+    string Render(string name, ViewData data) {
+        if (this.devReload) { this.LoadAll(); }
+        List<VNode> nodes = null;
+        if (!this.compiled.TryGetValue(name, out nodes)) {
+            return "<!-- view not found: " + name + " -->";
+        }
+        StringBuilder sb = new StringBuilder();
+        View.Emit(nodes, data, null, null, sb);
+        return sb.ToString();
+    }
+
+    /// <summary>Renders `name` wrapped in the nearest layout.html:
+    /// 1. "&lt;Module&gt;.layout"  (e.g. "Admin.layout") -- module-specific
+    /// 2. "layout"               -- root-level global fallback
+    /// Each module can therefore have its own look-and-feel while sharing a
+    /// global default when no per-module layout is present.</summary>
+    string RenderPage(string name, ViewData data) {
+        if (this.devReload) { this.LoadAll(); }
+        List<VNode> page = null;
+        if (!this.compiled.TryGetValue(name, out page)) {
+            page = View.Compile("<!-- view not found: " + name + " -->");
+        }
+        // Derive module from the first segment of the view key ("A.B.C" -> "A").
+        string layoutKey = "layout";
+        int dot = name.IndexOf(".");
+        if (dot > 0) {
+            string modLayout = name.Substring(0, dot) + ".layout";
+            if (this.compiled.ContainsKey(modLayout)) { layoutKey = modLayout; }
+        }
+        StringBuilder sb = new StringBuilder();
+        List<VNode> layout = null;
+        if (!this.compiled.TryGetValue(layoutKey, out layout)) {
+            View.Emit(page, data, null, null, sb);
+            return sb.ToString();
+        }
+        // The page is emitted straight into the layout's {{content}} hole:
+        // wrapping costs no intermediate page string and no second pass over
+        // the finished layout.
+        View.Emit(layout, data, null, page, sb);
+        return sb.ToString();
+    }
+
+    /// <summary>Renders template text that has no entry in the cache -- an
+    /// inline snippet, a mail body, a fragment built at runtime. Compiling on
+    /// every call is the price of not having a name to cache under, so views
+    /// that live on disk should go through <see cref="Render"/>.
+    /// <paramref name="row"/> supplies the fields an enclosing {{#each}} row
+    /// would (null outside a loop).</summary>
+    static string RenderStr(string tpl, ViewData data, StrMap row) {
+        StringBuilder sb = new StringBuilder();
+        View.Emit(View.Compile(tpl), data, row, null, sb);
+        return sb.ToString();
+    }
+
+    // ---- engine core ----
+
+    /// <summary>Parses template text into nodes. Called once per template at
+    /// load time; the scanning and slicing here never happens on a render.</summary>
+    static List<VNode> Compile(string tpl) {
+        List<VNode> nodes = new List<VNode>();
+        int i = 0;
+        int n = tpl.Length;
+        while (i < n) {
+            int open = View.Find(tpl, "{{", i);
+            if (open < 0) {
+                nodes.Add(new VNode(0, tpl.Substring(i, n - i)));
+                return nodes;
+            }
+            if (open > i) { nodes.Add(new VNode(0, tpl.Substring(i, open - i))); }
+            // {{{raw}}}
+            if (open + 2 < n && (tpl[open + 2] & 255) == 123) {
+                int close = View.Find(tpl, "}}}", open + 3);
+                if (close < 0) { return nodes; }
+                nodes.Add(new VNode(2,
+                    View.Trim(tpl.Substring(open + 3, close - open - 3))));
+                i = close + 3;
+            } else {
+                int close = View.Find(tpl, "}}", open + 2);
+                if (close < 0) { return nodes; }
+                string tag = View.Trim(tpl.Substring(open + 2, close - open - 2));
+                if (tag.Length > 4 && tag.Substring(0, 4) == "#if ") {
+                    int endIf = View.FindTag(tpl, "{{/if}}", close + 2);
+                    if (endIf < 0) { return nodes; }
+                    VNode node = new VNode(3,
+                        View.Trim(tag.Substring(4, tag.Length - 4)));
+                    // {{else}} 拆分（Bug#11）：同层 else 之前的段是真分支，
+                    // 之后的段是假分支。嵌套 if/each 内的 else 属于内层，
+                    // 由 FindElse 的深度计数跳过；无 else 时走原单段编译，
+                    // 向后兼容（修复前 else 只是被当空变量吞掉、真分支
+                    // 照样渲染假分支正文——12 处视图因此双渲染）。
+                    int anElse = View.FindElse(tpl, close + 2, endIf);
+                    if (anElse >= 0) {
+                        node.body = View.Compile(
+                            tpl.Substring(close + 2, anElse - close - 2));
+                        node.elseBody = View.Compile(
+                            tpl.Substring(anElse + 8, endIf - anElse - 8));
+                    } else {
+                        node.body = View.Compile(
+                            tpl.Substring(close + 2, endIf - close - 2));
+                    }
+                    nodes.Add(node);
+                    i = endIf + 7;
+                } else if (tag.Length > 6 && tag.Substring(0, 6) == "#each ") {
+                    int endEach = View.FindTag(tpl, "{{/each}}", close + 2);
+                    if (endEach < 0) { return nodes; }
+                    VNode node = new VNode(4,
+                        View.Trim(tag.Substring(6, tag.Length - 6)));
+                    node.body = View.Compile(
+                        tpl.Substring(close + 2, endEach - close - 2));
+                    nodes.Add(node);
+                    i = endEach + 9;
+                } else if (tag == "content") {
+                    nodes.Add(new VNode(5, ""));
+                    i = close + 2;
+                } else {
+                    nodes.Add(new VNode(1, tag));
+                    i = close + 2;
+                }
+            }
+        }
+        return nodes;
+    }
+
+    /// Walk a compiled template, appending to `sb`. `content` are the page nodes
+    /// that fill a layout's {{content}} hole; without them (a plain Render) the
+    /// placeholder resolves by precedence: a same-named variable (row field or
+    /// ViewData) interpolates escaped; only when nothing resolves is it emitted
+    /// unchanged, matching the old text-substitution behavior (Bug#2).
+    static void Emit(List<VNode> nodes, ViewData data, StrMap row,
+                     List<VNode> content, StringBuilder sb) {
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            VNode nd = nodes[i];
+            if (nd.kind == 0) {
+                sb.Append(nd.text);
+            } else if (nd.kind == 1) {
+                sb.Append(View.HtmlEscape(View.Lookup(nd.text, data, row)));
+            } else if (nd.kind == 2) {
+                sb.Append(View.Lookup(nd.text, data, row));
+            } else if (nd.kind == 3) {
+                string val = View.Lookup(nd.text, data, row);
+                if (val.Length > 0 && val != "0" && val != "false") {
+                    View.Emit(nd.body, data, row, content, sb);
+                } else if (nd.elseBody != null) {
+                    View.Emit(nd.elseBody, data, row, content, sb);
+                }
+            } else if (nd.kind == 4) {
+                List<StrMap> rows = null;
+                if (data != null) { rows = data.ListOf(nd.text); }
+                if (rows != null) {
+                    for (int r = 0; r < rows.Count; r = r + 1) {
+                        View.Emit(nd.body, data, rows[r], content, sb);
+                    }
+                }
+            } else {
+                /* {{content}} 双语义（Bug#2）：编译期不区分，发射期按可解析性
+                   定优先级——layout 填洞进行中（content != null）照旧填洞；
+                   否则同名变量可解析（行字段或 ViewData）即按转义变量插值；
+                   都不满足才回落字面量占位（旧文本替换行为的兼容面）。 */
+                if (content != null) {
+                    View.Emit(content, data, row, null, sb);
+                } else if (View.HasVar("content", data, row)) {
+                    sb.Append(View.HtmlEscape(View.Lookup("content", data, row)));
+                } else {
+                    sb.Append("{{content}}");
+                }
+            }
+        }
+    }
+
+    /// Row fields shadow the global ViewData. Each map is probed once
+    /// (Dictionary lookup is a hash probe, so there is no double walk to
+    /// avoid any more).
+    static string Lookup(string key, ViewData data, StrMap row) {
+        if (row != null && row.Has(key)) { return row.Get(key); }
+        if (data != null && data.vars.Has(key)) { return data.vars.Get(key); }
+        return "";
+    }
+
+    /* 变量可解析判定：Lookup 的布尔面——供 {{content}} 双语义分派
+       （Bug#2）等需要区分「解析得到空串」与「根本没有此名」的场合。 */
+    /// 该名字当前是否可解析（行字段或 ViewData 里有它）；只判存在，不取值。
+    static bool HasVar(string key, ViewData data, StrMap row) {
+        if (row != null && row.Has(key)) { return true; }
+        if (data != null && data.vars.Has(key)) { return true; }
+        return false;
+    }
+
+    /// <summary>Escapes &lt; &gt; &amp; " so variables are XSS-safe by default.</summary>
+    static string HtmlEscape(string s) {
+        // Fast path: nothing to escape (the common case). The four native
+        // IndexOf() scans beat a per-character loop here -- indexing a string
+        // from Zan costs far more than a strchr pass (measured: a single-pass
+        // char loop cost ~16% throughput on the MVC home page).
+        if (s.IndexOf("<") < 0 && s.IndexOf(">") < 0
+            && s.IndexOf("&") < 0 && s.IndexOf("\"") < 0) {
+            return s;
+        }
+        StringBuilder sb = new StringBuilder();
+        int n = s.Length;
+        int start = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            if (c != 60 && c != 62 && c != 38 && c != 34) { continue; }
+            if (i > start) { sb.Append(s.Substring(start, i - start)); }
+            if (c == 60) { sb.Append("&lt;"); }
+            else if (c == 62) { sb.Append("&gt;"); }
+            else if (c == 38) { sb.Append("&amp;"); }
+            else { sb.Append("&quot;"); }
+            start = i + 1;
+        }
+        if (n > start) { sb.Append(s.Substring(start, n - start)); }
+        return sb.ToString();
+    }
+
+    /// 从 from 起查找子串（原生 IndexOf；from<=0 从头找）。
+    static int Find(string hay, string needle, int from) {
+        // Native IndexOf (strstr) from an offset: searching from a copy of the
+        // tail allocated a full-length string per tag, which made rendering a
+        // page quadratic in template size.
+        if (from <= 0) { return hay.IndexOf(needle); }
+        if (from >= hay.Length) { return -1; }
+        return hay.IndexOf(needle, from);
+    }
+
+    /// <summary>Finds a closing tag, skipping nested blocks of the same kind.</summary>
+    static int FindTag(string tpl, string closeTag, int from) {
+        string openPrefix = "{{#if";
+        if (closeTag == "{{/each}}") { openPrefix = "{{#each"; }
+        int depth = 0;
+        int i = from;
+        int n = tpl.Length;
+        while (i < n) {
+            int nextOpen = View.Find(tpl, openPrefix, i);
+            int nextClose = View.Find(tpl, closeTag, i);
+            if (nextClose < 0) { return -1; }
+            if (nextOpen >= 0 && nextOpen < nextClose) {
+                depth = depth + 1;
+                i = nextOpen + openPrefix.Length;
+            } else if (depth > 0) {
+                depth = depth - 1;
+                i = nextClose + closeTag.Length;
+            } else {
+                return nextClose;
+            }
+        }
+        return -1;
+    }
+
+    /// <summary>Finds a same-level {{else}} within [from, end): nested
+    /// if/each blocks are skipped by depth counting, so an {{else}} inside
+    /// an inner {{#if}}/{{#each}} belongs to that inner block, not to the
+    /// caller's. Returns the position of the opening brace, or -1.</summary>
+    static int FindElse(string tpl, int from, int end) {
+        int depth = 0;
+        int i = from;
+        while (i < end) {
+            int openIf = View.Find(tpl, "{{#if ", i);
+            int openEach = View.Find(tpl, "{{#each ", i);
+            int closeIf = View.Find(tpl, "{{/if}}", i);
+            int closeEach = View.Find(tpl, "{{/each}}", i);
+            int anElse = View.Find(tpl, "{{else}}", i);
+            int best = -1;
+            if (openIf >= 0) { best = openIf; }
+            if (openEach >= 0 && (best < 0 || openEach < best)) { best = openEach; }
+            if (closeIf >= 0 && (best < 0 || closeIf < best)) { best = closeIf; }
+            if (closeEach >= 0 && (best < 0 || closeEach < best)) { best = closeEach; }
+            if (anElse >= 0 && (best < 0 || anElse < best)) { best = anElse; }
+            if (best < 0 || best >= end) { return -1; }
+            if (best == anElse) {
+                if (depth == 0) { return anElse; }
+                i = anElse + 8;
+            } else if (best == openIf) {
+                depth = depth + 1;
+                i = openIf + 6;
+            } else if (best == openEach) {
+                depth = depth + 1;
+                i = openEach + 8;
+            } else if (best == closeIf) {
+                depth = depth - 1;
+                i = closeIf + 7;
+            } else {
+                depth = depth - 1;
+                i = closeEach + 9;
+            }
+        }
+        return -1;
+    }
+
+    /// 去除首尾 ASCII 空格。
+    static string Trim(string s) {
+        int a = 0;
+        int b = s.Length;
+        for (; a < b && (s[a] & 255) == 32; a = a + 1) { }
+        while (b > a && (s[b - 1] & 255) == 32) { b = b - 1; }
+        if (a == 0 && b == s.Length) { return s; }
+        return s.Substring(a, b - a);
+    }
+}

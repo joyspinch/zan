@@ -1,0 +1,470 @@
+using System;
+using Gui;
+
+namespace Gui.Component.DataTable;
+
+/// DataTable 分部：排序与外观——条件格式颜色
+/// 辅助、外观钩子、归并排序与多列排序次序。
+partial class DataTable {
+    // ---- 条件格式的颜色辅助函数 ----
+    /// 不透明 0xFFRRGGBB（alpha 高位使其作为 int 常为负）。
+    static int Rgb(int r, int g, int b) {
+        return 4278190080 + r * 65536 + g * 256 + b;
+    }
+    /// 相同 RGB 但带自定义 alpha（用于半透明单元格底色/数据条）。
+    static int ColorAlpha(int packed, int a) {
+        int rgb = packed % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+        return rgb + a * 16777216;
+    }
+    /// 两个不透明打包颜色的线性混合：(1-num/den)*c0 + (num/den)*c1。
+    static int LerpColor(int c0, int c1, int num, int den) {
+        if (den <= 0) { return c0; }
+        if (num < 0) { num = 0; }
+        if (num > den) { num = den; }
+        // 拆通道前先取低 24 位归一成正数：负 int 直接 % 256
+        // 会得到负通道（高位 alpha 的打包色几乎都是负的）。
+        int rgb0 = c0 % 16777216;
+        if (rgb0 < 0) { rgb0 = rgb0 + 16777216; }
+        int rgb1 = c1 % 16777216;
+        if (rgb1 < 0) { rgb1 = rgb1 + 16777216; }
+        int r0 = (rgb0 / 65536) % 256;
+        int g0 = (rgb0 / 256) % 256;
+        int b0 = rgb0 % 256;
+        int r1 = (rgb1 / 65536) % 256;
+        int g1 = (rgb1 / 256) % 256;
+        int b1 = rgb1 % 256;
+        int r = r0 + (r1 - r0) * num / den;
+        int g = g0 + (g1 - g0) * num / den;
+        int b = b0 + (b1 - b0) * num / den;
+        return DataTable.Rgb(r, g, b);
+    }
+
+    // ---- 外观钩子（见 CellStyler） ----
+    // styler 返回 0 表示“不覆盖”：打包的 0 是完全透明的
+    // 黑色，因此永远不会与用户想绘制的颜色冲突。
+
+    /// 数据行的背景。styler 的颜色优先于斑马纹
+    /// 默认色，但选中和悬停是对它*染色*而非替换——
+    /// 各半混合让样式行在激活时仍能保持
+    /// 其含义清晰，而不是在光标下悄悄失去颜色。
+    /// 选中优先于悬停：光标扫过选中行时它仍是
+    /// 选中行——悬停只是一种"经过"，不该掩盖
+    /// 用户明确做出的选择（商业网格的通行做法）。
+    static int RowBackground(DataTableState st, DataSource src, int row,
+                             int stripeBg, int activeBg, int hoverBg,
+                             bool sel, bool hover) {
+        int custom = 0;
+        if (st.styler != null) { custom = st.styler.RowBg(src, row); }
+        if (custom == 0) {
+            if (sel) { return activeBg; }
+            if (hover) { return hoverBg; }
+            return stripeBg;
+        }
+        if (sel) { return DataTable.LerpColor(custom, activeBg, 1, 2); }
+        if (hover) { return DataTable.LerpColor(custom, hoverBg, 1, 2); }
+        return custom;
+    }
+
+    /// 单个单元格的背景，0 则露出行背景。
+    static int CellBackground(DataTableState st, DataSource src, int row, int col) {
+        if (st.styler == null) { return 0; }
+        return st.styler.CellBg(src, row, col);
+    }
+
+    /// 单个单元格的文本颜色，0 用主题默认色。单元格级颜色
+    /// 覆盖行级颜色；行级颜色应用于所有未设颜色的单元格。
+    static int CellForeground(DataTableState st, DataSource src, int row, int col) {
+        if (st.styler == null) { return 0; }
+        int fg = st.styler.CellFg(src, row, col);
+        if (fg == 0) { fg = st.styler.RowFg(src, row); }
+        return fg;
+    }
+
+    // ---- 按当前排序列对行索引做 O(n log n) 归并排序 ----
+    // 之前的选择排序是 O(n^2)，在大数据集上会卡死；
+    // 这个自底向上的归并排序让 10 万+ 行的排序保持流畅。
+    //
+    // 排序键预先一次性提取（装饰-排序-去装饰）到
+    // 并行数组中，合并时与行索引同步移动，
+    // 这样比较只是简单的 int/string 比较，而不是在每次
+    // 约 n*log2(n) 次比较中重新获取并解析单元格。
+
+    /// `kind` 选择装饰后的键数组：0 字符串、1 int、2 实数。
+    static void MergeKeyed(int kind, int dir,
+                           List<int> order, List<int> nkey, List<string> skey, List<double> rkey,
+                           int lo, int mid, int hi,
+                           List<int> otmp, List<int> ntmp, List<string> stmp, List<double> rtmp) {
+        int i = lo;
+        int j = mid;
+        int k = lo;
+        while (i < mid && j < hi) {
+            int cmp = 0;
+            if (kind == 1) {
+                if (nkey[i] < nkey[j]) { cmp = -1; }
+                else if (nkey[i] > nkey[j]) { cmp = 1; }
+            } else if (kind == 2) {
+                if (rkey[i] < rkey[j]) { cmp = -1; }
+                else if (rkey[i] > rkey[j]) { cmp = 1; }
+            } else {
+                cmp = DataTable.CompareStr(skey[i], skey[j]);
+            }
+            if (dir == 2) { cmp = 0 - cmp; }
+            if (cmp <= 0) {
+                otmp[k] = order[i];
+                if (kind == 1) { ntmp[k] = nkey[i]; }
+                else if (kind == 2) { rtmp[k] = rkey[i]; }
+                else { stmp[k] = skey[i]; }
+                i = i + 1;
+            } else {
+                otmp[k] = order[j];
+                if (kind == 1) { ntmp[k] = nkey[j]; }
+                else if (kind == 2) { rtmp[k] = rkey[j]; }
+                else { stmp[k] = skey[j]; }
+                j = j + 1;
+            }
+            k = k + 1;
+        }
+        while (i < mid) {
+            otmp[k] = order[i];
+            if (kind == 1) { ntmp[k] = nkey[i]; }
+            else if (kind == 2) { rtmp[k] = rkey[i]; }
+            else { stmp[k] = skey[i]; }
+            i = i + 1; k = k + 1;
+        }
+        while (j < hi) {
+            otmp[k] = order[j];
+            if (kind == 1) { ntmp[k] = nkey[j]; }
+            else if (kind == 2) { rtmp[k] = rkey[j]; }
+            else { stmp[k] = skey[j]; }
+            j = j + 1; k = k + 1;
+        }
+        k = lo;
+        while (k < hi) {
+            order[k] = otmp[k];
+            if (kind == 1) { nkey[k] = ntmp[k]; }
+            else if (kind == 2) { rkey[k] = rtmp[k]; }
+            else { skey[k] = stmp[k]; }
+            k = k + 1;
+        }
+    }
+
+    // ---------- 多列排序 ----------
+    /// sortKeys 保存当前生效的键（外→内）。sortCol/sortDir 与
+    /// 主键保持同步，以便现有读取方继续工作。
+    static void SyncPrimary(DataTableState st) {
+        if (st.sortKeys.Count > 0) { st.sortCol = st.sortKeys[0].col; st.sortDir = st.sortKeys[0].dir; }
+        else { st.sortCol = -1; st.sortDir = 1; }
+    }
+
+    /// `col` 在排序键中的索引，没有则为 -1。键现在是实体而非
+    /// 裸列索引列表，因此取代了 List.IndexOf。
+    static int SortIndexOf(DataTableState st, int col) {
+        for (int i = 0; i < st.sortKeys.Count; i = i + 1) {
+            if (st.sortKeys[i].col == col) { return i; }
+        }
+        return -1;
+    }
+
+    /// 用单个键替换排序（dir：1 升序，2 降序）。col<0 清除排序。
+    static void SortBy(DataTableState st, int col, int dir) {
+        st.sortKeys.Clear();
+        if (col >= 0) { st.sortKeys.Add(new SortKey(col, dir)); }
+        DataTable.SyncPrimary(st); DataTable.InvalidateQuery(st);
+    }
+
+    /// 追加（或重定向）一个次要排序键，不影响其他键。
+    static void AddSort(DataTableState st, int col, int dir) {
+        if (col < 0) { return; }
+        int idx = DataTable.SortIndexOf(st, col);
+        if (idx < 0) { st.sortKeys.Add(new SortKey(col, dir)); }
+        else { st.sortKeys[idx].dir = dir; }
+        DataTable.SyncPrimary(st); DataTable.InvalidateQuery(st);
+    }
+
+    /// 清空全部排序键并使查询失效。
+    static void ClearSort(DataTableState st) {
+        st.sortKeys.Clear();
+        DataTable.SyncPrimary(st); DataTable.InvalidateQuery(st);
+    }
+
+    /// 表头点击状态机。`additive`（Shift）把该列作为
+    /// 附加键循环切换（升序 → 降序 → 移除）；否则它成为唯一键，
+    /// 反复点击时循环：升序 → 降序 → 清除。
+    static void CycleSort(DataTableState st, int col, bool additive) {
+        int idx = DataTable.SortIndexOf(st, col);
+        if (additive) {
+            if (idx < 0) { st.sortKeys.Add(new SortKey(col, 1)); }
+            else if (st.sortKeys[idx].dir == 1) { st.sortKeys[idx].dir = 2; }
+            else { st.sortKeys.RemoveAt(idx); }
+        } else {
+            bool only = st.sortKeys.Count == 1 && idx == 0;
+            if (only) {
+                if (st.sortKeys[0].dir == 1) { st.sortKeys[0].dir = 2; }
+                else { st.sortKeys.Clear(); }
+            } else {
+                st.sortKeys.Clear();
+                st.sortKeys.Add(new SortKey(col, 1));
+            }
+        }
+        DataTable.SyncPrimary(st);
+        DataTable.InvalidateQuery(st);
+    }
+
+    /// 按所有生效的排序键比较两行数据（稳定平局次序）。
+    static int CmpMultiKey(DataTableState st, List<DataColumn> cols, DataSource src, int ra, int rb) {
+        foreach (SortKey sk in st.sortKeys) {
+            int sc = sk.col;
+            if (sc >= 0 && sc < cols.Count) {
+                string ta = src.CellText(ra, sc);
+                string tb = src.CellText(rb, sc);
+                // 计算列：比较公式值（实数）而非源文本。
+                double fa;
+                double fb;
+                if (DataTable.FormulaTryReal(cols, src, ra, sc, out fa)) {
+                    if (DataTable.FormulaTryReal(cols, src, rb, sc, out fb)) {
+                        int cr = fa < fb ? 0 - 1 : (fa > fb ? 1 : 0);
+                        if (sk.dir == 2) { cr = 0 - cr; }
+                        if (cr != 0) { return cr; }
+                        continue;
+                    }
+                }
+                int cmp = DataTable.CompareCellCol(cols[sc], ta, tb);
+                if (sk.dir == 2) { cmp = 0 - cmp; }
+                if (cmp != 0) { return cmp; }
+            }
+        }
+        return 0;
+    }
+
+    /// 按 CmpMultiKey 的次序对 order[lo..hi) 做归并排序的一趟合并。
+    static void MergeMulti(DataTableState st, List<DataColumn> cols, DataSource src,
+                           int lo, int mid, int hi, List<int> tmp) {
+        int i = lo;
+        int j = mid;
+        int k = lo;
+        while (i < mid && j < hi) {
+            if (DataTable.CmpMultiKey(st, cols, src, st.order[i], st.order[j]) <= 0) {
+                tmp[k] = st.order[i]; i = i + 1;
+            } else {
+                tmp[k] = st.order[j]; j = j + 1;
+            }
+            k = k + 1;
+        }
+        while (i < mid) { tmp[k] = st.order[i]; i = i + 1; k = k + 1; }
+        while (j < hi) { tmp[k] = st.order[j]; j = j + 1; k = k + 1; }
+        int p = lo;
+        while (p < hi) { st.order[p] = tmp[p]; p = p + 1; }
+    }
+
+    /// 多列排序：从最低优先级到最高优先级逐趟单列稳定排序，
+    /// 等价于按键序的字典序；少于两个键时为空操作。
+    static void SortOrderMulti(DataTableState st, List<DataColumn> cols, DataSource src) {
+        int n = st.order.Count;
+        if (n < 2 || st.sortKeys.Count < 2) { return; }
+
+        // 归并排序是稳定的，因此从最低优先级到最高优先级
+        // 逐趟装饰排序，等价于一次字典序比较：后续高优先级
+        // 键只会重排其自身相等的区间。每趟 SortOrderByCol
+        // 都只读取/解析一次该列，比较阶段只操作预计算键，
+        // 避免原 CmpMultiKey 在 O(N log N) 比较中反复访问源。
+        for (int k = st.sortKeys.Count - 1; k >= 0; k = k - 1) {
+            SortKey sk = st.sortKeys[k];
+            DataTable.SortOrderByCol(st, cols, src, sk.col, sk.dir);
+        }
+    }
+
+    /// 单主键（sortCol/sortDir）排序入口。
+    static void SortOrder(DataTableState st, List<DataColumn> cols, DataSource src) {
+        DataTable.SortOrderByCol(st, cols, src, st.sortCol, st.sortDir);
+    }
+
+    /// 对 st.order 按单列 `sc` 做稳定装饰排序（dir：1 升序，2
+    /// 降序）。从 SortOrder 中拆出，使分组排序能用同样的
+    /// O(n) 装饰后廉价比较机制按每个分组列做基数排序，
+    /// 而不是在每次 n*log2(n) 比较中重新获取单元格。
+    static void SortOrderByCol(DataTableState st, List<DataColumn> cols, DataSource src, int sc, int dir) {
+        int n = st.order.Count;
+        if (n < 2) { return; }
+        if (sc < 0 || sc >= cols.Count) { return; }
+        // 键类型：0 字符串、1 int、2 实数（小数数值列）。日期
+        // 列按天数做键，因此走 int 路径。
+        int kind = 0;
+        if (cols[sc].isDate || cols[sc].isBool) { kind = 1; }
+        else if (cols[sc].numeric) { if (cols[sc].decimals > 0) { kind = 2; } else { kind = 1; } }
+
+        // 装饰：为每个可见行提取一次排序键（O(n)），
+        // 使比较只是简单的 int/double/string 比较，而非
+        // 每次比较都调用 CellNum/CellReal/CellText。
+        List<int> nkey = new List<int>();
+        List<string> skey = new List<string>();
+        List<double> rkey = new List<double>();
+        // 计算列：按公式实数值排序，与该列 decimals>0 的
+        // 实数路径一致。公式列逐行可能求值失败（显示空），
+        // 失败行键取 0，保持稳定归并的行序不变。
+        bool fcol = DataTable.IsFormula(cols, sc);
+        for (int q = 0; q < n; q = q + 1) {
+            if (cols[sc].isDate) { nkey.Add(src.CellDay(st.order[q], sc, cols[sc].dateOrder)); }
+            else if (cols[sc].isBool) {
+                int bv = 0;
+                if (src.CellBool(st.order[q], sc)) { bv = 1; }
+                nkey.Add(bv);
+            }
+            else if (kind == 1) { nkey.Add(src.CellNum(st.order[q], sc)); }
+            else if (kind == 2) {
+                if (fcol) {
+                    double fv;
+                    if (!DataTable.FormulaTryReal(cols, src, st.order[q], sc, out fv)) { fv = 0.0; }
+                    rkey.Add(fv);
+                } else {
+                    rkey.Add(src.CellReal(st.order[q], sc));
+                }
+            }
+            else { skey.Add(src.CellText(st.order[q], sc)); }
+        }
+
+        List<int> otmp = new List<int>();
+        List<int> ntmp = new List<int>();
+        List<string> stmp = new List<string>();
+        List<double> rtmp = new List<double>();
+        for (int p = 0; p < n; p = p + 1) {
+            otmp.Add(0);
+            if (kind == 1) { ntmp.Add(0); }
+            else if (kind == 2) { rtmp.Add(0.0); }
+            else { stmp.Add(""); }
+        }
+
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width * 2;
+                if (hi > n) { hi = n; }
+                if (mid < hi) { DataTable.MergeKeyed(kind, dir, st.order, nkey, skey, rkey, lo, mid, hi, otmp, ntmp, stmp, rtmp); }
+                lo = lo + width * 2;
+            }
+            width = width * 2;
+        }
+    }
+
+    // ---- 唯一字符串的 O(u log u) 归并排序（用于 Distinct） ----
+
+    /// 去重哈希表容量：不小于 2n 的最小 2 的幂（下限 16）。
+    static int DistinctCapacity(int n) {
+        int cap = 16;
+        int need = n * 2;
+        while (cap < need) { cap = cap * 2; }
+        return cap;
+    }
+
+    /// FNV-1a 的 30 位字符串哈希。
+    static int DistinctHash(string val) {
+        int h = 2166136261;
+        for (int i = 0; i < val.Length; i = i + 1) {
+            h = ((h ^ (val[i] & 255)) * 16777619) & 1073741823;
+        }
+        return h;
+    }
+
+    /// 线性探测插入唯一值；已存在返回 false，新插入返回 true。
+    static bool DistinctAdd(List<string> vals, List<int> slots, string val) {
+        int slot = DataTable.DistinctHash(val) & (slots.Count - 1);
+        while (slots[slot] >= 0) {
+            if (vals[slots[slot]] == val) { return false; }
+            slot = (slot + 1) & (slots.Count - 1);
+        }
+        slots[slot] = vals.Count;
+        vals.Add(val);
+        return true;
+    }
+
+    /// 字符串归并排序的一趟合并（src[lo..hi)）。
+    static void MergeStr(List<string> src, int lo, int mid, int hi, List<string> tmp) {
+        int i = lo;
+        int j = mid;
+        int k = lo;
+        while (i < mid && j < hi) {
+            if (DataTable.CompareStr(src[i], src[j]) <= 0) { tmp[k] = src[i]; i = i + 1; }
+            else { tmp[k] = src[j]; j = j + 1; }
+            k = k + 1;
+        }
+        while (i < mid) { tmp[k] = src[i]; i = i + 1; k = k + 1; }
+        while (j < hi) { tmp[k] = src[j]; j = j + 1; k = k + 1; }
+        k = lo;
+        while (k < hi) { src[k] = tmp[k]; k = k + 1; }
+    }
+
+    /// 字符串稳定归并排序（就地）。
+    static void SortStr(List<string> a) {
+        int n = a.Count;
+        if (n < 2) { return; }
+        List<string> tmp = new List<string>();
+        for (int p = 0; p < n; p = p + 1) { tmp.Add(""); }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width * 2;
+                if (hi > n) { hi = n; }
+                if (mid < hi) { DataTable.MergeStr(a, lo, mid, hi, tmp); }
+                lo = lo + width * 2;
+            }
+            width = width * 2;
+        }
+    }
+
+    /// 某列在全部源行（不过滤）上的排序去重值。
+    /// 为向后兼容保留（历史用户代码在此传入 DataRow 列表）。
+    static List<string> Distinct(DataSource src, int col) {
+        List<string> vals = new List<string>();
+        int i = 0;
+        int nrows = src.RowCount();
+        List<int> slots = new List<int>();
+        int cap = DataTable.DistinctCapacity(nrows);
+        for (; i < cap; i = i + 1) { slots.Add(-1); }
+        i = 0;
+        while (i < nrows) {
+            DataTable.DistinctAdd(vals, slots, src.CellText(i, col));
+            i = i + 1;
+        }
+        DataTable.SortStr(vals);
+        return vals;
+    }
+
+    /// 某列在当前过滤视图范围内的排序去重值
+    /// （st.order）。这是集合筛选弹窗应显示的内容：
+    /// 当前过滤视图中存在、由 st.order 表示的值。
+    /// 对 n 个可见行和 u 个唯一值，哈希后仅对唯一值排序，
+    /// 复杂度为 O(n + u log u)。
+    static List<string> DistinctFiltered(DataTableState st, List<DataColumn> cols, DataSource src, int col) {
+        List<string> vals = new List<string>();
+        int i = 0;
+        int nrows = st.order.Count;
+        List<int> slots = new List<int>();
+        int cap = DataTable.DistinctCapacity(nrows);
+        for (; i < cap; i = i + 1) { slots.Add(-1); }
+        // 计算列：去重集合取公式文本（与显示一致）；
+        // 求值失败的行显示空，不为集合筛选提供候选。
+        bool fcol = DataTable.IsFormula(cols, col);
+        i = 0;
+        while (i < nrows) {
+            int row = st.order[i];
+            string v;
+            if (fcol) {
+                v = DataTable.FormulaText(cols, src, row, col);
+                if (v == null) { v = ""; }
+            } else {
+                v = src.CellText(row, col);
+            }
+            if (v.Length > 0) { DataTable.DistinctAdd(vals, slots, v); }
+            i = i + 1;
+        }
+        DataTable.SortStr(vals);
+        return vals;
+    }
+
+}

@@ -1,0 +1,450 @@
+using System;
+using System.Net.Http;
+using System.Net.Http.Client;
+
+namespace System.Net.WebDav;
+
+/// <summary>PROPFIND 207 Multi-Status 里解析出的一个资源：
+/// href、HTTP 状态，以及 resourcetype/getcontentlength/getcontenttype/
+/// getetag/getlastmodified 五个属性（服务器未返回的为默认值）。</summary>
+class WebDavResource {
+    string href;
+    int status;
+    bool collection;
+    long contentLength;
+    string contentType;
+    string etag;
+    string lastModified;
+
+    /// 内部构造：全默认值，字段由 ParseMultiStatus 填充。
+    WebDavResource() {
+        this.href = "";
+        this.status = 0;
+        this.collection = false;
+        this.contentLength = 0;
+        this.contentType = "";
+        this.etag = "";
+        this.lastModified = "";
+    }
+}
+
+/// <summary>
+/// 极简 WebDAV 客户端：PROPFIND（列目录）、MKCOL/GET/PUT/DELETE/
+/// COPY/MOVE。每次调用新建一个底层 HttpClient（无连接复用）；
+/// 传输层失败抛 HttpRequestException，WebDAV 状态码由调用方检查
+/// （PROPFIND 非 207 直接抛）。XML 解析是手写的容错标签扫描，
+/// Multi-Status 上限 4 MiB / 10000 个资源，超限抛 ArgumentException。
+/// </summary>
+class WebDavClient {
+    string host;
+    int port;
+    bool useTls;
+    bool verifyTls;
+    int timeout;
+    List<string> headers;
+
+    /// 内部构造：默认明文 80 端口、校验 TLS、30s 超时；经
+    /// WebDavClient(host, port) / CreateHttps 使用。
+    WebDavClient() {
+        this.host = "";
+        this.port = 80;
+        this.useTls = false;
+        this.verifyTls = true;
+        this.timeout = 30000;
+        this.headers = new List<string>();
+    }
+
+    /// 构造指向 host:port 的明文 HTTP WebDAV 客户端。
+    WebDavClient(string host, int port) {
+        this.host = host;
+        this.port = port;
+        this.useTls = false;
+        this.verifyTls = true;
+        this.timeout = 30000;
+        this.headers = new List<string>();
+    }
+
+    /// 构造 HTTPS WebDAV 客户端（证书校验保持开启）。
+    static WebDavClient CreateHttps(string host, int port) {
+        WebDavClient client = new WebDavClient(host, port);
+        client.useTls = true;
+        return client;
+    }
+
+    /// 为所有请求添加默认头（名字/值经 ValidateHeader 校验，非法抛
+    /// ArgumentException）；可链式调用。
+    WebDavClient SetHeader(string name, string headerValue) {
+        WebDavClient.ValidateHeader(name, headerValue);
+        this.headers.Add(name + ": " + headerValue);
+        return this;
+    }
+
+    /// 设置请求超时（毫秒），转发给底层 HttpClient；可链式调用。
+    WebDavClient SetTimeout(int milliseconds) {
+        this.timeout = milliseconds;
+        return this;
+    }
+
+    /// 禁用服务器证书校验（自签名服务器用）；同时隐含启用 TLS。
+    WebDavClient DisableTlsVerify() {
+        this.verifyTls = false;
+        this.useTls = true;
+        return this;
+    }
+
+    /// PROPFIND 请求体：请求 resourcetype/getcontentlength/
+    /// getcontenttype/getetag/getlastmodified 五个属性。
+    static string BuildPropFindXml() {
+        return "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+            + "<D:propfind xmlns:D=\"DAV:\"><D:prop>"
+            + "<D:resourcetype/><D:getcontentlength/><D:getcontenttype/>"
+            + "<D:getetag/><D:getlastmodified/>"
+            + "</D:prop></D:propfind>";
+    }
+
+    /// XML 五个预定义实体的转义。
+    static string EscapeXml(string text) {
+        StringBuilder result = new StringBuilder();
+        for (int i = 0; i < text.Length; i = i + 1) {
+            string ch = text.Substring(i, 1);
+            if (ch == "&") { result.Append("&amp;"); }
+            else if (ch == "<") { result.Append("&lt;"); }
+            else if (ch == ">") { result.Append("&gt;"); }
+            else if (ch == "\"") { result.Append("&quot;"); }
+            else if (ch == "'") { result.Append("&apos;"); }
+            else { result.Append(ch); }
+        }
+        return result.ToString();
+    }
+
+    /// XML 五个预定义实体的反转义；未知实体原样保留 "&"。
+    static string UnescapeXml(string text) {
+        StringBuilder result = new StringBuilder();
+        int i = 0;
+        while (i < text.Length) {
+            if (text.Substring(i, 1) == "&") {
+                int semi = WebDavClient.IndexOf(text, ";", i + 1);
+                if (semi > i) {
+                    string entity = text.Substring(i, semi - i + 1);
+                    if (entity == "&amp;") { result.Append("&"); i = semi + 1; }
+                    else if (entity == "&lt;") { result.Append("<"); i = semi + 1; }
+                    else if (entity == "&gt;") { result.Append(">"); i = semi + 1; }
+                    else if (entity == "&quot;") { result.Append("\""); i = semi + 1; }
+                    else if (entity == "&apos;") { result.Append("'"); i = semi + 1; }
+                    else { result.Append("&"); i = i + 1; }
+                } else { result.Append("&"); i = i + 1; }
+            } else {
+                result.Append(text.Substring(i, 1));
+                i = i + 1;
+            }
+        }
+        return result.ToString();
+    }
+
+    /// 解析 207 Multi-Status 响应体为资源列表（按文档顺序）；
+    /// 超 4 MiB 或 10000 个资源抛 ArgumentException。
+    static List<WebDavResource> ParseMultiStatus(string xml) {
+        if (xml.Length > 4194304) {
+            throw new ArgumentException("WebDAV Multi-Status exceeds 4194304 bytes");
+        }
+        List<WebDavResource> resources = new List<WebDavResource>();
+        int from = 0;
+        while (from < xml.Length) {
+            int open = WebDavClient.FindOpen(xml, "response", from);
+            if (open < 0) { break; }
+            int bodyStart = WebDavClient.TagEnd(xml, open);
+            if (bodyStart < 0) { break; }
+            int close = WebDavClient.FindClose(xml, "response", bodyStart + 1);
+            if (close < 0) { break; }
+            if (resources.Count >= 10000) {
+                throw new ArgumentException("WebDAV Multi-Status exceeds 10000 resources");
+            }
+            string block = xml.Substring(bodyStart + 1, close - bodyStart - 1);
+            WebDavResource resource = new WebDavResource();
+            resource.href = WebDavClient.TagValue(block, "href");
+            resource.status = WebDavClient.ParseStatus(WebDavClient.LastTagValue(block, "status"));
+            string resourceType = WebDavClient.TagInner(block, "resourcetype");
+            resource.collection = WebDavClient.FindOpen(resourceType, "collection", 0) >= 0;
+            resource.contentLength = WebDavClient.ParseLong(WebDavClient.TagValue(block, "getcontentlength"));
+            resource.contentType = WebDavClient.TagValue(block, "getcontenttype");
+            resource.etag = WebDavClient.TagValue(block, "getetag");
+            resource.lastModified = WebDavClient.TagValue(block, "getlastmodified");
+            resources.Add(resource);
+            int closeEnd = WebDavClient.TagEnd(xml, close);
+            from = closeEnd < 0 ? close + 1 : closeEnd + 1;
+        }
+        return resources;
+    }
+
+    /// PROPFIND 列出 <paramref name="path"/>：depth 为 "0"（自身）、
+    /// "1"（直接子级）或 "infinity"。响应非 207 抛 HttpRequestException
+    /// （响应已释放），成功返回解析后的资源列表。
+    async List<WebDavResource> PropFindAsync(string path, string depth) {
+        WebDavClient.ValidateDepth(depth);
+        HttpClient client = this.NewHttpClient();
+        client.SetHeader("Depth", depth);
+        client.SetHeader("Content-Type", "application/xml; charset=utf-8");
+        HttpResponse response = await client.SendAsync("PROPFIND", path, WebDavClient.BuildPropFindXml());
+        if (response.statusCode != 207) {
+            int statusCode = response.statusCode;
+            response.Dispose();
+            throw new HttpRequestException("PROPFIND expected 207 Multi-Status, got "
+                + Convert.ToString(statusCode));
+        }
+        List<WebDavResource> resources = WebDavClient.ParseMultiStatus(response.body);
+        response.Dispose();
+        return resources;
+    }
+
+    /// 创建集合（目录）；WebDAV 状态码（201/405 等）在返回的响应里。
+    async HttpResponse MkColAsync(string path) {
+        HttpClient client = this.NewHttpClient();
+        return await client.SendAsync("MKCOL", path, "");
+    }
+
+    /// 下载资源；状态码/正文在返回的响应里。
+    async HttpResponse GetAsync(string path) {
+        HttpClient client = this.NewHttpClient();
+        return await client.SendAsync("GET", path, "");
+    }
+
+    /// 上传资源（Content-Type: application/octet-stream）；
+    /// 201/204 等状态码在返回的响应里。
+    async HttpResponse PutAsync(string path, string body) {
+        HttpClient client = this.NewHttpClient();
+        client.SetHeader("Content-Type", "application/octet-stream");
+        return await client.SendAsync("PUT", path, body);
+    }
+
+    /// 删除资源或集合；状态码在返回的响应里。
+    async HttpResponse DeleteAsync(string path) {
+        HttpClient client = this.NewHttpClient();
+        return await client.SendAsync("DELETE", path, "");
+    }
+
+    /// 复制资源到 destination（绝对路径或完整 http(s) URI；
+    /// 非法抛 ArgumentException），overwrite 选 Overwrite: T/F 头。
+    async HttpResponse CopyAsync(string path, string destination, bool overwrite) {
+        WebDavClient.ValidateDestination(destination);
+        HttpClient client = this.NewHttpClient();
+        client.SetHeader("Destination", destination);
+        client.SetHeader("Overwrite", overwrite ? "T" : "F");
+        return await client.SendAsync("COPY", path, "");
+    }
+
+    /// 移动资源到 destination（校验与 Overwrite 头同 CopyAsync）。
+    async HttpResponse MoveAsync(string path, string destination, bool overwrite) {
+        WebDavClient.ValidateDestination(destination);
+        HttpClient client = this.NewHttpClient();
+        client.SetHeader("Destination", destination);
+        client.SetHeader("Overwrite", overwrite ? "T" : "F");
+        return await client.SendAsync("MOVE", path, "");
+    }
+
+    /// 每次调用新建的底层 HttpClient：按 useTls/verifyTls 建连，
+    /// 套用 timeout，并把默认头逐条搬过去。
+    HttpClient NewHttpClient() {
+        HttpClient client;
+        if (this.useTls) { client = HttpClient.CreateHttps(this.host, this.port); }
+        else { client = new HttpClient(this.host, this.port); }
+        if (!this.verifyTls) { client.DisableTlsVerify(); }
+        client.SetTimeout(this.timeout);
+        for (int i = 0; i < this.headers.Count; i = i + 1) {
+            string header = this.headers[i];
+            int colon = header.IndexOf(":");
+            client.SetHeader(header.Substring(0, colon), header.Substring(colon + 2));
+        }
+        return client;
+    }
+
+    /// Depth 头只接受 "0"、"1"、"infinity"，否则抛 ArgumentException。
+    static void ValidateDepth(string depth) {
+        if (depth != "0" && depth != "1" && depth != "infinity") {
+            throw new ArgumentException("WebDAV Depth must be 0, 1, or infinity");
+        }
+    }
+
+    /// Destination 必须是绝对路径或 http(s) URI 且不含控制字符，
+    /// 否则抛 ArgumentException。
+    static void ValidateDestination(string destination) {
+        if (destination.Length == 0 || WebDavClient.HasControl(destination)) {
+            throw new ArgumentException("WebDAV Destination is invalid");
+        }
+        bool path = destination.Substring(0, 1) == "/";
+        bool http = destination.Length >= 7 && destination.Substring(0, 7).ToLower() == "http://";
+        bool https = destination.Length >= 8 && destination.Substring(0, 8).ToLower() == "https://";
+        if (!path && !http && !https) {
+            throw new ArgumentException("WebDAV Destination must be an absolute path or HTTP URI");
+        }
+    }
+
+    /// 头名字非空、不含冒号，名字与值都不含控制字符，否则抛
+    /// ArgumentException（头注入防线）。
+    static void ValidateHeader(string name, string headerValue) {
+        if (name.Length == 0 || name.IndexOf(":") >= 0 || WebDavClient.HasControl(name)
+            || WebDavClient.HasControl(headerValue)) {
+            throw new ArgumentException("HTTP header name or text is invalid");
+        }
+    }
+
+    /// 文本是否含控制字符（< 32 或 DEL）。
+    static bool HasControl(string text) {
+        for (int i = 0; i < text.Length; i = i + 1) {
+            int ch = text[i] & 255;
+            if (ch < 32 || ch == 127) { return true; }
+        }
+        return false;
+    }
+
+    /// 第一个 localName 标签的去转义文本内容；不存在为 ""。
+    static string TagValue(string xml, string localName) {
+        return WebDavClient.UnescapeXml(WebDavClient.Trim(WebDavClient.TagInner(xml, localName)));
+    }
+
+    /// 最后一个 localName 标签的去转义文本内容；不存在为 ""。
+    /// （status 行可能在一个 response 里出现多次，取最后一个为准。）
+    static string LastTagValue(string xml, string localName) {
+        string result = "";
+        int from = 0;
+        while (from < xml.Length) {
+            int open = WebDavClient.FindOpen(xml, localName, from);
+            if (open < 0) { break; }
+            int start = WebDavClient.TagEnd(xml, open);
+            if (start < 0) { break; }
+            int close = WebDavClient.FindClose(xml, localName, start + 1);
+            if (close < 0) { break; }
+            result = WebDavClient.UnescapeXml(WebDavClient.Trim(
+                xml.Substring(start + 1, close - start - 1)));
+            from = close + 1;
+        }
+        return result;
+    }
+
+    /// 第一个 localName 标签的原始内部文本（不去转义、不去空白）；
+    /// 自闭合或不存在为 ""。resourcetype 里找 <collection/> 用。
+    static string TagInner(string xml, string localName) {
+        int open = WebDavClient.FindOpen(xml, localName, 0);
+        if (open < 0) { return ""; }
+        int start = WebDavClient.TagEnd(xml, open);
+        if (start < 0 || (start > open && xml.Substring(start - 1, 1) == "/")) { return ""; }
+        int close = WebDavClient.FindClose(xml, localName, start + 1);
+        if (close < 0) { return ""; }
+        return xml.Substring(start + 1, close - start - 1);
+    }
+
+    /// 从 from 起找第一个名为 localName 的开始标签（忽略命名空间
+    /// 前缀，跳过注释/处理指令/结束标签）；没有返回 -1。
+    static int FindOpen(string xml, string localName, int from) {
+        int pos = from;
+        while (pos < xml.Length) {
+            int lt = WebDavClient.IndexOf(xml, "<", pos);
+            if (lt < 0 || lt + 1 >= xml.Length) { return -1; }
+            string first = xml.Substring(lt + 1, 1);
+            if (first != "/" && first != "!" && first != "?") {
+                int end = lt + 1;
+                while (end < xml.Length) {
+                    string ch = xml.Substring(end, 1);
+                    if (ch == ">" || ch == "/" || ch == " " || ch == "\t"
+                        || ch == "\r" || ch == "\n") { break; }
+                    end = end + 1;
+                }
+                string name = xml.Substring(lt + 1, end - lt - 1);
+                int colon = name.IndexOf(":");
+                if (colon >= 0) { name = name.Substring(colon + 1); }
+                if (name == localName) { return lt; }
+            }
+            pos = lt + 1;
+        }
+        return -1;
+    }
+
+    /// 从 from 起找第一个 localName 结束标签（忽略命名空间前缀）；
+    /// 没有返回 -1。
+    static int FindClose(string xml, string localName, int from) {
+        int pos = from;
+        while (pos < xml.Length) {
+            int lt = WebDavClient.IndexOf(xml, "</", pos);
+            if (lt < 0) { return -1; }
+            int end = lt + 2;
+            while (end < xml.Length && xml.Substring(end, 1) != ">"
+                && xml.Substring(end, 1) != " " && xml.Substring(end, 1) != "\t") {
+                end = end + 1;
+            }
+            string name = xml.Substring(lt + 2, end - lt - 2);
+            int colon = name.IndexOf(":");
+            if (colon >= 0) { name = name.Substring(colon + 1); }
+            if (name == localName) { return lt; }
+            pos = lt + 2;
+        }
+        return -1;
+    }
+
+    /// 从 from 起的子串搜索；没有返回 -1。
+    static int IndexOf(string haystack, string needle, int from) {
+        int i = from;
+        while (i + needle.Length <= haystack.Length) {
+            if (haystack.Substring(i, needle.Length) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// 标签开始处的 "&lt;" 的下标 → 结束 ">" 的下标（跳过引号里的
+    /// ">"，属性值因此可含该字符）；没有返回 -1。
+    static int TagEnd(string xml, int start) {
+        bool quoted = false;
+        string quote = "";
+        int i = start + 1;
+        while (i < xml.Length) {
+            string ch = xml.Substring(i, 1);
+            if (quoted) {
+                if (ch == quote) { quoted = false; }
+            } else if (ch == "\"" || ch == "'") {
+                quoted = true;
+                quote = ch;
+            } else if (ch == ">") { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// 去掉两侧 XML 空白（空格/制表/CR/LF）。
+    static string Trim(string text) {
+        int first = 0;
+        int last = text.Length;
+        for (; first < last && WebDavClient.IsSpace(text.Substring(first, 1)); first = first + 1) { }
+        while (last > first && WebDavClient.IsSpace(text.Substring(last - 1, 1))) { last = last - 1; }
+        return text.Substring(first, last - first);
+    }
+
+    /// 该单字符是否为 XML 空白。
+    static bool IsSpace(string ch) {
+        return ch == " " || ch == "\t" || ch == "\r" || ch == "\n";
+    }
+
+    /// 从 "HTTP/1.1 207 Multi-Status" 一类文本里取第一段三位数字；
+    /// 没有返回 0。
+    static int ParseStatus(string text) {
+        for (int i = 0; i + 2 < text.Length; i = i + 1) {
+            int a = text[i] & 255;
+            int b = text[i + 1] & 255;
+            int c = text[i + 2] & 255;
+            if (a >= 48 && a <= 57 && b >= 48 && b <= 57 && c >= 48 && c <= 57) {
+                return (a - 48) * 100 + (b - 48) * 10 + c - 48;
+            }
+        }
+        return 0;
+    }
+
+    /// 解析无符号十进制整数；含非数字或空串返回 0。
+    static long ParseLong(string text) {
+        if (text.Length == 0) { return 0; }
+        long result = 0;
+        for (int i = 0; i < text.Length; i = i + 1) {
+            int ch = text[i] & 255;
+            if (ch < 48 || ch > 57) { return 0; }
+            result = result * 10 + ch - 48;
+        }
+        return result;
+    }
+}

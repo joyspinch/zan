@@ -1,0 +1,1412 @@
+using System;
+using System.Data;
+using System.Net.Sockets;
+
+namespace System.Data.Firebird;
+
+/// <summary>构建中的行：单元格文本加 SQL NULL 标志。</summary>
+class FbRow {
+    List<string> values;
+    List<bool> nulls;
+
+    /// 构造 n 格、默认全 NULL 的行。
+    FbRow(int n) {
+        this.values = new List<string>();
+        this.nulls = new List<bool>();
+        for (int i = 0; i < n; i = i + 1) {
+            this.values.Add("");
+            this.nulls.Add(true);
+        }
+    }
+
+    /// 写入第 i 格并清除其 NULL 标志。
+    void Set(int i, string v) {
+        this.values[i] = v;
+        this.nulls[i] = false;
+    }
+
+    /// 各格文本。
+    List<string> Values() { return this.values; }
+    /// 各格 NULL 标志。
+    List<bool> Nulls() { return this.nulls; }
+}
+
+/// <summary>载荷仍需另行取回的 BLOB 列。</summary>
+class FbBlobRef {
+    FbRow row;
+    int col;
+    FbBytes id;
+    int subtype;
+
+    /// 记录目标行、列号、BLOB id 与子类型。
+    FbBlobRef(FbRow row, int col, FbBytes id, int subtype) {
+        this.row = row;
+        this.col = col;
+        this.id = id;
+        this.subtype = subtype;
+    }
+
+    /// 构造 <see cref="FbBlobRef"/>。
+    static FbBlobRef Of(FbRow row, int col, FbBytes id, int subtype) {
+        return new FbBlobRef(row, col, id, subtype);
+    }
+}
+
+/// <summary>一个 <c>op_response</c>：对象句柄、其 id、info 缓冲区
+/// 以及随附的状态向量。</summary>
+class FbResponse {
+    int handle;
+    FbBytes oid;
+    FbBytes buf;
+    FbError err;
+
+    /// 打包 op_response 的四个字段。
+    FbResponse(int handle, FbBytes oid, FbBytes buf, FbError err) {
+        this.handle = handle;
+        this.oid = oid;
+        this.buf = buf;
+        this.err = err;
+    }
+
+    /// 构造 <see cref="FbResponse"/>。
+    static FbResponse Of(int handle, FbBytes oid, FbBytes buf, FbError err) {
+        return new FbResponse(handle, oid, buf, err);
+    }
+
+    /// 返回的对象句柄（数据库、事务、语句等）。
+    int Handle() { return this.handle; }
+    /// 8 字节对象 id。
+    FbBytes Oid() { return this.oid; }
+    /// 随附的 info 缓冲区。
+    FbBytes Buf() { return this.buf; }
+    /// 状态向量解析出的错误。
+    FbError Err() { return this.err; }
+    /// 服务器是否报告了错误。
+    bool Failed() { return this.err.Failed(); }
+
+    /// 释放 oid 与 buf 缓冲。
+    void Release() {
+        this.oid.Release();
+        this.buf.Release();
+    }
+}
+
+/// <summary>
+/// 原生 Firebird 客户端，使用服务器自身的线缆协议（版本 13，
+/// 即 Firebird 3 及以上）——无需 fbclient，无需 ODBC。它以 SRP 登录，
+/// 可选开启服务器的 ARC4 线路加密，并直接驱动
+/// 语句生命周期（allocate / prepare / execute / fetch / free）。
+///
+/// 每个网络步骤都在 IO 反应器上挂起（<c>Socket.ConnectAsync</c>、
+/// <c>Socket.SendAsync</c>、<c>Socket.RecvOv</c>），语句不会阻塞
+/// 工作线程，多连接可在单线程上推进。这正是
+/// 该类只暴露协程 API 而非阻塞式
+/// <see cref="IDbExecutor"/> 接口的原因：连接池见 <see cref="FirebirdPool"/>。
+///
+/// 用法：
+///   FirebirdConnection db = await FirebirdConnection.OpenAsync(
+///       "127.0.0.1", 3050, "/var/lib/firebird/data/test.fdb", "SYSDBA", "secret");
+///   DbResult r = await db.QueryAsync("SELECT id, name FROM t1 WHERE id > ?",
+///                                    new DbParams().AddInt(0));
+///   await db.CloseAsync();
+/// </summary>
+class FirebirdConnection {
+    nint sock;
+    bool connected;
+    string lastError;
+    int lastAffected;
+    string database;
+    string user;
+    string plugin;          // 服务器选择的认证插件
+    string cryptPlugin;     // 使用的线路加密，明文连接时为 ""
+    int acceptVersion;
+    int dbHandle;
+    int transHandle;
+    FbBytes authData;
+    FbArc4 encIn;
+    FbArc4 encOut;
+    bool wantCrypt;
+    FbError lastStatus;
+
+    /// <summary>每次 fetch 往返请求服务器发送的行数。</summary>
+    static int FETCH_ROWS = 400;
+    /// <summary>描述语句时请求的 info 缓冲区大小。</summary>
+    static int INFO_BUFFER = 32768;
+    /// <summary>可接受的单个协议块上限，用于防范
+    /// 损坏或恶意的长度前缀。</summary>
+    static int MAX_BLOCK = 33554432;
+
+    /// 空连接；外部经 <see cref="OpenAsync"/> 构造。
+    FirebirdConnection() {
+        this.sock = 0 - 1;
+        this.connected = false;
+        this.lastError = "";
+        this.lastAffected = 0;
+        this.database = "";
+        this.user = "";
+        this.plugin = "";
+        this.cryptPlugin = "";
+        this.acceptVersion = 0;
+        this.dbHandle = 0 - 1;
+        this.transHandle = 0 - 1;
+        this.authData = null;
+        this.encIn = null;
+        this.encOut = null;
+        this.wantCrypt = true;
+        this.lastStatus = new FbError();
+    }
+
+    // ============================================================
+    // 传输
+    // ============================================================
+
+    /// <summary>精确读取 <paramref name="need"/> 字节，会话加密时
+    /// 对其解密。返回实际读取的字节数。</summary>
+    async int recvExact(byte[] dst, int off, int need) {
+        int got = 0;
+        byte[] tmp = new byte[need + 1];
+        while (got < need) {
+            int n = await Socket.RecvOv(this.sock, tmp, need - got);
+            if (n <= 0) {
+                return got;
+            }
+            for (int j = 0; j < n; j = j + 1) {
+                dst[off + got + j] = tmp[j];
+            }
+            if (this.encIn != null) {
+                this.encIn.Translate(dst, off + got, n);
+            }
+            got = got + n;
+        }
+        return got;
+    }
+
+    /// <summary>发送整个数据包并释放它。字节在
+    /// 加密前复制，确保密钥流不会改写调用方的缓冲区。
+    /// </summary>
+    async bool sendPacket(FbBytes pkt) {
+        int n = pkt.Len();
+        byte[] buf = new byte[n + 1];
+        for (int i = 0; i < n; i = i + 1) {
+            buf[i] = (byte)pkt.At(i);
+        }
+        pkt.Release();
+        if (this.encOut != null) {
+            this.encOut.Translate(buf, 0, n);
+        }
+        int sent = await Socket.SendAsync(this.sock, buf, n);
+        if (sent < 0) {
+            this.lastError = "send failed";
+            this.connected = false;
+            return false;
+        }
+        return true;
+    }
+
+    /// 读取 4 字节大端整数；连接关闭时返回 -1 并标记断开。
+    async int recvInt() {
+        byte[] b = new byte[5];
+        int got = await this.recvExact(b, 0, 4);
+        if (got < 4) {
+            this.lastError = "connection closed by the server";
+            this.connected = false;
+            return 0 - 1;
+        }
+        return ((b[0] & 255) << 24) | ((b[1] & 255) << 16)
+             | ((b[2] & 255) << 8) | (b[3] & 255);
+    }
+
+    /// <summary>读取一个协议视为有符号的 32 位值。</summary>
+    async int recvSigned() {
+        int v = await this.recvInt();
+        if (v >= 2147483648) { return v - 4294967296; }
+        return v;
+    }
+
+    /// <summary><paramref name="n"/> 字节加上将其补至
+    /// 4 字节边界的填充。</summary>
+    async FbBytes recvAligned(int n) {
+        if (n < 0 || n > FirebirdConnection.MAX_BLOCK) {
+            this.lastError = "malformed block length";
+            this.connected = false;
+            return null;
+        }
+        int pad = (4 - (n % 4)) % 4;
+        FbBytes b = FbBytes.Alloc(n + pad);
+        int got = await this.recvExact(b.Data(), 0, n + pad);
+        if (got < n + pad) {
+            b.Release();
+            this.lastError = "truncated response";
+            this.connected = false;
+            return null;
+        }
+        FbBytes v = b.Slice(0, n);
+        b.Release();
+        return v;
+    }
+
+    /// <summary>带长度前缀、4 字节对齐的块。</summary>
+    async FbBytes recvBlock() {
+        int n = await this.recvInt();
+        if (n < 0) { return null; }
+        return await this.recvAligned(n);
+    }
+
+    // ============================================================
+    // 响应与错误
+    // ============================================================
+
+    /// <summary>读取状态向量并将其转为可读错误。</summary>
+    async FbError recvStatus() {
+        FbError e = new FbError();
+        List<string> segs = new List<string>();
+        int argNum = 0;
+        bool more = true;
+        while (more) {
+            int kind = await this.recvInt();
+            if (kind < 0) {
+                e.SetMessage("connection closed while reading the status vector");
+                return e;
+            }
+            if (kind == FbOp.ARG_END) {
+                more = false;
+            } else if (kind == FbOp.ARG_GDS) {
+                int code = await this.recvInt();
+                // 每个向量都以 0 结尾，无论成败；只有
+                // 非 0 的才带有消息。
+                if (code != 0) {
+                    e.AddCode(code);
+                    segs.Add(FbError.Text(code));
+                }
+                argNum = 0;
+            } else if (kind == FbOp.ARG_NUMBER) {
+                int v = await this.recvSigned();
+                argNum = argNum + 1;
+                if (e.CodeCount() > 0
+                        && e.CodeAt(e.CodeCount() - 1) == 335544436) {
+                    e.SetSqlCode(v);
+                }
+                FirebirdConnection.fill(segs, argNum, Convert.ToString(v));
+            } else if (kind == FbOp.ARG_STRING || kind == FbOp.ARG_CSTRING
+                    || kind == FbOp.ARG_SQL_STATE) {
+                FbBytes s = await this.recvBlock();
+                if (s == null) { return e; }
+                argNum = argNum + 1;
+                FirebirdConnection.fill(segs, argNum, s.Text());
+                s.Release();
+            } else if (kind == FbOp.ARG_INTERPRETED) {
+                FbBytes s = await this.recvBlock();
+                if (s == null) { return e; }
+                segs.Add(s.Text());
+                s.Release();
+                argNum = 0;
+            } else {
+                e.SetMessage("unsupported status argument "
+                             + Convert.ToString(kind));
+                return e;
+            }
+        }
+        if (segs.Count > 0) {
+            StringBuilder sb = new StringBuilder();
+            bool first = true;
+            for (int i = 0; i < segs.Count; i = i + 1) {
+                if (segs[i].Length > 0) {
+                    if (!first) { sb.Append("; "); }
+                    sb.Append(segs[i]);
+                    first = false;
+                }
+            }
+            e.SetMessage(sb.ToString());
+        }
+        return e;
+    }
+
+    /// <summary>将第 n 个参数代入正在等待它的
+    /// 消息段。</summary>
+    static void fill(List<string> segs, int argNum, string text) {
+        if (segs.Count == 0) {
+            segs.Add(text);
+            return;
+        }
+        int last = segs.Count - 1;
+        string mark = "@" + Convert.ToString(argNum);
+        if (segs[last].Contains(mark)) {
+            segs[last] = segs[last].Replace(mark, text);
+        } else {
+            segs.Add(text);
+        }
+    }
+
+    /// <summary>读取一个 <c>op_response</c>，跳过服务器可能
+    /// 穿插发送的 keep-alive 包。</summary>
+    async FbResponse recvResponse() {
+        int op = await this.recvInt();
+        while (op == FbOp.DUMMY) {
+            op = await this.recvInt();
+        }
+        if (op < 0) { return null; }
+        if (op != FbOp.RESPONSE) {
+            this.lastError = "unexpected operation " + Convert.ToString(op);
+            this.connected = false;
+            return null;
+        }
+        int handle = await this.recvInt();
+        FbBytes oid = await this.recvAligned(8);
+        if (oid == null) { return null; }
+        FbBytes buf = await this.recvBlock();
+        if (buf == null) {
+            oid.Release();
+            return null;
+        }
+        FbError err = await this.recvStatus();
+        return FbResponse.Of(handle, oid, buf, err);
+    }
+
+    /// <summary>发送一个数据包并读取对应的响应，记录
+    /// 任何服务器错误。</summary>
+    async FbResponse roundTrip(FbBytes pkt) {
+        bool sent = await this.sendPacket(pkt);
+        if (!sent) { return null; }
+        FbResponse resp = await this.recvResponse();
+        if (resp == null) { return null; }
+        // 失败后各次往返（例如释放语句）返回的干净状态
+        // 不能抹去真正的错误信息。
+        if (resp.Failed()) {
+            this.lastStatus = resp.Err();
+            this.lastError = resp.Err().Message();
+        }
+        return resp;
+    }
+
+    // ============================================================
+    // 连接、认证、附加
+    // ============================================================
+
+    /// <summary>打开连接，以 SRP 认证并附加到
+    /// 数据库。服务器支持时启用线路加密。</summary>
+    static async FirebirdConnection OpenAsync(string host, int port,
+            string database, string user, string password) {
+        return await FirebirdConnection.OpenAsync(host, port, database, user,
+                                                  password, true);
+    }
+
+    /// <summary>可拒绝线路加密的打开变体（适用于
+    /// 经由已加密隧道访问的服务器，或配置了
+    /// <c>WireCrypt = Disabled</c> 的服务器）。</summary>
+    static async FirebirdConnection OpenAsync(string host, int port,
+            string database, string user, string password, bool wireCrypt) {
+        Socket.Initialize();
+        FirebirdConnection conn = new FirebirdConnection();
+        conn.database = database;
+        conn.user = user;
+        conn.wantCrypt = wireCrypt;
+        bool ok = await conn.handshake(host, port, database, user, password);
+        conn.connected = ok;
+        if (!ok) {
+            if (conn.sock >= 0) {
+                Socket.Close(conn.sock);
+                conn.sock = 0 - 1;
+            }
+        }
+        return conn;
+    }
+
+    /// 完整连接序列：TCP 连接、op_connect（协议 13 + SRP 公钥）、
+    /// SRP 认证、op_attach 取数据库句柄并开启事务。
+    async bool handshake(string host, int port, string db, string user, string pw) {
+        this.sock = Socket.CreateTcp();
+        if (this.sock < 0) {
+            this.lastError = "socket create failed";
+            return false;
+        }
+        Socket.SetNonBlocking(this.sock);
+        int rc = await Socket.ConnectAsync(this.sock, host, port);
+        if (rc != 0) {
+            this.lastError = "cannot reach " + host + ":" + Convert.ToString(port);
+            return false;
+        }
+        Socket.SetNoDelay(this.sock);
+
+        FbSrp srp = FbSrp.Create();
+        if (srp == null) {
+            this.lastError = "no secure random source for the SRP exchange";
+            return false;
+        }
+        bool sent = await this.sendPacket(
+            FirebirdConnection.ConnectPacket(db, user, srp.PublicHex(),
+                                             this.wantCrypt));
+        if (!sent) { return false; }
+        if (!await this.authenticate(srp, user, pw)) { return false; }
+
+        FbResponse att = await this.roundTrip(
+            FirebirdConnection.AttachPacket(db, user, this.authData));
+        if (att == null) { return false; }
+        if (att.Failed()) {
+            att.Release();
+            return false;
+        }
+        this.dbHandle = att.Handle();
+        att.Release();
+        return await this.beginTransaction();
+    }
+
+    /// <summary>构建 <c>op_connect</c>：客户端提供协议 13 及
+    /// SRP 公钥，服务器以 salt 和自身公钥应答。
+    /// </summary>
+    static FbBytes ConnectPacket(string database, string user, string pubHex,
+            bool wireCrypt) {
+        FbBuf uid = new FbBuf();
+        FirebirdConnection.cnct(uid, FbOp.CNCT_LOGIN, user);
+        FirebirdConnection.cnct(uid, FbOp.CNCT_PLUGIN_NAME, "Srp256");
+        FirebirdConnection.cnct(uid, FbOp.CNCT_PLUGIN_LIST, "Srp256,Srp");
+        FirebirdConnection.cnctChunked(uid, FbOp.CNCT_SPECIFIC_DATA, pubHex);
+        uid.U8(FbOp.CNCT_CLIENT_CRYPT);
+        uid.U8(4);
+        if (wireCrypt) { uid.U8(1); } else { uid.U8(0); }
+        uid.U8(0); uid.U8(0); uid.U8(0);
+        FirebirdConnection.cnct(uid, FbOp.CNCT_USER, user);
+        FirebirdConnection.cnct(uid, FbOp.CNCT_HOST, "zan");
+        FirebirdConnection.cnct(uid, FbOp.CNCT_USER_VERIFICATION, "");
+
+        FbBuf p = new FbBuf();
+        p.Int(FbOp.CONNECT);
+        p.Int(FbOp.ATTACH);
+        p.Int(FbOp.CONNECT_VERSION);
+        p.Int(FbOp.ARCH_GENERIC);
+        p.Str(database);
+        p.Int(1);                       // 提供一个协议选项
+        FbBytes uidBytes = uid.ToBytes();
+        p.Block(uidBytes);
+        uidBytes.Release();
+        // 版本、架构、最小类型、最大类型（批量发送）、权重
+        p.Int(FbOp.PROTOCOL_V13);
+        p.Int(FbOp.ARCH_GENERIC);
+        p.Int(0);
+        p.Int(FbOp.PTYPE_BATCH_SEND);
+        p.Int(8);
+        return p.ToBytes();
+    }
+
+    /// 写入单个 connect 用户项（1 字节标签 + 1 字节长度 + 值）。
+    static void cnct(FbBuf b, int tag, string v) {
+        b.U8(tag);
+        b.U8(v.Length);
+        b.Raw(v);
+    }
+
+    /// <summary>specific-data clumplet 带有序号字节，按
+    /// 254 字节分片，SRP 公钥总是需要这样发送。</summary>
+    static void cnctChunked(FbBuf b, int tag, string v) {
+        int off = 0;
+        int seq = 0;
+        while (v.Length - off > 254) {
+            b.U8(tag);
+            b.U8(255);
+            b.U8(seq);
+            b.Raw(v.Substring(off, 254));
+            off = off + 254;
+            seq = seq + 1;
+        }
+        b.U8(tag);
+        b.U8(v.Length - off + 1);
+        b.U8(seq);
+        b.Raw(v.Substring(off, v.Length - off));
+    }
+
+    /// <summary>执行 SRP 续接流程，并在服务器要求时
+    /// 开启线路加密。</summary>
+    async bool authenticate(FbSrp srp, string user, string password) {
+        int op = await this.recvInt();
+        while (op == FbOp.DUMMY) {
+            op = await this.recvInt();
+        }
+        if (op < 0) { return false; }
+        if (op == FbOp.REJECT) {
+            this.lastError = "the server rejected the connection";
+            return false;
+        }
+        if (op == FbOp.RESPONSE) {
+            FbResponse r = await this.recvResponse4();
+            if (r != null) {
+                this.lastError = r.Err().Message();
+                if (this.lastError.Length == 0) {
+                    this.lastError = "the server refused the connection";
+                }
+                r.Release();
+            }
+            return false;
+        }
+        if (op != FbOp.ACCEPT && op != FbOp.ACCEPT_DATA
+                && op != FbOp.COND_ACCEPT) {
+            this.lastError = "unexpected connect response " + Convert.ToString(op);
+            return false;
+        }
+        int version = await this.recvInt();
+        this.acceptVersion = version & 255;
+        await this.recvInt();           // 架构
+        await this.recvInt();           // 数据包类型
+        if (this.acceptVersion != 13) {
+            this.lastError = "the server speaks protocol "
+                + Convert.ToString(this.acceptVersion)
+                + "; this driver needs 13 (Firebird 3 or newer)";
+            return false;
+        }
+        if (op == FbOp.ACCEPT) {
+            // 协议 13 的 accept 总带有认证数据；
+            // 裸 accept 意味着服务器想要我们未提供的认证方案。
+            this.lastError = "the server accepted without authentication data";
+            return false;
+        }
+
+        FbBytes data = await this.recvBlock();
+        if (data == null) { return false; }
+        FbBytes pluginName = await this.recvBlock();
+        if (pluginName == null) { data.Release(); return false; }
+        this.plugin = pluginName.Text();
+        pluginName.Release();
+        int authenticated = await this.recvInt();
+        FbBytes keys = await this.recvBlock();
+        if (keys == null) { data.Release(); return false; }
+        keys.Release();
+
+        FbBytes sessionKey = null;
+        if (authenticated == 0) {
+            if (this.plugin != "Srp" && this.plugin != "Srp256") {
+                data.Release();
+                this.lastError = "the server asked for the " + this.plugin
+                    + " authentication plugin, which this driver does not implement";
+                return false;
+            }
+            if (data.Len() == 0) {
+                // 服务器在发送 salt 前
+                // 再次索取公钥：继续握手。
+                data.Release();
+                bool sent = await this.sendPacket(FirebirdConnection.ContAuth(
+                    srp.Public(), this.plugin, "Srp256,Srp"));
+                if (!sent) { return false; }
+                int op2 = await this.recvInt();
+                if (op2 == FbOp.RESPONSE) {
+                    FbResponse r = await this.recvResponse4();
+                    if (r != null) {
+                        this.lastError = r.Err().Message();
+                        r.Release();
+                    }
+                    return false;
+                }
+                if (op2 != FbOp.CONT_AUTH) {
+                    this.lastError = "unexpected authentication response "
+                        + Convert.ToString(op2);
+                    return false;
+                }
+                data = await this.recvBlock();
+                if (data == null) { return false; }
+                FbBytes skip = await this.recvBlock();      // 插件名
+                if (skip != null) { skip.Release(); }
+                skip = await this.recvBlock();              // 插件列表
+                if (skip != null) { skip.Release(); }
+                skip = await this.recvBlock();              // 密钥
+                if (skip != null) { skip.Release(); }
+            }
+            if (data.Len() < 4) {
+                data.Release();
+                this.lastError = "the server sent no SRP challenge (login refused)";
+                return false;
+            }
+            int saltLen = (data.At(0) & 255) | ((data.At(1) & 255) << 8);
+            if (saltLen < 0 || saltLen + 4 > data.Len()) {
+                data.Release();
+                this.lastError = "malformed SRP challenge";
+                return false;
+            }
+            FbBytes salt = data.Slice(2, saltLen);
+            FbBytes keyHex = data.Slice(4 + saltLen, data.Len() - 4 - saltLen);
+            FbBytes serverPub = FbBytes.FromHex(keyHex.Text());
+            keyHex.Release();
+            FbSrpProof proof = srp.Prove(FbSrp.NormalizeUser(user), password,
+                                         salt, serverPub,
+                                         this.plugin == "Srp256");
+            salt.Release();
+            serverPub.Release();
+            if (proof == null) {
+                data.Release();
+                this.lastError = "the SRP challenge could not be answered";
+                return false;
+            }
+            this.authData = proof.Proof();
+            sessionKey = proof.Key();
+        } else {
+            this.authData = FbBytes.Empty();
+        }
+        data.Release();
+
+        if (op == FbOp.COND_ACCEPT) {
+            bool sent = await this.sendPacket(FirebirdConnection.ContAuth(
+                this.authData, this.plugin, "Srp256,Srp"));
+            if (!sent) {
+                if (sessionKey != null) { sessionKey.Release(); }
+                return false;
+            }
+            FbResponse resp = await this.recvResponse();
+            if (resp == null) {
+                if (sessionKey != null) { sessionKey.Release(); }
+                return false;
+            }
+            if (resp.Failed()) {
+                this.lastError = resp.Err().Message();
+                resp.Release();
+                if (sessionKey != null) { sessionKey.Release(); }
+                return false;
+            }
+            string enc = FirebirdConnection.GuessWireCrypt(resp.Buf());
+            resp.Release();
+            if (enc.Length > 0 && this.wantCrypt && sessionKey != null) {
+                if (enc != "Arc4") {
+                    this.lastError = "the server offers only the " + enc
+                        + " wire encryption plugin, which this driver does not"
+                        + " implement; run the connection through a tunnel or"
+                        + " allow Arc4";
+                    sessionKey.Release();
+                    return false;
+                }
+                bool up = await this.startCrypt(sessionKey);
+                sessionKey.Release();
+                if (!up) { return false; }
+                // 握手已认证会话，因此 attach
+                // 的参数块中不得重复证明。
+                this.authData.Release();
+                this.authData = FbBytes.Empty();
+                return true;
+            }
+        }
+        if (sessionKey != null) { sessionKey.Release(); }
+        return true;
+    }
+
+    /// <summary>读取一个操作码已从线缆上取走的响应的
+    /// 正文。</summary>
+    async FbResponse recvResponse4() {
+        int handle = await this.recvInt();
+        FbBytes oid = await this.recvAligned(8);
+        if (oid == null) { return null; }
+        FbBytes buf = await this.recvBlock();
+        if (buf == null) {
+            oid.Release();
+            return null;
+        }
+        FbError err = await this.recvStatus();
+        return FbResponse.Of(handle, oid, buf, err);
+    }
+
+    /// 构建 op_cont_auth：认证数据（hex）、插件名与插件列表。
+    static FbBytes ContAuth(FbBytes authData, string plugin, string pluginList) {
+        FbBuf p = new FbBuf();
+        p.Int(FbOp.CONT_AUTH);
+        p.Str(authData.Hex());
+        p.Str(plugin);
+        p.Str(pluginList);
+        p.Str("");
+        return p.ToBytes();
+    }
+
+    /// <summary>从服务器提供的列表中选择线路加密插件。
+    /// 缓冲区是 clumplet 列表：标签 1 保存以空格分隔的插件名。
+    /// </summary>
+    static string GuessWireCrypt(FbBytes buf) {
+        FbReader r = FbReader.Over(buf);
+        string names = "";
+        while (r.Left() >= 2) {
+            int tag = r.U8();
+            int ln = r.U8();
+            string v = r.Text(ln);
+            if (tag == 1) { names = v; }
+        }
+        if (names.Length == 0) { return ""; }
+        if (names.Contains("Arc4")) { return "Arc4"; }
+        int sp = names.IndexOf(" ");
+        if (sp > 0) { return names.Substring(0, sp); }
+        return names;
+    }
+
+    /// 发送 op_crypt 请求 Arc4 线路加密，并在发出请求之后、
+    /// 读取应答之前启用双向 ARC4 密钥流。
+    async bool startCrypt(FbBytes sessionKey) {
+        FbBuf p = new FbBuf();
+        p.Int(FbOp.CRYPT);
+        p.Str("Arc4");
+        p.Str("Symmetric");
+        bool sent = await this.sendPacket(p.ToBytes());
+        if (!sent) { return false; }
+        // 密钥流从各方向的下一字节开始，因此
+        // 翻译器应在请求发出后、
+        // 读取应答前启用。
+        this.encOut = new FbArc4(sessionKey);
+        this.encIn = new FbArc4(sessionKey);
+        this.cryptPlugin = "Arc4";
+        FbResponse resp = await this.recvResponse();
+        if (resp == null) { return false; }
+        if (resp.Failed()) {
+            this.lastError = resp.Err().Message();
+            resp.Release();
+            return false;
+        }
+        resp.Release();
+        return true;
+    }
+
+    /// <summary>构建带数据库参数块的 <c>op_attach</c>。</summary>
+    static FbBytes AttachPacket(string database, string user, FbBytes authData) {
+        FbBuf dpb = new FbBuf();
+        dpb.U8(FbOp.DPB_VERSION1);
+        FirebirdConnection.dpbStr(dpb, FbOp.DPB_LC_CTYPE, "UTF8");
+        FirebirdConnection.dpbStr(dpb, FbOp.DPB_USER_NAME, user);
+        FirebirdConnection.dpbStr(dpb, FbOp.DPB_PROCESS_NAME, "zan");
+        dpb.U8(FbOp.DPB_SQL_DIALECT);
+        dpb.U8(4);
+        dpb.U8(3); dpb.U8(0); dpb.U8(0); dpb.U8(0);
+        if (authData != null && authData.Len() > 0) {
+            FirebirdConnection.dpbStr(dpb, FbOp.DPB_SPECIFIC_AUTH_DATA,
+                                      authData.Hex());
+        }
+        FbBuf p = new FbBuf();
+        p.Int(FbOp.ATTACH);
+        p.Int(0);
+        p.Str(database);
+        FbBytes d = dpb.ToBytes();
+        p.Block(d);
+        d.Release();
+        return p.ToBytes();
+    }
+
+    /// 写入单个 DPB 字符串项（标签 + 长度 + 值）。
+    static void dpbStr(FbBuf b, int tag, string v) {
+        b.U8(tag);
+        b.U8(v.Length);
+        b.Raw(v);
+    }
+
+    // ============================================================
+    // 事务
+    // ============================================================
+
+    /// 以 WRITE / WAIT / READ COMMITTED（REC_VERSION）开启新事务。
+    async bool beginTransaction() {
+        FbBuf tpb = new FbBuf();
+        tpb.U8(FbOp.TPB_VERSION3);
+        tpb.U8(FbOp.TPB_WRITE);
+        tpb.U8(FbOp.TPB_WAIT);
+        tpb.U8(FbOp.TPB_READ_COMMITTED);
+        tpb.U8(FbOp.TPB_REC_VERSION);
+
+        FbBuf p = new FbBuf();
+        p.Int(FbOp.TRANSACTION);
+        p.Int(this.dbHandle);
+        FbBytes t = tpb.ToBytes();
+        p.Block(t);
+        t.Release();
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return false; }
+        if (resp.Failed()) {
+            resp.Release();
+            return false;
+        }
+        this.transHandle = resp.Handle();
+        resp.Release();
+        return true;
+    }
+
+    /// <summary>提交但不放弃事务句柄：在显式事务之外执行的语句
+    /// 都以此方式提交，这正是
+    /// 连接像自动提交一样工作的原因。</summary>
+    async bool commitRetaining() {
+        FbBuf p = new FbBuf();
+        p.Int(FbOp.COMMIT_RETAINING);
+        p.Int(this.transHandle);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return false; }
+        bool ok = !resp.Failed();
+        resp.Release();
+        return ok;
+    }
+
+    /// <summary>提交当前事务并开启新事务。</summary>
+    async bool CommitAsync() {
+        if (!this.connected) { return false; }
+        FbBuf p = new FbBuf();
+        p.Int(FbOp.COMMIT);
+        p.Int(this.transHandle);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return false; }
+        bool ok = !resp.Failed();
+        resp.Release();
+        this.transHandle = 0 - 1;
+        if (!ok) { return false; }
+        return await this.beginTransaction();
+    }
+
+    /// <summary>回滚当前事务并开启新事务。</summary>
+    async bool RollbackAsync() {
+        if (!this.connected) { return false; }
+        FbBuf p = new FbBuf();
+        p.Int(FbOp.ROLLBACK);
+        p.Int(this.transHandle);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return false; }
+        bool ok = !resp.Failed();
+        resp.Release();
+        this.transHandle = 0 - 1;
+        if (!ok) { return false; }
+        return await this.beginTransaction();
+    }
+
+    // ============================================================
+    // 语句
+    // ============================================================
+
+    /// 分配语句句柄；失败返回 -1。
+    async int allocStatement() {
+        FbBuf p = new FbBuf();
+        p.Int(FbOp.ALLOCATE_STATEMENT);
+        p.Int(this.dbHandle);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return 0 - 1; }
+        if (resp.Failed()) {
+            resp.Release();
+            return 0 - 1;
+        }
+        int h = resp.Handle();
+        resp.Release();
+        return h;
+    }
+
+    /// <summary>prepare 请求的 describe 条目：先是语句类型，
+    /// 再是每个输出列的布局。</summary>
+    static FbBytes describeItems() {
+        FbBuf b = new FbBuf();
+        b.U8(FbType.INFO_STMT_TYPE);
+        b.U8(FbType.INFO_SELECT);
+        b.U8(FbType.INFO_DESCRIBE_VARS);
+        b.U8(FbType.INFO_SQLDA_SEQ);
+        b.U8(FbType.INFO_TYPE);
+        b.U8(FbType.INFO_SUB_TYPE);
+        b.U8(FbType.INFO_SCALE);
+        b.U8(FbType.INFO_LENGTH);
+        b.U8(FbType.INFO_NULL_IND);
+        b.U8(FbType.INFO_FIELD);
+        b.U8(FbType.INFO_RELATION);
+        b.U8(FbType.INFO_OWNER);
+        b.U8(FbType.INFO_ALIAS);
+        b.U8(FbType.INFO_DESCRIBE_END);
+        return b.ToBytes();
+    }
+
+    /// prepare 语句并解析输出描述（XSQLDA）；描述超出单个缓冲区时
+    /// 按 INFO_SQLDA_START 从服务器停下的列继续读取，失败返回 null。
+    async FbXsqlda prepare(int stmt, string sql) {
+        FbBuf p = new FbBuf();
+        p.Int(FbOp.PREPARE_STATEMENT);
+        p.Int(this.transHandle);
+        p.Int(stmt);
+        p.Int(3);                       // SQL 方言
+        p.Str(sql);
+        FbBytes items = FirebirdConnection.describeItems();
+        p.Block(items);
+        items.Release();
+        p.Int(FirebirdConnection.INFO_BUFFER);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return null; }
+        if (resp.Failed()) {
+            resp.Release();
+            return null;
+        }
+        FbXsqlda xs = new FbXsqlda();
+        int next = xs.Parse(resp.Buf());
+        resp.Release();
+        if (next == 0 - 2) {
+            this.lastError = "malformed statement description";
+            return null;
+        }
+        // 超出单个缓冲区的描述会被截断返回；从服务器
+        // 停下的列开始请求剩余部分。
+        while (next > 0) {
+            FbBuf q = new FbBuf();
+            q.Int(FbOp.INFO_SQL);
+            q.Int(stmt);
+            q.Int(0);
+            FbBuf items2 = new FbBuf();
+            items2.U8(FbType.INFO_SQLDA_START);
+            items2.U8(2);
+            items2.U8(next & 255);
+            items2.U8((next >> 8) & 255);
+            items2.U8(FbType.INFO_SELECT);
+            items2.U8(FbType.INFO_DESCRIBE_VARS);
+            items2.U8(FbType.INFO_SQLDA_SEQ);
+            items2.U8(FbType.INFO_TYPE);
+            items2.U8(FbType.INFO_SUB_TYPE);
+            items2.U8(FbType.INFO_SCALE);
+            items2.U8(FbType.INFO_LENGTH);
+            items2.U8(FbType.INFO_NULL_IND);
+            items2.U8(FbType.INFO_FIELD);
+            items2.U8(FbType.INFO_RELATION);
+            items2.U8(FbType.INFO_OWNER);
+            items2.U8(FbType.INFO_ALIAS);
+            items2.U8(FbType.INFO_DESCRIBE_END);
+            FbBytes i2 = items2.ToBytes();
+            q.Block(i2);
+            i2.Release();
+            q.Int(FirebirdConnection.INFO_BUFFER);
+            FbResponse more = await this.roundTrip(q.ToBytes());
+            if (more == null) { return null; }
+            if (more.Failed()) {
+                more.Release();
+                return null;
+            }
+            int again = xs.Parse(more.Buf());
+            more.Release();
+            if (again == next) {
+                this.lastError = "the server keeps truncating the description";
+                return null;
+            }
+            next = again;
+        }
+        return xs;
+    }
+
+    /// 执行语句：无参数走空 BLR；有参数经 FbValue.Params 编码
+    /// BLR 与绑定值后随 op_execute 发送。
+    async bool execute(int stmt, DbParams prms) {
+        FbParamBlock pb = FbValue.Params(prms);
+        FbBuf p = new FbBuf();
+        p.Int(FbOp.EXECUTE);
+        p.Int(stmt);
+        p.Int(this.transHandle);
+        int count = 0;
+        if (prms != null) { count = prms.Count(); }
+        if (count == 0) {
+            FbBytes none = FbBytes.Empty();
+            p.Block(none);
+            none.Release();
+            p.Int(0);
+            p.Int(0);
+        } else {
+            p.Block(pb.Blr());
+            p.Int(0);
+            p.Int(1);
+            p.RawBlock(pb.Values());
+        }
+        pb.Release();
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return false; }
+        bool ok = !resp.Failed();
+        resp.Release();
+        return ok;
+    }
+
+    /// 释放（DSQL_DROP）语句句柄。
+    async bool freeStatement(int stmt) {
+        FbBuf p = new FbBuf();
+        p.Int(FbOp.FREE_STATEMENT);
+        p.Int(stmt);
+        p.Int(FbOp.DSQL_DROP);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return false; }
+        bool ok = !resp.Failed();
+        resp.Release();
+        return ok;
+    }
+
+    /// <summary>读取上一条语句产生的行计数器。</summary>
+    async int affectedRows(int stmt, bool select) {
+        FbBuf p = new FbBuf();
+        p.Int(FbOp.INFO_SQL);
+        p.Int(stmt);
+        p.Int(0);
+        FbBytes items = FbBytes.Alloc(1);
+        items.SetAt(0, FbType.INFO_RECORDS);
+        p.Block(items);
+        items.Release();
+        p.Int(FirebirdConnection.INFO_BUFFER);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return 0; }
+        if (resp.Failed()) {
+            resp.Release();
+            return 0;
+        }
+        int total = 0;
+        FbReader r = FbReader.Over(resp.Buf());
+        if (r.U8() == FbType.INFO_RECORDS) {
+            r.U16LE();                  // 计数器组的长度
+            bool more = true;
+            while (more && r.Left() > 0) {
+                int item = r.U8();
+                if (item == FbType.INFO_END) {
+                    more = false;
+                } else {
+                    int ln = r.U16LE();
+                    int v = r.IntLE(ln);
+                    if (select) {
+                        if (item == FbType.REQ_SELECT_COUNT) { total = v; }
+                    } else if (item == FbType.REQ_INSERT_COUNT
+                            || item == FbType.REQ_UPDATE_COUNT
+                            || item == FbType.REQ_DELETE_COUNT) {
+                        total = total + v;
+                    }
+                }
+            }
+        }
+        resp.Release();
+        return total;
+    }
+
+    // ============================================================
+    // 取数
+    // ============================================================
+
+    /// <summary>从线缆读取一个值，遵循每字段
+    /// 补齐到的 4 字节对齐。</summary>
+    async FbBytes fetchValue(FbColumn col) {
+        int n = col.IoLength();
+        if (n < 0) {
+            n = await this.recvInt();
+            if (n < 0) { return null; }
+        }
+        return await this.recvAligned(n);
+    }
+
+    /// <summary>拉取打开游标的每一行。BLOB 列先收集
+    /// 稍后再解析，因为其载荷需要单独的往返，
+    /// 且不能与取数流交错。</summary>
+    async DbResult fetchAll(int stmt, FbXsqlda xs) {
+        DbResult res = new DbResult();
+        int cols = xs.Count();
+        res.SetColumnCount(cols);
+        for (int c = 0; c < cols; c = c + 1) {
+            res.AddColumnName(xs.At(c).Name());
+        }
+        List<FbRow> rows = new List<FbRow>();
+        List<FbBlobRef> blobs = new List<FbBlobRef>();
+        FbBytes blr = xs.CalcBlr();
+        int nullBytes = cols / 8;
+        if ((cols % 8) != 0) { nullBytes = nullBytes + 1; }
+
+        bool more = true;
+        while (more) {
+            FbBuf p = new FbBuf();
+            p.Int(FbOp.FETCH);
+            p.Int(stmt);
+            p.Block(blr);
+            p.Int(0);
+            p.Int(FirebirdConnection.FETCH_ROWS);
+            bool sent = await this.sendPacket(p.ToBytes());
+            if (!sent) {
+                blr.Release();
+                return res;
+            }
+            int op = await this.recvInt();
+            while (op == FbOp.DUMMY) {
+                op = await this.recvInt();
+            }
+            if (op == FbOp.RESPONSE) {
+                FbResponse r = await this.recvResponse4();
+                if (r != null) {
+                    if (r.Failed()) { this.lastError = r.Err().Message(); }
+                    r.Release();
+                }
+                blr.Release();
+                return res;
+            }
+            if (op != FbOp.FETCH_RESPONSE) {
+                this.lastError = "unexpected fetch response "
+                    + Convert.ToString(op);
+                this.connected = false;
+                blr.Release();
+                return res;
+            }
+            int status = await this.recvInt();
+            int count = await this.recvInt();
+            while (count != 0) {
+                FbBytes flags = await this.recvAligned(nullBytes);
+                if (flags == null) {
+                    blr.Release();
+                    return res;
+                }
+                FbRow row = new FbRow(cols);
+                for (int i = 0; i < cols; i = i + 1) {
+                    bool isNull = ((flags.At(i / 8) >> (i % 8)) & 1) != 0;
+                    if (!isNull) {
+                        FbColumn col = xs.At(i);
+                        FbBytes raw = await this.fetchValue(col);
+                        if (raw == null) {
+                            flags.Release();
+                            blr.Release();
+                            return res;
+                        }
+                        if (col.SqlType() == FbType.BLOB) {
+                            blobs.Add(FbBlobRef.Of(row, i, raw, col.SubType()));
+                            row.Set(i, "");
+                        } else {
+                            row.Set(i, FbValue.Decode(col, raw));
+                            raw.Release();
+                        }
+                    }
+                }
+                flags.Release();
+                rows.Add(row);
+                op = await this.recvInt();
+                status = await this.recvInt();
+                count = await this.recvInt();
+            }
+            if (status == 100) { more = false; }
+        }
+        blr.Release();
+
+        for (int b = 0; b < blobs.Count; b = b + 1) {
+            FbBlobRef br = blobs[b];
+            string text = await this.readBlob(br.id, br.subtype);
+            br.row.Set(br.col, text);
+            br.id.Release();
+        }
+
+        for (int k = 0; k < rows.Count; k = k + 1) {
+            res.AddRowNulls(rows[k].Values(), rows[k].Nulls());
+        }
+        return res;
+    }
+
+    /// <summary>完整读取 BLOB。子类型 1 为文本，按文本返回；
+    /// 其余为二进制，以十六进制渲染，而非在
+    /// 首个零字节处截断。</summary>
+    async string readBlob(FbBytes blobId, int subtype) {
+        FbBuf p = new FbBuf();
+        p.Int(FbOp.OPEN_BLOB2);
+        p.Int(0);
+        p.Int(this.transHandle);
+        p.RawBlock(blobId);
+        FbResponse open = await this.roundTrip(p.ToBytes());
+        if (open == null) { return ""; }
+        if (open.Failed()) {
+            open.Release();
+            return "";
+        }
+        int h = open.Handle();
+        open.Release();
+
+        FbBuf all = new FbBuf();
+        bool more = true;
+        while (more) {
+            FbBuf g = new FbBuf();
+            g.Int(FbOp.GET_SEGMENT);
+            g.Int(h);
+            g.Int(FirebirdConnection.INFO_BUFFER);
+            g.Int(0);
+            FbResponse seg = await this.roundTrip(g.ToBytes());
+            if (seg == null) { return ""; }
+            if (seg.Failed()) {
+                seg.Release();
+                more = false;
+            } else {
+                FbReader r = FbReader.Over(seg.Buf());
+                while (r.Left() >= 2) {
+                    int ln = r.U16LE();
+                    FbBytes part = r.Raw(ln);
+                    all.RawBlock(part);
+                    part.Release();
+                }
+                if (seg.Handle() == 2) { more = false; }
+                seg.Release();
+            }
+        }
+
+        FbBuf cl = new FbBuf();
+        cl.Int(FbOp.CLOSE_BLOB);
+        cl.Int(h);
+        FbResponse close = await this.roundTrip(cl.ToBytes());
+        if (close != null) { close.Release(); }
+
+        FbBytes data = all.ToBytes();
+        string outp;
+        if (subtype == 1) {
+            outp = FbReader.Over(data).Text(data.Len());
+        } else {
+            outp = "0x" + data.Hex();
+        }
+        data.Release();
+        return outp;
+    }
+
+    // ============================================================
+    // 协程查询 API
+    // ============================================================
+
+    /// <summary>运行语句并返回其行（不产生行的语句
+    /// 返回空）。语句失败时抛出 <see cref="DbException"/>，
+    /// 因此空结果总是表示“无行”而绝非“未执行”；
+    /// <see cref="GetError"/> 和 <see cref="SqlCode"/> 仍携带
+    /// 上次失败信息，供调用方自行检查。</summary>
+    async DbResult QueryAsync(string sql) {
+        return await this.QueryAsync(sql, null);
+    }
+
+    /// <summary>运行带参数的语句。占位符是协议
+    /// 自身的位置占位符，因此值采用绑定而非拼入
+    /// SQL 文本。</summary>
+    async DbResult QueryAsync(string sql, DbParams prms) {
+        this.lastError = "";
+        this.lastStatus = new FbError();
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.fail();
+        }
+        int stmt = await this.allocStatement();
+        if (stmt < 0) { this.fail(); }
+        FbXsqlda xs = await this.prepare(stmt, sql);
+        if (xs == null) {
+            await this.freeStatement(stmt);
+            this.fail();
+        }
+        if (xs.StmtType() == FbType.STMT_EXEC_PROCEDURE && xs.Count() > 0) {
+            // 带输出参数的过程以 op_sql_response 应答，
+            // 而非游标；应据此判断，避免误读数据流。
+            await this.freeStatement(stmt);
+            this.lastError = "EXECUTE PROCEDURE with output parameters is not"
+                + " supported; select from the procedure instead";
+            this.fail();
+        }
+        bool ok = await this.execute(stmt, prms);
+        if (!ok) {
+            await this.freeStatement(stmt);
+            this.fail();
+        }
+        DbResult res = DbResult.Empty();
+        if (xs.IsSelect() && xs.Count() > 0) {
+            res = await this.fetchAll(stmt, xs);
+            this.lastAffected = res.RowCount();
+        } else {
+            this.lastAffected = await this.affectedRows(stmt, false);
+        }
+        await this.freeStatement(stmt);
+        if (!xs.IsSelect()) {
+            await this.commitRetaining();
+        }
+        return res;
+    }
+
+    /// <summary>运行语句并返回其影响的行数。语句
+    /// 失败时抛出 <see cref="DbException"/>。</summary>
+    async int ExecuteAsync(string sql) {
+        return await this.ExecuteAsync(sql, null);
+    }
+
+    /// <summary>ExecuteAsync 的带参数版本。</summary>
+    async int ExecuteAsync(string sql, DbParams prms) {
+        DbResult r = await this.QueryAsync(sql, prms);
+        if (this.lastError.Length > 0) { this.fail(); }
+        return this.lastAffected;
+    }
+
+    /// <summary>抛出记录的失败，让调用方看到服务器的
+    /// 原始措辞和 SQL 码，而不是空结果。</summary>
+    void fail() {
+        string why = this.lastError;
+        if (why.Length == 0) {
+            why = "the statement failed";
+        }
+        throw new DbException(why, this.lastStatus.SqlCode(),
+                              DbProvider.Firebird);
+    }
+
+    /// <summary>第一行第一列的值，无行时返回 ""。</summary>
+    async string ExecuteScalarAsync(string sql) {
+        DbResult r = await this.QueryAsync(sql, null);
+        if (r.RowCount() == 0) { return ""; }
+        return r.GetString(0, 0);
+    }
+
+    /// <summary>ExecuteScalarAsync 的带参数版本。</summary>
+    async string ExecuteScalarAsync(string sql, DbParams prms) {
+        DbResult r = await this.QueryAsync(sql, prms);
+        if (r.RowCount() == 0) { return ""; }
+        return r.GetString(0, 0);
+    }
+
+    /// <summary>用于验证会话仍可用的往返。</summary>
+    async bool PingAsync() {
+        if (!this.connected) { return false; }
+        FbBuf p = new FbBuf();
+        p.Int(FbOp.PING);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return false; }
+        bool ok = !resp.Failed();
+        resp.Release();
+        return ok;
+    }
+
+    // ============================================================
+    // 状态
+    // ============================================================
+
+    /// <summary>上一条语句影响的行数。</summary>
+    int AffectedRows() { return this.lastAffected; }
+
+    /// <summary>上次失败的描述，没有则为 ""。</summary>
+    string GetError() { return this.lastError; }
+
+    /// <summary>上次失败的 Firebird SQL 码（无失败时为 0）。
+    /// </summary>
+    int SqlCode() { return this.lastStatus.SqlCode(); }
+
+    /// <summary>服务器选择的认证插件。</summary>
+    string AuthPlugin() { return this.plugin; }
+
+    /// <summary>当前线路加密方式，会话未加密时为 ""。
+    /// </summary>
+    string WireCrypt() { return this.cryptPlugin; }
+
+    /// <summary>服务器接受的协议版本。</summary>
+    int ProtocolVersion() { return this.acceptVersion; }
+
+    /// <summary>本会话附加到的数据库。</summary>
+    string Database() { return this.database; }
+
+    /// 连接是否仍打开。
+    bool IsConnected() { return this.connected; }
+
+    /// 驱动标识，恒为 <see cref="DbProvider.Firebird"/>。
+    int GetProvider() { return DbProvider.Firebird; }
+
+    /// <summary>礼貌地分离（回滚打开的事务），然后
+    /// 关闭套接字。</summary>
+    async void CloseAsync() {
+        if (this.connected && this.transHandle >= 0) {
+            FbBuf p = new FbBuf();
+            p.Int(FbOp.ROLLBACK);
+            p.Int(this.transHandle);
+            FbResponse r = await this.roundTrip(p.ToBytes());
+            if (r != null) { r.Release(); }
+            this.transHandle = 0 - 1;
+        }
+        if (this.connected && this.dbHandle >= 0) {
+            FbBuf p = new FbBuf();
+            p.Int(FbOp.DETACH);
+            p.Int(this.dbHandle);
+            FbResponse r = await this.roundTrip(p.ToBytes());
+            if (r != null) { r.Release(); }
+            this.dbHandle = 0 - 1;
+        }
+        this.Close();
+    }
+
+    /// <summary>不经分离往返直接丢弃连接。</summary>
+    void Close() {
+        if (this.sock >= 0) {
+            Socket.Close(this.sock);
+            this.sock = 0 - 1;
+        }
+        this.connected = false;
+        this.encIn = null;
+        this.encOut = null;
+        if (this.authData != null) {
+            this.authData.Release();
+            this.authData = null;
+        }
+    }
+}

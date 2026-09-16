@@ -1,0 +1,324 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+// ---- 象形柱图（ECharts type 'pictorialBar'） ----
+//
+// 四种绘制模式（ECharts 语义，demo 全集归类）：
+// ① 拉伸（默认）：符号随 (类目带宽, 值高) 变形铺满——hill/vehicle/
+//    graphicType 的默认观感；
+// ② 盖帽（symbolPosition:'end'）：符号按 symbolSize 画在值顶；
+// ③ 重复（symbolRepeat:true）：符号按自身尺寸自基线向上平铺，
+//    超出值高的部分裁掉——forest 的树、dotted 的点阵；
+//    repeat:'fixed' 按符号自身高度步进，语义相同；
+// ④ 裁剪（symbolClip:true）：符号按 symbolBoundingData（缺省轴
+//    最大值）映射到整幅绘图区高、底边贴基线画满，再裁到值高
+//    ——spirit/body-fill 的液位填充。
+//
+// 符号源三类：内置形状名（'' = roundRect、circle/rect/triangle/
+// diamond/pin/arrow）、path://（ChartSvgMap 折线化 + 各向异性
+// 仿射进目标盒，随系列色填充）、image://data:...;base64（解码进
+// ImageLoadMem，BlitImage 缩放/裁剪）。/// 符号几何每帧重算
+// （单个 path 折线化的开销在图表尺度下可忽略），位图缓存在
+// 运行时 mem 图像缓存（同 IconSvg 契约：探测→缺失重注册）。
+
+partial class ChartView {
+
+    static void DrawPictorialBar(App app, int x, int y, int w, int h,
+                                 ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        List<ChartSeries> series = o.series;
+        List<string> labels = o.XCategories();
+        // 类目名缺失时从首个系列 data.name 推导（pictorialBar 常见
+        // 无显式 xAxis.data 的写法）。
+        if (labels.Count < 1) {
+            for (int si = 0; si < series.Count; si = si + 1) {
+                if (series[si].hidden || series[si].data.Count < 1) { continue; }
+                for (int di = 0; di < series[si].data.Count; di = di + 1) {
+                    labels.Add(series[si].data[di].name);
+                }
+                break;
+            }
+        }
+        int n = labels.Count;
+        if (n < 1) { return; }
+
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.title, series,
+            o.iwid, o.showLegend);
+        ChartFrame f = Chart.BuildAxesR(app, x, y, w, h, plotTop, labels,
+            o, series, 0 - 1, 0 - 1, 0 - 1, 0 - 1);
+        int alpha = 255;
+        if (g < 1000) { alpha = 60 + 195 * g / 1000; }
+        if (alpha > 255) { alpha = 255; }
+
+        // 可见 pictorialBar 系列占槽（同类目带内并排，同柱状族）。
+        int nsVis = 0;
+        for (int si = 0; si < series.Count; si = si + 1) {
+            if (!series[si].hidden && series[si].custom == "pictorialBar") {
+                nsVis = nsVis + 1;
+            }
+        }
+        if (nsVis < 1) { nsVis = 1; }
+        int slot = 0;
+        int mX = app.mouseX;
+        int mY = app.mouseY;
+        for (int si = 0; si < series.Count; si = si + 1) {
+            ChartSeries s = series[si];
+            if (s.hidden || s.custom != "pictorialBar") { continue; }
+            int col = s.color;
+            if (col == 0) { col = Chart.Palette(t, slot); }
+            int colA = Chart.WithAlpha(col, alpha);
+            int subW = f.plotW / n * 6 / 10 / (nsVis > 0 ? nsVis : 1);
+            if (subW < 2) { subW = 2; }
+            for (int i = 0; i < n; i = i + 1) {
+                if (i >= s.data.Count) { break; }
+                if (s.data[i].gap) { continue; }
+                int v = s.Value(i);
+                int bx = f.CatLeft(i, n);
+                int bw = f.CatWidth(i, n);
+                int sx = bx + bw / 2 - subW * nsVis / 2 + slot * subW;
+                int yBase = f.plotY + f.plotH;
+                int yTop = f.YOf(v, 0);
+                if (yTop > yBase) { yTop = yBase; }
+                int hVal = yBase - yTop;
+                if (hVal < 0) { hVal = 0; }
+                ChartView.Symbol(app, c, f, s, sx, yBase, subW,
+                    hVal, col, colA, v);
+                // 命中：整槽矩形出 tooltip 数据点。
+                if (mX >= bx && mX < bx + bw && mY >= yTop
+                    && mY <= yBase) {
+                    ChartHit mh = ChartHit.Of(ChartElementType.Bar,
+                        ChartView.SeriesIndexOf(o, s), s.name, i,
+                        i < labels.Count ? labels[i] : "", v, mX, mY);
+                    ChartView.OfferActiveHit(mh);
+                }
+            }
+            slot = slot + 1;
+        }
+    }
+
+    /// 一个数据槽的符号绘制（模式分派见类注释）。
+    static void Symbol(App app, Canvas c, ChartFrame f, ChartSeries s,
+                       int sx, int yBase, int sw, int hVal, int col,
+                       int colA, int v) {
+        string sym = s.picSymbol;
+        bool repeat = s.picRepeat == "true" || s.picRepeat == "fixed";
+        if (s.picClip) {
+            // ④ 裁剪：bound 值映射到整幅绘图区高，符号底边贴基线。
+            int bound = s.picBound > 0 ? s.picBound : f.leftMax;
+            if (bound < 1) { bound = 1; }
+            int fullH = f.plotH;
+            if (hVal > fullH) { hVal = fullH; }
+            ChartView.DrawSource(app, c, s, sym,
+                sx, yBase - hVal, sw, hVal, fullH, col, colA, true);
+            return;
+        }
+        if (repeat) {
+            // ③ 平铺：符号自身尺寸（缺省 sw×sw），自基线向上，
+            // 顶部越界裁掉。
+            int tw = s.picW > 0 ? s.picW : sw;
+            if (s.picWPct > 0) { tw = sw * s.picWPct / 100; }
+            int th = s.picH > 0 ? s.picH : tw;
+            if (s.picHPct > 0) { th = f.plotH * s.picHPct / 100; }
+            if (tw < 1 || th < 1) { return; }
+            c.PushClip(sx, yBase - hVal, sw, hVal);
+            int ty = yBase - th;
+            while (ty + th > yBase - hVal) {
+                ChartView.DrawSource(app, c, s, sym,
+                    sx + (sw - tw) / 2, ty, tw, th, th, col, colA, false);
+                ty = ty - th;
+                if (ty < f.plotY - th) { break; }
+            }
+            c.PopClip();
+            return;
+        }
+        if (s.picPos == "end") {
+            // ② 盖帽：符号画在值顶（缺省 sw×sw 居中）。
+            int cw = s.picW > 0 ? s.picW : sw;
+            int chh = s.picH > 0 ? s.picH : cw;
+            ChartView.DrawSource(app, c, s, sym,
+                sx + (sw - cw) / 2, yBase - hVal - chh / 2, cw, chh,
+                chh, col, colA, false);
+            return;
+        }
+        // ① 拉伸：符号随 (sw, hVal) 变形（ECharts 默认）。
+        ChartView.DrawSource(app, c, s, sym,
+            sx, yBase - hVal, sw, hVal, hVal, col, colA, false);
+    }
+
+    /// 符号源分派：内置形状 / path:// 折线仿射 / image:// 位图。
+    /// fullH 仅 clip 模式用（位图裁剪的源窗口比例）。
+    static void DrawSource(App app, Canvas c, ChartSeries s, string sym,
+                           int dx, int dy, int dw, int dh, int fullH,
+                           int col, int colA, bool clip) {
+        if (dw < 1 || dh < 1) { return; }
+        if (sym == "" || sym == "roundRect" || sym == "rect") {
+            int rad = sym == "rect" ? 0 : (dw < dh ? dw : dh) / 5;
+            if (rad < 1) { rad = 1; }
+            c.FillRoundRect(dx, dy, dw, dh, rad, colA);
+            return;
+        }
+        if (sym == "circle") {
+            c.FillCircle(dx + dw / 2, dy + dh / 2,
+                (dw < dh ? dw : dh) / 2, colA);
+            return;
+        }
+        if (sym == "triangle") {
+            ChartView.Poly(c, dx, dy, dw, dh, colA,
+                new int[] { 50, 0, 100, 100, 0, 100 });
+            return;
+        }
+        if (sym == "diamond") {
+            ChartView.Poly(c, dx, dy, dw, dh, colA,
+                new int[] { 50, 0, 100, 50, 50, 100, 0, 50 });
+            return;
+        }
+        if (sym == "pin") {
+            c.FillCircle(dx + dw / 2, dy + dh * 40 / 100, dw / 2, colA);
+            ChartView.Poly(c, dx, dy, dw, dh, colA,
+                new int[] { 50, 100, 78, 55, 22, 55 });
+            return;
+        }
+        if (sym == "arrow") {
+            ChartView.Poly(c, dx, dy, dw, dh, colA,
+                new int[] { 50, 0, 100, 50, 68, 50, 68, 100, 32, 100,
+                    32, 50, 0, 50 });
+            return;
+        }
+        if (sym.StartsWith("path://")) {
+            string dd = sym.Substring(7, sym.Length - 7);
+            ChartView.DrawPath(c, dd, dx, dy, dw, dh, colA, col);
+            return;
+        }
+        if (sym.StartsWith("image://")) {
+            string uri = sym.Substring(8, sym.Length - 8);
+            ChartView.DrawImageUri(c, uri, dx, dy, dw, dh,
+                fullH, clip);
+            return;
+        }
+        // 未知符号名按 roundRect 兜底（ECharts 图形名全集之外）。
+        int rad2 = (dw < dh ? dw : dh) / 5;
+        if (rad2 < 1) { rad2 = 1; }
+        c.FillRoundRect(dx, dy, dw, dh, rad2, colA);
+    }
+
+    /// 内置多边形：uv 千分比坐标对仿射到 (dx,dy,dw,dh) 后填充。
+    static void Poly(Canvas c, int dx, int dy, int dw, int dh, int col,
+                     int[] uv) {
+        List<ChartMapPoint> pts = new List<ChartMapPoint>();
+        for (int k = 0; k + 1 < uv.Length; k = k + 2) {
+            pts.Add(ChartMapPoint.Of(dx + uv[k] * dw / 100,
+                dy + uv[k + 1] * dh / 100));
+        }
+        ChartView.FillPolygon(c, pts, col);
+    }
+
+    /// path:// 折线化后各向异性仿射进目标盒（ECharts 把 path bbox
+    /// 拉到 symbolSize 盒，不保纵横比），随系列色填充、洞回填底色。
+    static void DrawPath(Canvas c, string dd, int dx, int dy, int dw,
+                         int dh, int colA, int col) {
+        List<ChartMapRing> rings = ChartSvgMap.PathRings(dd,
+            1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+        if (rings.Count < 1) { return; }
+        int mnX = 0; int mnY = 0; int mxX = 0; int mxY = 0;
+        bool any = false;
+        for (int r = 0; r < rings.Count; r = r + 1) {
+            List<ChartMapPoint> ps = rings[r].points;
+            for (int k = 0; k < ps.Count; k = k + 1) {
+                if (!any) { mnX = ps[k].x; mxX = mnX; mnY = ps[k].y; mxY = mnY; any = true; }
+                else {
+                    if (ps[k].x < mnX) { mnX = ps[k].x; }
+                    if (ps[k].x > mxX) { mxX = ps[k].x; }
+                    if (ps[k].y < mnY) { mnY = ps[k].y; }
+                    if (ps[k].y > mxY) { mxY = ps[k].y; }
+                }
+            }
+        }
+        if (!any) { return; }
+        long bw = (long)mxX - (long)mnX;
+        long bh = (long)mxY - (long)mnY;
+        if (bw < 1) { bw = 1; }
+        if (bh < 1) { bh = 1; }
+        for (int r2 = 0; r2 < rings.Count; r2 = r2 + 1) {
+            List<ChartMapPoint> ps2 = rings[r2].points;
+            List<ChartMapPoint> tr = new List<ChartMapPoint>();
+            for (int k = 0; k < ps2.Count; k = k + 1) {
+                int tx = dx + (int)(((long)ps2[k].x - (long)mnX) * (long)dw / bw);
+                int ty = dy + (int)(((long)ps2[k].y - (long)mnY) * (long)dh / bh);
+                tr.Add(ChartMapPoint.Of(tx, ty));
+            }
+            ChartView.FillPolygon(c, tr, colA);
+        }
+    }
+
+    /// image://data:...;base64,DATA：解码注册进运行时 mem 图像缓存
+    /// （键 = 数据指纹，逐出后按需重注册），按目标盒缩放；clip 时
+    /// 源窗口取位图下部（符号底边贴基线、上沿裁到值高）。
+    static void DrawImageUri(Canvas c, string uri, int dx, int dy, int dw,
+                             int dh, int fullH, bool clip) {
+        int b64 = uri.IndexOf("base64,");
+        if (b64 < 0) { return; }
+        string data = uri.Substring(b64 + 7, uri.Length - (b64 + 7));
+        string key = "mem:pic:" + ChartView.Fingerprint(data);
+        if (Canvas.ImageWidth(key) <= 0) {
+            byte[] bin = ChartView.B64Decode(data);
+            if (bin == null || bin.Length < 8) { return; }
+            Canvas.ImageLoadMem(key, bin, bin.Length);
+        }
+        int iw = Canvas.ImageWidth(key);
+        int ih = Canvas.ImageHeight(key);
+        if (iw < 1 || ih < 1) { return; }
+        if (clip && fullH > 0 && dh < fullH) {
+            int sh = ih * dh / fullH;
+            if (sh < 1) { sh = 1; }
+            c.BlitImage(key, dx, dy, dw, dh, 0, ih - sh, iw, sh);
+            return;
+        }
+        c.BlitImage(key, dx, dy, dw, dh, 0, 0, 0, 0);
+    }
+
+    /// base64 数据指纹（采样哈希；只为缓存键稳定，不作校验）。
+    static int Fingerprint(string data) {
+        int h = data.Length;
+        int step = data.Length / 32 + 1;
+        for (int i = 0; i < data.Length; i = i + step) {
+            h = h * 31 + data[i];
+        }
+        return h;
+    }
+
+    /// 标准 base64 解码（忽略空白；'=' 截断）。失败返回已解出的
+    /// 前缀（调用方以长度门槛兜底）。
+    static byte[] B64Decode(string s) {
+        int cap = s.Length / 4 * 3 + 3;
+        byte[] buf = new byte[cap];
+        int n = 0;
+        int acc = 0;
+        int bits = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int ch = s[i];
+            int v = 0 - 1;
+            if (ch >= 65 && ch <= 90) { v = ch - 65; }
+            else if (ch >= 97 && ch <= 122) { v = ch - 97 + 26; }
+            else if (ch >= 48 && ch <= 57) { v = ch - 48 + 52; }
+            else if (ch == 43) { v = 62; }
+            else if (ch == 47) { v = 63; }
+            else if (ch == 61) { break; }
+            else { continue; }
+            acc = acc * 64 + v;
+            bits = bits + 6;
+            if (bits >= 8) {
+                bits = bits - 8;
+                buf[n] = (byte)((acc >> bits) & 255);
+                n = n + 1;
+            }
+        }
+        if (n == cap) { return buf; }
+        byte[] outp = new byte[n];
+        for (int k = 0; k < n; k = k + 1) { outp[k] = buf[k]; }
+        return outp;
+    }
+}

@@ -1,0 +1,570 @@
+using System;
+
+namespace Gui.Component.Chart;
+
+/// SVG 地图（echarts registerMap(name, {svg})）的 Zan 侧扫描器。
+/// 不做完整 XML 解析，只提取地图渲染需要的最小集合：
+/// ① 根元素 viewBox（缺省退化 width/height，再缺省 0 0 100 100）；
+/// ② 形状元素 path/rect/circle/ellipse/polygon/polyline 的几何，
+///    经 g/形状上的 translate/scale/matrix 仿射栈换算（素材中
+///    无 rotate，暂不实现）；
+/// ③ 区域命名：name= &gt; data-name= &gt; id=（ECharts SVG 地图的
+///    region 名同源）。
+/// 曲线（C/S/Q/T/A）只取端点做折线近似——按名填色、命中与
+/// 标签锚点在这个精度下足够；底图质感由 nanosvg 光栅承担
+/// （ChartViewMap 的 svgMode）。text 不参与（nanosvg 同样
+/// 不渲染文字）；defs/clipPath/marker/mask/symbol/pattern 内的
+/// 形状不渲染，整体跳过。
+/// 坐标输出为 SVG 用户单位取整（int，y 向下与屏幕系一致），
+/// MapLayout 可直接 contain-fit；viewBox 作为布局源框，保证
+/// 光栅底图与折线覆盖共用同一仿射、像素对齐。
+class ChartSvgMap {
+
+    /// 扫描入口：填充 entry 的 viewBox 与 regions（幂等）。
+    static void Scan(ChartMapEntry e) {
+        if (e.scanned) { return; }
+        e.scanned = true;
+        e.regions = new List<ChartMapRegion>();
+        if (e.svg == null || e.svg.Length == 0) { return; }
+        ChartSvgMap.RootBox(e);
+        List<double> tf = new List<double>();
+        ChartSvgMap.Push(tf, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+        List<ChartSvgShape> shapes = new List<ChartSvgShape>();
+        List<string> skip = new List<string>();
+        string svg = e.svg;
+        int n = svg.Length;
+        int i = 0;
+        while (i < n) {
+            int lt = svg.IndexOf("<", i);
+            if (lt < 0) { break; }
+            int gt = svg.IndexOf(">", lt);
+            if (gt < 0) { break; }
+            ChartSvgMap.Tag(svg, lt, gt, tf, skip, shapes);
+            i = gt + 1;
+        }
+        // 形状 → 区域；同名的多形状并成一个区域的多条环
+        // （flight-seats 同名座椅/设施并档，区域数即名字数）。
+        for (int s = 0; s < shapes.Count; s = s + 1) {
+            ChartSvgShape sh = shapes[s];
+            if (sh.rings.Count < 1) { continue; }
+            int dst = 0 - 1;
+            if (sh.name.Length > 0) {
+                for (int r = 0; r < e.regions.Count; r = r + 1) {
+                    if (e.regions[r].name == sh.name) { dst = r; break; }
+                }
+            }
+            if (dst >= 0) {
+                for (int k = 0; k < sh.rings.Count; k = k + 1) {
+                    e.regions[dst].rings.Add(sh.rings[k]);
+                }
+            } else {
+                e.regions.Add(ChartMapRegion.Of(sh.name, 0, sh.rings));
+            }
+        }
+    }
+
+    /// 根 viewBox：svg 根标签的 viewBox="x y w h"；退化 width/height
+    /// （数值带 px/pt 单位尾巴也认；百分比不认）；再缺省 0 0 100 100。
+    static void RootBox(ChartMapEntry e) {
+        e.vx = 0.0; e.vy = 0.0; e.vw = 100.0; e.vh = 100.0;
+        string svg = e.svg;
+        int p = svg.IndexOf("<svg");
+        if (p < 0) { return; }
+        int gt = svg.IndexOf(">", p);
+        if (gt < 0) { gt = svg.Length; }
+        string vb = ChartSvgMap.Attr(svg, p, gt, "viewBox");
+        if (vb.Length > 0) {
+            ChartSvgCursor cs = ChartSvgCursor.Of(vb, 0, vb.Length);
+            double x = cs.NextNum();
+            double y = cs.NextNum();
+            double w = cs.NextNum();
+            double h = cs.NextNum();
+            if (w > 0.0 && h > 0.0) { e.vx = x; e.vy = y; e.vw = w; e.vh = h; return; }
+        }
+        double dw = ChartSvgMap.UnitNum(ChartSvgMap.Attr(svg, p, gt, "width"));
+        double dh = ChartSvgMap.UnitNum(ChartSvgMap.Attr(svg, p, gt, "height"));
+        if (dw > 0.0 && dh > 0.0) { e.vw = dw; e.vh = dh; }
+    }
+
+    /// defs/clipPath/marker/mask/symbol/pattern：内部形状不渲染。
+    static bool IsSkipEl(string name) {
+        return name == "defs" || name == "clipPath" || name == "marker"
+            || name == "mask" || name == "symbol" || name == "pattern";
+    }
+
+    /// 处理一个标签：闭标签弹仿射栈/跳过栈；开标签解析 transform、
+    /// 形状出几何。lt/gt 是 '<'/'>' 下标。
+    static void Tag(string svg, int lt, int gt, List<double> tf,
+                    List<string> skip, List<ChartSvgShape> shapes) {
+        if (lt + 1 >= gt) { return; }
+        bool close = svg[lt + 1] == '/';
+        int name0 = close ? lt + 2 : lt + 1;
+        int name1 = name0;
+        while (name1 < gt) {
+            int ch = svg[name1];
+            if (ch == 32 || ch == 9 || ch == 10 || ch == 13
+                || ch == 47 || ch == 62) { break; }
+            name1 = name1 + 1;
+        }
+        string name = svg.Substring(name0, name1 - name0);
+        if (name.Length == 0) { return; }
+        bool selfClose = svg[gt - 1] == '/';
+        if (close) {
+            if (name == "g" && tf.Count > 6) {
+                for (int k = 0; k < 6; k = k + 1) { tf.RemoveAt(tf.Count - 1); }
+            }
+            if (skip.Count > 0 && skip[skip.Count - 1] == name) {
+                skip.RemoveAt(skip.Count - 1);
+            }
+            return;
+        }
+        // g 一律压栈（无 transform 就复制当前层），保证闭标签
+        // 弹出的层和开标签压入的层一一对应。
+        if (name == "g" && !selfClose) {
+            int tn = tf.Count;
+            double ga = tf[tn - 6]; double gb = tf[tn - 5]; double gc = tf[tn - 4];
+            double gd = tf[tn - 3]; double ge = tf[tn - 2]; double gf = tf[tn - 1];
+            string gtr = ChartSvgMap.Attr(svg, name1, gt, "transform");
+            if (gtr.Length > 0) {
+                List<double> m = ChartSvgMap.ParseTransform(gtr, ga, gb, gc, gd, ge, gf);
+                ga = m[0]; gb = m[1]; gc = m[2]; gd = m[3]; ge = m[4]; gf = m[5];
+            }
+            ChartSvgMap.Push(tf, ga, gb, gc, gd, ge, gf);
+        }
+        if (skip.Count > 0) {
+            if (!selfClose && ChartSvgMap.IsSkipEl(name)) { skip.Add(name); }
+            return;
+        }
+        if (!selfClose && ChartSvgMap.IsSkipEl(name)) { skip.Add(name); return; }
+        if (name == "path" || name == "rect" || name == "circle"
+            || name == "ellipse" || name == "polygon" || name == "polyline") {
+            int tn2 = tf.Count;
+            double a = tf[tn2 - 6]; double b = tf[tn2 - 5]; double c = tf[tn2 - 4];
+            double d = tf[tn2 - 3]; double ee = tf[tn2 - 2]; double f = tf[tn2 - 1];
+            string str = ChartSvgMap.Attr(svg, name1, gt, "transform");
+            if (str.Length > 0) {
+                List<double> m2 = ChartSvgMap.ParseTransform(str, a, b, c, d, ee, f);
+                a = m2[0]; b = m2[1]; c = m2[2]; d = m2[3]; ee = m2[4]; f = m2[5];
+            }
+            string nm = ChartSvgMap.RegionName(svg, name1, gt);
+            List<ChartMapRing> rings = ChartSvgMap.ShapeRings(
+                name, svg, name1, gt, a, b, c, d, ee, f);
+            if (rings.Count > 0) { shapes.Add(ChartSvgShape.Of(nm, rings)); }
+        }
+    }
+
+    /// 区域名优先级 name= > data-name= > id=。
+    static string RegionName(string svg, int from, int to) {
+        string nm = ChartSvgMap.Attr(svg, from, to, "name");
+        if (nm.Length == 0) { nm = ChartSvgMap.Attr(svg, from, to, "data-name"); }
+        if (nm.Length == 0) { nm = ChartSvgMap.Attr(svg, from, to, "id"); }
+        return nm;
+    }
+
+    /// 一个形状元素的环组（折线化）。line 无法成面，跳过。
+    static List<ChartMapRing> ShapeRings(string name, string svg, int from, int to,
+                                         double a, double b, double c, double d,
+                                         double ee, double f) {
+        List<ChartMapRing> rings = new List<ChartMapRing>();
+        if (name == "path") {
+            string dd = ChartSvgMap.Attr(svg, from, to, "d");
+            if (dd.Length > 0) {
+                rings = ChartSvgMap.PathRings(dd, a, b, c, d, ee, f);
+            }
+        } else if (name == "rect") {
+            double x = ChartSvgMap.UnitNum(ChartSvgMap.Attr(svg, from, to, "x"));
+            double y = ChartSvgMap.UnitNum(ChartSvgMap.Attr(svg, from, to, "y"));
+            double w = ChartSvgMap.UnitNum(ChartSvgMap.Attr(svg, from, to, "width"));
+            double h = ChartSvgMap.UnitNum(ChartSvgMap.Attr(svg, from, to, "height"));
+            if (w > 0.0 && h > 0.0) {
+                List<ChartMapPoint> pts = new List<ChartMapPoint>();
+                ChartSvgMap.Emit(pts, x, y, a, b, c, d, ee, f);
+                ChartSvgMap.Emit(pts, x + w, y, a, b, c, d, ee, f);
+                ChartSvgMap.Emit(pts, x + w, y + h, a, b, c, d, ee, f);
+                ChartSvgMap.Emit(pts, x, y + h, a, b, c, d, ee, f);
+                rings.Add(ChartMapRing.Of(pts, false));
+            }
+        } else if (name == "circle" || name == "ellipse") {
+            double cx = ChartSvgMap.UnitNum(ChartSvgMap.Attr(svg, from, to, "cx"));
+            double cy = ChartSvgMap.UnitNum(ChartSvgMap.Attr(svg, from, to, "cy"));
+            double rx = ChartSvgMap.UnitNum(ChartSvgMap.Attr(svg, from, to, "r"));
+            double ry = rx;
+            if (name == "ellipse") {
+                rx = ChartSvgMap.UnitNum(ChartSvgMap.Attr(svg, from, to, "rx"));
+                ry = ChartSvgMap.UnitNum(ChartSvgMap.Attr(svg, from, to, "ry"));
+            }
+            if (rx > 0.0 && ry > 0.0) {
+                // 16 边形近似：座位/桌椅的小圆在图表尺度下够圆。
+                List<ChartMapPoint> pts = new List<ChartMapPoint>();
+                for (int k = 0; k < 16; k = k + 1) {
+                    double ang = k * 0.39269908169872414;  // 2π/16
+                    ChartSvgMap.Emit(pts, cx + rx * Math.Cos(ang),
+                        cy + ry * Math.Sin(ang), a, b, c, d, ee, f);
+                }
+                rings.Add(ChartMapRing.Of(pts, false));
+            }
+        } else {
+            string pl = ChartSvgMap.Attr(svg, from, to, "points");
+            if (pl.Length > 0) {
+                ChartSvgCursor cs = ChartSvgCursor.Of(pl, 0, pl.Length);
+                List<ChartMapPoint> pts = new List<ChartMapPoint>();
+                while (cs.HasMore()) {
+                    double x = cs.NextNum();
+                    double y = cs.NextNum();
+                    if (!cs.any) { break; }
+                    ChartSvgMap.Emit(pts, x, y, a, b, c, d, ee, f);
+                }
+                if (pts.Count >= 3) { rings.Add(ChartMapRing.Of(pts, false)); }
+            }
+        }
+        return rings;
+    }
+
+    /// path d → 环组。M/m 起环；Z/z 闭合并落环（≥3 点才留）；
+    /// C/S/Q/T 取终点，A 取末参端点，H/V 单轴；命令后的数对
+    /// 隐式重复（SVG 语义）。子路径的洞判定在落环时统一做
+    /// （首点落在第 0 条子路径内 = 洞）。
+    static List<ChartMapRing> PathRings(string dd, double a, double b, double c,
+                                        double d, double ee, double f) {
+        List<ChartMapRing> rings = new List<ChartMapRing>();
+        List<ChartMapPoint> cur = new List<ChartMapPoint>();
+        ChartSvgCursor cs = ChartSvgCursor.Of(dd, 0, dd.Length);
+        double cx = 0.0; double cy = 0.0;
+        double sx = 0.0; double sy = 0.0;
+        int cmd = 0;  // 上一命令字母（大写）；0 = 尚未开始
+        while (true) {
+            int ch = cs.Peek();
+            if (ch == 0) { break; }
+            if ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122)) {
+                cmd = ch >= 97 ? ch - 32 : ch;
+                cs.i = cs.i + 1;
+            }
+            if (cmd == 0) { break; }
+            int up = cmd >= 97 ? cmd - 32 : cmd;
+            bool rel = cmd >= 97;
+            double x1; double y1;
+            if (up == 77) {  // M
+                if (cur.Count >= 3) { ChartSvgMap.Finish(rings, cur); cur = new List<ChartMapPoint>(); }
+                x1 = cs.NextNum();
+                y1 = cs.NextNum();
+                if (!cs.any) { break; }
+                if (rel) { cx = cx + x1; cy = cy + y1; } else { cx = x1; cy = y1; }
+                sx = cx; sy = cy;
+                ChartSvgMap.Emit(cur, cx, cy, a, b, c, d, ee, f);
+                cmd = rel ? 108 : 76;  // 后续数对 = L/l
+            } else if (up == 76) {  // L
+                x1 = cs.NextNum();
+                y1 = cs.NextNum();
+                if (!cs.any) { break; }
+                if (rel) { cx = cx + x1; cy = cy + y1; } else { cx = x1; cy = y1; }
+                ChartSvgMap.Emit(cur, cx, cy, a, b, c, d, ee, f);
+            } else if (up == 72) {  // H
+                x1 = cs.NextNum();
+                if (!cs.any) { break; }
+                if (rel) { cx = cx + x1; } else { cx = x1; }
+                ChartSvgMap.Emit(cur, cx, cy, a, b, c, d, ee, f);
+            } else if (up == 86) {  // V
+                y1 = cs.NextNum();
+                if (!cs.any) { break; }
+                if (rel) { cy = cy + y1; } else { cy = y1; }
+                ChartSvgMap.Emit(cur, cx, cy, a, b, c, d, ee, f);
+            } else if (up == 67) {  // C：两控制点丢弃，取终点
+                cs.NextNum(); cs.NextNum(); cs.NextNum(); cs.NextNum();
+                x1 = cs.NextNum();
+                y1 = cs.NextNum();
+                if (!cs.any) { break; }
+                if (rel) { cx = cx + x1; cy = cy + y1; } else { cx = x1; cy = y1; }
+                ChartSvgMap.Emit(cur, cx, cy, a, b, c, d, ee, f);
+            } else if (up == 83 || up == 81) {  // S/Q：一控制点丢弃
+                cs.NextNum(); cs.NextNum();
+                x1 = cs.NextNum();
+                y1 = cs.NextNum();
+                if (!cs.any) { break; }
+                if (rel) { cx = cx + x1; cy = cy + y1; } else { cx = x1; cy = y1; }
+                ChartSvgMap.Emit(cur, cx, cy, a, b, c, d, ee, f);
+            } else if (up == 84) {  // T
+                x1 = cs.NextNum();
+                y1 = cs.NextNum();
+                if (!cs.any) { break; }
+                if (rel) { cx = cx + x1; cy = cy + y1; } else { cx = x1; cy = y1; }
+                ChartSvgMap.Emit(cur, cx, cy, a, b, c, d, ee, f);
+            } else if (up == 65) {  // A rx ry rot laf sf x y
+                cs.NextNum(); cs.NextNum(); cs.NextNum();
+                cs.NextNum(); cs.NextNum();
+                x1 = cs.NextNum();
+                y1 = cs.NextNum();
+                if (!cs.any) { break; }
+                if (rel) { cx = cx + x1; cy = cy + y1; } else { cx = x1; cy = y1; }
+                ChartSvgMap.Emit(cur, cx, cy, a, b, c, d, ee, f);
+            } else if (up == 90) {  // Z
+                if (cur.Count >= 3) { ChartSvgMap.Finish(rings, cur); }
+                cur = new List<ChartMapPoint>();
+                cx = sx; cy = sy;
+                cmd = 0;
+            } else {
+                cmd = 0;  // 未知命令：放弃，等待下一命令字母
+            }
+        }
+        if (cur.Count >= 3) { ChartSvgMap.Finish(rings, cur); }
+        return rings;
+    }
+
+    /// 落环：子路径 1..n 的首点在第 0 条子路径内 → hole。
+    static void Finish(List<ChartMapRing> rings, List<ChartMapPoint> cur) {
+        bool hole = false;
+        if (rings.Count > 0 && cur.Count > 0) {
+            hole = Chart.PointInPoly(rings[0].points, cur[0].x, cur[0].y);
+        }
+        rings.Add(ChartMapRing.Of(cur, hole));
+    }
+
+    /// 仿射换算后取整落点；与上一点重合的丢弃（免零长边）。
+    static void Emit(List<ChartMapPoint> pts, double x, double y, double a,
+                     double b, double c, double d, double ee, double f) {
+        double px = a * x + c * y + ee;
+        double py = b * x + d * y + f;
+        int ix = (int)(px >= 0.0 ? px + 0.5 : px - 0.5);
+        int iy = (int)(py >= 0.0 ? py + 0.5 : py - 0.5);
+        int cnt = pts.Count;
+        if (cnt > 0) {
+            ChartMapPoint last = pts[cnt - 1];
+            if (last.x == ix && last.y == iy) { return; }
+        }
+        pts.Add(ChartMapPoint.Of(ix, iy));
+    }
+
+    /// transform 属性串："translate(12.5,3) scale(2)" 等，逐段
+    /// local ∘ current 复合。rotate 素材中未出现，不支持。
+    /// 返回 [a,b,c,d,e,f]。
+    static List<double> ParseTransform(string tr, double a, double b, double c,
+                                       double d, double ee, double f) {
+        int n = tr.Length;
+        int i = 0;
+        while (i < n) {
+            int p0 = tr.IndexOf("(", i);
+            if (p0 < 0) { break; }
+            int p1 = tr.IndexOf(")", p0);
+            if (p1 < 0) { break; }
+            int k = p0 - 1;
+            while (k >= 0) {
+                int ch = tr[k];
+                if ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122)) { k = k - 1; continue; }
+                break;
+            }
+            string fn = tr.Substring(k + 1, p0 - (k + 1));
+            ChartSvgCursor cs = ChartSvgCursor.Of(tr, p0 + 1, p1);
+            double a2 = 1.0; double b2 = 0.0; double c2 = 0.0;
+            double d2 = 1.0; double e2 = 0.0; double f2 = 0.0;
+            if (fn == "translate" && cs.HasMore()) {
+                e2 = cs.NextNum();
+                f2 = cs.HasMore() ? cs.NextNum() : 0.0;
+            } else if (fn == "scale" && cs.HasMore()) {
+                a2 = cs.NextNum();
+                d2 = cs.HasMore() ? cs.NextNum() : a2;
+            } else if (fn == "matrix" && cs.HasMore()) {
+                a2 = cs.NextNum(); b2 = cs.NextNum(); c2 = cs.NextNum();
+                d2 = cs.NextNum(); e2 = cs.NextNum(); f2 = cs.NextNum();
+            }
+            double na = a * a2 + c * b2;
+            double nb = b * a2 + d * b2;
+            double nc = a * c2 + c * d2;
+            double nd = b * c2 + d * d2;
+            double ne = a * e2 + c * f2 + ee;
+            double nf = b * e2 + d * f2 + f;
+            a = na; b = nb; c = nc; d = nd; ee = ne; f = nf;
+            i = p1 + 1;
+        }
+        List<double> outp = new List<double>();
+        outp.Add(a); outp.Add(b); outp.Add(c);
+        outp.Add(d); outp.Add(ee); outp.Add(f);
+        return outp;
+    }
+
+    /// 读 [from,to) 区间里的属性值（' 与 " 两种引号、无引号都认）。
+    /// name 必须是完整属性名（前面不能是字母/-/_，防止 name= 误配
+    /// data-name= 的尾部）。
+    static string Attr(string svg, int from, int to, string name) {
+        int p = from;
+        while (p < to) {
+            p = svg.IndexOf(name, p);
+            if (p < 0 || p >= to) { return ""; }
+            bool ok = true;
+            if (p > from) {
+                int prev = svg[p - 1];
+                if ((prev >= 65 && prev <= 90) || (prev >= 97 && prev <= 122)
+                    || prev == 45 || prev == 95) { ok = false; }
+            }
+            int eq = p + name.Length;
+            if (ok) {
+                while (eq < to && (svg[eq] == 32 || svg[eq] == 9
+                    || svg[eq] == 10 || svg[eq] == 13)) { eq = eq + 1; }
+                if (eq >= to || svg[eq] != 61) { ok = false; }
+            }
+            if (!ok) { p = p + name.Length; continue; }
+            eq = eq + 1;
+            while (eq < to && (svg[eq] == 32 || svg[eq] == 9
+                || svg[eq] == 10 || svg[eq] == 13)) { eq = eq + 1; }
+            if (eq >= to) { return ""; }
+            int q = svg[eq];
+            if (q == 34 || q == 39) {
+                string quote = q == 34 ? "\"" : "'";
+                int end = svg.IndexOf(quote, eq + 1);
+                if (end < 0 || end > to) { return ""; }
+                return svg.Substring(eq + 1, end - eq - 1);
+            }
+            int e2 = eq;
+            while (e2 < to) {
+                int ch = svg[e2];
+                if (ch == 32 || ch == 9 || ch == 10 || ch == 13
+                    || ch == 47 || ch == 62) { break; }
+                e2 = e2 + 1;
+            }
+            return svg.Substring(eq, e2 - eq);
+        }
+        return "";
+    }
+
+    /// "12.5px" → 12.5；解析失败或百分比 → 0。
+    static double UnitNum(string s) {
+        if (s.Length == 0) { return 0.0; }
+        if (s.IndexOf("%") >= 0) { return 0.0; }
+        ChartSvgCursor cs = ChartSvgCursor.Of(s, 0, s.Length);
+        return cs.NextNum();
+    }
+
+    static void Push(List<double> tf, double a, double b, double c,
+                     double d, double ee, double f) {
+        tf.Add(a); tf.Add(b); tf.Add(c); tf.Add(d); tf.Add(ee); tf.Add(f);
+    }
+}
+
+/// 扫出的一个形状：区域名 + 折线化环组（环内含洞标记）。
+class ChartSvgShape {
+    string name;
+    List<ChartMapRing> rings;
+
+    static ChartSvgShape Of(string name, List<ChartMapRing> rings) {
+        ChartSvgShape s = new ChartSvgShape();
+        s.name = name;
+        s.rings = rings;
+        return s;
+    }
+}
+
+/// 文本区间数字游标：SVG 属性/路径里的十进制数流（分隔符任意，
+/// 负号直接拼在前一个数后也是新数，如 "10-5" = [10, -5]）。
+class ChartSvgCursor {
+    string s;
+    int i;
+    int to;
+    public bool any;  // 最近一次 NextNum 是否真的读到数字
+
+    static ChartSvgCursor Of(string s, int from, int to) {
+        ChartSvgCursor c = new ChartSvgCursor();
+        c.s = s;
+        c.i = from;
+        c.to = to;
+        return c;
+    }
+
+    /// 是否还有非分隔符字符可读。
+    bool HasMore() {
+        this.SkipSep();
+        return this.i < this.to;
+    }
+
+    /// 越过空白/逗号后返回下一个字符（到尾返回 0），不推进。
+    int Peek() {
+        this.SkipSep();
+        if (this.i < this.to) { return this.s[this.i]; }
+        return 0;
+    }
+
+    /// 读一个带符号十进制数（含指数），推进游标；无数字时
+    /// any=false 并返回 0（游标原地不动）。
+    double NextNum() {
+        this.SkipSep();
+        this.any = false;
+        int n = this.to;
+        int start = this.i;
+        if (this.i < n && (this.s[this.i] == 43 || this.s[this.i] == 45)) {
+            this.i = this.i + 1;
+        }
+        while (this.i < n && this.s[this.i] >= 48 && this.s[this.i] <= 57) {
+            this.i = this.i + 1;
+            this.any = true;
+        }
+        if (this.i < n && this.s[this.i] == 46) {
+            this.i = this.i + 1;
+            while (this.i < n && this.s[this.i] >= 48 && this.s[this.i] <= 57) {
+                this.i = this.i + 1;
+                this.any = true;
+            }
+        }
+        if (this.any && this.i < n && (this.s[this.i] == 101 || this.s[this.i] == 69)) {
+            int save = this.i;
+            this.i = this.i + 1;
+            if (this.i < n && (this.s[this.i] == 43 || this.s[this.i] == 45)) {
+                this.i = this.i + 1;
+            }
+            bool expAny = false;
+            while (this.i < n && this.s[this.i] >= 48 && this.s[this.i] <= 57) {
+                this.i = this.i + 1;
+                expAny = true;
+            }
+            if (!expAny) { this.i = save; }
+        }
+        if (!this.any) { return 0.0; }
+        return ChartSvgCursor.ParseDouble(this.s, start, this.i);
+    }
+
+    void SkipSep() {
+        while (this.i < this.to) {
+            int ch = this.s[this.i];
+            if (ch == 32 || ch == 44 || ch == 9 || ch == 10 || ch == 13) {
+                this.i = this.i + 1;
+                continue;
+            }
+            break;
+        }
+    }
+
+    /// [start,end) 十进制串 → double（手写，免逐数 JSON 开销；
+    /// 1e308 内安全，指数钳 300）。
+    static double ParseDouble(string s, int start, int end) {
+        long ip = 0;
+        int i = start;
+        bool neg = false;
+        if (i < end && (s[i] == 43 || s[i] == 45)) { neg = s[i] == 45; i = i + 1; }
+        while (i < end && s[i] >= 48 && s[i] <= 57) {
+            ip = ip * 10 + (s[i] - 48);
+            i = i + 1;
+        }
+        double frac = 0.0;
+        double scale = 1.0;
+        if (i < end && s[i] == 46) {
+            i = i + 1;
+            while (i < end && s[i] >= 48 && s[i] <= 57) {
+                scale = scale * 10.0;
+                frac = frac * 10.0 + (s[i] - 48);
+                i = i + 1;
+            }
+        }
+        double v = ip + frac / scale;
+        if (i < end && (s[i] == 101 || s[i] == 69)) {
+            i = i + 1;
+            bool eneg = false;
+            if (i < end && (s[i] == 43 || s[i] == 45)) { eneg = s[i] == 45; i = i + 1; }
+            int ex = 0;
+            while (i < end && s[i] >= 48 && s[i] <= 57) {
+                ex = ex * 10 + (s[i] - 48);
+                i = i + 1;
+            }
+            if (ex > 300) { ex = 300; }
+            double m = 1.0;
+            for (int k = 0; k < ex; k = k + 1) { m = m * 10.0; }
+            v = eneg ? v / m : v * m;
+        }
+        return neg ? 0.0 - v : v;
+    }
+}

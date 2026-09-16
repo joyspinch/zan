@@ -1,0 +1,250 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Diagnostics;
+
+namespace Gui;
+/// IconSvg 的数据表:Tabler Icons 精选子集(MIT 授权,
+/// https://github.com/tabler/tabler-icons),由 scripts/gen_icons_tabler.py
+/// 生成——**生成物,请勿手改**;要换子集或更新上游版本时重跑该脚本。
+///
+/// 数据以 JSON 包(stdlib/Gui/icons/tabler.json)随标准库走,编译发布时经
+/// `zanc --embed` 烤进可执行镜像,运行时惰性解析一次:没画过图标的程序
+/// 只带一份 ~260KB 的数据文件,不再把它展开成代码节;画了才在内存里建表。
+///
+/// 发现顺序(与皮肤 Skin.Roots 同一思路,让应用可以替换/扩充图标包):
+///   1. 环境变量 ZAN_GUI_ICONS 指向的文件或目录;
+///   2. exe 旁 icons/、assets/icons/;
+///   3. exe 内嵌资源 icons/(*.json);
+///   4. 标准库副本 stdlib/Gui/icons/(开发树)。
+/// 后发现的同名文件不覆盖先命中的;不同名的 JSON 与内置包合并(追加/覆盖
+/// 同名图标),所以应用只需放一个自己的 json 就能加图标或换掉个别图标。
+///
+/// 约定:
+///   · 包形如 {"图标名": "SVG body", ...},名称升序(二分查找要求);
+///   · 所有图标均为 24x24 viewBox,IconSvg 据此包装 SVG 文档;
+///   · body 里的双引号改写为单引号,避免 JSON/Zan 字面量转义;
+///   · body 保留 currentColor 占位,颜色由 IconSvg 在绘制时替换。
+class IconSvgData {
+    static List<string> names;
+    static List<string> bodies;
+
+    /// 惰性建表：首次访问时按发现顺序合并全部 JSON 包并按名排序；
+    /// 无任何包可读时也建立空表，行为与“未知图标名”一致。
+    static void Ensure() {
+        if (names != null) { return; }
+        // 主包:内置 tabler.json(可被用户包覆盖/扩充后的合并结果替代)。
+        List<string> pkgs = IconSvgData.Packages();
+        List<string> n = new List<string>();
+        List<string> b = new List<string>();
+        for (int i = 0; i < pkgs.Count; i = i + 1) {
+            IconSvgData.Merge(n, b, pkgs[i]);
+        }
+        if (n.Count == 0) {
+            // 没有任何包可读时也要保证调用方拿到空表而非 null,
+            // IndexOf 恒 -1、Draw 静默跳过,行为与"未知图标名"一致。
+            names = n;
+            bodies = b;
+            return;
+        }
+        IconSvgData.SortByNames(n, b);
+        names = n;
+        bodies = b;
+    }
+
+    /// 有序合并一份 JSON 包到 (names, bodies):先二分定位覆盖同名项,
+    /// 再按序插入新项,调用方最后统一排序由本函数增量维护。
+    static void Merge(List<string> names, List<string> bodies, string json) {
+        if (json == null || json.Length == 0) { return; }
+        JsonValue v = JsonValue.ParseLenient(json);
+        if (v == null || v.kind != 5) { return; }
+        List<string> keys = v.keys;
+        List<JsonValue> vals = v.vals;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            JsonValue item = vals[i];
+            if (item == null || item.kind != 3) { continue; }
+            string body = item.strVal;
+            if (body == null || body.Length == 0) { continue; }
+            int lo = 0;
+            int hi = names.Count - 1;
+            int at = -1;
+            while (lo <= hi) {
+                int mid = (lo + hi) / 2;
+                int cmp = keys[i].CompareTo(names[mid]);
+                if (cmp == 0) { at = mid; break; }
+                if (cmp < 0) { hi = mid - 1; } else { lo = mid + 1; }
+            }
+            if (at >= 0) {
+                bodies[at] = body;
+                continue;
+            }
+            names.Insert(lo, keys[i]);
+            bodies.Insert(lo, body);
+        }
+    }
+
+    /// JSON 包文本,按发现顺序拼接:磁盘命中的在前(应用自定义优先),
+    /// 内嵌/标准库兜底的在后;同 key 后写不覆盖先写(Merge 先到先得)。
+    static List<string> Packages() {
+        List<string> outp = new List<string>();
+        // 1) 环境变量:单个 json 文件或一个目录(目录下所有 *.json)。
+        string env = IconSvgData.Env("ZAN_GUI_ICONS");
+        if (env.Length > 0) {
+            if (Directory.Exists(env)) {
+                List<string> fs = Directory.GetFiles(env);
+                for (int i = 0; i < fs.Count; i = i + 1) {
+                    if (fs[i].EndsWith(".json")) {
+                        outp.Add(IconSvgData.ReadFile(fs[i]));
+                    }
+                }
+            } else if (File.Exists(env)) {
+                outp.Add(IconSvgData.ReadFile(env));
+            }
+        }
+        // 2) exe 旁的 icons/、assets/icons/(发布目录自带图标包)。
+        string exe = IconSvgData.ExeDir();
+        if (exe != "") {
+            IconSvgData.CollectDir(exe + "/icons", outp);
+            IconSvgData.CollectDir(exe + "/assets/icons", outp);
+        }
+        // 3) 内嵌资源 icons/ 下的 *.json(发布时 --embed 烤进镜像)。
+        string listing = zan_embed_list("icons/");
+        if (listing != null && listing.Length > 0) {
+            List<string> emb = listing.Split('\n');
+            for (int i = 0; i < emb.Count; i = i + 1) {
+                if (emb[i].Length == 0) { continue; }
+                if (!emb[i].EndsWith(".json")) { continue; }
+                string text = zan_embed_read(emb[i]);
+                if (text != null && text.Length > 0) {
+                    outp.Add(text);
+                }
+            }
+        }
+        // 4) 标准库副本(开发树/源码运行时)。
+        if (exe != "") {
+            IconSvgData.CollectDir(exe + "/../stdlib/Gui/icons", outp);
+        }
+        IconSvgData.CollectDir("stdlib/Gui/icons", outp);
+        return outp;
+    }
+
+    /// 把目录下所有 *.json 的文本按文件名序追加到 outp
+    /// （目录不存在时为空操作）。
+    static void CollectDir(string dir, List<string> outp) {
+        if (!Directory.Exists(dir)) { return; }
+        List<string> fs = Directory.GetFiles(dir);
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            // Directory.GetFiles 返回的是裸文件名,读之前先拼回目录。
+            string nm = IconSvgData.Leaf(fs[i]);
+            if (!nm.EndsWith(".json")) { continue; }
+            string text = IconSvgData.ReadFile(dir + "/" + nm);
+            if (text.Length > 0) { outp.Add(text); }
+        }
+    }
+
+    /// 路径的文件名部分（最后一个 / 或 \ 之后）。
+    static string Leaf(string path) {
+        int cut = 0 - 1;
+        for (int i = 0; i < path.Length; i = i + 1) {
+            string ch = path.Substring(i, 1);
+            if (ch == "/" || ch == "\\") { cut = i; }
+        }
+        if (cut < 0) { return path; }
+        return path.Substring(cut + 1, path.Length - cut - 1);
+    }
+
+    /// 读取整个文本文件；读不到/出错时返回 ""（绝不返回 null）。
+    static string ReadFile(string path) {
+        // 磁盘读不到(或没这个文件)时 File.ReadAllText 自己会回退内嵌表,
+        // 这里再做一层 null 兜底,保证调用方拿到 "" 而非 null。
+        try {
+            string text = File.ReadAllText(path);
+            return text == null ? "" : text;
+        } catch (Exception) {
+            return "";
+        }
+    }
+
+    /// (names, bodies) 按名称升序原地排序(插入排序:包内已经接近有序,
+    /// 合并场景位移量小;表规模 ~1k,构造期一次性成本可忽略)。
+    static void SortByNames(List<string> names, List<string> bodies) {
+        int n = names.Count;
+        for (int i = 1; i < n; i = i + 1) {
+            string kn = names[i];
+            string kb = bodies[i];
+            int j = i - 1;
+            while (j >= 0 && names[j].CompareTo(kn) > 0) {
+                names[j + 1] = names[j];
+                bodies[j + 1] = bodies[j];
+                j = j - 1;
+            }
+            names[j + 1] = kn;
+            bodies[j + 1] = kb;
+        }
+    }
+
+    /// 读取环境变量(缺失返回 "")。
+    [DllImport("crt")]
+    static extern string getenv(string name);
+
+    /// getenv 的包装：null 转为 ""。
+    static string Env(string name) {
+        string v = getenv(name);
+        if (v == null) { return ""; }
+        return v;
+    }
+
+    /// 正在运行的可执行文件所在目录(不含末尾分隔符),无法确定时返回 ""。
+    static string ExeDir() {
+        string p = ProcessHost.SelfExe();
+        int cut = 0 - 1;
+        for (int i = 0; i < p.Length; i = i + 1) {
+            string ch = p.Substring(i, 1);
+            if (ch == "\\" || ch == "/") { cut = i; }
+        }
+        if (cut < 0) { return ""; }
+        return p.Substring(0, cut);
+    }
+
+    [DllImport("crt")]
+    static extern int zan_embed_has(string name);
+
+    [DllImport("crt")]
+    static extern string zan_embed_read(string name);
+
+    [DllImport("crt")]
+    static extern string zan_embed_list(string prefix);
+
+    /// 表内图标个数。
+    static int Count() {
+        IconSvgData.Ensure();
+        return names.Count;
+    }
+
+    /// 全部图标名(升序)。供画廊、文档工具枚举。
+    static List<string> Names() {
+        IconSvgData.Ensure();
+        return names;
+    }
+
+    /// 二分查找图标名,未命中返回 -1。
+    static int IndexOf(string name) {
+        IconSvgData.Ensure();
+        int lo = 0;
+        int hi = names.Count - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            int cmp = name.CompareTo(names[mid]);
+            if (cmp == 0) { return mid; }
+            if (cmp < 0) { hi = mid - 1; }
+            else { lo = mid + 1; }
+        }
+        return -1;
+    }
+
+    /// 按下标取 SVG body(不含 <svg> 外壳)。
+    static string Body(int index) {
+        IconSvgData.Ensure();
+        return bodies[index];
+    }
+}

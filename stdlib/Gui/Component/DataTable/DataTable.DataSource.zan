@@ -1,0 +1,754 @@
+using System;
+
+namespace Gui.Component.DataTable;
+
+/// 视口请求。start/count 用于 offset 分页；cursor 非空时可由服务端
+/// 采用 keyset/cursor 分页。查询描述本身不携带回调或运行时对象。
+class QueryViewport {
+    int start;
+    int count;
+    string cursor;
+
+    /// 构造视口；start 钳制到 >=0，count 钳制到 >=1，cursor 为 null 记空串。
+    QueryViewport(int at, int size, string token) {
+        this.start = at;
+        this.count = size;
+        this.cursor = token;
+        if (this.start < 0) { this.start = 0; }
+        if (this.count < 1) { this.count = 1; }
+        if (this.cursor == null) { this.cursor = ""; }
+    }
+
+    /// 页起始行索引（offset 分页）。
+    int Start() { return this.start; }
+    /// 请求的页大小（行数），至少 1。
+    int Count() { return this.count; }
+    /// 服务端续页 token；未使用时为空串。
+    string Cursor() { return this.cursor; }
+    /// 是否携带续页 token（可走 keyset/cursor 分页）。
+    bool UsesCursor() { return this.cursor.Length > 0; }
+}
+
+/// 一次查询请求的不可变身份。cancel 只改变请求状态，不改变身份，
+/// 因而迟到结果即使内容相同也不能重新进入缓存。
+class QueryRequestToken {
+    int requestId;
+    int generation;
+    string queryText;
+    int queryHash;
+    int schemaVersion;
+    int serverRevision;
+    bool cancelled;
+
+    /// 构造请求身份；cancelled 初始为 false，canonical 为 null 记空串。
+    QueryRequestToken(int id, int gen, string canonical, int hash,
+                      int schema, int server) {
+        this.requestId = id;
+        this.generation = gen;
+        this.queryText = canonical;
+        if (this.queryText == null) { this.queryText = ""; }
+        this.queryHash = hash;
+        this.schemaVersion = schema;
+        this.serverRevision = server;
+        this.cancelled = false;
+    }
+
+    /// 单调递增的请求序号。
+    int RequestId() { return this.requestId; }
+    /// 创建时的源 generation；Refresh/SetSchema 等会使旧代失效。
+    int Generation() { return this.generation; }
+    /// 请求的 canonical 查询文本。
+    string QueryText() { return this.queryText; }
+    /// 查询指纹。
+    int QueryHash() { return this.queryHash; }
+    /// 创建时的 schema 版本。
+    int SchemaVersion() { return this.schemaVersion; }
+    /// 创建时的服务端 revision。
+    int ServerRevision() { return this.serverRevision; }
+    /// token 是否已被取消。
+    bool IsCancelled() { return this.cancelled; }
+    /// 取消该 token；只改变请求状态，不改变身份。
+    void Cancel() { this.cancelled = true; }
+
+    /// 六个身份字段全部相等才视为同一次请求；other 为 null 返回 false。
+    bool SameIdentity(QueryRequestToken other) {
+        if (other == null) { return false; }
+        return this.requestId == other.requestId
+            && this.generation == other.generation
+            && this.queryText == other.queryText
+            && this.queryHash == other.queryHash
+            && this.schemaVersion == other.schemaVersion
+            && this.serverRevision == other.serverRevision;
+    }
+}
+
+/// 查询数据源的兼容门面。旧 DataSource 读取接口只暴露当前已提交页；
+/// Execute/Finish/Poll 负责把不可变 QueryResult 原子交给 UI，旧结果不会
+/// 因为网络返回顺序而覆盖新查询。
+class QueryDataSource : DataSource {
+    QueryDescriptor activeQuery;
+    QueryViewport activeViewport;
+    QueryRequestToken activeToken;
+    QueryResult pendingResult;
+    QueryResult currentResult;
+    QueryResult errorResult;
+    bool resultPending;
+    bool requestActive;
+    int generation;
+    int pageSize;
+    int nextRequestId;
+    int schemaVersion;
+    int serverRevision;
+    List<SchemaColumn> schema;
+    DataPageCache pageCache;
+    TableTransaction activeTransaction;
+    TransactionRequestToken activeTransactionToken;
+    TableTransactionResult pendingTransactionResult;
+    TableTransactionResult currentTransactionResult;
+    TableTransactionResult errorTransactionResult;
+    bool transactionPending;
+    bool transactionActive;
+    int nextTransactionRequestId;
+
+    /// 构造源：generation 从 1 起，页大小 100，页缓存上限 256 MiB。
+    QueryDataSource() { this.Setup(); }
+
+    /// 重置全部查询与事务状态到初始值。
+    void Setup() {
+        this.activeQuery = null;
+        this.activeViewport = null;
+        this.activeToken = null;
+        this.pendingResult = null;
+        this.currentResult = null;
+        this.errorResult = null;
+        this.resultPending = false;
+        this.requestActive = false;
+        this.generation = 1;
+        this.pageSize = 100;
+        this.nextRequestId = 1;
+        this.schemaVersion = 1;
+        this.serverRevision = 0;
+        this.schema = new List<SchemaColumn>();
+        this.pageCache = new DataPageCache(268435456);
+        this.activeTransaction = null;
+        this.activeTransactionToken = null;
+        this.pendingTransactionResult = null;
+        this.currentTransactionResult = null;
+        this.errorTransactionResult = null;
+        this.transactionPending = false;
+        this.transactionActive = false;
+        this.nextTransactionRequestId = 1;
+    }
+
+    /// 取消活动事务 token、终结仍在 Pending 的事务并清理事务状态；
+    /// keepCurrent=false 时连同当前事务结果一起清除。
+    void ClearTransactionState(bool keepCurrent) {
+        if (this.activeTransactionToken != null) {
+            this.activeTransactionToken.Cancel();
+        }
+        if (this.activeTransaction != null
+            && this.activeTransaction.State() == TransactionState.Pending) {
+            this.activeTransaction.Cancel();
+        }
+        this.activeTransaction = null;
+        this.activeTransactionToken = null;
+        this.pendingTransactionResult = null;
+        this.errorTransactionResult = null;
+        this.transactionPending = false;
+        this.transactionActive = false;
+        if (!keepCurrent) { this.currentTransactionResult = null; }
+    }
+
+    /// 修改页大小（最小 1）；同时取消活动请求、清空结果与页缓存、
+    /// 清理事务并推进 generation。页大小未变化时为空操作。
+    void SetPageSize(int size) {
+        if (size < 1) { size = 1; }
+        if (this.pageSize == size) { return; }
+        this.pageSize = size;
+        if (this.activeToken != null) { this.activeToken.Cancel(); }
+        this.pendingResult = null;
+        this.currentResult = null;
+        this.errorResult = null;
+        this.resultPending = false;
+        this.requestActive = false;
+        this.ClearTransactionState(false);
+        this.pageCache.Clear();
+        this.generation = this.generation + 1;
+    }
+
+    /// 当前页大小。
+    int PageSize() { return this.pageSize; }
+
+    /// 源内容或行身份改变时使当前页、活动请求和页缓存一起失效。
+    void Refresh() {
+        if (this.activeToken != null) { this.activeToken.Cancel(); }
+        this.pendingResult = null;
+        this.currentResult = null;
+        this.errorResult = null;
+        this.resultPending = false;
+        this.requestActive = false;
+        this.activeToken = null;
+        this.activeViewport = null;
+        this.ClearTransactionState(false);
+        this.pageCache.Clear();
+        this.generation = this.generation + 1;
+    }
+
+    /// 替换 schema（复制保存、跳过 null 列），版本号钳制到 >=1；
+    /// 同时取消活动请求、清空页缓存与结果、清理事务并推进 generation。
+    void SetSchema(List<SchemaColumn> value, int version) {
+        this.schema = new List<SchemaColumn>();
+        if (value != null) {
+            for (int i = 0; i < value.Count; i = i + 1) {
+                if (value[i] != null) { this.schema.Add(value[i]); }
+            }
+        }
+        if (version < 1) { version = 1; }
+        this.schemaVersion = version;
+        if (this.activeToken != null) { this.activeToken.Cancel(); }
+        this.pageCache.Clear();
+        this.pendingResult = null;
+        this.currentResult = null;
+        this.errorResult = null;
+        this.resultPending = false;
+        this.requestActive = false;
+        this.ClearTransactionState(false);
+        this.generation = this.generation + 1;
+    }
+
+    /// 当前 schema 的浅拷贝列表。
+    List<SchemaColumn> DescribeSchema() {
+        List<SchemaColumn> copy = new List<SchemaColumn>();
+        for (int i = 0; i < this.schema.Count; i = i + 1) {
+            copy.Add(this.schema[i]);
+        }
+        return copy;
+    }
+    /// 门面基类只承诺分页；子类按实际能力覆盖。
+    virtual QueryCapabilities Capabilities() {
+        return QueryCapabilities.Of(QueryCapabilities.Page);
+    }
+
+    /// 构建远端执行契约。schema 尚未描述时使用未知列数，
+    /// 避免把未初始化的远端源误判为零列。
+    virtual QueryPlanContract BuildQueryPlan(QueryDescriptor query) {
+        if (this.schema.Count > 0) {
+            return QueryPlanContract.Build(query, this.schema, this.Capabilities());
+        }
+        return QueryPlanContract.Build(query, -1, this.Capabilities());
+    }
+
+    /// 将已校验契约、视口和 token 绑定为稳定的远端请求包。
+    /// 服务端适配器可直接序列化该对象，不必重复拼装身份字段。
+    QueryRequestEnvelope BuildQueryRequest(QueryPlanContract contract,
+                                            QueryViewport viewport,
+                                            QueryRequestToken token) {
+        return QueryRequestEnvelope.Build(contract, viewport, token);
+    }
+
+    /// 当前 schema 版本号。
+    int SchemaVersion() { return this.schemaVersion; }
+    /// 当前服务端数据 revision。
+    int ServerRevision() { return this.serverRevision; }
+
+    /// server revision 变化必须由调用方显式推进；旧 token 不会再匹配。
+    void SetServerRevision(int revision) {
+        if (this.serverRevision == revision) { return; }
+        this.serverRevision = revision;
+        if (this.activeToken != null) { this.activeToken.Cancel(); }
+        this.pageCache.Clear();
+        this.pendingResult = null;
+        this.currentResult = null;
+        this.errorResult = null;
+        this.resultPending = false;
+        this.requestActive = false;
+        this.ClearTransactionState(false);
+        this.generation = this.generation + 1;
+    }
+
+    /// 用下一个请求序号和当前源状态（generation/schema/revision）构造
+    /// 请求 token；query 为 null 时身份字段取空串/0。
+    QueryRequestToken NewToken(QueryDescriptor query, int generation) {
+        int hash = 0;
+        if (query != null) { hash = query.QueryFingerprint(); }
+        string canonical = "";
+        if (query != null) { canonical = query.QueryJson(); }
+        QueryRequestToken token = new QueryRequestToken(
+            this.nextRequestId,
+            generation,
+            canonical,
+            hash,
+            this.schemaVersion,
+            this.serverRevision);
+        this.nextRequestId = this.nextRequestId + 1;
+        return token;
+    }
+
+    /// 开始一个查询。子类可重写 Execute 做同步 fake 或启动异步工作；
+    /// 异步完成路径只调用 FinishQuery(result, token)。
+    QueryRequestToken RequestQuery(QueryDescriptor query,
+                                   QueryViewport viewport,
+                                   QueryRequestToken token) {
+        if (viewport == null) { viewport = new QueryViewport(0, this.pageSize, ""); }
+        if (token == null) {
+            token = this.NewToken(query, this.generation);
+        } else {
+            string expectedText = "";
+            int expectedHash = 0;
+            if (query != null) {
+                expectedText = query.QueryJson();
+                expectedHash = query.QueryFingerprint();
+            }
+            if (token.IsCancelled() || token == this.activeToken
+                || token.SchemaVersion() != this.schemaVersion
+                || token.ServerRevision() != this.serverRevision
+                || token.QueryText() != expectedText
+                || token.QueryHash() != expectedHash
+                || token.Generation() != this.generation) { return null; }
+        }
+        if (this.activeToken != null && this.requestActive) {
+            this.activeToken.Cancel();
+        }
+        this.activeQuery = query;
+        this.activeViewport = viewport;
+        this.activeToken = token;
+        this.pendingResult = null;
+        this.currentResult = null;
+        this.errorResult = null;
+        this.resultPending = false;
+        this.requestActive = true;
+        QueryResult cached = this.pageCache.Get(
+            DataPageKey.For(query, viewport, this.generation,
+                this.schemaVersion, this.serverRevision));
+        if (cached != null) {
+            QueryResult rebound = cached.Rebind(token, viewport);
+            if (rebound != null) {
+                this.pendingResult = rebound;
+                this.resultPending = true;
+                return token;
+            }
+        }
+        QueryPlanContract contract = this.BuildQueryPlan(query);
+        this.FetchQueryPlan(query, contract, viewport, token);
+        return token;
+    }
+
+    /// 请求包含 row 的随机视口页；已就绪或同一页正在请求时合并。
+    override void RequestBlock(int row) {
+        if (row < 0) { return; }
+        if (this.currentResult != null && this.currentResult.Covers(row)) { return; }
+        if (this.CachedRow(row) != null) { return; }
+        if (this.requestActive && this.activeViewport != null) {
+            int activeStart = this.activeViewport.Start();
+            if (row >= activeStart && row < activeStart + this.activeViewport.Count()) {
+                return;
+            }
+        }
+        int start = (row / this.pageSize) * this.pageSize;
+        QueryViewport viewport = new QueryViewport(start, this.pageSize, "");
+        this.RequestQuery(this.activeQuery, viewport, null);
+    }
+
+    /// 请求紧接当前结果之后的下一页：start 顺延，有 continuation 时
+    /// 携带它继续 keyset 分页。total 已知且已到尾、或结果声明无更多
+    /// 数据时不发请求；已有请求在途时忽略。
+    override void RequestNextBlock() {
+        if (this.requestActive) { return; }
+        int start = 0;
+        string cursor = "";
+        if (this.currentResult != null) {
+            if (this.currentResult.Continuation().Length > 0) {
+                start = this.currentResult.Start() + this.currentResult.RequestedCount();
+                cursor = this.currentResult.Continuation();
+            } else {
+                start = this.currentResult.Start() + this.currentResult.RequestedCount();
+            }
+            if (this.currentResult.TotalKnown() && start >= this.currentResult.Total()) { return; }
+            if (!this.currentResult.HasMore() && !this.currentResult.TotalKnown()) { return; }
+        }
+        QueryViewport viewport = new QueryViewport(start, this.pageSize, cursor);
+        this.RequestQuery(this.activeQuery, viewport, null);
+    }
+
+    /// 是否还有后续页：尚无结果时为 true（未知）；total 已知时按
+    /// start+count<total 判断，否则沿用结果的 hasMore 标记。
+    override bool HasMore() {
+        if (this.currentResult == null) { return true; }
+        if (this.currentResult.TotalKnown()) {
+            return this.currentResult.Start() + this.currentResult.Count()
+                < this.currentResult.Total();
+        }
+        return this.currentResult.HasMore();
+    }
+
+    /// 同步扩展点：调用 Execute 并立即 FinishQuery。异步源改为重写
+    /// FetchQueryPlan 启动后台工作，完成时只回调 FinishQuery。
+    virtual void FetchQuery(QueryDescriptor query,
+                            QueryViewport viewport,
+                            QueryRequestToken token) {
+        QueryResult result = this.Execute(query, viewport, token);
+        this.FinishQuery(result, token);
+    }
+
+    /// 新的远端入口同时接收下推/残差契约；使用独立名称避免
+    /// 依赖同名重载虚分派。默认实现保留旧 FetchQuery 扩展点，
+    /// 已有数据源无需修改即可继续工作。
+    virtual void FetchQueryPlan(QueryDescriptor query,
+                                QueryPlanContract contract,
+                                QueryViewport viewport,
+                                QueryRequestToken token) {
+        if (contract == null || !contract.IsValid()) {
+            string message = "query plan contract is invalid";
+            if (contract != null && contract.Error().Length > 0) {
+                message = contract.Error();
+            }
+            this.FinishQuery(QueryResult.Failure(token, viewport, message), token);
+            return;
+        }
+        if (contract.HasResidual()) {
+            this.FinishQuery(QueryResult.Failure(token, viewport,
+                "query plan has residual operations"), token);
+            return;
+        }
+        this.FetchQuery(query, viewport, token);
+    }
+
+    /// 执行一页查询；基类返回 null（经 FinishQuery 视为失败），
+    /// 子类必须提供真实实现。
+    virtual QueryResult Execute(QueryDescriptor query,
+                                QueryViewport viewport,
+                                QueryRequestToken token) {
+        return null;
+    }
+
+    /// 构建独立于分页请求的事务传输包。
+    TransactionRequestEnvelope BuildTransactionRequest(
+        TableTransaction transaction, TransactionRequestToken token) {
+        return TransactionRequestEnvelope.Build(transaction, token);
+    }
+
+    /// 提交一个已完成本地校验的事务。事务必须处于 Pending，
+    /// 同一数据源同时只保留一个活动提交。
+    TransactionRequestToken SubmitTransaction(TableTransaction transaction) {
+        if (transaction == null || !transaction.IsValid()
+            || transaction.State() != TransactionState.Pending
+            || this.transactionActive) { return null; }
+        TransactionRequestToken token = new TransactionRequestToken(
+            this.nextTransactionRequestId, transaction.TransactionId(),
+            this.generation, this.schemaVersion, this.serverRevision);
+        this.nextTransactionRequestId = this.nextTransactionRequestId + 1;
+        this.activeTransaction = transaction;
+        this.activeTransactionToken = token;
+        this.pendingTransactionResult = null;
+        this.errorTransactionResult = null;
+        this.transactionPending = false;
+        this.transactionActive = true;
+        this.FetchTransaction(transaction, token);
+        return token;
+    }
+
+    /// 远端适配器重写此方法启动实际提交；完成时只调用 FinishTransaction。
+    virtual void FetchTransaction(TableTransaction transaction,
+                                  TransactionRequestToken token) {
+    }
+
+    /// 校验结果形状可否采信：事务 id 与条数匹配活动事务，每条结果
+    /// 有效、mutationId 属于该事务且不重复，且逐条状态分布与事务级
+    /// 状态一致——Acked/Cancelled 要求全部同态；Rejected/Conflict 在
+    /// AllOrNothing 模式下不允许部分接受。
+    bool TransactionResultShapeValid(TableTransactionResult result) {
+        if (result == null || !result.IsValid()
+            || this.activeTransaction == null
+            || result.TransactionId() != this.activeTransaction.TransactionId()
+            || result.Count() != this.activeTransaction.Count()) { return false; }
+        int accepted = 0;
+        int rejected = 0;
+        int conflicts = 0;
+        int cancelled = 0;
+        for (int i = 0; i < result.Count(); i = i + 1) {
+            MutationResult value = result.ResultAt(i);
+            if (value == null || !value.IsValid()
+                || !this.activeTransaction.HasMutationId(value.MutationId())) {
+                return false;
+            }
+            for (int j = 0; j < i; j = j + 1) {
+                MutationResult previous = result.ResultAt(j);
+                if (previous != null
+                    && previous.MutationId() == value.MutationId()) { return false; }
+            }
+            if (value.Status() == MutationResult.Accepted) { accepted = accepted + 1; }
+            else if (value.Status() == MutationResult.Rejected) { rejected = rejected + 1; }
+            else if (value.Status() == MutationResult.Conflict) { conflicts = conflicts + 1; }
+            else if (value.Status() == MutationResult.Cancelled) { cancelled = cancelled + 1; }
+        }
+        if (result.Status() == TableTransactionResult.Acked) {
+            return accepted == result.Count();
+        }
+        if (result.Status() == TableTransactionResult.Rejected) {
+            if (rejected < 1 || conflicts > 0 || cancelled > 0) { return false; }
+            return this.activeTransaction.Mode() == TransactionMode.BestEffort
+                || accepted == 0;
+        }
+        if (result.Status() == TableTransactionResult.Conflict) {
+            if (conflicts < 1 || rejected > 0 || cancelled > 0) { return false; }
+            return this.activeTransaction.Mode() == TransactionMode.BestEffort
+                || accepted == 0;
+        }
+        if (result.Status() == TableTransactionResult.Cancelled) {
+            return cancelled == result.Count();
+        }
+        return false;
+    }
+
+    /// 在收到完整且匹配身份的事务结果后排入 UI 线程 pending 槽。
+    bool FinishTransaction(TableTransactionResult result,
+                           TransactionRequestToken token) {
+        if (token == null || this.activeTransactionToken == null
+            || !token.SameIdentity(this.activeTransactionToken)
+            || !this.transactionActive || this.transactionPending
+            || this.activeTransaction.State() != TransactionState.Pending
+            || token.IsCancelled()
+            || result == null
+            || result.TransactionId() != token.TransactionId()
+            || !this.TransactionResultShapeValid(result)) { return false; }
+        this.pendingTransactionResult = result.Copy();
+        this.transactionPending = true;
+        return true;
+    }
+
+    /// 取消 transport token，并将仍在 Pending 的事务终结为 Cancelled。
+    void CancelTransaction(TransactionRequestToken token) {
+        if (token == null || this.activeTransactionToken == null
+            || !token.SameIdentity(this.activeTransactionToken)) { return; }
+        token.Cancel();
+        if (this.activeTransaction != null
+            && this.activeTransaction.State() == TransactionState.Pending) {
+            this.activeTransaction.Cancel();
+        }
+        this.activeTransaction = null;
+        this.activeTransactionToken = null;
+        this.pendingTransactionResult = null;
+        this.transactionPending = false;
+        this.transactionActive = false;
+    }
+
+    /// 尚无完成事务时为 null。
+    TableTransactionResult CurrentTransactionResult() {
+        if (this.currentTransactionResult == null) { return null; }
+        return this.currentTransactionResult.Copy();
+    }
+
+    /// 最近一次被拒绝入库的异常事务结果；尚无为 null。
+    TableTransactionResult ErrorTransaction() {
+        if (this.errorTransactionResult == null) { return null; }
+        return this.errorTransactionResult.Copy();
+    }
+
+    /// accepted 结果默认使查询页和缓存失效；具体 source 可重写此方法
+    /// 先更新后端/overlay，再调用 base 触发新 revision 查询。
+    virtual void ApplyTransactionResult(TableTransactionResult result) {
+        int newestRevision = this.serverRevision;
+        bool hasAcceptedRevision = false;
+        if (result != null) {
+            for (int i = 0; i < result.Count(); i = i + 1) {
+                MutationResult value = result.ResultAt(i);
+                if (value != null && value.Status() == MutationResult.Accepted
+                    && value.ServerRevision() > newestRevision) {
+                    newestRevision = value.ServerRevision();
+                    hasAcceptedRevision = true;
+                }
+            }
+        }
+        if (hasAcceptedRevision) { this.SetServerRevision(newestRevision); }
+        else { this.Refresh(); }
+    }
+
+    /// 把 pending 事务结果落实为状态迁移：Acked 触发 ApplyTransactionResult，
+    /// Conflict/Rejected 把首条详情记入事务，其余取消；形状不再合法时把
+    /// 结果转入 error 槽。返回 UI 是否需要刷新（有已落实快照）。
+    bool PollTransaction() {
+        if (!this.transactionPending) { return false; }
+        TableTransactionResult result = this.pendingTransactionResult;
+        this.pendingTransactionResult = null;
+        this.transactionPending = false;
+        if (result == null || this.activeTransaction == null
+            || this.activeTransactionToken == null
+            || this.activeTransaction.State() != TransactionState.Pending
+            || this.activeTransactionToken.IsCancelled()
+            || !this.TransactionResultShapeValid(result)) {
+            this.errorTransactionResult = result;
+            this.activeTransaction = null;
+            this.activeTransactionToken = null;
+            this.transactionActive = false;
+            return false;
+        }
+        TableTransaction transaction = this.activeTransaction;
+        if (result.Status() == TableTransactionResult.Acked) {
+            transaction.Ack();
+            this.ApplyTransactionResult(result);
+        } else if (result.Status() == TableTransactionResult.Conflict) {
+            string detail = "transaction conflict";
+            MutationResult first = result.ResultAt(0);
+            if (first != null && first.Message().Length > 0) { detail = first.Message(); }
+            transaction.MarkConflict(detail);
+        } else if (result.Status() == TableTransactionResult.Rejected) {
+            string detail = "transaction rejected";
+            MutationResult first = result.ResultAt(0);
+            if (first != null && first.Message().Length > 0) { detail = first.Message(); }
+            transaction.Reject(detail);
+        } else {
+            transaction.Cancel();
+        }
+        TableTransactionResult snapshot = result.Copy();
+        if (this.activeTransactionToken != null) { this.activeTransactionToken.Cancel(); }
+        this.activeTransaction = null;
+        this.activeTransactionToken = null;
+        this.transactionActive = false;
+        this.currentTransactionResult = snapshot;
+        return true;
+    }
+
+    /// 迟到、取消、schema/revision 不匹配的结果在进入 pending 前丢弃。
+    void FinishQuery(QueryResult result, QueryRequestToken token) {
+        if (token == null || this.activeToken == null
+            || !token.SameIdentity(this.activeToken)) { return; }
+        if (!this.requestActive) { return; }
+        if (token.IsCancelled() || token.Generation() != this.generation
+            || result == null || !result.Matches(token)
+            || !result.MatchesViewport(this.activeViewport)
+            || result.Failed()) {
+            this.requestActive = false;
+            this.errorResult = result;
+            this.pendingResult = null;
+            this.resultPending = false;
+            this.activeToken = null;
+            this.activeViewport = null;
+            return;
+        }
+        int rowCount = result.Count();
+        int bytes = 1;
+        if (rowCount > 2147483647 / 64) {
+            bytes = 2147483647;
+        } else {
+            bytes = rowCount * 64;
+            if (bytes < 1) { bytes = 1; }
+        }
+        this.pageCache.Put(
+            DataPageKey.For(this.activeQuery, this.activeViewport,
+                this.generation, this.schemaVersion, this.serverRevision),
+            result, bytes);
+        this.pendingResult = result;
+        this.resultPending = true;
+    }
+
+    /// UI 每帧轮询：先落实事务结果，再把 pending 查询结果原子转入
+    /// currentResult。过期、取消或视口不匹配的结果被静默丢弃。
+    /// 返回本轮是否有任何数据变化。
+    override bool Poll() {
+        bool changed = this.PollTransaction();
+        if (!this.resultPending) { return changed; }
+        QueryResult result = this.pendingResult;
+        this.pendingResult = null;
+        this.resultPending = false;
+        if (result == null || this.activeToken == null
+            || this.activeToken.IsCancelled()
+            || !result.Matches(this.activeToken)
+            || !result.MatchesViewport(this.activeViewport)) {
+            this.requestActive = false;
+            this.activeToken = null;
+            this.activeViewport = null;
+            return changed;
+        }
+        this.currentResult = result;
+        this.requestActive = false;
+        this.activeToken = null;
+        this.activeViewport = null;
+        return true;
+    }
+
+    /// 取消 token；若它正是活动请求，同时复位请求状态。token 为 null
+    /// 时不做任何事。
+    void Cancel(QueryRequestToken token) {
+        if (token == null) { return; }
+        bool active = this.activeToken != null
+            && token.SameIdentity(this.activeToken);
+        token.Cancel();
+        if (active) {
+            this.requestActive = false;
+            this.pendingResult = null;
+            this.resultPending = false;
+            this.activeToken = null;
+            this.activeViewport = null;
+        }
+    }
+
+    /// 当前已提交页的结果；尚无为 null。
+    QueryResult CurrentResult() { return this.currentResult; }
+    /// 最近一次失败/过期查询的结果；尚无为 null。
+    QueryResult ErrorResult() { return this.errorResult; }
+    /// 页缓存当前占用的估算字节数。
+    int CacheBytes() { return this.pageCache.Bytes(); }
+    /// 清空页缓存（不影响当前结果）。
+    void ClearCache() { this.pageCache.Clear(); }
+
+    /// 按当前查询身份在页缓存中查找包含 row 的页；未命中返回 null。
+    QueryResult CachedRow(int row) {
+        return this.pageCache.GetRow(this.activeQuery, this.generation,
+            this.schemaVersion, this.serverRevision, row);
+    }
+
+    /// 查询门面由外部查询驱动，行序归“服务端”掌控；渲染层因此
+    /// 不自动把表头排序/筛选下推为查询。
+    override bool ServerControlled() { return true; }
+
+    /// total 已知时为 total，否则为已获取范围的尾部（start+count）。
+    override int RowCount() {
+        if (this.currentResult == null) { return 0; }
+        if (this.currentResult.TotalKnown()) { return this.currentResult.Total(); }
+        return this.currentResult.Start() + this.currentResult.Count();
+    }
+
+    /// 当前页覆盖该行或页缓存命中时为 true。
+    override bool CellReady(int row, int col) {
+        if (this.currentResult != null && this.currentResult.Covers(row)) { return true; }
+        return this.CachedRow(row) != null;
+    }
+
+    /// 行的业务身份；当前页与页缓存都未覆盖该行时返回 null。
+    override RowKey GetRowKey(int row) {
+        QueryResult result = this.currentResult;
+        if (result == null || !result.Covers(row)) { result = this.CachedRow(row); }
+        if (result == null) { return null; }
+        QueryRow value = result.RowAt(row);
+        if (value == null) { return null; }
+        return value.Key();
+    }
+
+    /// 单元格文本；当前页未覆盖该行时回退页缓存，仍不可得为空串。
+    override string CellText(int row, int col) {
+        QueryResult result = this.currentResult;
+        if (result == null || !result.Covers(row)) { result = this.CachedRow(row); }
+        if (result == null) { return ""; }
+        return result.CellText(row, col);
+    }
+
+    /// 单元格文本经 DataTable.ParseInt 的整数解读。
+    override int CellNum(int row, int col) {
+        return DataTable.ParseInt(this.CellText(row, col));
+    }
+
+    /// 单元格文本经 DataTable.ParseReal 的实数解读。
+    override double CellReal(int row, int col) {
+        return DataTable.ParseReal(this.CellText(row, col));
+    }
+
+    /// 单元格文本经 DataTable.ParseDate 的日号解读（order 为列的日期字段顺序）。
+    override int CellDay(int row, int col, int order) {
+        return DataTable.ParseDate(this.CellText(row, col), order);
+    }
+
+    /// 单元格文本经 DataTable.ParseBool 的真值解读。
+    override bool CellBool(int row, int col) {
+        return DataTable.ParseBool(this.CellText(row, col));
+    }
+}

@@ -1,0 +1,296 @@
+using System;
+
+namespace System.Text;
+
+/// <summary>
+/// 面向应用文本的小型确定性 Markdown 转 HTML 渲染器。
+///
+/// <c>Markdown.ToHtml(text)</c> 支持 ATX 标题、段落、块级
+/// 引用、有序和无序列表、三反引号围栏代码、行内
+/// 代码、斜体、粗体、链接及反斜杠转义。输出
+/// 紧凑：块级元素以换行分隔，段落的软换行
+/// 变为空格。
+///
+/// 刻意不兼容 CommonMark：块不嵌套，列表项和
+/// 引用各占一行源码，围栏信息字符串被忽略，行内
+/// 定界符取第一个匹配的闭合符。未闭合的定界符原样输出，
+/// 未闭合的围栏把剩余输入当作代码。
+/// 源文本、代码、标签和链接属性均做 HTML 转义。链接 URL
+/// 必须是相对路径，或使用 <c>http</c>、<c>https</c>、<c>mailto</c>
+/// 协议；含 ASCII 控制字符的 URL 只渲染为标签文本，
+/// 不生成锚点链接。
+/// </summary>
+class Markdown {
+    /// <summary>将受支持的 Markdown 语法渲染为紧凑的转义 HTML。</summary>
+    static string ToHtml(string text) {
+        List<string> lines = Markdown.Lines(text);
+        StringBuilder html = new StringBuilder();
+        int i = 0;
+        bool first = true;
+        while (i < lines.Count) {
+            string line = lines[i];
+            if (Markdown.Trim(line) == "") { i = i + 1; continue; }
+
+            if (Markdown.StartsWith(line, "```")) {
+                StringBuilder code = new StringBuilder();
+                i = i + 1;
+                bool codeFirst = true;
+                while (i < lines.Count && !Markdown.StartsWith(lines[i], "```")) {
+                    if (!codeFirst) { code.Append("\n"); }
+                    code.Append(lines[i]);
+                    codeFirst = false;
+                    i = i + 1;
+                }
+                if (i < lines.Count) { i = i + 1; }
+                first = Markdown.Block(html, first, "<pre><code>" + Markdown.EscapeHtml(code.ToString()) + "</code></pre>");
+                continue;
+            }
+
+            int heading = Markdown.HeadingLevel(line);
+            if (heading > 0) {
+                string body = line.Substring(heading + 1, line.Length - heading - 1);
+                string tag = Convert.ToString(heading);
+                first = Markdown.Block(html, first, "<h" + tag + ">" + Markdown.Inline(body) + "</h" + tag + ">");
+                i = i + 1;
+                continue;
+            }
+
+            int listKind = Markdown.ListKind(line);
+            if (listKind != 0) {
+                string tag = "ul";
+                if (listKind == 2) { tag = "ol"; }
+                StringBuilder list = new StringBuilder();
+                list.Append("<" + tag + ">");
+                while (i < lines.Count && Markdown.ListKind(lines[i]) == listKind) {
+                    int at = Markdown.ListBody(lines[i], listKind);
+                    list.Append("<li>" + Markdown.Inline(lines[i].Substring(at, lines[i].Length - at)) + "</li>");
+                    i = i + 1;
+                }
+                list.Append("</" + tag + ">");
+                first = Markdown.Block(html, first, list.ToString());
+                continue;
+            }
+
+            if (Markdown.IsQuote(line)) {
+                StringBuilder quote = new StringBuilder();
+                bool quoteFirst = true;
+                while (i < lines.Count && Markdown.IsQuote(lines[i])) {
+                    if (!quoteFirst) { quote.Append(" "); }
+                    int at = 1;
+                    if (lines[i].Length > 1 && lines[i].Substring(1, 1) == " ") { at = 2; }
+                    quote.Append(Markdown.Inline(lines[i].Substring(at, lines[i].Length - at)));
+                    quoteFirst = false;
+                    i = i + 1;
+                }
+                first = Markdown.Block(html, first, "<blockquote><p>" + quote.ToString() + "</p></blockquote>");
+                continue;
+            }
+
+            StringBuilder paragraph = new StringBuilder();
+            bool paraFirst = true;
+            while (i < lines.Count && Markdown.Trim(lines[i]) != "" && !Markdown.IsBlockStart(lines[i])) {
+                if (!paraFirst) { paragraph.Append(" "); }
+                paragraph.Append(Markdown.Inline(lines[i]));
+                paraFirst = false;
+                i = i + 1;
+            }
+            first = Markdown.Block(html, first, "<p>" + paragraph.ToString() + "</p>");
+        }
+        return html.ToString();
+    }
+
+    /// <summary>追加一个块级元素；非首块前置 "\n"。返回后续调用的
+    /// first 值（恒 false）。</summary>
+    static bool Block(StringBuilder html, bool first, string block) {
+        if (!first) { html.Append("\n"); }
+        html.Append(block);
+        return false;
+    }
+
+    /// 行内语法（代码/粗体/斜体/链接/转义）渲染入口。
+    static string Inline(string text) {
+        return Markdown.InlineAt(text, 0);
+    }
+
+    /// Inline 的递归实现：`depth` 限制嵌套层数，超限时整段只做
+    /// HTML 转义。未闭合的定界符按字面输出。
+    static string InlineAt(string text, int depth) {
+        if (depth >= 32) { return Markdown.EscapeHtml(text); }
+        StringBuilder html = new StringBuilder();
+        int i = 0;
+        while (i < text.Length) {
+            string ch = text.Substring(i, 1);
+            if (ch == "\\" && i + 1 < text.Length) {
+                html.Append(Markdown.EscapeHtml(text.Substring(i + 1, 1)));
+                i = i + 2;
+            } else if (ch == "`") {
+                int close = Markdown.Find(text, "`", i + 1);
+                if (close >= 0) {
+                    html.Append("<code>" + Markdown.EscapeHtml(text.Substring(i + 1, close - i - 1)) + "</code>");
+                    i = close + 1;
+                } else {
+                    html.Append("`"); i = i + 1;
+                }
+            } else if ((ch == "*" || ch == "_") && i + 1 < text.Length && text.Substring(i + 1, 1) == ch) {
+                string mark = ch + ch;
+                int close = Markdown.Find(text, mark, i + 2);
+                if (close > i + 2) {
+                    html.Append("<strong>" + Markdown.InlineAt(text.Substring(i + 2, close - i - 2), depth + 1) + "</strong>");
+                    i = close + 2;
+                } else {
+                    html.Append(Markdown.EscapeHtml(mark)); i = i + 2;
+                }
+            } else if (ch == "*" || ch == "_") {
+                int close = Markdown.Find(text, ch, i + 1);
+                if (close > i + 1) {
+                    html.Append("<em>" + Markdown.InlineAt(text.Substring(i + 1, close - i - 1), depth + 1) + "</em>");
+                    i = close + 1;
+                } else {
+                    html.Append(Markdown.EscapeHtml(ch)); i = i + 1;
+                }
+            } else if (ch == "[") {
+                int labelEnd = Markdown.Find(text, "]", i + 1);
+                int urlEnd = -1;
+                if (labelEnd >= 0 && labelEnd + 1 < text.Length && text.Substring(labelEnd + 1, 1) == "(") {
+                    urlEnd = Markdown.Find(text, ")", labelEnd + 2);
+                }
+                if (labelEnd >= 0 && urlEnd >= 0) {
+                    string label = Markdown.InlineAt(text.Substring(i + 1, labelEnd - i - 1), depth + 1);
+                    string url = Markdown.Trim(text.Substring(labelEnd + 2, urlEnd - labelEnd - 2));
+                    if (Markdown.SafeUrl(url)) {
+                        html.Append("<a href=\"" + Markdown.EscapeHtml(url) + "\">" + label + "</a>");
+                    } else { html.Append(label); }
+                    i = urlEnd + 1;
+                } else {
+                    html.Append("["); i = i + 1;
+                }
+            } else {
+                html.Append(Markdown.EscapeHtml(ch));
+                i = i + 1;
+            }
+        }
+        return html.ToString();
+    }
+
+    /// 链接 URL 是否可生成锚点：相对路径，或 http/https/mailto
+    /// 协议，且不含 ASCII 控制字符。
+    static bool SafeUrl(string url) {
+        int colon = -1;
+        bool relative = false;
+        for (int i = 0; i < url.Length; i = i + 1) {
+            int c = url[i] & 255;
+            if (c <= 31 || c == 127) { return false; }
+            string ch = url.Substring(i, 1);
+            if (!relative && ch == ":" && colon < 0) { colon = i; }
+            if (ch == "/" || ch == "?" || ch == "#") { relative = true; }
+        }
+        if (colon < 0) { return true; }
+        string scheme = url.Substring(0, colon).ToLower();
+        return scheme == "http" || scheme == "https" || scheme == "mailto";
+    }
+
+    /// HTML 转义：&lt; &gt; &amp; &quot; &#39;。
+    static string EscapeHtml(string text) {
+        StringBuilder html = new StringBuilder();
+        for (int i = 0; i < text.Length; i = i + 1) {
+            string ch = text.Substring(i, 1);
+            if (ch == "&") { html.Append("&amp;"); }
+            else if (ch == "<") { html.Append("&lt;"); }
+            else if (ch == ">") { html.Append("&gt;"); }
+            else if (ch == "\"") { html.Append("&quot;"); }
+            else if (ch == "'") { html.Append("&#39;"); }
+            else { html.Append(ch); }
+        }
+        return html.ToString();
+    }
+
+    /// 该行是否开始一个新块（围栏代码/标题/列表/引用），
+    /// 段落累积据此停止。
+    static bool IsBlockStart(string line) {
+        return Markdown.StartsWith(line, "```") || Markdown.HeadingLevel(line) > 0 ||
+            Markdown.ListKind(line) != 0 || Markdown.IsQuote(line);
+    }
+
+    /// ATX 标题级别（1-6，"#" 后须有空格）；非标题返回 0。
+    static int HeadingLevel(string line) {
+        int n = 0;
+        for (; n < line.Length && n < 6 && line.Substring(n, 1) == "#"; n = n + 1) { }
+        if (n > 0 && n < line.Length && line.Substring(n, 1) == " ") { return n; }
+        return 0;
+    }
+
+    /// 该行是否为块级引用（以 ">" 开头）。
+    static bool IsQuote(string line) {
+        return line.Length > 0 && line.Substring(0, 1) == ">";
+    }
+
+    /// 列表行类别：1 无序（"- "/"* "/"+ "），2 有序（"N. "），
+    /// 非列表行返回 0。
+    static int ListKind(string line) {
+        if (line.Length >= 2) {
+            string ch = line.Substring(0, 1);
+            if ((ch == "-" || ch == "*" || ch == "+") && line.Substring(1, 1) == " ") { return 1; }
+        }
+        int at = 0;
+        for (; at < line.Length; at = at + 1) {
+            string ch = line.Substring(at, 1);
+            if (ch < "0" || ch > "9") { break; }
+        }
+        if (at > 0 && at + 1 < line.Length && line.Substring(at, 2) == ". ") { return 2; }
+        return 0;
+    }
+
+    /// 列表行中项正文（"<li>" 内容）的起始下标。
+    static int ListBody(string line, int kind) {
+        if (kind == 1) { return 2; }
+        int at = 0;
+        for (; at < line.Length && line.Substring(at, 1) >= "0" && line.Substring(at, 1) <= "9"; at = at + 1) { }
+        return at + 2;
+    }
+
+    /// 按 CR/CRLF/LF 把文本切成行；结尾无换行也补最后一行。
+    static List<string> Lines(string text) {
+        List<string> lines = new List<string>();
+        StringBuilder line = new StringBuilder();
+        for (int i = 0; i < text.Length; i = i + 1) {
+            string ch = text.Substring(i, 1);
+            if (ch == "\r") {
+                if (i + 1 < text.Length && text.Substring(i + 1, 1) == "\n") { i = i + 1; }
+                lines.Add(line.ToString()); line = new StringBuilder();
+            } else if (ch == "\n") {
+                lines.Add(line.ToString()); line = new StringBuilder();
+            } else { line.Append(ch); }
+        }
+        lines.Add(line.ToString());
+        return lines;
+    }
+
+    /// <summary>去除两端空白（空格、制表、换行）。</summary>
+    static string Trim(string text) {
+        int start = 0;
+        int end = text.Length;
+        for (; start < end && Markdown.IsSpace(text.Substring(start, 1)); start = start + 1) { }
+        while (end > start && Markdown.IsSpace(text.Substring(end - 1, 1))) { end = end - 1; }
+        return text.Substring(start, end - start);
+    }
+
+    /// 字符是否为空白（空格/制表/CR/LF）。
+    static bool IsSpace(string ch) {
+        return ch == " " || ch == "\t" || ch == "\r" || ch == "\n";
+    }
+
+    /// 前缀匹配。
+    static bool StartsWith(string text, string prefix) {
+        return text.Length >= prefix.Length && text.Substring(0, prefix.Length) == prefix;
+    }
+
+    /// 从 from 起查找子串，找不到返回 -1。
+    static int Find(string text, string needle, int from) {
+        int i = from;
+        while (i + needle.Length <= text.Length) {
+            if (text.Substring(i, needle.Length) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+}

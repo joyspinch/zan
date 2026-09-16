@@ -1,0 +1,1095 @@
+using System;
+
+namespace System.Linq;
+
+/// <summary>当元素应被保留时返回 true。</summary>
+delegate bool Predicate<T>(T item);
+
+/// <summary>将 T 类型的元素投影为 R 类型的值。</summary>
+delegate R Selector<T, R>(T item);
+
+/// <summary>从元素提取整数排序键。</summary>
+delegate int KeySelector<T>(T item);
+
+/// <summary>从元素提取字符串排序键。</summary>
+delegate string StrKeySelector<T>(T item);
+
+/// <summary>从元素提取浮点排序键。</summary>
+delegate double NumKeySelector<T>(T item);
+
+/// <summary>将累加器与下一个元素合并。</summary>
+delegate A Accumulator<T, A>(A acc, T item);
+
+/// <summary>两个元素之间的结构相等性（对引用类型
+/// 而言 == 是同一性比较）。</summary>
+delegate bool EqualityComparer<T>(T a, T b);
+
+/// <summary>GroupBy 产生的一组结果：key 及其元素。</summary>
+class Grouping<T> {
+    /// <summary>分组键的字符串形式（始终设置）。</summary>
+    public string Key;
+    /// <summary>使用 GroupBy(KeySelector) 分组时的整数键。</summary>
+    public int IntKey;
+    /// <summary>组内元素（按出现顺序）。</summary>
+    public List<T> Items;
+
+    /// <summary>空组：键为空串、元素列表为空。</summary>
+    public Grouping() {
+        Key = "";
+        IntKey = 0;
+        Items = new List<T>();
+    }
+}
+
+/// <summary>
+/// 对 List&lt;T&gt; 的类型化、即时求值的 LINQ 风格查询操作符。
+///
+/// 操作符是扩展方法（`this List&lt;T&gt;` 接收者），可像 C# 一样链式调用；
+/// lambda 参数类型从接收者的元素类型推断。
+/// 静态调用形式（Enumerable.Where(nums, pred)）同样可用。
+/// 结果物化为新的 List，因此可以复用并
+/// 多次枚举。
+///
+///   using System.Linq;
+///   List&lt;int&gt; evens = nums.Where(x => x % 2 == 0);
+///   List&lt;User&gt; adults = users.Where(u => u.age >= 18).OrderBy(u => u.age);
+///   List&lt;User&gt; byName = users.OrderByStr(u => u.name);
+///   bool ok = nums.Any(x => x > 100);
+///
+/// 排序键是类型化的：OrderBy 接受 int 键，OrderByStr 接受 string 键，
+/// OrderByNum 接受 double 键（分开命名是因为仅 delegate 返回类型不同的重载
+/// 无法从无类型 lambda 解析）。
+/// OrderBy(k1, k2) 按主、次两个 int 键排序。出于同样
+/// 的原因，double 序列聚合使用 *Num 命名
+/// （SumNum/MinNum/MaxNum/AverageNum）。
+///
+/// First/Last/Single 在空序列（Single 对不明确的序列）时抛出
+/// InvalidOperationException，与 C# 一致；*OrDefault 变体
+/// 则返回类型默认值。
+/// </summary>
+class Enumerable {
+    /// <summary>保留 pred 返回 true 的元素。</summary>
+    static List<T> Where<T>(this List<T> src, Predicate<T> pred) {
+        List<T> outp = new List<T>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (pred(src[i])) { outp.Add(src[i]); }
+        }
+        return outp;
+    }
+
+    /// <summary>用 selector 投影每个元素。</summary>
+    static List<R> Select<T, R>(this List<T> src, Selector<T, R> selector) {
+        List<R> outp = new List<R>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            outp.Add(selector(src[i]));
+        }
+        return outp;
+    }
+
+    /// <summary>将每个元素投影为 List 并展平结果。</summary>
+    static List<R> SelectMany<T, R>(this List<T> src, Selector<T, List<R>> selector) {
+        List<R> outp = new List<R>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            List<R> part = selector(src[i]);
+            for (int j = 0; j < part.Count; j = j + 1) {
+                outp.Add(part[j]);
+            }
+        }
+        return outp;
+    }
+
+    /// <summary>任一元素满足 pred 时返回 true。</summary>
+    static bool Any<T>(this List<T> src, Predicate<T> pred) {
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (pred(src[i])) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary>序列至少有一个元素时返回 true。</summary>
+    static bool Any<T>(this List<T> src) {
+        return src.Count > 0;
+    }
+
+    /// <summary>所有元素都满足 pred 时返回 true。</summary>
+    static bool All<T>(this List<T> src, Predicate<T> pred) {
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (!pred(src[i])) { return false; }
+        }
+        return true;
+    }
+
+    /// <summary>满足 pred 的元素个数。</summary>
+    static int Count<T>(this List<T> src, Predicate<T> pred) {
+        int n = 0;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (pred(src[i])) { n = n + 1; }
+        }
+        return n;
+    }
+
+    /// <summary>元素总数。</summary>
+    static int Count<T>(this List<T> src) {
+        return src.Count;
+    }
+
+    /// <summary>第一个元素；为空时抛出 InvalidOperationException。</summary>
+    static T First<T>(this List<T> src) {
+        if (src.Count == 0) {
+            throw new InvalidOperationException("Sequence contains no elements");
+        }
+        return src[0];
+    }
+
+    /// <summary>第一个满足 pred 的元素；无匹配时抛出。</summary>
+    static T First<T>(this List<T> src, Predicate<T> pred) {
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (pred(src[i])) { return src[i]; }
+        }
+        throw new InvalidOperationException("Sequence contains no matching element");
+    }
+
+    /// <summary>第一个元素；为空时返回类型默认值。</summary>
+    static T FirstOrDefault<T>(this List<T> src) {
+        if (src.Count > 0) { return src[0]; }
+        T d = 0;
+        return d;
+    }
+
+    /// <summary>第一个满足 pred 的元素，否则返回类型默认值。</summary>
+    static T FirstOrDefault<T>(this List<T> src, Predicate<T> pred) {
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (pred(src[i])) { return src[i]; }
+        }
+        T d = 0;
+        return d;
+    }
+
+    /// <summary>最后一个元素；为空时抛出 InvalidOperationException。</summary>
+    static T Last<T>(this List<T> src) {
+        if (src.Count == 0) {
+            throw new InvalidOperationException("Sequence contains no elements");
+        }
+        return src[src.Count - 1];
+    }
+
+    /// <summary>最后一个满足 pred 的元素；无匹配时抛出。</summary>
+    static T Last<T>(this List<T> src, Predicate<T> pred) {
+        for (int i = src.Count - 1; i >= 0; i = i - 1) {
+            if (pred(src[i])) { return src[i]; }
+        }
+        throw new InvalidOperationException("Sequence contains no matching element");
+    }
+
+    /// <summary>最后一个元素；为空时返回类型默认值。</summary>
+    static T LastOrDefault<T>(this List<T> src) {
+        if (src.Count > 0) { return src[src.Count - 1]; }
+        T d = 0;
+        return d;
+    }
+
+    /// <summary>最后一个满足 pred 的元素，否则返回类型默认值。</summary>
+    static T LastOrDefault<T>(this List<T> src, Predicate<T> pred) {
+        for (int i = src.Count - 1; i >= 0; i = i - 1) {
+            if (pred(src[i])) { return src[i]; }
+        }
+        T d = 0;
+        return d;
+    }
+
+    /// <summary>唯一的元素；序列不恰为单个元素时抛出。</summary>
+    static T Single<T>(this List<T> src) {
+        if (src.Count == 0) {
+            throw new InvalidOperationException("Sequence contains no elements");
+        }
+        if (src.Count > 1) {
+            throw new InvalidOperationException("Sequence contains more than one element");
+        }
+        return src[0];
+    }
+
+    /// <summary>唯一满足 pred 的元素；零个或多个时抛出。</summary>
+    static T Single<T>(this List<T> src, Predicate<T> pred) {
+        int found = -1;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (pred(src[i])) {
+                if (found >= 0) {
+                    throw new InvalidOperationException("Sequence contains more than one matching element");
+                }
+                found = i;
+            }
+        }
+        if (found < 0) {
+            throw new InvalidOperationException("Sequence contains no matching element");
+        }
+        return src[found];
+    }
+
+    /// <summary>唯一的元素；为空时返回类型默认值，多个时抛出。</summary>
+    static T SingleOrDefault<T>(this List<T> src) {
+        if (src.Count > 1) {
+            throw new InvalidOperationException("Sequence contains more than one element");
+        }
+        if (src.Count == 1) { return src[0]; }
+        T d = 0;
+        return d;
+    }
+
+    /// <summary>唯一匹配的元素，否则返回类型默认值；多个时抛出。</summary>
+    static T SingleOrDefault<T>(this List<T> src, Predicate<T> pred) {
+        int found = -1;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (pred(src[i])) {
+                if (found >= 0) {
+                    throw new InvalidOperationException("Sequence contains more than one matching element");
+                }
+                found = i;
+            }
+        }
+        if (found >= 0) { return src[found]; }
+        T d = 0;
+        return d;
+    }
+
+    /// <summary>target 存在时返回 true（对元素类型使用 ==；
+    /// 对引用类型是同一性比较，而非结构相等）。</summary>
+    static bool Contains<T>(this List<T> src, T target) {
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (src[i] == target) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary>在给定的相等比较器下 target 存在时返回 true
+    /// （对引用类型采用 Equals 风格语义）。</summary>
+    static bool Contains<T>(this List<T> src, T target, EqualityComparer<T> eq) {
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (eq(src[i], target)) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary>按字符串值比较，target 存在时返回 true
+    /// （ContainsStr 的 C# 风格重载）。</summary>
+    static bool Contains(this List<string> src, string target) {
+        return Enumerable.ContainsStr(src, target);
+    }
+
+    /// <summary>按字符串值比较，target 存在时返回 true。</summary>
+    static bool ContainsStr(this List<string> src, string target) {
+        for (int i = 0; i < src.Count; i = i + 1) {
+            string s = src[i];
+            if (s == target) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary>序列的浅拷贝，作为新 List。</summary>
+    static List<T> ToList<T>(this List<T> src) {
+        List<T> outp = new List<T>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            outp.Add(src[i]);
+        }
+        return outp;
+    }
+
+    /// <summary>前 count 个元素（不足则全部）。</summary>
+    static List<T> Take<T>(this List<T> src, int count) {
+        List<T> outp = new List<T>();
+        for (int i = 0; i < src.Count && i < count; i = i + 1) {
+            outp.Add(src[i]);
+        }
+        return outp;
+    }
+
+    /// <summary>取 pred 成立时的前导元素。</summary>
+    static List<T> TakeWhile<T>(this List<T> src, Predicate<T> pred) {
+        List<T> outp = new List<T>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (!pred(src[i])) { return outp; }
+            outp.Add(src[i]);
+        }
+        return outp;
+    }
+
+    /// <summary>跳过前 count 个元素后的所有元素。</summary>
+    static List<T> Skip<T>(this List<T> src, int count) {
+        List<T> outp = new List<T>();
+        int i = count;
+        if (i < 0) { i = 0; }
+        for (; i < src.Count; i = i + 1) {
+            outp.Add(src[i]);
+        }
+        return outp;
+    }
+
+    /// <summary>pred 成立的前导段之后的元素。</summary>
+    static List<T> SkipWhile<T>(this List<T> src, Predicate<T> pred) {
+        List<T> outp = new List<T>();
+        int i = 0;
+        for (; i < src.Count && pred(src[i]); i = i + 1) { }
+        for (; i < src.Count; i = i + 1) {
+            outp.Add(src[i]);
+        }
+        return outp;
+    }
+
+    /// <summary>反转顺序后的元素。</summary>
+    static List<T> Reverse<T>(this List<T> src) {
+        List<T> outp = new List<T>();
+        for (int i = src.Count - 1; i >= 0; i = i - 1) {
+            outp.Add(src[i]);
+        }
+        return outp;
+    }
+
+    /// <summary>去重元素，保留首次出现（使用 ==；
+    /// 对引用类型是同一性比较，而非结构相等）。</summary>
+    static List<T> Distinct<T>(this List<T> src) {
+        List<T> outp = new List<T>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (!Enumerable.Contains<T>(outp, src[i])) { outp.Add(src[i]); }
+        }
+        return outp;
+    }
+
+    /// <summary>在给定相等比较器下去重，保留
+    /// 首次出现（对引用类型采用 Equals 风格语义）。</summary>
+    static List<T> Distinct<T>(this List<T> src, EqualityComparer<T> eq) {
+        List<T> outp = new List<T>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (!Enumerable.Contains<T>(outp, src[i], eq)) { outp.Add(src[i]); }
+        }
+        return outp;
+    }
+
+    /// <summary>按值比较去重字符串（DistinctStr 的 C# 风格重载；
+    /// 由接收者的元素类型选择该重载）。</summary>
+    static List<string> Distinct(this List<string> src) {
+        return Enumerable.DistinctStr(src);
+    }
+
+    /// <summary>按值比较去重字符串，保留首次出现。</summary>
+    static List<string> DistinctStr(this List<string> src) {
+        List<string> outp = new List<string>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (!Enumerable.ContainsStr(outp, src[i])) { outp.Add(src[i]); }
+        }
+        return outp;
+    }
+
+    /// <summary>按字符串键升序排序（OrderByStr 的 C# 风格重载；
+    /// 由 lambda 的键类型选择该重载）。</summary>
+    static List<T> OrderBy<T>(this List<T> src, StrKeySelector<T> key) {
+        return Enumerable.MergeSortStr<T>(src, key, false);
+    }
+
+    /// <summary>按 double 键升序排序（OrderByNum 的 C# 风格重载；
+    /// OrderByNum）。</summary>
+    static List<T> OrderBy<T>(this List<T> src, NumKeySelector<T> key) {
+        return Enumerable.MergeSortNum<T>(src, key, false);
+    }
+
+    /// <summary>按字符串键降序排序。</summary>
+    static List<T> OrderByDescending<T>(this List<T> src, StrKeySelector<T> key) {
+        return Enumerable.MergeSortStr<T>(src, key, true);
+    }
+
+    /// <summary>按 double 键降序排序。</summary>
+    static List<T> OrderByDescending<T>(this List<T> src, NumKeySelector<T> key) {
+        return Enumerable.MergeSortNum<T>(src, key, true);
+    }
+
+    /// <summary>按整数键升序排序（稳定归并排序）。</summary>
+    static List<T> OrderBy<T>(this List<T> src, KeySelector<T> key) {
+        return Enumerable.MergeSortInt<T>(src, key, 1);
+    }
+
+    /// <summary>按主、次两个整数键升序排序（稳定）。</summary>
+    static List<T> OrderBy<T>(this List<T> src, KeySelector<T> key1, KeySelector<T> key2) {
+        List<T> pass1 = Enumerable.MergeSortInt<T>(src, key2, 1);
+        return Enumerable.MergeSortInt<T>(pass1, key1, 1);
+    }
+
+    /// <summary>按整数键降序排序（稳定归并排序）。</summary>
+    static List<T> OrderByDescending<T>(this List<T> src, KeySelector<T> key) {
+        return Enumerable.MergeSortInt<T>(src, key, -1);
+    }
+
+    /// <summary>按字符串键升序排序（稳定归并排序）。</summary>
+    static List<T> OrderByStr<T>(this List<T> src, StrKeySelector<T> key) {
+        return Enumerable.MergeSortStr<T>(src, key, false);
+    }
+
+    /// <summary>按字符串键降序排序（稳定归并排序）。</summary>
+    static List<T> OrderByStrDescending<T>(this List<T> src, StrKeySelector<T> key) {
+        return Enumerable.MergeSortStr<T>(src, key, true);
+    }
+
+    /// <summary>按 double 键升序排序（稳定归并排序）。</summary>
+    static List<T> OrderByNum<T>(this List<T> src, NumKeySelector<T> key) {
+        return Enumerable.MergeSortNum<T>(src, key, false);
+    }
+
+    /// <summary>按 double 键降序排序（稳定归并排序）。</summary>
+    static List<T> OrderByNumDescending<T>(this List<T> src, NumKeySelector<T> key) {
+        return Enumerable.MergeSortNum<T>(src, key, true);
+    }
+
+    /* 基于预计算 int 键的自底向上稳定归并排序；sign 翻转排序方向。 */
+    static List<T> MergeSortInt<T>(List<T> src, KeySelector<T> key, int sign) {
+        List<T> a = Enumerable.ToList<T>(src);
+        int n = a.Count;
+        if (n < 2) { return a; }
+        List<int> ka = new List<int>();
+        for (int i = 0; i < n; i = i + 1) { ka.Add(sign * key(a[i])); }
+        List<T> b = Enumerable.ToList<T>(src);
+        List<int> kb = new List<int>();
+        for (int i = 0; i < n; i = i + 1) { kb.Add(0); }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width + width;
+                if (hi > n) { hi = n; }
+                int l = lo;
+                int r = mid;
+                int o = lo;
+                while (l < mid && r < hi) {
+                    if (ka[l] <= ka[r]) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; }
+                    else { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; }
+                    o = o + 1;
+                }
+                while (l < mid) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; o = o + 1; }
+                while (r < hi) { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; o = o + 1; }
+                lo = hi;
+            }
+            List<T> tl = a; a = b; b = tl;
+            List<int> tk = ka; ka = kb; kb = tk;
+            width = width + width;
+        }
+        return a;
+    }
+
+    /* 基于预计算 string 键的自底向上稳定归并排序。 */
+    static List<T> MergeSortStr<T>(List<T> src, StrKeySelector<T> key, bool desc) {
+        List<T> a = Enumerable.ToList<T>(src);
+        int n = a.Count;
+        if (n < 2) { return a; }
+        List<string> ka = new List<string>();
+        for (int i = 0; i < n; i = i + 1) { ka.Add(key(a[i])); }
+        List<T> b = Enumerable.ToList<T>(src);
+        List<string> kb = new List<string>();
+        for (int i = 0; i < n; i = i + 1) { kb.Add(""); }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width + width;
+                if (hi > n) { hi = n; }
+                int l = lo;
+                int r = mid;
+                int o = lo;
+                while (l < mid && r < hi) {
+                    string kl = ka[l];
+                    string kr = ka[r];
+                    bool takeLeft = kl <= kr;
+                    if (desc) { takeLeft = kl >= kr; }
+                    if (takeLeft) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; }
+                    else { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; }
+                    o = o + 1;
+                }
+                while (l < mid) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; o = o + 1; }
+                while (r < hi) { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; o = o + 1; }
+                lo = hi;
+            }
+            List<T> tl = a; a = b; b = tl;
+            List<string> tk = ka; ka = kb; kb = tk;
+            width = width + width;
+        }
+        return a;
+    }
+
+    /* 基于预计算 double 键的自底向上稳定归并排序。 */
+    static List<T> MergeSortNum<T>(List<T> src, NumKeySelector<T> key, bool desc) {
+        List<T> a = Enumerable.ToList<T>(src);
+        int n = a.Count;
+        if (n < 2) { return a; }
+        List<double> ka = new List<double>();
+        for (int i = 0; i < n; i = i + 1) { ka.Add(key(a[i])); }
+        List<T> b = Enumerable.ToList<T>(src);
+        List<double> kb = new List<double>();
+        for (int i = 0; i < n; i = i + 1) { kb.Add(0.0); }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width + width;
+                if (hi > n) { hi = n; }
+                int l = lo;
+                int r = mid;
+                int o = lo;
+                while (l < mid && r < hi) {
+                    double kl = ka[l];
+                    double kr = ka[r];
+                    bool takeLeft = kl <= kr;
+                    if (desc) { takeLeft = kl >= kr; }
+                    if (takeLeft) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; }
+                    else { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; }
+                    o = o + 1;
+                }
+                while (l < mid) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; o = o + 1; }
+                while (r < hi) { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; o = o + 1; }
+                lo = hi;
+            }
+            List<T> tl = a; a = b; b = tl;
+            List<double> tk = ka; ka = kb; kb = tk;
+            width = width + width;
+        }
+        return a;
+    }
+
+    /* --- query-expression lowering helpers (B17) ---------------------------
+     * The compiler lowers `orderby k` to a pre-pass that extracts the keys
+     * into a List<K> and calls OrderByKeys*; `group e by k` similarly uses
+     * GroupByKeys* with parallel (key, element) lists. */
+
+    /// <summary>按预先计算的整数键列表稳定排序（升序）。</summary>
+    static List<T> OrderByKeysInt<T>(this List<T> src, List<int> keys) {
+        return Enumerable.MergeSortKeysInt<T>(src, keys, 1);
+    }
+
+    /// <summary>按预先计算的整数键列表稳定排序（降序）。</summary>
+    static List<T> OrderByKeysIntDescending<T>(this List<T> src, List<int> keys) {
+        return Enumerable.MergeSortKeysInt<T>(src, keys, -1);
+    }
+
+    /// <summary>按预先计算的 long 键列表稳定排序（升序）。</summary>
+    static List<T> OrderByKeysLong<T>(this List<T> src, List<long> keys) {
+        return Enumerable.MergeSortKeysLong<T>(src, keys, 1);
+    }
+
+    /// <summary>按预先计算的 long 键列表稳定排序（降序）。</summary>
+    static List<T> OrderByKeysLongDescending<T>(this List<T> src, List<long> keys) {
+        return Enumerable.MergeSortKeysLong<T>(src, keys, -1);
+    }
+
+    /// <summary>按预先计算的 double 键列表稳定排序（升序）。</summary>
+    static List<T> OrderByKeysNum<T>(this List<T> src, List<double> keys) {
+        return Enumerable.MergeSortKeysNum<T>(src, keys, false);
+    }
+
+    /// <summary>按预先计算的 double 键列表稳定排序（降序）。</summary>
+    static List<T> OrderByKeysNumDescending<T>(this List<T> src, List<double> keys) {
+        return Enumerable.MergeSortKeysNum<T>(src, keys, true);
+    }
+
+    /// <summary>按预先计算的字符串键列表稳定排序（升序）。</summary>
+    static List<T> OrderByKeysStr<T>(this List<T> src, List<string> keys) {
+        return Enumerable.MergeSortKeysStr<T>(src, keys, false);
+    }
+
+    /// <summary>按预先计算的字符串键列表稳定排序（降序）。</summary>
+    static List<T> OrderByKeysStrDescending<T>(this List<T> src, List<string> keys) {
+        return Enumerable.MergeSortKeysStr<T>(src, keys, true);
+    }
+
+    /* 基于预计算 int 键的自底向上稳定归并排序（键列表与 src 并行；
+     * sign 翻转排序方向）。
+     *
+     * 键列表按值拷贝一份再排：两个缓冲区每轮互换，第二轮之后 `kb` 指向的就是
+     * 传进来的那个 list，直接拿它当 scratch 会把**调用方的键列表原地改成排序后
+     * 的样子**——同一个键列表连排两次，第二次拿到的已是被改过的数据，结果就是错的。 */
+    static List<T> MergeSortKeysInt<T>(List<T> src, List<int> keys, int sign) {
+        List<T> a = Enumerable.ToList<T>(src);
+        int n = a.Count;
+        if (n < 2) { return a; }
+        List<T> b = Enumerable.ToList<T>(src);
+        List<int> ka = new List<int>();
+        List<int> kb = new List<int>();
+        for (int i = 0; i < n; i = i + 1) { ka.Add(keys[i]); kb.Add(0); }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width + width;
+                if (hi > n) { hi = n; }
+                int l = lo;
+                int r = mid;
+                int o = lo;
+                while (l < mid && r < hi) {
+                    if (sign * ka[l] <= sign * ka[r]) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; }
+                    else { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; }
+                    o = o + 1;
+                }
+                while (l < mid) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; o = o + 1; }
+                while (r < hi) { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; o = o + 1; }
+                lo = hi;
+            }
+            List<T> tl = a; a = b; b = tl;
+            List<int> tk = ka; ka = kb; kb = tk;
+            width = width + width;
+        }
+        return a;
+    }
+
+    /* 基于预计算 long 键的自底向上稳定归并排序。 */
+    /* 键列表按值拷贝，理由见 MergeSortKeysInt。 */
+    static List<T> MergeSortKeysLong<T>(List<T> src, List<long> keys, int sign) {
+        List<T> a = Enumerable.ToList<T>(src);
+        int n = a.Count;
+        if (n < 2) { return a; }
+        List<T> b = Enumerable.ToList<T>(src);
+        List<long> ka = new List<long>();
+        List<long> kb = new List<long>();
+        for (int i = 0; i < n; i = i + 1) { ka.Add(keys[i]); kb.Add(0); }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width + width;
+                if (hi > n) { hi = n; }
+                int l = lo;
+                int r = mid;
+                int o = lo;
+                while (l < mid && r < hi) {
+                    if (sign * ka[l] <= sign * ka[r]) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; }
+                    else { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; }
+                    o = o + 1;
+                }
+                while (l < mid) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; o = o + 1; }
+                while (r < hi) { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; o = o + 1; }
+                lo = hi;
+            }
+            List<T> tl = a; a = b; b = tl;
+            List<long> tk = ka; ka = kb; kb = tk;
+            width = width + width;
+        }
+        return a;
+    }
+
+    /* 基于预计算 string 键的自底向上稳定归并排序。 */
+    /* 键列表按值拷贝，理由见 MergeSortKeysInt。 */
+    static List<T> MergeSortKeysStr<T>(List<T> src, List<string> keys, bool desc) {
+        List<T> a = Enumerable.ToList<T>(src);
+        int n = a.Count;
+        if (n < 2) { return a; }
+        List<T> b = Enumerable.ToList<T>(src);
+        List<string> ka = new List<string>();
+        List<string> kb = new List<string>();
+        for (int i = 0; i < n; i = i + 1) { ka.Add(keys[i]); kb.Add(""); }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width + width;
+                if (hi > n) { hi = n; }
+                int l = lo;
+                int r = mid;
+                int o = lo;
+                while (l < mid && r < hi) {
+                    string kl = ka[l];
+                    string kr = ka[r];
+                    bool takeLeft = kl <= kr;
+                    if (desc) { takeLeft = kl >= kr; }
+                    if (takeLeft) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; }
+                    else { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; }
+                    o = o + 1;
+                }
+                while (l < mid) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; o = o + 1; }
+                while (r < hi) { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; o = o + 1; }
+                lo = hi;
+            }
+            List<T> tl = a; a = b; b = tl;
+            List<string> tk = ka; ka = kb; kb = tk;
+            width = width + width;
+        }
+        return a;
+    }
+
+    /* 基于预计算 double 键的自底向上稳定归并排序。 */
+    /* 键列表按值拷贝，理由见 MergeSortKeysInt。 */
+    static List<T> MergeSortKeysNum<T>(List<T> src, List<double> keys, bool desc) {
+        List<T> a = Enumerable.ToList<T>(src);
+        int n = a.Count;
+        if (n < 2) { return a; }
+        List<T> b = Enumerable.ToList<T>(src);
+        List<double> ka = new List<double>();
+        List<double> kb = new List<double>();
+        for (int i = 0; i < n; i = i + 1) { ka.Add(keys[i]); kb.Add(0.0); }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width + width;
+                if (hi > n) { hi = n; }
+                int l = lo;
+                int r = mid;
+                int o = lo;
+                while (l < mid && r < hi) {
+                    double kl = ka[l];
+                    double kr = ka[r];
+                    bool takeLeft = kl <= kr;
+                    if (desc) { takeLeft = kl >= kr; }
+                    if (takeLeft) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; }
+                    else { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; }
+                    o = o + 1;
+                }
+                while (l < mid) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; o = o + 1; }
+                while (r < hi) { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; o = o + 1; }
+                lo = hi;
+            }
+            List<T> tl = a; a = b; b = tl;
+            List<double> tk = ka; ka = kb; kb = tk;
+            width = width + width;
+        }
+        return a;
+    }
+
+    /// <summary>按整数键对元素分组。Grouping.IntKey 保存
+    /// 键；Grouping.Key 保存其字符串形式。分组顺序按首次
+    /// 出现排序。</summary>
+    static List<Grouping<T>> GroupBy<T>(this List<T> src, KeySelector<T> key) {
+        List<Grouping<T>> groups = new List<Grouping<T>>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            int k = key(src[i]);
+            Grouping<T> g = null;
+            for (int j = 0; j < groups.Count; j = j + 1) {
+                if (groups[j].IntKey == k) { g = groups[j]; }
+            }
+            if (g == null) {
+                g = new Grouping<T>();
+                g.IntKey = k;
+                g.Key = Convert.ToString(k);
+                groups.Add(g);
+            }
+            g.Items.Add(src[i]);
+        }
+        return groups;
+    }
+
+    /// <summary>按字符串键分组（GroupByStr 的 C# 风格重载；
+    /// 由 lambda 的键类型选择该重载）。</summary>
+    static List<Grouping<T>> GroupBy<T>(this List<T> src, StrKeySelector<T> key) {
+        return Enumerable.GroupByStr<T>(src, key);
+    }
+
+    /// <summary>按字符串键（按值比较）分组。分组
+    /// 顺序按首次出现排列。</summary>
+    static List<Grouping<T>> GroupByStr<T>(this List<T> src, StrKeySelector<T> key) {
+        List<Grouping<T>> groups = new List<Grouping<T>>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            string k = key(src[i]);
+            Grouping<T> g = null;
+            for (int j = 0; j < groups.Count; j = j + 1) {
+                string gk = groups[j].Key;
+                if (gk == k) { g = groups[j]; }
+            }
+            if (g == null) {
+                g = new Grouping<T>();
+                g.Key = k;
+                groups.Add(g);
+            }
+            g.Items.Add(src[i]);
+        }
+        return groups;
+    }
+
+    /// <summary>按预先计算的整数键分组（键与元素列表并行；
+    /// Grouping.Items 为投影后的元素）。</summary>
+    static List<Grouping<R>> GroupByKeysInt<T, R>(this List<T> src, List<int> keys, List<R> items) {
+        List<Grouping<R>> groups = new List<Grouping<R>>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            int k = keys[i];
+            Grouping<R> g = null;
+            for (int j = 0; j < groups.Count; j = j + 1) {
+                if (groups[j].IntKey == k) { g = groups[j]; }
+            }
+            if (g == null) {
+                g = new Grouping<R>();
+                g.IntKey = k;
+                g.Key = Convert.ToString(k);
+                groups.Add(g);
+            }
+            g.Items.Add(items[i]);
+        }
+        return groups;
+    }
+
+    /// <summary>按预先计算的字符串键分组（键与元素列表并行；
+    /// Grouping.Items 为投影后的元素）。</summary>
+    static List<Grouping<R>> GroupByKeysStr<T, R>(this List<T> src, List<string> keys, List<R> items) {
+        List<Grouping<R>> groups = new List<Grouping<R>>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            string k = keys[i];
+            Grouping<R> g = null;
+            for (int j = 0; j < groups.Count; j = j + 1) {
+                string gk = groups[j].Key;
+                if (gk == k) { g = groups[j]; }
+            }
+            if (g == null) {
+                g = new Grouping<R>();
+                g.Key = k;
+                groups.Add(g);
+            }
+            g.Items.Add(items[i]);
+        }
+        return groups;
+    }
+
+    /// <summary>从 seed 开始把序列折叠进累加器。</summary>
+    static A Aggregate<T, A>(this List<T> src, A seed, Accumulator<T, A> folder) {
+        A acc = seed;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            acc = folder(acc, src[i]);
+        }
+        return acc;
+    }
+
+    /// <summary>整数序列的和。</summary>
+    static int Sum(this List<int> src) {
+        int total = 0;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            total = total + src[i];
+        }
+        return total;
+    }
+
+    /// <summary>double 序列的和（SumNum 的 C# 风格重载；
+    /// 由接收者的元素类型选择该重载）。</summary>
+    static double Sum(this List<double> src) {
+        return Enumerable.SumNum(src);
+    }
+
+    /// <summary>序列上 double 键之和。</summary>
+    static double Sum<T>(this List<T> src, NumKeySelector<T> key) {
+        return Enumerable.SumNum<T>(src, key);
+    }
+
+    /// <summary>double 序列的和。</summary>
+    static double SumNum(this List<double> src) {
+        double total = 0.0;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            total = total + src[i];
+        }
+        return total;
+    }
+
+    /// <summary>序列上整数键之和。</summary>
+    static int Sum<T>(this List<T> src, KeySelector<T> key) {
+        int total = 0;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            total = total + key(src[i]);
+        }
+        return total;
+    }
+
+    /// <summary>序列上 double 键之和。</summary>
+    static double SumNum<T>(this List<T> src, NumKeySelector<T> key) {
+        double total = 0.0;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            total = total + key(src[i]);
+        }
+        return total;
+    }
+
+    /// <summary>整数序列的最小值（为空时为 0）。</summary>
+    static int Min(this List<int> src) {
+        if (src.Count == 0) { return 0; }
+        int m = src[0];
+        for (int i = 1; i < src.Count; i = i + 1) {
+            if (src[i] < m) { m = src[i]; }
+        }
+        return m;
+    }
+
+    /// <summary>double 序列的最小值（MinNum 的 C# 风格重载；
+    /// 由接收者的元素类型选择该重载）。</summary>
+    static double Min(this List<double> src) {
+        return Enumerable.MinNum(src);
+    }
+
+    /// <summary>double 序列的最小值（为空时为 0）。</summary>
+    static double MinNum(this List<double> src) {
+        if (src.Count == 0) { return 0.0; }
+        double m = src[0];
+        for (int i = 1; i < src.Count; i = i + 1) {
+            if (src[i] < m) { m = src[i]; }
+        }
+        return m;
+    }
+
+    /// <summary>序列上最小整数键（为空时为 0）。</summary>
+    static int Min<T>(this List<T> src, KeySelector<T> key) {
+        if (src.Count == 0) { return 0; }
+        int m = key(src[0]);
+        for (int i = 1; i < src.Count; i = i + 1) {
+            int k = key(src[i]);
+            if (k < m) { m = k; }
+        }
+        return m;
+    }
+
+    /// <summary>整数序列的最大值（为空时为 0）。</summary>
+    static int Max(this List<int> src) {
+        if (src.Count == 0) { return 0; }
+        int m = src[0];
+        for (int i = 1; i < src.Count; i = i + 1) {
+            if (src[i] > m) { m = src[i]; }
+        }
+        return m;
+    }
+
+    /// <summary>double 序列的最大值（MaxNum 的 C# 风格重载；
+    /// MaxNum）。</summary>
+    static double Max(this List<double> src) {
+        return Enumerable.MaxNum(src);
+    }
+
+    /// <summary>double 序列的最大值（为空时为 0）。</summary>
+    static double MaxNum(this List<double> src) {
+        if (src.Count == 0) { return 0.0; }
+        double m = src[0];
+        for (int i = 1; i < src.Count; i = i + 1) {
+            if (src[i] > m) { m = src[i]; }
+        }
+        return m;
+    }
+
+    /// <summary>序列上最大整数键（为空时为 0）。</summary>
+    static int Max<T>(this List<T> src, KeySelector<T> key) {
+        if (src.Count == 0) { return 0; }
+        int m = key(src[0]);
+        for (int i = 1; i < src.Count; i = i + 1) {
+            int k = key(src[i]);
+            if (k > m) { m = k; }
+        }
+        return m;
+    }
+
+    /// <summary>整数序列的平均值；为空时抛出。</summary>
+    static double Average(this List<int> src) {
+        if (src.Count == 0) {
+            throw new InvalidOperationException("Sequence contains no elements");
+        }
+        double total = 0.0;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            total = total + (double)src[i];
+        }
+        return total / (double)src.Count;
+    }
+
+    /// <summary>double 序列的平均值（AverageNum 的 C# 风格重载；
+    /// AverageNum）。</summary>
+    static double Average(this List<double> src) {
+        return Enumerable.AverageNum(src);
+    }
+
+    /// <summary>double 序列的平均值；为空时抛出。</summary>
+    static double AverageNum(this List<double> src) {
+        if (src.Count == 0) {
+            throw new InvalidOperationException("Sequence contains no elements");
+        }
+        double total = 0.0;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            total = total + src[i];
+        }
+        return total / (double)src.Count;
+    }
+
+    /// <summary>序列上整数键的平均值；为空时抛出。</summary>
+    static double Average<T>(this List<T> src, KeySelector<T> key) {
+        if (src.Count == 0) {
+            throw new InvalidOperationException("Sequence contains no elements");
+        }
+        double total = 0.0;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            total = total + (double)key(src[i]);
+        }
+        return total / (double)src.Count;
+    }
+
+    /// <summary>对字符串序列执行 SQL LIKE：'%' 匹配任意连续
+    /// 字符，'_' 恰好匹配一个（如 "a%"、"%.log"、"b_b"）。</summary>
+    static List<string> Like(this List<string> src, string pattern) {
+        List<string> outp = new List<string>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (Enumerable.LikeMatch(src[i], pattern)) { outp.Add(src[i]); }
+        }
+        return outp;
+    }
+
+    /// <summary>text 匹配 SQL LIKE 模式（'%'/'_'）时返回 true。</summary>
+    static bool LikeMatch(string text, string pattern) {
+        return Enumerable.LikeAt(text, 0, pattern, 0);
+    }
+
+    /// LikeMatch 的递归体：'%' 尝试消耗任意长度，'_' 匹配单个字符。
+    static bool LikeAt(string t, int ti, string p, int pi) {
+        while (pi < p.Length) {
+            string pc = p.Substring(pi, 1);
+            if (pc == "%") {
+                if (Enumerable.LikeAt(t, ti, p, pi + 1)) { return true; }
+                int k = ti;
+                while (k < t.Length) {
+                    if (Enumerable.LikeAt(t, k + 1, p, pi + 1)) { return true; }
+                    k = k + 1;
+                }
+                return false;
+            }
+            if (ti >= t.Length) { return false; }
+            if (pc != "_" && pc != t.Substring(ti, 1)) { return false; }
+            ti = ti + 1;
+            pi = pi + 1;
+        }
+        return ti == t.Length;
+    }
+
+    /// <summary>SQL IN：保留 values 中存在的元素（使用 ==）。</summary>
+    static List<T> In<T>(this List<T> src, List<T> values) {
+        List<T> outp = new List<T>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (Enumerable.Contains<T>(values, src[i])) { outp.Add(src[i]); }
+        }
+        return outp;
+    }
+
+    /// <summary>在给定相等比较器下的 SQL IN（对引用类型
+    /// 采用 Equals 风格语义）。</summary>
+    static List<T> In<T>(this List<T> src, List<T> values, EqualityComparer<T> eq) {
+        List<T> outp = new List<T>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (Enumerable.Contains<T>(values, src[i], eq)) { outp.Add(src[i]); }
+        }
+        return outp;
+    }
+
+    /// <summary>对字符串执行 SQL IN，按值比较（InStr 的 C# 风格重载；
+    /// InStr）。</summary>
+    static List<string> In(this List<string> src, List<string> values) {
+        return Enumerable.InStr(src, values);
+    }
+
+    /// <summary>对字符串执行 SQL IN，按值比较。</summary>
+    static List<string> InStr(this List<string> src, List<string> values) {
+        List<string> outp = new List<string>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (Enumerable.ContainsStr(values, src[i])) { outp.Add(src[i]); }
+        }
+        return outp;
+    }
+}

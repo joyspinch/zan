@@ -1,0 +1,189 @@
+using System;
+using System.IO;
+
+namespace System.Web;
+
+/// <summary>
+/// Serves files from a directory on disk (CSS/JS/fonts/images: everything the
+/// views reference but no controller should own).
+///
+/// It is a Before hook rather than a route: assets must be answered before
+/// authentication, rate limiting and the router's pattern matching, and they
+/// must not appear in the route table (nothing to secure, nothing to put in a
+/// menu). Returning false from the hook short-circuits the request with the
+/// response already built.
+///
+/// <code>
+/// StaticFiles.Mount(app, "/static", "public");   // GET /static/css/app.css
+/// </code>
+///
+/// The URL path is resolved against the mounted directory only: a request is
+/// rejected unless every byte is an unreserved file character, so "..", "//",
+/// backslashes, NUL and query-smuggled separators cannot walk out of the root.
+///
+/// Bodies are cached per worker after the first hit (assets are immutable in a
+/// deployment; restart or bump the file name to publish a new one) and served
+/// with a long max-age. Files are read as bytes and written back untouched, so
+/// images and fonts survive the trip.
+/// </summary>
+class StaticFiles {
+    static string prefix = "";
+    static string root = "";
+    static int maxAge = 86400;
+    // Per-worker asset cache, parallel by index: an asset is read once and
+    // then served straight from these. Bodies are byte arrays with an explicit
+    // length -- a string body would end at the first NUL, which is how a PNG
+    // or a woff2 arrives truncated.
+    static List<string> paths = null;
+    static List<byte[]> blobs = null;
+    static List<int> sizes = null;
+    static List<string> types = null;
+
+    /// <summary>Mounts `dir` under `urlPrefix` and registers the hook on the
+    /// app. `urlPrefix` is matched literally ("/static" answers
+    /// "/static/css/app.css"); `dir` is relative to the process working
+    /// directory.</summary>
+    static void Mount(WebApp app, string urlPrefix, string dir) {
+        StaticFiles.prefix = urlPrefix;
+        StaticFiles.root = dir;
+        StaticFiles.paths = new List<string>();
+        StaticFiles.blobs = new List<byte[]>();
+        StaticFiles.sizes = new List<int>();
+        StaticFiles.types = new List<string>();
+        app.Before(StaticFiles.Serve);
+    }
+
+    /// <summary>How long browsers may cache an asset (seconds). Set it to 0
+    /// while developing so an edited file is picked up by a reload -- the
+    /// per-worker body cache still needs a restart.</summary>
+    static void MaxAge(int seconds) {
+        StaticFiles.maxAge = seconds;
+    }
+
+    /// <summary>Before hook: answers asset requests, passes everything else on
+    /// (true = keep going).</summary>
+    static bool Serve(HttpContext ctx) {
+        if (StaticFiles.root.Length == 0) { return true; }
+        if (ctx.method != "GET" && ctx.method != "HEAD") { return true; }
+        string rel = StaticFiles.Relative(ctx.path);
+        if (rel == null) { return true; }
+        if (rel.Length == 0 || !StaticFiles.IsSafe(rel)) {
+            ctx.Status(404, "Not Found").Text("not found");
+            return false;
+        }
+        int hit = StaticFiles.Cached(rel);
+        if (hit < 0) {
+            string full = StaticFiles.root + "/" + rel;
+            if (!File.Exists(full)) {
+                ctx.Status(404, "Not Found").Text("not found");
+                return false;
+            }
+            int size = File.GetSize(full);
+            if (size < 0) {
+                ctx.Status(404, "Not Found").Text("not found");
+                return false;
+            }
+            StaticFiles.paths.Add(rel);
+            StaticFiles.blobs.Add(File.ReadAllBytes(full));
+            StaticFiles.sizes.Add(size);
+            StaticFiles.types.Add(StaticFiles.ContentType(rel));
+            hit = StaticFiles.paths.Count - 1;
+        }
+        // An asset that exists on disk is a served interface, so it names
+        // itself for the metrics ("GET /static/js/app.js"). The key is built
+        // from the mount prefix and the validated relative path, never from the
+        // raw URL: a request for a file that is not there 404s above and stays
+        // out of the counters entirely, so a scanner cannot add rows.
+        ctx.routePattern = StaticFiles.prefix + "/" + StaticFiles.paths[hit];
+        ctx.SetHeader("Cache-Control", "public, max-age="
+            + Convert.ToString(StaticFiles.maxAge));
+        // HEAD answers the same headers, Content-Length included, with the
+        // body suppressed by the server rather than by a shortened length.
+        ctx.Binary(StaticFiles.types[hit], StaticFiles.blobs[hit],
+            StaticFiles.sizes[hit]);
+        return false;
+    }
+
+    /// <summary>Index of an already-read asset, or -1. The table holds one
+    /// entry per file served since start-up, so the scan is over a handful of
+    /// deployed assets, not over anything a request can grow.</summary>
+    static int Cached(string rel) {
+        if (StaticFiles.paths == null) { return -1; }
+        for (int i = 0; i < StaticFiles.paths.Count; i = i + 1) {
+            if (StaticFiles.paths[i] == rel) { return i; }
+        }
+        return -1;
+    }
+
+    /// <summary>The path below the mount point, or null when the request is not
+    /// for this mount.</summary>
+    static string Relative(string path) {
+        string p = StaticFiles.prefix;
+        int pn = p.Length;
+        if (path.Length <= pn) { return null; }
+        if (path.Substring(0, pn) != p) { return null; }
+        if ((path[pn] & 255) != 47) { return null; }        // '/'
+        return path.Substring(pn + 1);
+    }
+
+    /// <summary>Only unreserved path characters, and no empty or dot-leading
+    /// segment: that rules out "..", absolute paths, backslashes, NUL bytes and
+    /// hidden files in one pass.</summary>
+    static bool IsSafe(string rel) {
+        int n = rel.Length;
+        bool segStart = true;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = rel[i] & 255;
+            if (c == 47) {                                   // '/'
+                if (segStart) { return false; }              // "//" or leading
+                segStart = true;
+                continue;
+            }
+            if (segStart && c == 46) { return false; }       // ".." / dotfile
+            segStart = false;
+            bool ok = (c >= 97 && c <= 122)                  // a-z
+                || (c >= 65 && c <= 90)                      // A-Z
+                || (c >= 48 && c <= 57)                      // 0-9
+                || c == 46 || c == 45 || c == 95;            // . - _
+            if (!ok) { return false; }
+        }
+        return !segStart;
+    }
+
+    /// 按扩展名（小写化后）映射 Content-Type；未知类型为
+    /// application/octet-stream。
+    static string ContentType(string rel) {
+        string ext = StaticFiles.Extension(rel);
+        if (ext == "css") { return "text/css; charset=utf-8"; }
+        if (ext == "js") { return "application/javascript; charset=utf-8"; }
+        if (ext == "mjs") { return "application/javascript; charset=utf-8"; }
+        if (ext == "json") { return "application/json; charset=utf-8"; }
+        if (ext == "map") { return "application/json; charset=utf-8"; }
+        if (ext == "html") { return "text/html; charset=utf-8"; }
+        if (ext == "txt") { return "text/plain; charset=utf-8"; }
+        if (ext == "svg") { return "image/svg+xml"; }
+        if (ext == "png") { return "image/png"; }
+        if (ext == "jpg") { return "image/jpeg"; }
+        if (ext == "jpeg") { return "image/jpeg"; }
+        if (ext == "gif") { return "image/gif"; }
+        if (ext == "webp") { return "image/webp"; }
+        if (ext == "ico") { return "image/x-icon"; }
+        if (ext == "woff") { return "font/woff"; }
+        if (ext == "woff2") { return "font/woff2"; }
+        if (ext == "ttf") { return "font/ttf"; }
+        return "application/octet-stream";
+    }
+
+    /// 末段最后一个 '.' 之后的扩展名（小写）；无扩展名或以 '.' 结尾为空串。
+    static string Extension(string rel) {
+        int n = rel.Length;
+        int dot = -1;
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            int c = rel[i] & 255;
+            if (c == 47) { break; }                          // '/'
+            if (c == 46) { dot = i; break; }                 // '.'
+        }
+        if (dot < 0 || dot == n - 1) { return ""; }
+        return rel.Substring(dot + 1, n - dot - 1).ToLower();
+    }
+}

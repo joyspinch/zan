@@ -1,0 +1,431 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Management;
+
+namespace System.Windows;
+
+/// <summary>
+/// 屏幕捕获、像素探测与显示器信息。Windows 通过
+/// GDI（GetDC/BitBlt/GetDIBits）实现。Linux/macOS 调用平台自带的截图
+/// 工具（X11 用 ImageMagick import，Wayland 用 grim，macOS 用
+/// screencapture）写出 BMP 后再读回像素；工具不存在时抛出
+/// PlatformNotSupportedException 而不是返回黑图。
+///
+/// 像素以 BGRA 字节数组返回（stride = 宽度 * 4，行序
+/// 自上而下）。颜色为 0xAARRGGBB。
+///
+///   byte[] px = Screen.CapturePixels(0, 0, 100, 80);
+///   Screen.CaptureAllToBmp("screen.bmp");
+///   int c = Screen.GetPixel(10, 10);
+/// </summary>
+class Screen {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "GetDC")]
+    static extern nint WinGetDC(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "ReleaseDC")]
+    static extern int WinReleaseDC(nint hwnd, nint dc);
+
+    [DllImport("user32", EntryPoint = "GetSystemMetrics")]
+    static extern int WinGetSystemMetrics(int index);
+
+    [DllImport("gdi32", EntryPoint = "CreateCompatibleDC")]
+    static extern nint WinCreateCompatibleDC(nint dc);
+
+    [DllImport("gdi32", EntryPoint = "CreateCompatibleBitmap")]
+    static extern nint WinCreateCompatibleBitmap(nint dc, int w, int h);
+
+    [DllImport("gdi32", EntryPoint = "SelectObject")]
+    static extern nint WinSelectObject(nint dc, nint obj);
+
+    [DllImport("gdi32", EntryPoint = "DeleteObject")]
+    static extern int WinDeleteObject(nint obj);
+
+    [DllImport("gdi32", EntryPoint = "DeleteDC")]
+    static extern int WinDeleteDC(nint dc);
+
+    [DllImport("gdi32", EntryPoint = "BitBlt")]
+    static extern int WinBitBlt(nint dst, int x, int y, int w, int h,
+                                nint src, int sx, int sy, int rop);
+
+    [DllImport("gdi32", EntryPoint = "GetDIBits")]
+    static extern int WinGetDIBits(nint dc, nint bmp, int start, int lines,
+                                   nint bits, nint bmi, int usage);
+
+    [DllImport("gdi32", EntryPoint = "GetDeviceCaps")]
+    static extern int WinGetDeviceCaps(nint dc, int index);
+
+    [DllImport("crt", EntryPoint = "fopen")]
+    static extern nint PlatFopen(string path, string mode);
+
+    [DllImport("crt", EntryPoint = "fwrite")]
+    static extern long PlatFwrite(byte[] buf, long size, long count, nint fp);
+
+    [DllImport("crt", EntryPoint = "fclose")]
+    static extern int PlatFclose(nint fp);
+    #endif
+
+    /// <summary>主屏幕宽度（像素）。</summary>
+    static int ScreenWidth() {
+        #if WINDOWS
+        return Screen.WinGetSystemMetrics(0 /*SM_CXSCREEN*/);
+        #else
+        return Display.ScreenWidth();
+        #endif
+    }
+
+    /// <summary>主屏幕高度（像素）。</summary>
+    static int ScreenHeight() {
+        #if WINDOWS
+        return Screen.WinGetSystemMetrics(1 /*SM_CYSCREEN*/);
+        #else
+        return Display.ScreenHeight();
+        #endif
+    }
+
+    /// <summary>主屏幕 DPI（96 = 100%）。</summary>
+    static int Dpi() {
+        #if WINDOWS
+        nint dc = Screen.WinGetDC(0);
+        int dpi = Screen.WinGetDeviceCaps(dc, 88 /*LOGPIXELSX*/);
+        Screen.WinReleaseDC(0, dc);
+        if (dpi <= 0) { dpi = 96; }
+        return dpi;
+        #elif LINUX
+        // xdpyinfo: "  resolution:    96x96 dots per inch"
+        ProcessResult r = Process.Capture("xdpyinfo 2>/dev/null");
+        if (r.lines != null) {
+            for (int i = 0; i < r.lines.Count; i = i + 1) {
+                if (r.lines[i].IndexOf("resolution:") < 0) { continue; }
+                int dpi = Screen.FirstInt(r.lines[i]);
+                if (dpi > 0) { return dpi; }
+            }
+        }
+        return 96;
+        #else
+        return 96;
+        #endif
+    }
+
+    /// <summary>屏幕坐标 (x, y) 处像素的颜色，格式为
+    /// 0xAARRGGBB；捕获失败返回 -1。通过 1x1 BitBlt 实现
+    /// （GDI GetPixel 在 DWM 合成桌面上不可靠）。</summary>
+    static int GetPixel(int x, int y) {
+        #if WINDOWS
+        byte[] px = Screen.CapturePixels(x, y, 1, 1);
+        if (px == null || px.Length < 4) { return -1; }
+        int b = px[0] & 255;
+        int g = px[1] & 255;
+        int r = px[2] & 255;
+        return 0xFF000000 | (r << 16) | (g << 8) | b;
+        #else
+        byte[] px = Screen.CapturePixels(x, y, 1, 1);
+        if (px == null || px.Length < 4) { return -1; }
+        int b = px[0] & 255;
+        int g = px[1] & 255;
+        int r = px[2] & 255;
+        return 0xFF000000 | (r << 16) | (g << 8) | b;
+        #endif
+    }
+
+    /// <summary>将屏幕矩形捕获为 BGRA 像素（自上而下，
+    /// stride = 宽度 * 4）。捕获失败返回 null。</summary>
+    static byte[] CapturePixels(int x, int y, int w, int h) {
+        #if WINDOWS
+        if (w <= 0 || h <= 0) { return null; }
+        nint screenDc = Screen.WinGetDC(0);
+        if (screenDc == 0) { return null; }
+        nint memDc = Screen.WinCreateCompatibleDC(screenDc);
+        if (memDc == 0) {
+            Screen.WinReleaseDC(0, screenDc);
+            return null;
+        }
+        nint bmp = Screen.WinCreateCompatibleBitmap(screenDc, w, h);
+        if (bmp == 0) {
+            Screen.WinDeleteDC(memDc);
+            Screen.WinReleaseDC(0, screenDc);
+            return null;
+        }
+        Screen.WinSelectObject(memDc, bmp);
+        int ok = Screen.WinBitBlt(memDc, 0, 0, w, h, screenDc, x, y,
+                                  0x00CC0020 /*SRCCOPY*/);
+        byte[] px = null;
+        if (ok != 0) { px = Screen.ReadBitmap(memDc, bmp, w, h); }
+        Screen.WinDeleteObject(bmp);
+        Screen.WinDeleteDC(memDc);
+        Screen.WinReleaseDC(0, screenDc);
+        return px;
+        #else
+        if (w <= 0 || h <= 0) { return null; }
+        string tmp = Screen.TempBmp();
+        byte[] px = null;
+        if (Screen.ShotToBmp(tmp, x, y, w, h)) {
+            px = Screen.ReadBmpPixels(tmp, w, h);
+        }
+        if (File.Exists(tmp)) { File.Delete(tmp); }
+        return px;
+        #endif
+    }
+
+    /// <summary>捕获主屏幕并写入 32 位 BMP 文件。
+    /// 成功返回 true。</summary>
+    static bool CaptureAllToBmp(string path) {
+        #if WINDOWS
+        return Screen.CaptureToBmp(path, 0, 0, Screen.ScreenWidth(),
+                                   Screen.ScreenHeight());
+        #else
+        // 全屏：不传 -crop，省得先去问一遍屏幕尺寸
+        return Screen.ShotToBmp(path, 0, 0, 0, 0);
+        #endif
+    }
+
+    /// <summary>捕获屏幕矩形并写入 32 位 BMP 文件。
+    /// 成功返回 true。</summary>
+    static bool CaptureToBmp(string path, int x, int y, int w, int h) {
+        #if WINDOWS
+        byte[] px = Screen.CapturePixels(x, y, w, h);
+        if (px == null) { return false; }
+        return Screen.WriteBmp(path, px, w, h);
+        #else
+        return Screen.ShotToBmp(path, x, y, w, h);
+        #endif
+    }
+
+    #if !WINDOWS
+    /// 非截图工具进程间互不干扰的临时 BMP 路径（按 PID 命名）。
+    static string TempBmp() {
+        return Path.GetTempPath() + "zan_shot_"
+            + Convert.ToString(ProcessHost.Pid()) + ".bmp";
+    }
+
+    /// PATH 里是否存在名为 `tool` 的命令。
+    static bool Have(string tool) {
+        return Process.Capture("command -v " + tool + " >/dev/null 2>&1").Ok();
+    }
+
+    /// <summary>用平台截图工具把屏幕矩形写成 BMP。w/h 为 0 表示整屏。
+    /// 一个可用工具都没有时抛 PlatformNotSupportedException——静默返回
+    /// false 会让调用方以为是运行时失败而不停重试。</summary>
+    static bool ShotToBmp(string path, int x, int y, int w, int h) {
+        string geom = "";
+        if (w > 0 && h > 0) {
+            geom = Convert.ToString(w) + "x" + Convert.ToString(h)
+                + "+" + Convert.ToString(x) + "+" + Convert.ToString(y);
+        }
+        string cmd = "";
+        #if MACOS
+        if (!Screen.Have("screencapture")) {
+            throw new PlatformNotSupportedException(
+                "Screen capture needs /usr/sbin/screencapture");
+        }
+        cmd = "screencapture -x -t bmp";
+        if (geom.Length > 0) {
+            cmd = cmd + " -R" + Convert.ToString(x) + "," + Convert.ToString(y)
+                + "," + Convert.ToString(w) + "," + Convert.ToString(h);
+        }
+        cmd = cmd + " '" + path + "'";
+        #else
+        bool wayland = ProcessHost.Env("WAYLAND_DISPLAY").Length > 0;
+        if (wayland && Screen.Have("grim")) {
+            // grim 只写 PNG/PPM，先出 PPM 再自己转 BMP
+            string ppm = path + ".ppm";
+            string g = "grim -t ppm";
+            if (geom.Length > 0) {
+                g = g + " -g '" + Convert.ToString(x) + "," + Convert.ToString(y)
+                    + " " + Convert.ToString(w) + "x" + Convert.ToString(h) + "'";
+            }
+            int grc = Process.Run(g + " '" + ppm + "' 2>/dev/null");
+            bool ok = grc == 0 && Screen.PpmToBmp(ppm, path);
+            if (File.Exists(ppm)) { File.Delete(ppm); }
+            return ok;
+        }
+        if (Screen.Have("import")) {
+            // ImageMagick：BMP3 是无压缩 24 位，最容易读回
+            cmd = "import -window root";
+            if (geom.Length > 0) { cmd = cmd + " -crop " + geom + " +repage"; }
+            cmd = cmd + " BMP3:'" + path + "'";
+        } else if (Screen.Have("spectacle")) {
+            cmd = "spectacle -b -n -o '" + path + "'";
+        } else if (Screen.Have("gnome-screenshot")) {
+            cmd = "gnome-screenshot -f '" + path + "'";
+        } else {
+            throw new PlatformNotSupportedException(
+                "Screen capture needs a screenshot tool: install imagemagick "
+                + "(X11) or grim (Wayland)");
+        }
+        #endif
+        int rc = Process.Run(cmd + " 2>/dev/null");
+        return rc == 0 && File.Exists(path);
+    }
+
+    /// <summary>P6 PPM -> 24 位 BMP（grim 不会写 BMP）。</summary>
+    static bool PpmToBmp(string ppm, string bmpPath) {
+        byte[] data = File.ReadAllBytes(ppm);
+        if (data == null || data.Length < 16) { return false; }
+        if (data[0] != 80 || data[1] != 54) { return false; }   // "P6"
+        int p = 2;
+        List<int> head = new List<int>();
+        while (head.Count < 3 && p < data.Length) {
+            int c = data[p] & 255;
+            if (c == 35) {                       // '#' 注释到行尾
+                while (p < data.Length && (data[p] & 255) != 10) { p = p + 1; }
+            } else if (c >= 48 && c <= 57) {
+                int v = 0;
+                while (p < data.Length && (data[p] & 255) >= 48 && (data[p] & 255) <= 57) {
+                    v = v * 10 + ((data[p] & 255) - 48);
+                    p = p + 1;
+                }
+                head.Add(v);
+                continue;
+            }
+            p = p + 1;
+        }
+        if (head.Count < 3 || head[2] != 255) { return false; }
+        int w = head[0];
+        int h = head[1];
+        if (w <= 0 || h <= 0 || p + w * h * 3 > data.Length) { return false; }
+        byte[] px = new byte[w * h * 4];
+        for (int row = 0; row < h; row = row + 1) {
+            for (int col = 0; col < w; col = col + 1) {
+                int s = p + (row * w + col) * 3;
+                int d = (row * w + col) * 4;
+                px[d] = data[s + 2];       // B
+                px[d + 1] = data[s + 1];   // G
+                px[d + 2] = data[s];       // R
+                px[d + 3] = 255;
+            }
+        }
+        return Screen.WriteBmp(bmpPath, px, w, h);
+    }
+
+    /// <summary>读回 BMP 的像素为自上而下的 BGRA。24/32 位无压缩
+    /// （BI_RGB）的 BMP 才支持——截图工具写出的正是这种。
+    /// w/h 传 0 表示按文件里的尺寸；尺寸不符时返回 null。</summary>
+    static byte[] ReadBmpPixels(string path, int w, int h) {
+        byte[] f = File.ReadAllBytes(path);
+        if (f == null || f.Length < 54) { return null; }
+        if (f[0] != 66 || f[1] != 77) { return null; }        // "BM"
+        int off = Screen.GetInt(f, 10);
+        int bw = Screen.GetInt(f, 18);
+        int bh = Screen.GetInt(f, 22);
+        int bpp = (f[28] & 255) | ((f[29] & 255) << 8);
+        int comp = Screen.GetInt(f, 30);
+        bool topDown = bh < 0;
+        if (bh < 0) { bh = 0 - bh; }
+        if (comp != 0 && comp != 3) { return null; }
+        if (bpp != 24 && bpp != 32) { return null; }
+        if (bw <= 0 || bh <= 0) { return null; }
+        if (w > 0 && (bw != w || bh != h)) { return null; }
+        int srcStride = ((bw * bpp / 8) + 3) / 4 * 4;   // BMP 行按 4 字节对齐
+        if (off + srcStride * bh > f.Length) { return null; }
+        byte[] px = new byte[bw * bh * 4];
+        for (int row = 0; row < bh; row = row + 1) {
+            int srcRow = topDown ? row : bh - 1 - row;
+            int s = off + srcRow * srcStride;
+            int d = row * bw * 4;
+            for (int col = 0; col < bw; col = col + 1) {
+                int si = s + col * (bpp / 8);
+                px[d] = f[si];
+                px[d + 1] = f[si + 1];
+                px[d + 2] = f[si + 2];
+                px[d + 3] = bpp == 32 ? f[si + 3] : (byte)255;
+                d = d + 4;
+            }
+        }
+        return px;
+    }
+
+    /// 从 b 的 off 处读小端 32 位（BMP 头部字段为小端）。
+    static int GetInt(byte[] b, int off) {
+        return (b[off] & 255) | ((b[off + 1] & 255) << 8)
+            | ((b[off + 2] & 255) << 16) | ((b[off + 3] & 255) << 24);
+    }
+
+    /// 返回行中第一个十进制整数；没有则返回 0（xdpyinfo 解析 DPI 用）。
+    static int FirstInt(string line) {
+        int i = 0;
+        while (i < line.Length) {
+            int c = line[i] & 255;
+            if (c >= 48 && c <= 57) {
+                int v = 0;
+                while (i < line.Length && (line[i] & 255) >= 48
+                       && (line[i] & 255) <= 57) {
+                    v = v * 10 + ((line[i] & 255) - 48);
+                    i = i + 1;
+                }
+                return v;
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+    #endif
+
+    #if WINDOWS
+    /// 用 GetDIBits 将选中的位图读入自上而下的 BGRA 字节数组。
+    static byte[] ReadBitmap(nint dc, nint bmp, int w, int h) {
+        nint bmi = NativeMemory.Alloc(40);
+        new Span<int>(bmi, 10)[0] = 40;            // biSize
+        new Span<int>(bmi + 4, 1)[0] = w;          // biWidth
+        new Span<int>(bmi + 8, 1)[0] = 0 - h;      // biHeight（自上而下）
+        new Span<ushort>(bmi + 12, 1)[0] = 1;      // biPlanes
+        new Span<ushort>(bmi + 14, 1)[0] = 32;     // biBitCount
+        new Span<int>(bmi + 16, 1)[0] = 0;         // biCompression = BI_RGB
+        int stride = w * 4;
+        int size = stride * h;
+        nint bits = NativeMemory.Alloc(size);
+        int got = Screen.WinGetDIBits(dc, bmp, 0, h, bits, bmi, 0 /*DIB_RGB_COLORS*/);
+        byte[] px = null;
+        if (got == h) {
+            px = new byte[size];
+            for (int i = 0; i < size; i = i + 1) {
+                px[i] = new Span<byte>(bits + i, 1)[0];
+            }
+        }
+        NativeMemory.Free(bits);
+        NativeMemory.Free(bmi);
+        return px;
+    }
+    #endif
+
+    /// 将 32 位 BGRA 像素缓冲写入自下而上 (bottom-up) 的 BMP 文件。
+    static bool WriteBmp(string path, byte[] px, int w, int h) {
+        int stride = w * 4;
+        int pixelBytes = stride * h;
+        int fileSize = 54 + pixelBytes;
+        byte[] bmp = new byte[fileSize];
+        // BITMAPFILEHEADER（14 字节）。
+        bmp[0] = 66; bmp[1] = 77;                 // "BM"
+        Screen.PutInt(bmp, 2, fileSize);
+        Screen.PutInt(bmp, 10, 54);               // 数据偏移量
+        // BITMAPINFOHEADER（40 字节）。
+        Screen.PutInt(bmp, 14, 40);               // biSize
+        Screen.PutInt(bmp, 18, w);
+        Screen.PutInt(bmp, 22, h);                // 自下而上 (bottom-up)
+        bmp[26] = 1;                              // 平面数
+        bmp[28] = 32;                             // 位深 (bit count)
+        // biCompression = 0（BI_RGB），其余字段为 0。
+        // 像素：行序翻转（BMP 自下而上存储）。
+        int dst = 54;
+        int row = h - 1;
+        while (row >= 0) {
+            int src = row * stride;
+            for (int k = 0; k < stride; k = k + 1) {
+                bmp[dst + k] = px[src + k];
+            }
+            dst = dst + stride;
+            row = row - 1;
+        }
+        File.WriteAllBytes(path, bmp);
+        return File.Exists(path);
+    }
+
+    /// 向 b 的 off 处写小端 32 位。
+    static void PutInt(byte[] b, int off, int v) {
+        b[off] = (byte)(v & 255);
+        b[off + 1] = (byte)((v >> 8) & 255);
+        b[off + 2] = (byte)((v >> 16) & 255);
+        b[off + 3] = (byte)((v >> 24) & 255);
+    }
+}

@@ -1,0 +1,1906 @@
+using System;
+using System.IO;
+using System.Json;
+
+namespace Gui;
+
+/// 一个小型 CSS 解析器：把以真实 CSS 文本编写的皮肤样式表转换成
+/// StyleSheet 已能应用的 选择器 -> 声明 映射。
+///
+/// 皮肤过去是 Zan 代码（每个皮肤一个 Theme 预设），因此任何超出
+/// 调色板交换的东西——控件形状、渐变、阴影、各状态外观——都意味着
+/// 要改控件代码。现在皮肤是放在美术资源旁的 `.css` 文件，
+/// GUI 在运行时加载，用户可以重新设计应用外观（或自带皮肤），
+/// 而无需改动或重新构建任何代码：
+///
+///   :root { --accent: #d92b2b; --radius: 999; }
+///   button.primary        { background: linear-gradient(#ffd76a, #e0a020);
+///                           radius: var(--radius); border: 1 #8a5b12; }
+///   button.primary:hover  { background: #ffe08a; }
+///   tab.item:active       { border-bottom: 2 var(--accent); }
+///
+/// 有目的地支持（仅此而已，无更多级联）：声明块、选择器
+/// 列表（`a, b { }`）、`:state` 后缀、`/* 注释 */` 以及 `:root`
+/// 中以 `var(--name)` 引用的自定义属性。其余一律解析为
+/// 普通属性，由 StyleSheet/控件决定其含义。
+class Css {
+    /// 把 `src` 解析为样式表，选择器保留其 `:state` 后缀。
+    /// 格式错误的文档会产出所有干净解析出的部分，一条坏规则
+    /// 不会毁掉整个皮肤。
+    static StyleSheet Parse(string src) {
+        return Css.ParseWith(src, null, null);
+    }
+
+    /// 同 Parse，但额外认得 `extraNames`/`extraVals` 里的自定义属性
+    /// （当前皮肤的 `:root` 变量与主题 token）：应用自己的 CSS 里
+    /// 写 `var(--accent)`、`var(--bg-primary)` 因此能解析到当前皮肤/
+    /// 主题（以前展开为空，因为只看得见同一份源文本里的变量）。
+    /// 外来变量只参与展开，不会写进结果表的 vars：sheet.vars 仍然
+    /// 只代表这份 CSS 自己声明了什么（Skin.ThemeOf 按它推导主题，
+    /// 掺进主题 token 就成了自我喂养）。同名时本身的变量胜出。
+    static StyleSheet ParseWith(string src, List<string> extraNames,
+                                List<string> extraVals) {
+        int physicalCount = extraNames == null ? 0 : extraNames.Count;
+        return Css.ParseWithSources(src, extraNames, extraVals, physicalCount);
+    }
+
+    /// 读取 CSS 文件并把其中的 `@import "x.css";` / `@import url("x.css");`
+    /// 语句替换成被引文件的内容。相对路径按引入者所在目录解析；
+    /// 环形引用与超过 8 层的嵌套按空文本收场（浏览器对循环
+    /// @import 也只是忽略）。文件不存在返回 ""。
+    static string ResolveImports(string path) {
+        return Css.ResolveImportsDepth(path, new List<string>(), 0);
+    }
+
+    static string ResolveImportsDepth(string path, List<string> seen, int depth) {
+        if (depth > 8) { return ""; }
+        string real = Css.Trim(path);
+        if (real == "" || !File.Exists(real)) { return ""; }
+        // 环检测键：统一分隔符并解析 `./`、`../`（运行期拿不到
+        // 规范化绝对路径，同文件以不同相对形式写出时靠它对齐）。
+        string key = Css.NormalizeKey(real);
+        for (int i = 0; i < seen.Count; i = i + 1) {
+            if (seen[i] == key) { return ""; }
+        }
+        seen.Add(key);
+        string text = File.ReadAllText(real);
+        text = Css.StripComments(text);
+        // 逐条找顶层 `@import ...;`（字符串里的分号不算）。
+        string outp = "";
+        string rest = text;
+        while (true) {
+            int at = Css.IndexOfImport(rest);
+            if (at < 0) { break; }
+            int semi = Css.MatchImportEnd(rest, at);
+            if (semi < 0) { break; }
+            string stmt = Css.Trim(rest.Substring(at + 7, semi - at - 7));
+            outp = outp + rest.Substring(0, at);
+            rest = rest.Substring(semi + 1, rest.Length - semi - 1);
+            // 只有目标以引号或 url( 开头的才是导入；`@layer a, b;`
+            // 这类语句原样放回。
+            if (stmt == "") { continue; }
+            string target = "";
+            string media = "";
+            string first = stmt.Substring(0, 1);
+            if (first == "\"" || first == "'") {
+                int end2 = Css.IndexFrom(stmt, first, 1);
+                if (end2 < 0) { continue; }
+                target = Css.Trim(stmt.Substring(1, end2 - 1));
+                media = Css.Trim(stmt.Substring(
+                    end2 + 1, stmt.Length - end2 - 1));
+            } else if (Css.StartsWithStr(Css.Lower(stmt), "url(")) {
+                int open = Css.IndexFrom(stmt, "(", 0);
+                int close = Css.IndexFrom(stmt, ")", open);
+                if (close < 0) { continue; }
+                target = Css.Trim(stmt.Substring(open + 1, close - open - 1));
+                if (target.Length >= 2
+                    && (target.Substring(0, 1) == "\""
+                        || target.Substring(0, 1) == "'")) {
+                    target = target.Substring(1, target.Length - 2);
+                }
+                media = Css.Trim(stmt.Substring(
+                    close + 1, stmt.Length - close - 1));
+            } else {
+                outp = outp + "@import " + stmt + ";";
+                continue;
+            }
+            if (target == "") { continue; }
+            // 相对路径按引入者所在目录解析；先试原样（绝对路径或
+            // 相对工作目录），再试拼接目录。
+            string baseDir = "";
+            int slash = -1;
+            for (int k = real.Length - 1; k >= 0; k = k - 1) {
+                string c = real.Substring(k, 1);
+                if (c == "/" || c == "\\") { slash = k; break; }
+            }
+            if (slash >= 0) { baseDir = real.Substring(0, slash); }
+            string sub = target;
+            if (baseDir != "" && !File.Exists(sub)) { sub = baseDir + "/" + target; }
+            // 带媒体限定（`@import "x.css" print;`）的导入按条件
+            // 现算；打印类在本引擎恒假，导入被丢弃。
+            if (media != "") {
+                MediaCond mc = Css.ParseMedia(media);
+                if (mc == null || !mc.True(new StyleBox())) { continue; }
+            }
+            outp = outp + Css.ResolveImportsDepth(sub, seen, depth + 1);
+        }
+        return outp + rest;
+    }
+
+    /// `s` 里第一个不在字符串里的 `@import` 关键字位置。
+    static int IndexOfImport(string s) {
+        int i = 0;
+        string quote = "";
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (quote != "") {
+                if (ch == "\\" && i + 1 < s.Length) { i = i + 2; continue; }
+                if (ch == quote) { quote = ""; }
+                i = i + 1;
+                continue;
+            }
+            if (ch == "\"" || ch == "'") { quote = ch; i = i + 1; continue; }
+            if (ch == "@" && i + 7 <= s.Length
+                && Css.StartsWithStr(Css.Lower(s.Substring(i, 7)), "@import")) {
+                return i;
+            }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// `at` 起的 import 语句的结尾分号下标（字符串里的分号不算）。
+    static int MatchImportEnd(string s, int at) {
+        string quote = "";
+        int i = at;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (quote != "") {
+                if (ch == "\\" && i + 1 < s.Length) { i = i + 2; continue; }
+                if (ch == quote) { quote = ""; }
+                i = i + 1;
+                continue;
+            }
+            if (ch == "\"" || ch == "'") { quote = ch; i = i + 1; continue; }
+            if (ch == ";") { return i; }
+            if (ch == "{") {
+                // 语句没写分号就开了块：坏写法，放弃导入。
+                return 0 - 1;
+            }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// 环检测用的路径规范化：`\` 归一为 `/`，逐段消解 `.` 与
+    /// `..`（越顶的 `..` 丢弃）。保留大小写，不在不同文件系统
+    /// 之间猜语义。
+    static string NormalizeKey(string path) {
+        List<string> parts = new List<string>();
+        int i = 0;
+        while (i < path.Length) {
+            string seg = "";
+            while (i < path.Length && path.Substring(i, 1) != "/"
+                   && path.Substring(i, 1) != "\\") {
+                seg = seg + path.Substring(i, 1);
+                i = i + 1;
+            }
+            while (i < path.Length
+                   && (path.Substring(i, 1) == "/"
+                       || path.Substring(i, 1) == "\\")) {
+                i = i + 1;
+            }
+            if (seg == "" || seg == ".") { continue; }
+            if (seg == ".." && parts.Count > 0
+                && parts[parts.Count - 1] != "..") {
+                parts.RemoveAt(parts.Count - 1);
+                continue;
+            }
+            parts.Add(seg);
+        }
+        string outp = "";
+        for (int k = 0; k < parts.Count; k = k + 1) {
+            outp = outp + (k > 0 ? "/" : "") + parts[k];
+        }
+        return outp;
+    }
+
+    /// External theme tokens precede inherited logical skin variables. Keep
+    /// the boundary explicit so app CSS does not mistake skin sizes for pixels.
+    static StyleSheet ParseWithSources(string src, List<string> extraNames,
+                                       List<string> extraVals, int physicalCount) {
+        StyleSheet sheet = new StyleSheet();
+        string s = Css.StripComments(src);
+        // 第 1 遍：`:root` 自定义属性，便于值引用它们。
+        List<string> ownNames = new List<string>();
+        List<string> ownVals = new List<string>();
+        Css.CollectVars(s, ownNames, ownVals);
+        // 展开用的名单：外来变量在前、本身变量在后（ExpandVars 取
+        // 最后一个同名命中，因此这份 CSS 自己的声明覆盖皮肤/主题）。
+        List<string> varNames = new List<string>();
+        List<string> varVals = new List<string>();
+        if (extraNames != null && extraVals != null) {
+            int ei = 0;
+            while (ei < extraNames.Count && ei < extraVals.Count) {
+                varNames.Add(extraNames[ei]);
+                varVals.Add(extraVals[ei]);
+                ei = ei + 1;
+            }
+        }
+        int externalCount = physicalCount < varNames.Count ? physicalCount : varNames.Count;
+        for (int vi = 0; vi < ownNames.Count; vi = vi + 1) {
+            sheet.vars.Set(ownNames[vi], JsonValue.NewStr(ownVals[vi]));
+            varNames.Add(ownNames[vi]);
+            varVals.Add(ownVals[vi]);
+        }
+        // 第 2 遍：所有规则块。
+        //
+        // 配对必须按括号深度做，不能取「下一个 }」：`@media (...){a{x}}`
+        // 的第一个 `}` 是内层 `a` 的，用它会得到选择器 `@media (...){a`
+        // ——这条 at-rule 连同紧随其后的第一条规则一起消失，中间那个
+        // `x` 还会被当成声明表。样式表里出现一条媒体查询就悄悄吃掉
+        // 相邻规则，是这套解析器最贵的一个坑。
+        Css.ParseRulesInto(sheet, s, varNames, varVals, externalCount);
+        return sheet;
+    }
+
+    /// 把一段样式表文本里的规则块解析进 `sheet`（供顶层与
+    /// `@supports` 的内层递归调用）。
+    ///
+    /// 配对必须按括号深度做，不能取「下一个 }」：`@media (...){a{x}}`
+    /// 的第一个 `}` 是内层 `a` 的，用它会得到选择器 `@media (...){a`
+    /// ——这条 at-rule 连同紧随其后的第一条规则一起消失，中间那个
+    /// `x` 还会被当成声明表。样式表里出现一条媒体查询就悄悄吃掉
+    /// 相邻规则，是这套解析器最贵的一个坑。
+    static void ParseRulesInto(StyleSheet sheet, string s, List<string> varNames,
+                               List<string> varVals, int externalCount) {
+        Css.ParseRulesIntoM(sheet, s, varNames, varVals, externalCount, null);
+    }
+
+    /// ParseRulesInto 的媒体上下文版本：`outer` 非空表示正在
+    /// `@media` 块内解析，普通规则带着条件进 mediaRules（运行期
+    /// 按窗口/主题求值），不再进常驻级联。
+    static void ParseRulesIntoM(StyleSheet sheet, string s, List<string> varNames,
+                                List<string> varVals, int externalCount,
+                                MediaCond outer) {
+        int i = 0;
+        while (i < s.Length) {
+            int open = Css.IndexFrom(s, "{", i);
+            if (open < 0) { break; }
+            int close = Css.MatchBrace(s, open);
+            if (close < 0) { break; }
+            string selectors = Css.Trim(s.Substring(i, open - i));
+            string body = s.Substring(open + 1, close - open - 1);
+            i = close + 1;
+            // `@import "x.css"; button { ... }`：块前的整条 @ 语句是导入，
+            // 不是选择器的一部分，按 `;` 剥掉。否则下面会把这条规则
+            // 当成 at-rule 整块跳过——一条 import 就让紧随其后的规则失效。
+            while (selectors.Length > 0 && selectors.Substring(0, 1) == "@") {
+                int semi = Css.IndexFrom(selectors, ";", 0);
+                if (semi < 0) { break; }
+                selectors = Css.Trim(selectors.Substring(
+                    semi + 1, selectors.Length - semi - 1));
+            }
+            if (selectors.Length == 0) { continue; }
+            if (selectors.Substring(0, 1) == "@") {
+                // `@supports (a: b) { ... }` 的条件是静态可判定的
+                // （引擎认不认这条声明），成立就把内层规则照常解析。
+                // `@layer name { ... }` 没有层叠优先级模型，按文档顺序
+                // 展平——是近似，但比整块丢弃更接近作者意图。
+                // `@media`/`@keyframes`/`@font-face` 仍是整块跳过（浏览器
+                // 对不支持的 at-rule 也是忽略），丢了哪些由 Lint 按名字报出。
+                string at = Css.AtName(selectors);
+                if (at == "supports") {
+                    // 守卫成立就展开内层；判假只跳过这一块，并由
+                    // NoteGuard 按条件原文报出（不是"不支持 @supports"）。
+                    string cond = Css.AtPrelude(selectors);
+                    if (Css.SupportsCondition(cond)) {
+                        Css.ParseRulesIntoM(sheet, body, varNames, varVals,
+                                            externalCount, outer);
+                    } else {
+                        sheet.NoteGuard(cond);
+                    }
+                } else if (at == "media") {
+                    // 媒体查询：prelude 解析成可求值条件，内层规则带
+                    // 条件收进 mediaRules，Apply 时按窗口/主题现算。
+                    // 解析不了的条件判假并按守卫报出（CSS 语义：
+                    // 未知的媒体查询 = "not all"）。
+                    string mcond = Css.AtPrelude(selectors);
+                    MediaCond mc = Css.ParseMedia(mcond);
+                    if (mc == null) {
+                        sheet.NoteGuard(mcond);
+                    } else if (outer != null) {
+                        mc = MediaCond.And(outer, mc);
+                        Css.ParseRulesIntoM(sheet, body, varNames, varVals,
+                                            externalCount, mc);
+                    } else {
+                        Css.ParseRulesIntoM(sheet, body, varNames, varVals,
+                                            externalCount, mc);
+                    }
+                } else if (at == "layer") {
+                    // 走到这里必然带块（`@layer a, b;` 语句式已被上面的
+                    // `;` 剥离吃掉），匿名 `@layer { ... }` 同样摊平。
+                    Css.ParseRulesIntoM(sheet, body, varNames, varVals,
+                                        externalCount, outer);
+                } else {
+                    sheet.NoteAtRule(at);
+                }
+                continue;
+            }
+            // 选择器列表按顶层逗号切：`:is(.a, .b)` / `[class="a,b"]`
+            // 里的逗号不是分隔符，用朴素的 String.Split 会把一条规则
+            // 劈成两条都解析失败的选择器。
+            List<string> sels = Css.SplitTopTrim(selectors, ",");
+            JsonValue block = Css.ParseBlockWithSources(body, varNames, varVals, externalCount);
+            if (block.Count() == 0) { continue; }
+            int k = 0;
+            while (k < sels.Count) {
+                string sel = sels[k];
+                k = k + 1;
+                if (sel.Length == 0) { continue; }
+                if (sel == ":root") { continue; }
+                if (outer != null) {
+                    sheet.AddMediaRule(sel, block, outer);
+                } else {
+                    Css.MergeInto(sheet, sel, block);
+                }
+            }
+        }
+    }
+
+    /// `@supports` / `@media` 等 at-rule 的名字（去掉 `@`，转小写）。
+    static string AtName(string prelude) {
+        int sp = Css.IndexFrom(prelude, " ", 0);
+        int par = Css.IndexFrom(prelude, "(", 0);
+        int end = prelude.Length;
+        if (sp >= 0 && sp < end) { end = sp; }
+        if (par >= 0 && par < end) { end = par; }
+        return Css.Lower(Css.Trim(prelude.Substring(1, end - 1)));
+    }
+
+    /// at-rule 的 prelude 部分（名字之后、`{` 之前）。
+    static string AtPrelude(string prelude) {
+        int sp = Css.IndexFrom(prelude, " ", 0);
+        int par = Css.IndexFrom(prelude, "(", 0);
+        int at = prelude.Length;
+        if (sp >= 0) { at = sp; }
+        if (par >= 0 && par < at) { at = par; }
+        if (at >= prelude.Length) { return ""; }
+        return Css.Trim(prelude.Substring(at, prelude.Length - at));
+    }
+
+    /// 把 `@media` 的 prelude 解析成可求值条件；解析不了（空、
+    /// 括号不配对、特征语法坏）返回 null——CSS 语义是"not all"，
+    /// 调用方按判假 + 守卫报出处理。
+    static MediaCond ParseMedia(string prelude) {
+        string p = Css.Trim(prelude);
+        if (p == "") { return null; }
+        MediaCond outC = new MediaCond();
+        outC.alts = new List<MediaAlt>();
+        // 逗号分隔 = or。
+        List<string> alts = Css.SplitTopTrim(p, ",");
+        for (int i = 0; i < alts.Count; i = i + 1) {
+            MediaAlt a = Css.ParseMediaAlt(alts[i]);
+            if (a == null) { return null; }
+            outC.alts.Add(a);
+        }
+        return outC;
+    }
+
+    /// 单个备选：`[not] [only] feat [and feat]*`。
+    static MediaAlt ParseMediaAlt(string alt) {
+        string s = Css.Trim(alt);
+        string lo = Css.Lower(s);
+        MediaAlt a = new MediaAlt();
+        a.feats = new List<MediaFeat>();
+        a.neg = false;
+        if (Css.StartsWithStr(lo, "not ")) {
+            a.neg = true;
+            s = Css.Trim(s.Substring(4, s.Length - 4));
+            lo = Css.Lower(s);
+        }
+        if (Css.StartsWithStr(lo, "only ")) {
+            s = Css.Trim(s.Substring(5, s.Length - 5));
+            lo = Css.Lower(s);
+        }
+        if (s == "") { return null; }
+        // `and` 连接（括号外切）。
+        List<string> parts = Css.SplitKeyword(s, " and ");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (!Css.ParseMediaFeatInto(parts[i], a.feats)) { return null; }
+        }
+        return a;
+    }
+
+    /// 解析一条媒体特征并追加进 acc（1 或 2 条）。支持
+    /// `(min-width: 800px)`、裸特征 `(pointer: coarse)`、裸媒体
+    /// 类型、Level 4 单边范围（`(width >= 800px)`、`(800px <=
+    /// width)`——名字在右时方向翻转）与双边链 `(400px <= width
+    /// <= 2000px)`（拆成 min/max 两条特征）。
+    static bool ParseMediaFeatInto(string part, List<MediaFeat> acc) {
+        string p2 = Css.Trim(part);
+        if (p2 == "") { return false; }
+        if (p2.Substring(0, 1) != "(") {
+            // 裸媒体类型：screen / print / all。
+            MediaFeat tf = new MediaFeat();
+            tf.name = Css.Lower(p2);
+            tf.val = "";
+            if (!Css.IsMediaName(tf.name)) { return false; }
+            acc.Add(tf);
+            return true;
+        }
+        if (p2.Substring(p2.Length - 1, 1) != ")") { return false; }
+        string inner = Css.Trim(p2.Substring(1, p2.Length - 2));
+        // 扫出全部比较符（`<=`/`>=` 优先于裸 `<`/`>`）。
+        List<int> opAt = new List<int>();
+        List<string> opTx = new List<string>();
+        int i = 0;
+        while (i < inner.Length) {
+            string c = inner.Substring(i, 1);
+            if (c == "<" || c == ">") {
+                string tx = c;
+                if (i + 1 < inner.Length
+                    && inner.Substring(i + 1, 1) == "=") { tx = tx + "="; }
+                opAt.Add(i);
+                opTx.Add(tx);
+                i = i + tx.Length;
+                continue;
+            }
+            i = i + 1;
+        }
+        if (opAt.Count > 2) { return false; }
+        if (opAt.Count == 2) {
+            // 双边链 `a <= width <= b`：两操作符必须同向。
+            string mid = Css.Lower(Css.Trim(inner.Substring(
+                opAt[0] + opTx[0].Length,
+                opAt[1] - opAt[0] - opTx[0].Length)));
+            string v1 = Css.Trim(inner.Substring(0, opAt[0]));
+            string v2 = Css.Trim(inner.Substring(
+                opAt[1] + opTx[1].Length,
+                inner.Length - opAt[1] - opTx[1].Length));
+            bool up = opTx[0] == "<" || opTx[0] == "<=";
+            bool up2 = opTx[1] == "<" || opTx[1] == "<=";
+            if (!Css.IsMediaName(mid) || v1 == "" || v2 == ""
+                || up != up2) { return false; }
+            MediaFeat f1 = new MediaFeat();
+            f1.name = up ? Css.MinFeatName(mid) : Css.MaxFeatName(mid);
+            f1.val = v1;
+            MediaFeat f2 = new MediaFeat();
+            f2.name = up ? Css.MaxFeatName(mid) : Css.MinFeatName(mid);
+            f2.val = v2;
+            acc.Add(f1);
+            acc.Add(f2);
+            return true;
+        }
+        MediaFeat pf = new MediaFeat();
+        if (opAt.Count == 1) {
+            string op2 = opTx[0];
+            int at2 = opAt[0];
+            string left = Css.Trim(inner.Substring(0, at2));
+            string right = Css.Trim(inner.Substring(
+                at2 + op2.Length, inner.Length - at2 - op2.Length));
+            string lo2 = Css.Lower(left);
+            string ro = Css.Lower(right);
+            bool nameLeft = Css.IsMediaName(lo2);
+            string name = nameLeft ? lo2 : ro;
+            string val = nameLeft ? right : left;
+            if (!Css.IsMediaName(name)) { return false; }
+            bool up = op2 == ">" || op2 == ">=";
+            // 名字在左：`width >= n` 即 min；名字在右：
+            // `n <= width` 同样是 min——方向随位置翻转。
+            pf.name = (nameLeft == up) ? Css.MinFeatName(name)
+                                        : Css.MaxFeatName(name);
+            pf.val = val;
+            acc.Add(pf);
+            return true;
+        }
+        int colon = Css.IndexFrom(inner, ":", 0);
+        if (colon < 0) {
+            pf.name = Css.Lower(Css.Trim(inner));
+            pf.val = "";
+            if (!Css.IsMediaName(pf.name)) { return false; }
+            acc.Add(pf);
+            return true;
+        }
+        pf.name = Css.Lower(Css.Trim(inner.Substring(0, colon)));
+        pf.val = Css.Trim(inner.Substring(colon + 1, inner.Length - colon - 1));
+        if (pf.val == "" || !Css.IsMediaName(pf.name)) { return false; }
+        acc.Add(pf);
+        return true;
+    }
+
+    /// `width` 族特征名 -> `min-` 形式（未知名原样返回，
+    /// 求值时按未知特征判假）。
+    static string MinFeatName(string name) {
+        if (name == "width") { return "min-width"; }
+        if (name == "height") { return "min-height"; }
+        if (name == "aspect-ratio") { return "min-aspect-ratio"; }
+        return name;
+    }
+
+    /// `width` 族特征名 -> `max-` 形式。
+    static string MaxFeatName(string name) {
+        if (name == "width") { return "max-width"; }
+        if (name == "height") { return "max-height"; }
+        if (name == "aspect-ratio") { return "max-aspect-ratio"; }
+        return name;
+    }
+
+    /// 媒体特征名/媒体类型是否是引擎认识的拼写。
+    static bool IsMediaName(string name) {
+        if (name == "screen" || name == "all" || name == "print"
+            || name == "speech" || name == "tv" || name == "tty"
+            || name == "projection" || name == "handheld") { return true; }
+        if (name == "width" || name == "height" || name == "aspect-ratio"
+            || name == "min-width" || name == "max-width"
+            || name == "min-height" || name == "max-height"
+            || name == "min-aspect-ratio" || name == "max-aspect-ratio") { return true; }
+        if (name == "orientation" || name == "prefers-color-scheme"
+            || name == "prefers-reduced-motion" || name == "pointer"
+            || name == "any-pointer" || name == "hover" || name == "any-hover"
+            || name == "grid" || name == "resolution" || name == "display-mode") {
+            return true;
+        }
+        return false;
+    }
+
+    /// 按（括号外的）关键词 `kw` 切分。
+    static List<string> SplitKeyword(string s, string kw) {
+        List<string> outR = new List<string>();
+        int depth = 0;
+        int start = 0;
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "(") { depth = depth + 1; i = i + 1; continue; }
+            if (ch == ")") { if (depth > 0) { depth = depth - 1; } i = i + 1; continue; }
+            if (depth == 0 && i + kw.Length <= s.Length
+                && Css.Lower(s.Substring(i, kw.Length)) == kw) {
+                outR.Add(Css.Trim(s.Substring(start, i - start)));
+                i = i + kw.Length;
+                start = i;
+                continue;
+            }
+            i = i + 1;
+        }
+        outR.Add(Css.Trim(s.Substring(start, s.Length - start)));
+        return outR;
+    }
+
+    /// 求值 `@supports` 条件：静态可判定的子集——`not` / `and` / `or`、
+    /// 括号、以及 `(prop: value)` 声明测试（引擎认得这条声明即为真）。
+    /// `selector(...)` / `font-tech(...)` 等一律假。
+    static bool SupportsCondition(string cond) {
+        string c = Css.Trim(cond);
+        if (c == "") { return false; }
+        // 顶层 `or` 优先（优先级最低）。
+        int o = Css.FindTopKeyword(c, "or");
+        if (o >= 0) {
+            return Css.SupportsCondition(c.Substring(0, o))
+                || Css.SupportsCondition(c.Substring(o + 2, c.Length - o - 2));
+        }
+        int a = Css.FindTopKeyword(c, "and");
+        if (a >= 0) {
+            return Css.SupportsCondition(c.Substring(0, a))
+                && Css.SupportsCondition(c.Substring(a + 3, c.Length - a - 3));
+        }
+        string lo = Css.Lower(c);
+        if (Css.StartsWithStr(lo, "not ")) {
+            return !Css.SupportsCondition(c.Substring(4, c.Length - 4));
+        }
+        if (c.Substring(0, 1) == "(" && c.Substring(c.Length - 1, 1) == ")") {
+            string inner = Css.Trim(c.Substring(1, c.Length - 2));
+            int colon = Css.TopToken(inner, ":");
+            if (colon > 0) {
+                string prop = Css.Trim(inner.Substring(0, colon));
+                string val = Css.Trim(inner.Substring(
+                    colon + 1, inner.Length - colon - 1));
+                return StyleSheet.SupportsDecl(prop, val);
+            }
+            return Css.SupportsCondition(inner);
+        }
+        return false;
+    }
+
+    /// 括号外第一个整词 `kw`（前后是空白或边界）的下标，无则 -1。
+    static int FindTopKeyword(string s, string kw) {
+        int depth = 0;
+        int i = 0;
+        int n = s.Length;
+        while (i < n) {
+            string ch = s.Substring(i, 1);
+            if (ch == "(") { depth = depth + 1; i = i + 1; continue; }
+            if (ch == ")") { depth = depth - 1; i = i + 1; continue; }
+            if (depth == 0 && Css.Lower(ch) == kw.Substring(0, 1)
+                && i + kw.Length <= n
+                && Css.Lower(s.Substring(i, kw.Length)) == kw) {
+                bool before = (i == 0) || Css.Space(s.Substring(i - 1, 1));
+                int after = i + kw.Length;
+                bool okAfter = (after >= n) || Css.Space(s.Substring(after, 1));
+                if (before && okAfter) { return i; }
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// 顶层（括号外）第一个 `tok` 的下标，无则 -1。
+    static int TopToken(string s, string tok) {
+        int depth = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == "(") { depth = depth + 1; }
+            else if (ch == ")") { if (depth > 0) { depth = depth - 1; } }
+            else if (ch == tok && depth == 0) { return i; }
+        }
+        return -1;
+    }
+
+    /// s 是否以 prefix 开头。
+    static bool StartsWithStr(string s, string prefix) {
+        if (s.Length < prefix.Length) { return false; }
+        return s.Substring(0, prefix.Length) == prefix;
+    }
+
+    /// 与 `open`（一个 `{` 的下标）配对的那个 `}`，按嵌套深度找；
+    /// 没有配对时返回 -1。引号里的花括号不计数（`content: "}"`）。
+    static int MatchBrace(string s, int open) {
+        int depth = 0;
+        int i = open;
+        string quote = "";
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (quote != "") {
+                if (ch == "\\") { i = i + 2; continue; }
+                if (ch == quote) { quote = ""; }
+                i = i + 1;
+                continue;
+            }
+            if (ch == "\"" || ch == "'") { quote = ch; }
+            else if (ch == "{") { depth = depth + 1; }
+            else if (ch == "}") {
+                depth = depth - 1;
+                if (depth == 0) { return i; }
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// 单个块的声明，`var(--x)` 已解析，自定义
+    /// 属性被丢弃（它们只用于被引用）。
+    static JsonValue ParseBlock(string body, List<string> varNames,
+                                List<string> varVals) {
+        return Css.ParseBlockWithSources(body, varNames, varVals, 0);
+    }
+
+    static JsonValue ParseBlockWithSources(string body, List<string> varNames,
+                                           List<string> varVals, int externalCount) {
+        JsonValue block = JsonValue.NewObject();
+        JsonValue source = JsonValue.NewObject();
+        JsonValue important = JsonValue.NewObject();
+        List<string> decls = Css.SplitTrim(body, ";");
+        int i = 0;
+        while (i < decls.Count) {
+            string d = decls[i];
+            i = i + 1;
+            if (d.Length == 0) { continue; }
+            int colon = Css.IndexFrom(d, ":", 0);
+            if (colon <= 0) { continue; }
+            string key = Css.Trim(d.Substring(0, colon));
+            string val = Css.Trim(d.Substring(colon + 1, d.Length - colon - 1));
+            if (key.Length == 0 || val.Length == 0) { continue; }
+            if (key.Length > 2 && key.Substring(0, 2) == "--") { continue; }
+            string lowerKey = Css.Lower(key);
+            string plain = Css.StripImportant(Css.ExpandVars(val, varNames, varVals));
+            bool imp = Css.HasImportant(val);
+            // 带 !important 的声明进 `__zan_important`；不带的照旧。
+            // 同一键在块内被两种写法各写一次时，important 的那条胜出
+            // （CSS 语义），所以普通声明不得覆盖已记下的 important。
+            if (imp) { important.Set(lowerKey, JsonValue.NewStr(plain)); }
+            else if (important.Get(lowerKey) == null) {
+                block.Set(lowerKey, JsonValue.NewStr(plain));
+            }
+            // `__zan_prescaled` 是 per-key 的，important/普通两处都要
+            // 记：ApplyImportant 靠它决定是否跳过 DPI 缩放。
+            source.Set(lowerKey, JsonValue.NewBool(
+                Css.IsPrescaledValue(val, varNames, varVals, externalCount)));
+        }
+        if (source.Count() > 0) {
+            block.Set("__zan_prescaled", source);
+        }
+        if (important.Count() > 0) {
+            block.Set("__zan_important", important);
+        }
+        return block;
+    }
+
+    /// Only externally supplied theme font metrics are physical pixels. Local
+    /// :root declarations remain logical, even when they shadow a theme token.
+    /// Follow aliases with the same bounded expansion used by ExpandVars.
+    static bool IsPrescaledValue(string val, List<string> names,
+                                List<string> vals, int externalCount) {
+        string value = val;
+        for (int guard = 0; guard < 8; guard = guard + 1) {
+            int at = Css.IndexFrom(value, "var(", 0);
+            if (at < 0) { return false; }
+            int close = Css.IndexFrom(value, ")", at);
+            if (close < 0) { return false; }
+            string name = Css.Trim(value.Substring(at + 4, close - at - 4));
+            int found = -1;
+            for (int i = 0; i < names.Count; i = i + 1) {
+                if (names[i] == name) { found = i; }
+            }
+            if (found < 0) { return false; }
+            if (found < externalCount && Css.IndexFrom(name, "--font-size-", 0) == 0) {
+                return true;
+            }
+            value = vals[found];
+        }
+        return false;
+    }
+
+    /// 去掉结尾的 `!important`（此处的级联本就是"后规则
+    /// 胜出"，因此该标志没有额外含义）。
+    static string StripImportant(string val) {
+        int at = Css.IndexFrom(Css.Lower(val), "!important", 0);
+        if (at < 0) { return val; }
+        return Css.Trim(val.Substring(0, at));
+    }
+
+    /// 值是否带 `!important`。
+    ///
+    /// 级联里 `!important` 的权重高于一切（连 inline 也压得住）。
+    /// 这里把它实现为「带标记的声明最后再套一遍」：解析时把带标记的
+    /// 声明另存一份到 `__zan_important`，StyleSheet.Apply 在普通级联
+    /// （含 inline）之后统一应用，于是 `label { color: red !important }`
+    /// 真的能压住 inline 的 `color: blue`。
+    ///
+    /// 之前这个标记被直接剥掉、当普通声明处理，等于把"作者明确
+    /// 要求不许被覆盖"降级成"看谁写在后面"——换肤或宿主注入一行
+    /// inline 就能悄悄改掉它。
+    static bool HasImportant(string val) {
+        return Css.IndexFrom(Css.Lower(val), "!important", 0) >= 0;
+    }
+
+    /// 把属性名/关键字转小写（选择器保留大小写，因此 `#Save`
+    /// 仍能匹配名为 `Save` 的控件）。
+    static string Lower(string s) {
+        return s.ToLower();
+    }
+
+    /// `block` 里那条 `!important` 的声明（`k` 不区分大小写），
+    /// 没有时返回 ""。
+    static string ImportantOf(JsonValue block, string k) {
+        if (block == null) { return ""; }
+        JsonValue imp = block.Get("__zan_important");
+        if (imp == null || !imp.IsObject()) { return ""; }
+        JsonValue v = imp.Get(k);
+        if (v == null) { return ""; }
+        return StyleSheet.ValStr(v);
+    }
+
+    /// 把 `block` 的声明加入 `sel`，保留同一选择器早先规则
+    /// 已设置的声明（与 CSS 一样，后规则胜出）。
+    static void MergeInto(StyleSheet sheet, string sel, JsonValue block) {
+        JsonValue existing = sheet.rules.Get(sel);
+        if (existing == null || !existing.IsObject()) {
+            JsonValue copy = JsonValue.NewObject();
+            for (int i = 0; i < block.Count(); i = i + 1) {
+                copy.Set(block.KeyAt(i), block.ValAt(i));
+            }
+            sheet.rules.Set(sel, copy);
+            return;
+        }
+        for (int j = 0; j < block.Count(); j = j + 1) {
+            string key = block.KeyAt(j);
+            if (key == "__zan_prescaled" || key == "__zan_important") {
+                JsonValue oldObj = existing.Get(key);
+                if (oldObj == null || !oldObj.IsObject()) {
+                    oldObj = JsonValue.NewObject();
+                    existing.Set(key, oldObj);
+                }
+                JsonValue newObj = block.ValAt(j);
+                for (int k = 0; k < newObj.Count(); k = k + 1) {
+                    oldObj.Set(newObj.KeyAt(k), newObj.ValAt(k));
+                }
+            } else {
+                existing.Set(key, block.ValAt(j));
+            }
+        }
+    }
+
+    /// 从每个 `:root` 块中读取 `--name: value` 对。
+    static void CollectVars(string s, List<string> names, List<string> vals) {
+        int i = 0;
+        while (i < s.Length) {
+            int open = Css.IndexFrom(s, "{", i);
+            if (open < 0) { return; }
+            int close = Css.MatchBrace(s, open);
+            if (close < 0) { return; }
+            string sel = Css.Trim(s.Substring(i, open - i));
+            string body = s.Substring(open + 1, close - open - 1);
+            i = close + 1;
+            // `@media (...) { :root { ... } }` 里的变量不是全局的，
+            // 而且这个 sel 是 `@media (...)` 加内层选择器——不是
+            // `:root`，所以直接跳过（收集阶段不为嵌套块递归）。
+            if (sel != ":root") { continue; }
+            List<string> decls = Css.SplitTrim(body, ";");
+            int k = 0;
+            while (k < decls.Count) {
+                string d = decls[k];
+                k = k + 1;
+                int colon = Css.IndexFrom(d, ":", 0);
+                if (colon <= 0) { continue; }
+                string key = Css.Trim(d.Substring(0, colon));
+                if (key.Length <= 2 || key.Substring(0, 2) != "--") { continue; }
+                names.Add(key);
+                vals.Add(Css.Trim(d.Substring(colon + 1, d.Length - colon - 1)));
+            }
+        }
+    }
+
+    /// 替换 `val` 中的每个 `var(--name)`；未知名称展开为 ""。
+    static string ExpandVars(string val, List<string> names, List<string> vals) {
+        string s = val;
+        for (int guard = 0; guard < 8; guard = guard + 1) {
+            int at = Css.IndexFrom(s, "var(", 0);
+            if (at < 0) { return s; }
+            int close = Css.MatchParen(s, at + 3);
+            if (close < 0) { return s; }
+            string inner = Css.Trim(s.Substring(at + 4, close - at - 4));
+            // `var(--x, fallback)`：取第一个顶层逗号之前的名字，
+            // 之后（含逗号）是回退值。回退值里还能再写 var()，
+            // 所以整串替换后由外层 guard 循环继续展开。
+            int comma = Css.TopComma(inner);
+            string name = inner;
+            string fb = "";
+            bool hasFb = false;
+            if (comma >= 0) {
+                name = Css.Trim(inner.Substring(0, comma));
+                fb = Css.Trim(inner.Substring(
+                    comma + 1, inner.Length - comma - 1));
+                hasFb = true;
+            }
+            string rep = "";
+            bool found = false;
+            for (int i = 0; i < names.Count; i = i + 1) {
+                if (names[i] == name) { rep = vals[i]; found = true; }
+            }
+            // 未定义（含空值）时用回退值：这是 `var(--x, 8px)` 的全部
+            // 意义，也是「换肤时少给一个令牌就整条声明消失」的解法。
+            if (!found || rep == "") {
+                if (hasFb) { rep = fb; }
+                else if (!found) {
+                    s = s.Substring(0, at)
+                        + s.Substring(close + 1, s.Length - close - 1);
+                    continue;
+                }
+            }
+            s = s.Substring(0, at) + rep + s.Substring(close + 1, s.Length - close - 1);
+        }
+        return s;
+    }
+
+    /// 与 `open`（一个 `(` 的下标）配对的那个 `)`，按嵌套深度找；
+    /// 没有配对时返回 -1。`var(--x, rgba(0,0,0,.4))` 的第一个 `)` 是
+    /// 内层 rgba 的，直接取会把回退值截断成 `rgba(0,0,0,.4`。
+    static int MatchParen(string s, int open) {
+        int depth = 0;
+        int i = open;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "(") { depth = depth + 1; }
+            else if (ch == ")") {
+                depth = depth - 1;
+                if (depth == 0) { return i; }
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// `s` 中第一个括号外层的 `,` 下标，没有时 -1。
+    static int TopComma(string s) {
+        int depth = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == "(") { depth = depth + 1; }
+            else if (ch == ")") { if (depth > 0) { depth = depth - 1; } }
+            else if (ch == "," && depth == 0) { return i; }
+        }
+        return -1;
+    }
+
+    /// 删除 `/* ... */` 注释（逐片处理，大样式表只需一趟
+    /// 而非每字符一个字符串）。
+    static string StripComments(string src) {
+        string outp = "";
+        int i = 0;
+        while (i < src.Length) {
+            int open = Css.IndexFrom(src, "/*", i);
+            if (open < 0) {
+                return outp + src.Substring(i, src.Length - i);
+            }
+            outp = outp + src.Substring(i, open - i);
+            int end = Css.IndexFrom(src, "*/", open + 2);
+            if (end < 0) { return outp; }
+            i = end + 2;
+        }
+        return outp;
+    }
+
+    /// 按 `sep` 拆分并修剪每部分（空白和换行）。
+    static List<string> SplitTrim(string s, string sep) {
+        List<string> outp = new List<string>();
+        List<string> parts = s.Split(sep);
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            outp.Add(Css.Trim(parts[i]));
+        }
+        return outp;
+    }
+
+    /// 按顶层 `sep`（单字符）拆分并修剪每部分：括号内与引号内的分隔符
+    /// 不拆，因此 `linear-gradient(90deg, rgba(0,0,0,.5), #fff)` 的
+    /// 函数式颜色停靠点、`[class="a,b"]` 的属性值、`tab:is(.a, .b)`
+    /// 的选择器列表都作为整体保留。
+    static List<string> SplitTopTrim(string s, string sep) {
+        List<string> outp = new List<string>();
+        int depth = 0;
+        string quote = "";
+        int start = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (quote != "") {
+                if (ch == "\\") { i = i + 1; continue; }
+                if (ch == quote) { quote = ""; }
+                continue;
+            }
+            if (ch == "\"" || ch == "'") { quote = ch; continue; }
+            if (ch == "(") { depth = depth + 1; }
+            else if (ch == ")") { if (depth > 0) { depth = depth - 1; } }
+            else if (ch == sep && depth == 0) {
+                outp.Add(Css.Trim(s.Substring(start, i - start)));
+                start = i + 1;
+            }
+        }
+        outp.Add(Css.Trim(s.Substring(start, s.Length - start)));
+        return outp;
+    }
+
+    /// 选择器文本的 token 化：复合选择器原文与组合器交替。显式组合器
+    /// （`>`/`+`/`~`）各占一个 token，纯空隙产出单空格 token（后代
+    /// 组合器）；括号与引号内的符号和空白原样保留，因此 `:not(a > b)`、
+    /// `[title="a b"]` 仍是一个完整的复合块。
+    static List<string> SelectorTokens(string s) {
+        List<string> items = new List<string>();
+        string cur = "";
+        int depth = 0;
+        string quote = "";
+        bool ws = false;
+        int i = 0;
+        int n = s.Length;
+        while (i < n) {
+            string ch = s.Substring(i, 1);
+            i = i + 1;
+            if (quote != "") {
+                cur = cur + ch;
+                if (ch == "\\" && i < n) {
+                    cur = cur + s.Substring(i, 1);
+                    i = i + 1;
+                    continue;
+                }
+                if (ch == quote) { quote = ""; }
+                continue;
+            }
+            if (ch == "\"" || ch == "'") {
+                quote = ch;
+                cur = cur + ch;
+                ws = false;
+                continue;
+            }
+            if (ch == "[" || ch == "(") { depth = depth + 1; cur = cur + ch; ws = false; continue; }
+            if (ch == "]" || ch == ")") { depth = depth - 1; cur = cur + ch; continue; }
+            if (depth > 0) { cur = cur + ch; continue; }
+            if (Css.Space(ch)) {
+                if (cur != "") { ws = true; }
+                continue;
+            }
+            if (ch == ">" || ch == "+" || ch == "~") {
+                if (cur != "") { items.Add(cur); cur = ""; }
+                items.Add(ch);
+                ws = false;
+                continue;
+            }
+            if (ws) {
+                items.Add(cur);
+                cur = "";
+                items.Add(" ");
+                ws = false;
+            }
+            cur = cur + ch;
+        }
+        if (cur != "") { items.Add(cur); }
+        return items;
+    }
+
+    /// `s` 中从 `start` 起首次出现 `needle` 的下标，无则 -1。
+    static int IndexFrom(string s, string needle, int start) {
+        int from = start;
+        if (from < 0) { from = 0; }
+        if (from > s.Length) { return -1; }
+        int at = s.Substring(from, s.Length - from).IndexOf(needle);
+        if (at < 0) { return -1; }
+        return from + at;
+    }
+
+    /// ch 是否为空白字符（空格/制表/回车/换行）。
+    static bool Space(string ch) {
+        return ch == " " || ch == "\t" || ch == "\r" || ch == "\n";
+    }
+
+    /// 去除两端的空白字符。
+    static string Trim(string s) {
+        int a = 0;
+        int b = s.Length;
+        for (; a < b && Css.Space(s.Substring(a, 1)); a = a + 1) { }
+        while (b > a && Css.Space(s.Substring(b - 1, 1))) { b = b - 1; }
+        return s.Substring(a, b - a);
+    }
+}
+
+/// `[attr op "value"]` 里的一个 class 属性条件（见 Selector.attrs）。
+/// op 为 "" 表示存在性（`[class]`），否则是 `= ~= |= ^= $= *=`。
+class AttrCond {
+    string op;
+    string val;
+    bool nocase;
+}
+
+/// 一个已解析的选择器：最右侧复合块是主体（`panel.card > .head .title:hover`
+/// 的主体是 `.title:hover`），左侧的复合块经 `up`/`combo` 挂成链。主体块拆成
+/// 类型名、类链、id、部件与状态；另加属性条件（`[class*="frag"]` / `[disabled]`）、
+/// `:not()/:is()/:where()` 与结构性伪类（`:nth-child()` 等）。
+///
+/// 组合器链和结构性伪类要真实的树上下文才能求值：带 Control 的 retained
+/// 路径（`MatchNodeCtx`）按 parent/children 匹配；immediate 路径（`MatchNode`）
+/// 没有节点可看，这些选择器整体不命中（规则不丢，换到 retained 树里就活）。
+/// 两者都不静默——Lint 会把"只在 retained 树生效"的条数汇总报出。
+class Selector {
+    string type;
+    /// `*` 通配：匹配任意类型（权重 0）。
+    bool universal;
+    string classes;   // 以空格分隔，无类时为 ""
+    /// classes 的预切分形式（匹配热路径上不再分配）。
+    List<string> classList;
+    string id;
+    string part;
+    /// 以空格分隔的伪类名（`:hover:selected` -> "hover selected"），
+    /// 无状态时为 ""。多个伪类是与关系，因此"选中且悬停"
+    /// 这类组合外观能写在 CSS 里，而不必回到代码里分支。
+    string state;
+    /// `[class*="frag"]` 里的 frag：class 属性原文的子串匹配，
+    /// 用于 `custom-{hex}` 这类复合 class 片段（无该条件时为 ""）。
+    /// 大小写敏感的子串条件才走这个快路径，其余走 attrs。
+    string clsContains;
+    /// class 上的属性条件（`[class^="x"]` 等）。
+    List<AttrCond> attrs;
+    /// 必须置位的状态位（`:hover`、`[disabled]`）。
+    int reqMask;
+    /// 必须清零的状态位（`:enabled`、`[disabled="false"]`）。
+    int forbidMask;
+    /// `:not(...)`：其中任一命中则本选择器不匹配。
+    List<Selector> nots;
+    /// `:is(...)` / `:where(...)`：任一命中即命中（前者计特异性，后者不计）。
+    List<Selector> ises;
+    List<Selector> wheres;
+    /// 主体左侧的复合块（null = 没有链，主体就是整个选择器）。
+    /// 链上的状态/伪类按被匹配祖先自身最近一次解析的状态求值。
+    Selector up;
+    /// `up` 与本块之间的连接器：0 后代（空隙）、1 子（`>`）、
+    /// 2 相邻兄弟（`+`）、3 通用兄弟（`~`）。
+    int combo;
+    /// 结构性伪类码（StructCode：1 first-child … 12 root），0 无。
+    /// 要兄弟/父子信息，仅在带树上下文的匹配里可判定。
+    int structCode;
+    /// `:nth-child(an+b)` 系参数（结构码 4/5/9/10 时有效）。
+    int anbA;
+    int anbB;
+    /// 语法接受但引擎无法判定（生成内容的伪元素、无法求值的
+    /// `:not()`、`:has()`）时置位，永不匹配。
+    bool never;
+    /// never 的原因（Lint 用它把"写了没反应"说清楚）。
+    string why;
+
+    /// 解析一个选择器：先按组合器切成复合块序列（从右往左挂链），
+    /// 再逐块走 ParseCompound。引擎无法建模的块按约定返回 null
+    /// （丢弃整条规则）或置 never（永不匹配），二者都不静默。
+    static Selector Parse(string sel) {
+        string s = Css.Trim(sel);
+        if (s == "" || s == ":root") { return null; }
+        List<string> items = Css.SelectorTokens(s);
+        List<string> chunks = new List<string>();
+        List<int> conns = new List<int>();
+        int conn = 0 - 1;
+        for (int i = 0; i < items.Count; i = i + 1) {
+            string it = items[i];
+            if (it == ">") { conn = 1; }
+            else if (it == "+") { conn = 2; }
+            else if (it == "~") { conn = 3; }
+            else if (it == " ") { if (conn < 0) { conn = 0; } }
+            else {
+                chunks.Add(it);
+                conns.Add(conn < 0 ? 0 : conn);
+                conn = 0 - 1;
+            }
+        }
+        if (chunks.Count == 0) { return null; }
+        Selector subject = Selector.ParseCompound(chunks[chunks.Count - 1]);
+        if (subject == null) { return null; }
+        Selector cur = subject;
+        int k = chunks.Count - 1;
+        while (k >= 1) {
+            Selector link = Selector.ParseCompound(chunks[k - 1]);
+            if (link == null) { return null; }
+            cur.up = link;
+            cur.combo = conns[k];
+            cur = link;
+            k = k - 1;
+        }
+        return subject;
+    }
+
+    /// 解析单个复合选择器（不含组合器）：`button.ghost.primary::icon:hover`。
+    /// 引擎不建模的形式按约定返回 null 或置 never。
+    static Selector ParseCompound(string sel) {
+        string s = Css.Trim(sel);
+        if (s == "" || s == ":root") { return null; }
+        Selector p = new Selector();
+        p.type = "";
+        p.universal = false;
+        p.classes = "";
+        p.classList = new List<string>();
+        p.id = "";
+        p.part = "";
+        p.state = "";
+        p.clsContains = "";
+        p.attrs = new List<AttrCond>();
+        p.reqMask = 0;
+        p.forbidMask = 0;
+        p.nots = new List<Selector>();
+        p.ises = new List<Selector>();
+        p.wheres = new List<Selector>();
+        p.up = null;
+        p.combo = 0;
+        p.structCode = 0;
+        p.anbA = 0;
+        p.anbB = 0;
+        p.never = false;
+        p.why = "";
+        int i = 0;
+        int n = s.Length;
+        if (n > 0 && s.Substring(0, 1) == "*") { p.universal = true; i = 1; }
+        else {
+            for (; i < n && Selector.NameChar(s.Substring(i, 1)); i = i + 1) {
+                p.type = p.type + s.Substring(i, 1);
+            }
+            // type 选择器大小写不敏感地匹配控件类型：StyleType()
+            // 给的是 Kind() 的小写形式，CSS 侧同样折到小写
+            // （class/id 仍严格区分大小写）。
+            p.type = p.type.ToLower();
+        }
+        while (i < n) {
+            string ch = s.Substring(i, 1);
+            if (ch == "[") {
+                int close = Css.IndexFrom(s, "]", i);
+                if (close < 0) { return null; }
+                if (!p.AddAttr(Css.Trim(s.Substring(i + 1, close - i - 1)))) {
+                    return null;
+                }
+                i = close + 1;
+                continue;
+            }
+            if (ch == ":") {
+                int ni = p.Pseudo(s, i);
+                if (ni < 0) { return null; }
+                i = ni;
+                continue;
+            }
+            if (ch == "." || ch == "#") {
+                int j = i + 1;
+                string name = "";
+                while (j < n && Selector.NameChar(s.Substring(j, 1))) {
+                    name = name + s.Substring(j, 1);
+                    j = j + 1;
+                }
+                if (name == "") { return null; }
+                if (ch == ".") {
+                    if (p.classes == "") { p.classes = name; }
+                    else { p.classes = p.classes + " " + name; }
+                    p.classList.Add(name);
+                } else {
+                    p.id = name;
+                }
+                i = j;
+                continue;
+            }
+            return null;
+        }
+        return p;
+    }
+
+    /// 处理 `at` 处的 `:`：`::part`、`:state`、`[pseudo-element]`、
+    /// `:not()/:is()/:where()` 或结构性伪类（`:nth-child()` 等）。
+    /// 返回下一个下标，硬错误（无法配对）返回 -1。
+    int Pseudo(string s, int at) {
+        int n = s.Length;
+        int start = at + 1;
+        bool isPart = false;
+        if (start < n && s.Substring(start, 1) == ":") { isPart = true; start = start + 1; }
+        int j = start;
+        string name = "";
+        while (j < n && Selector.NameChar(s.Substring(j, 1))) {
+            name = name + s.Substring(j, 1);
+            j = j + 1;
+        }
+        if (name == "") { return -1; }
+        if (isPart) {
+            if (Selector.IsGenerated(name)) {
+                // `::before` 与 `:before` 同义，都是要生成内容的伪元素：
+                // 双冒号这条以前会落成部件名静默不匹配，现在按永不匹配报出。
+                never = true;
+                why = "pseudo-element '" + name + "' needs generated content";
+                return j;
+            }
+            part = name;
+            return j;
+        }
+        bool func = (j < n && s.Substring(j, 1) == "(");
+        if (func) {
+            int close = Css.MatchParen(s, j);
+            if (close < 0) { return -1; }
+            string inner = s.Substring(j + 1, close - j - 1);
+            string lo = Css.Lower(name);
+            if (lo == "not") {
+                List<Selector> sub = Selector.ParseList(inner);
+                bool determinate = sub.Count > 0;
+                for (int q = 0; q < sub.Count; q = q + 1) {
+                    if (sub[q] == null || sub[q].never) { determinate = false; }
+                }
+                // 内层带树条件（`:not(:first-child)`）时不再保守置 never：
+                // 匹配期的 MatchNodeCtx 会带上下文递归求值。只有解析不出
+                // 或内层永不匹配（`:not(#nope)` 恒真除外）才落 never。
+                if (!determinate) {
+                    never = true;
+                    why = "':not()' argument cannot be evaluated";
+                }
+                for (int q = 0; q < sub.Count; q = q + 1) {
+                    if (sub[q] != null) { nots.Add(sub[q]); }
+                }
+            } else if (lo == "is" || lo == "where") {
+                List<Selector> sub = Selector.ParseList(inner);
+                bool any = false;
+                for (int q = 0; q < sub.Count; q = q + 1) {
+                    if (sub[q] != null && !sub[q].never) {
+                        any = true;
+                        if (lo == "is") { ises.Add(sub[q]); }
+                        else { wheres.Add(sub[q]); }
+                    }
+                }
+                if (!any) {
+                    never = true;
+                    why = "':" + lo + "()' has no matchable alternative";
+                }
+            } else {
+                int sc = Selector.StructCode(name);
+                if (sc == 0) {
+                    // `:has()` / `:lang()` 等：语法接受，但本引擎没有
+                    // 对应信息可判定，永不匹配。
+                    never = true;
+                    why = "functional pseudo-class ':" + name
+                        + "()' cannot be evaluated";
+                    return close + 1;
+                }
+                if (sc == 4 || sc == 5 || sc == 9 || sc == 10) {
+                    if (!SetAnB(inner)) {
+                        never = true;
+                        why = "':" + lo + "(" + inner + ")' is not an an+b argument";
+                        return close + 1;
+                    }
+                }
+                structCode = sc;
+            }
+            return close + 1;
+        }
+        if (Selector.IsPseudoElement(name)) {
+            if (Selector.IsGenerated(name)) {
+                // `::before`/`::after`/`::first-line`/`::first-letter` 要
+                // 生成内容或行盒，retained/immediate 控件模型没有对应
+                // 绘制原语，语法接受但永不匹配（Lint 报出来）。
+                never = true;
+                why = "pseudo-element '" + name + "' needs generated content";
+                return j;
+            }
+            // 其余标准伪元素（`:placeholder` 是 `::placeholder` 的旧拼写）
+            // 统一归到部件，于是 `input:placeholder` 与 `input::placeholder`
+            // 等价，部件存在就命中。
+            part = name;
+            return j;
+        }
+        int bit = Style.StateBit(name);
+        if (bit != 0) {
+            if (state == "") { state = name; }
+            else { state = state + " " + name; }
+            reqMask = reqMask | bit;
+            return j;
+        }
+        if (name == "enabled") {
+            forbidMask = forbidMask | Style.SDisabled();
+            if (state == "") { state = name; } else { state = state + " " + name; }
+            return j;
+        }
+        int sc2 = Selector.StructCode(name);
+        if (sc2 != 0) {
+            // 结构性伪类（`:first-child`/`:last-child`/`:empty`…）：
+            // 要兄弟/父子信息，匹配期在 retained 树上求值。
+            structCode = sc2;
+            return j;
+        }
+        // 拼错的伪类：无信息可判定，标记 never（而不是当无状态规则
+        // 误命中）。
+        never = true;
+        why = "pseudo-class ':" + name + "' cannot be evaluated";
+        return j;
+    }
+
+    /// 结构性伪类名 -> 码。0 = 不是结构性伪类。
+    static int StructCode(string name) {
+        if (name == "first-child") { return 1; }
+        if (name == "last-child") { return 2; }
+        if (name == "only-child") { return 3; }
+        if (name == "nth-child") { return 4; }
+        if (name == "nth-last-child") { return 5; }
+        if (name == "first-of-type") { return 6; }
+        if (name == "last-of-type") { return 7; }
+        if (name == "only-of-type") { return 8; }
+        if (name == "nth-of-type") { return 9; }
+        if (name == "nth-last-of-type") { return 10; }
+        if (name == "empty") { return 11; }
+        if (name == "root") { return 12; }
+        return 0;
+    }
+
+    /// 解析 `an+b` 参数（空格容忍）：odd/even/`3`/`n`/`-n+3`/`2n-1`。
+    bool SetAnB(string arg) {
+        string s = Css.Lower(Css.Trim(arg));
+        string t = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch != " ") { t = t + ch; }
+        }
+        if (t == "odd") { anbA = 2; anbB = 1; return true; }
+        if (t == "even") { anbA = 2; anbB = 0; return true; }
+        int nAt = Css.IndexFrom(t, "n", 0);
+        if (nAt < 0) {
+            int v = 0;
+            if (!Selector.SignedInt(t, out v)) { return false; }
+            anbA = 0;
+            anbB = v;
+            return true;
+        }
+        string aPart = t.Substring(0, nAt);
+        string bPart = t.Substring(nAt + 1, t.Length - nAt - 1);
+        int a = 1;
+        if (aPart == "-") { a = 0 - 1; }
+        else if (aPart != "" && aPart != "+") {
+            if (!Selector.SignedInt(aPart, out a)) { return false; }
+        }
+        int b = 0;
+        if (bPart != "") {
+            if (!Selector.SignedInt(bPart, out b)) { return false; }
+        }
+        anbA = a;
+        anbB = b;
+        return true;
+    }
+
+    /// 带符号十进制整数（`-3`/`+7`/`12`），坏文本返回 false。
+    static bool SignedInt(string s, out int v) {
+        v = 0;
+        if (s.Length == 0) { return false; }
+        string t = s;
+        int sign = 1;
+        if (t.Substring(0, 1) == "+") { t = t.Substring(1, t.Length - 1); }
+        else if (t.Substring(0, 1) == "-") {
+            sign = 0 - 1;
+            t = t.Substring(1, t.Length - 1);
+        }
+        if (t.Length == 0) { return false; }
+        for (int i = 0; i < t.Length; i = i + 1) {
+            if (!StyleSheet.Digit(t.Substring(i, 1))) { return false; }
+        }
+        v = sign * StyleSheet.Num(t);
+        return true;
+    }
+
+    /// 1 基序号是否落在 `anA*n + anbB` 的序列里（n = 0,1,2,…）。
+    bool MatchAnB(int idx) {
+        if (anbA == 0) { return idx == anbB; }
+        int d = idx - anbB;
+        if (anbA > 0) { return d >= 0 && d % anbA == 0; }
+        return d <= 0 && d % anbA == 0;
+    }
+
+    /// 逗号分隔的选择器列表（`:not(a, b)` 内层）；无法解析的项留 null。
+    static List<Selector> ParseList(string text) {
+        List<Selector> outR = new List<Selector>();
+        List<string> parts = Css.SplitTopTrim(text, ",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            outR.Add(Selector.Parse(parts[i]));
+        }
+        return outR;
+    }
+
+    /// 解析 `[...]` 的内容并记入本选择器；不建模的属性返回 false
+    /// （调用方因此丢弃整条规则，与旧行为一致）。
+    bool AddAttr(string inner) {
+        int k = 0;
+        int m = inner.Length;
+        string name = "";
+        // 属性名不能吃到运算符字符（`^`/`$`/`|` 也是合法名字符，
+        // 但在 `[...]` 里它们是 `^=`/`$=`/`|=` 的开头）。
+        while (k < m) {
+            string c0 = inner.Substring(k, 1);
+            if (Css.Space(c0) || c0 == "=" || c0 == "~" || c0 == "|"
+                || c0 == "^" || c0 == "$" || c0 == "*") {
+                break;
+            }
+            name = name + c0;
+            k = k + 1;
+        }
+        name = Css.Lower(name);
+        if (name == "") { return false; }
+        while (k < m && Css.Space(inner.Substring(k, 1))) { k = k + 1; }
+        string op = "";
+        string val = "";
+        bool nocase = false;
+        if (k < m) {
+            string c = inner.Substring(k, 1);
+            if (c == "=") { op = "="; k = k + 1; }
+            else if ((c == "~" || c == "|" || c == "^" || c == "$" || c == "*")
+                     && k + 1 < m && inner.Substring(k + 1, 1) == "=") {
+                op = c + "=";
+                k = k + 2;
+            } else {
+                return false;
+            }
+            while (k < m && Css.Space(inner.Substring(k, 1))) { k = k + 1; }
+            if (k < m && (inner.Substring(k, 1) == "\""
+                          || inner.Substring(k, 1) == "'")) {
+                string q = inner.Substring(k, 1);
+                int e = Css.IndexFrom(inner, q, k + 1);
+                if (e < 0) { return false; }
+                val = inner.Substring(k + 1, e - k - 1);
+                k = e + 1;
+            } else {
+                while (k < m && !Css.Space(inner.Substring(k, 1))) {
+                    val = val + inner.Substring(k, 1);
+                    k = k + 1;
+                }
+            }
+            while (k < m && Css.Space(inner.Substring(k, 1))) { k = k + 1; }
+            if (k < m) {
+                string f = Css.Lower(inner.Substring(k, 1));
+                if (f == "i") { nocase = true; k = k + 1; }
+                else if (f == "s") { k = k + 1; }
+                else { return false; }
+                while (k < m && Css.Space(inner.Substring(k, 1))) { k = k + 1; }
+                if (k < m) { return false; }
+            }
+            if (val == "") { return false; }
+        }
+        if (name == "class") {
+            AttrCond a = new AttrCond();
+            a.op = op;
+            a.val = val;
+            a.nocase = nocase;
+            attrs.Add(a);
+            if (op == "*=" && !nocase && clsContains == "") { clsContains = val; }
+            return true;
+        }
+        // 布尔属性映射到已有状态位：`[disabled]` 就是 `:disabled`，
+        // `[checked]` / `[selected]` 同理。这让网页 CSS 里最常见的
+        // 属性选择器直接生效，而不是整条规则被丢弃。
+        int bit = Selector.AttrState(name);
+        if (bit == 0) {
+            // 语法上认得这条属性选择器，但引擎观察不到该属性
+            // （`[hidden]`、`[type="text"]`、`[href]`…）。保守取不匹配，
+            // 由 Lint 点名，而不是让整条规则静默消失。
+            never = true;
+            if (why == "") {
+                why = "attribute '[" + name + "]' cannot be evaluated";
+            }
+            return true;
+        }
+        bool truthy = true;
+        if (op != "") {
+            string lo = Css.Lower(val);
+            if (lo == "false" || lo == "0" || lo == "off" || lo == "no"
+                || lo == "none") {
+                truthy = false;
+            }
+        }
+        if (truthy) { reqMask = reqMask | bit; }
+        else { forbidMask = forbidMask | bit; }
+        return true;
+    }
+
+    /// 布尔属性名对应的状态位（无对应返回 0）。
+    static int AttrState(string name) {
+        if (name == "disabled") { return Style.SDisabled(); }
+        if (name == "checked") { return Style.SChecked(); }
+        if (name == "selected") { return Style.SSelected(); }
+        return 0;
+    }
+
+    /// 是否为 CSS 标准伪元素名（单冒号旧拼写也要认成部件）。
+    static bool IsPseudoElement(string name) {
+        if (name == "before" || name == "after") { return true; }
+        if (name == "first-line" || name == "first-letter") { return true; }
+        if (name == "placeholder" || name == "selection" || name == "marker") {
+            return true;
+        }
+        if (name == "backdrop" || name == "file-selector-button") { return true; }
+        if (name == "caret" || name == "scrollbar" || name == "track"
+            || name == "thumb") {
+            return true;
+        }
+        return false;
+    }
+
+    /// 需要生成内容/行盒的伪元素：只能标记永不匹配，不能当部件。
+    static bool IsGenerated(string name) {
+        return name == "before" || name == "after"
+            || name == "first-line" || name == "first-letter";
+    }
+
+    /// 规则 `i` 是否选中给定的节点（无树上下文版本：组合器链与
+    /// 结构性伪类整体不命中——immediate 路径没有节点可看）。
+    bool MatchNode(string nodeType, List<string> classes, string cls, string nodeId,
+                   string nodePart, int stateBits) {
+        return this.MatchNodeCtx(nodeType, classes, cls, nodeId, nodePart,
+                                 stateBits, null);
+    }
+
+    /// 带树上下文的匹配：`node` 是主体控件（retained 树的节点），
+    /// 组合器沿 parent/children 求值，结构性伪类按兄弟信息求值。
+    bool MatchNodeCtx(string nodeType, List<string> classes, string cls,
+                      string nodeId, string nodePart, int stateBits,
+                      Control node) {
+        if (never) { return false; }
+        if (part != nodePart) { return false; }
+        if (type != "" && type != nodeType) { return false; }
+        if (id != "" && (nodeId == "" || id != nodeId)) { return false; }
+        if ((stateBits & reqMask) != reqMask) { return false; }
+        if ((stateBits & forbidMask) != 0) { return false; }
+        if (clsContains != "" && (cls == "" || Css.IndexFrom(cls, clsContains, 0) < 0)) {
+            return false;
+        }
+        for (int k = 0; k < classList.Count; k = k + 1) {
+            if (!StyleSheet.Holds(classes, classList[k])) { return false; }
+        }
+        for (int a = 0; a < attrs.Count; a = a + 1) {
+            if (!Selector.MatchAttr(attrs[a], classes, cls)) { return false; }
+        }
+        for (int t = 0; t < nots.Count; t = t + 1) {
+            if (nots[t].MatchNodeCtx(nodeType, classes, cls, nodeId, nodePart,
+                                     stateBits, node)) {
+                return false;
+            }
+        }
+        if (ises.Count + wheres.Count > 0) {
+            bool any = false;
+            for (int q = 0; q < ises.Count; q = q + 1) {
+                if (ises[q].MatchNodeCtx(nodeType, classes, cls, nodeId,
+                                         nodePart, stateBits, node)) {
+                    any = true;
+                }
+            }
+            for (int w = 0; w < wheres.Count; w = w + 1) {
+                if (wheres[w].MatchNodeCtx(nodeType, classes, cls, nodeId,
+                                           nodePart, stateBits, node)) {
+                    any = true;
+                }
+            }
+            if (!any) { return false; }
+        }
+        if (structCode != 0) {
+            if (node == null || !this.MatchStruct(node)) { return false; }
+        }
+        if (up != null) {
+            if (node == null || !this.MatchChain(up, node)) { return false; }
+        }
+        return true;
+    }
+
+    /// 组合器连接：`up` 复合块要能在 `node` 的对应近邻上命中。
+    /// 链上的状态位按近邻控件最近一次解析的状态求值（未解析过
+    /// 视为常态）——不是完全实时，但比一律按常态强。
+    bool MatchChain(Selector up, Control node) {
+        Control par = node.parent;
+        if (combo == 1) {
+            if (par == null) { return false; }
+            return up.MatchNodeCtx(par.StyleType(), Style.Classes(par.Class),
+                                   par.Class, par.name, "",
+                                   Style.NodeState(par), par);
+        }
+        if (combo == 2) {
+            Control prev = Selector.SiblingAt(par, node, 1);
+            if (prev == null) { return false; }
+            return up.MatchNodeCtx(prev.StyleType(), Style.Classes(prev.Class),
+                                   prev.Class, prev.name, "",
+                                   Style.NodeState(prev), prev);
+        }
+        if (combo == 3) {
+            int back = 1;
+            while (true) {
+                Control sib = Selector.SiblingAt(par, node, back);
+                if (sib == null) { return false; }
+                if (up.MatchNodeCtx(sib.StyleType(), Style.Classes(sib.Class),
+                                    sib.Class, sib.name, "",
+                                    Style.NodeState(sib), sib)) {
+                    return true;
+                }
+                back = back + 1;
+            }
+        }
+        // 后代：任一祖先命中即可。
+        Control anc = par;
+        while (anc != null) {
+            if (up.MatchNodeCtx(anc.StyleType(), Style.Classes(anc.Class),
+                                anc.Class, anc.name, "",
+                                Style.NodeState(anc), anc)) {
+                return true;
+            }
+            anc = anc.parent;
+        }
+        return false;
+    }
+
+    /// `node` 往前数第 `back` 个兄弟（1 = 紧邻的前一个），越界为 null。
+    /// 兄弟关系只看 children（与 CSS 的元素兄弟一致，不区分可见性）。
+    static Control SiblingAt(Control par, Control node, int back) {
+        if (par == null) { return null; }
+        int idx = par.IndexOf(node);
+        if (idx < 0 || idx - back < 0) { return null; }
+        return par.children[idx - back];
+    }
+
+    /// 结构性伪类在真实节点上的求值。没有父节点的根视为
+    /// 首子 + 末子 + 唯一子（CSS 里根元素同样如此）。
+    bool MatchStruct(Control node) {
+        Control par = node.parent;
+        int idx = par == null ? 0 : par.IndexOf(node);
+        int count = par == null ? 1 : par.ChildCount();
+        if (structCode == 1) { return idx == 0; }
+        if (structCode == 2) { return idx == count - 1; }
+        if (structCode == 3) { return count == 1; }
+        if (structCode == 4) { return this.MatchAnB(idx + 1); }
+        if (structCode == 5) { return this.MatchAnB(count - idx); }
+        if (structCode == 11) { return node.ChildCount() == 0; }
+        if (structCode == 12) { return par == null; }
+        if (structCode >= 6 && structCode <= 10) {
+            string ty = node.StyleType();
+            int before = 0;
+            int after = 0;
+            for (int i = 0; i < count; i = i + 1) {
+                Control sib = par.children[i];
+                if (sib == node || sib.StyleType() != ty) { continue; }
+                if (i < idx) { before = before + 1; }
+                else { after = after + 1; }
+            }
+            if (structCode == 6) { return before == 0; }
+            if (structCode == 7) { return after == 0; }
+            if (structCode == 8) { return before == 0 && after == 0; }
+            if (structCode == 9) { return this.MatchAnB(before + 1); }
+            return this.MatchAnB(after + 1);
+        }
+        return false;
+    }
+
+    /// 此选择器是否依赖树上下文（组合器链或结构性伪类）：
+    /// immediate 路径不会命中，Lint 按它汇总"只在 retained 树生效"。
+    bool Relational() {
+        return up != null || structCode != 0;
+    }
+
+    /// 一个 class 属性条件是否成立。
+    static bool MatchAttr(AttrCond a, List<string> classes, string cls) {
+        if (a.op == "") { return cls != ""; }
+        string hay = cls;
+        string val = a.val;
+        if (a.nocase) { hay = Css.Lower(hay); val = Css.Lower(val); }
+        if (val == "") { return false; }
+        if (a.op == "~=") {
+            if (a.nocase) { return Selector.HoldsCI(classes, val); }
+            return StyleSheet.Holds(classes, val);
+        }
+        if (a.op == "=") { return hay == val; }
+        int hl = hay.Length;
+        int vl = val.Length;
+        if (a.op == "^=") { return hl >= vl && hay.Substring(0, vl) == val; }
+        if (a.op == "$=") { return hl >= vl && hay.Substring(hl - vl, vl) == val; }
+        if (a.op == "|=") {
+            return hay == val
+                || (hl > vl && hay.Substring(0, vl) == val
+                    && hay.Substring(vl, 1) == "-");
+        }
+        return Css.IndexFrom(hay, val, 0) >= 0;
+    }
+
+    /// 大小写不敏感的类 token 命中（类名已在调用前转小写）。
+    static bool HoldsCI(List<string> classes, string name) {
+        for (int i = 0; i < classes.Count; i = i + 1) {
+            if (Css.Lower(classes[i]) == name) { return true; }
+        }
+        return false;
+    }
+
+    /// 此选择器在级联中的权重。伪状态高于
+    /// 其他一切，因此无论作者写在哪里，`:hover` 都叠加在基础外观之上；
+    /// 其下按 CSS 顺序：type <
+    /// class < 类链 < id。属性条件按一个类计，布尔属性按一个伪状态计；
+    /// `:not()`/`:is()` 取内层最大权重；组合器链按 CSS 逐块累加。
+    int Specificity() {
+        int spec = 0;
+        if (type != "") { spec = spec + 1; }
+        spec = spec + classList.Count * 100;
+        spec = spec + attrs.Count * 100;
+        if (id != "") { spec = spec + 10000; }
+        spec = spec + Style.Classes(state).Count * 1000000;
+        if (reqMask != 0 || forbidMask != 0) { spec = spec + 1000000; }
+        int inner = 0;
+        for (int t = 0; t < nots.Count; t = t + 1) {
+            int s = nots[t].Specificity();
+            if (s > inner) { inner = s; }
+        }
+        for (int q = 0; q < ises.Count; q = q + 1) {
+            int s = ises[q].Specificity();
+            if (s > inner) { inner = s; }
+        }
+        spec = spec + inner;
+        if (up != null) { spec = spec + up.Specificity(); }
+        return spec;
+    }
+
+    /// 可作为类型/类/id/部件名称字符时为 true。
+    static bool NameChar(string ch) {
+        if (ch == "." || ch == "#" || ch == ":" || ch == "*") { return false; }
+        if (ch == "," || ch == ">" || ch == "+" || ch == "~" || ch == "[") {
+            return false;
+        }
+        if (ch == "(" || ch == ")" || ch == "]" || ch == "=") { return false; }
+        if (ch == "\"" || ch == "'") { return false; }
+        return !Css.Space(ch);
+    }
+}
+
+
+/// `@media` 条件：逗号分隔的备选（or 连接）。
+/// 由 Css.ParseMedia 从 prelude 解析，Apply 时按窗口/主题现算。
+class MediaCond {
+    /// 逗号分隔的备选，任一成立即成立。
+    List<MediaAlt> alts;
+
+    /// 条件在本环境是否成立。任意备选成立即为真。
+    bool True(StyleBox b) {
+        if (alts == null || alts.Count == 0) { return false; }
+        for (int i = 0; i < alts.Count; i = i + 1) {
+            if (alts[i].AltTrue(b)) { return true; }
+        }
+        return false;
+    }
+
+    /// 两个条件的 and 组合（嵌套 @media 用）：A 的每个备选与 B 的
+    /// 每个备选做笛卡尔 and。
+    static MediaCond And(MediaCond x, MediaCond y) {
+        MediaCond outC = new MediaCond();
+        outC.alts = new List<MediaAlt>();
+        for (int i = 0; i < x.alts.Count; i = i + 1) {
+            for (int j = 0; j < y.alts.Count; j = j + 1) {
+                outC.alts.Add(MediaAlt.And(x.alts[i], y.alts[j]));
+            }
+        }
+        return outC;
+    }
+}
+
+/// 一个备选：`not` 前缀 + and 连接的特征。
+class MediaAlt {
+    bool neg;
+    List<MediaFeat> feats;
+
+    bool AltTrue(StyleBox b) {
+        if (feats == null || feats.Count == 0) { return false; }
+        bool ok = true;
+        for (int i = 0; i < feats.Count; i = i + 1) {
+            if (!feats[i].True(b)) { ok = false; break; }
+        }
+        return neg ? !ok : ok;
+    }
+
+    /// 两个备选的 and（特征并集；neg 简化取或——两边同时取反的
+    /// 嵌套 @media 极罕见，语义差可忽略）。
+    static MediaAlt And(MediaAlt x, MediaAlt y) {
+        MediaAlt outA = new MediaAlt();
+        outA.neg = x.neg || y.neg;
+        outA.feats = new List<MediaFeat>();
+        for (int i = 0; i < x.feats.Count; i = i + 1) { outA.feats.Add(x.feats[i]); }
+        for (int j = 0; j < y.feats.Count; j = j + 1) { outA.feats.Add(y.feats[j]); }
+        return outA;
+    }
+}
+
+/// 单个媒体特征：`(min-width: 800px)`、`(orientation: landscape)`、
+/// 裸媒体类型（`screen`）。未知特征/取值一律判假（保守）。
+class MediaFeat {
+    string name;
+    string val;
+
+    bool True(StyleBox b) {
+        string n = Css.Lower(Css.Trim(name));
+        string v = Css.Lower(Css.Trim(val));
+        if (n == "screen" || n == "all") { return true; }
+        if (n == "print" || n == "speech" || n == "tv" || n == "tty"
+            || n == "projection" || n == "handheld") { return false; }
+        int w = b.envVw > 0 ? b.envVw : 1280;
+        int h = b.envVh > 0 ? b.envVh : 720;
+        if (n == "orientation") {
+            if (v == "landscape") { return w >= h; }
+            if (v == "portrait") { return h >= w; }
+            return false;
+        }
+        if (n == "prefers-color-scheme") {
+            if (v == "dark") { return b.mediaDark; }
+            if (v == "light") { return !b.mediaDark; }
+            return false;
+        }
+        if (n == "prefers-reduced-motion") {
+            if (v == "reduce") { return b.mediaReduced; }
+            if (v == "no-preference") { return !b.mediaReduced; }
+            return false;
+        }
+        if (n == "pointer" || n == "any-pointer") {
+            // 引擎按鼠标桌面环境对待：fine 可用，coarse 不可用。
+            if (v == "fine") { return true; }
+            return false;
+        }
+        if (n == "hover" || n == "any-hover") {
+            if (v == "hover") { return true; }
+            return false;
+        }
+        if (n == "grid") { return v == "0"; }
+        if (n == "min-width") { return w >= StyleSheet.UnitPx(b, val); }
+        if (n == "max-width") { return w <= StyleSheet.UnitPx(b, val); }
+        if (n == "min-height") { return h >= StyleSheet.UnitPx(b, val); }
+        if (n == "max-height") { return h <= StyleSheet.UnitPx(b, val); }
+        if (n == "width") { return v == "" || w == StyleSheet.UnitPx(b, val); }
+        if (n == "height") { return v == "" || h == StyleSheet.UnitPx(b, val); }
+        if (n == "min-aspect-ratio" || n == "max-aspect-ratio"
+            || n == "aspect-ratio") {
+            int slash = Css.IndexFrom(val, "/", 0);
+            if (slash < 0) { return false; }
+            int dw = StyleSheet.Num(Css.Trim(val.Substring(0, slash)));
+            int dh = StyleSheet.Num(Css.Trim(val.Substring(
+                slash + 1, val.Length - slash - 1)));
+            if (dw <= 0 || dh <= 0) { return false; }
+            long lhs = (long)w * dh;
+            long rhs = (long)h * dw;
+            if (n == "min-aspect-ratio") { return lhs >= rhs; }
+            if (n == "max-aspect-ratio") { return lhs <= rhs; }
+            return lhs == rhs;
+        }
+        // resolution / display-mode 等：没有对应环境，判假。
+        return false;
+    }
+}

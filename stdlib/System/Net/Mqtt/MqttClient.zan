@@ -1,0 +1,518 @@
+using System;
+using System.Net.Sockets;
+
+namespace System.Net.Mqtt;
+
+/// <summary>MQTT v3.1.1 控制报文类型（固定头第一个字节的高 4 位）。</summary>
+class MqttPacketType {
+    /// <summary>连接请求。</summary>
+    static const int CONNECT = 1;
+    /// <summary>连接确认。</summary>
+    static const int CONNACK = 2;
+    /// <summary>发布消息。</summary>
+    static const int PUBLISH = 3;
+    /// <summary>QoS 1 发布确认。</summary>
+    static const int PUBACK = 4;
+    /// <summary>订阅请求。</summary>
+    static const int SUBSCRIBE = 8;
+    /// <summary>订阅确认。</summary>
+    static const int SUBACK = 9;
+    /// <summary>退订请求。</summary>
+    static const int UNSUBSCRIBE = 10;
+    /// <summary>退订确认。</summary>
+    static const int UNSUBACK = 11;
+    /// <summary>保活请求。</summary>
+    static const int PINGREQ = 12;
+    /// <summary>保活响应。</summary>
+    static const int PINGRESP = 13;
+    /// <summary>断开连接。</summary>
+    static const int DISCONNECT = 14;
+}
+
+/// <summary>MQTT QoS 服务等级（编码进 PUBLISH 固定头）。</summary>
+class MqttQos {
+    /// <summary>至多一次：不确认、不重传。</summary>
+    static const int AtMostOnce = 0;
+    /// <summary>至少一次：发送后等待 PUBACK。</summary>
+    static const int AtLeastOnce = 1;
+    /// <summary>恰好一次（协议 QoS 2；本客户端发送后并不等待确认，
+    /// 实际处理与 QoS 0 相同）。</summary>
+    static const int ExactlyOnce = 2;
+}
+
+/// <summary>
+/// MQTT v3.1.1 客户端。
+///
+/// 对协程友好：每个网络操作都是 <c>async</c> 方法，
+/// 通过 <see cref="TcpClient"/> await 底层非阻塞套接字，因此
+/// 协程内使用的 MQTT 客户端会在 IO reactor 上挂起（将 worker
+/// 让给其他协程），而不会在等待 broker 应答或传入 PUBLISH 时
+/// 阻塞操作系统线程。
+///
+/// 用法：
+///   MqttClient c = await MqttClient.ConnectAsync("broker", 1883, "client-1");
+///   int s = await c.SubscribeAsync("sensors/temp", MqttQos.AtLeastOnce);
+///   int p = await c.PublishAsync("sensors/temp", "21.5", MqttQos.AtLeastOnce);
+///   string msg = await c.ReceiveAsync();   // suspends until a PUBLISH arrives
+///   int d = await c.DisconnectAsync();
+/// </summary>
+class MqttClient {
+    TcpClient conn;
+    string clientId;
+    string host;
+    int port;
+    bool connected;
+    int nextPacketId;
+    int keepAlive;
+
+    [DllImport("crt")]
+    static extern long strlen(string str);
+
+    /// <summary>构造未连接的客户端；连接通过 <see cref="ConnectAsync"/> 建立。</summary>
+    MqttClient() {
+        this.clientId = "";
+        this.host = "";
+        this.port = 1883;
+        this.connected = false;
+        this.nextPacketId = 1;
+        this.keepAlive = 60;
+    }
+
+    // ---- 帧解析辅助 ----
+    //
+    // 单次 Socket recv 只返回当前可用的字节，
+    // 可能不足一个完整 MQTT 报文（TCP 是字节流）。这些辅助函数
+    // 会在 reactor 上等待并重读，直到读够精确字节数 / 组装出完整报文，
+    // 使控制报文解析与负载提取
+    // 无论 broker 如何分段写入都能保持对齐。
+
+    // 它们通过真正的重叠接收（RecvOv）读取：单次 recv 只返回
+    // 当前可用的字节，而 ReadReady 的零字节可读性探测会在数据
+    // 尚未到达时立即完成，此时 Recv 返回的 would-block（-1）会被
+    // 误判成对端关闭。RecvOv 投递真正的接收操作，只有读到数据
+    // 或对端关闭时才完成；返回 0（或负数，运行时按对端关闭上报）
+    // 即流结束。MQTT 报文含 NUL 字节，因此也不能用依赖字符串
+    // 长度的接收接口。
+
+    /// <summary>精确读取一个字节，对端关闭时返回 -1。</summary>
+    async int ReadByteAsync() {
+        nint sock = this.conn.GetSocket();
+        byte[] b = new byte[2];
+        int n = await Socket.RecvOv(sock, b, 1);
+        if (n <= 0) {
+            this.connected = false;
+            return -1;
+        }
+        return b[0] & 255;
+    }
+
+    /// <summary>在 IO reactor 上挂起，精确读取 <paramref name="need"/> 字节，
+    /// 直到所需的多次 recv 全部完成。</summary>
+    async byte[] ReadBytesAsync(int need) {
+        byte[] buf = new byte[need + 1];
+        byte[] tmp = new byte[need + 1];
+        nint sock = this.conn.GetSocket();
+        int got = 0;
+        while (got < need) {
+            int n = await Socket.RecvOv(sock, tmp, need - got);
+            if (n <= 0) {
+                this.connected = false;
+                return buf;
+            }
+            for (int i = 0; i < n; i = i + 1) {
+                buf[got] = (byte)(tmp[i]);
+                got = got + 1;
+            }
+        }
+        return buf;
+    }
+
+    /// <summary>解码 MQTT "remaining length" varint（1-4 字节）。</summary>
+    async int ReadRemainingLenAsync() {
+        int multiplier = 1;
+        int acc = 0;
+        int encoded = 128;
+        while ((encoded & 128) != 0) {
+            // MQTT 变长编码最多 4 字节；无上限时一串连续的 0x80
+            // 让本循环无限自旋（恶意 broker 的每连接 CPU DoS）。
+            if (multiplier > 128 * 128 * 128) {
+                this.connected = false;
+                return -1;
+            }
+            encoded = await ReadByteAsync();
+            if (encoded < 0) {
+                // varint 中途对端关闭：把不完整的累计值当成功
+                // 返回会让上层把残包当真报文解析。
+                this.connected = false;
+                return -1;
+            }
+            acc = acc + (encoded & 127) * multiplier;
+            multiplier = multiplier * 128;
+        }
+        return acc;
+    }
+
+    /// <summary>MQTT "remaining length" varint 编码所需的字节数（1-4）。</summary>
+    static int RemainLenBytes(int remainLen) {
+        int n = 1;
+        int rl = remainLen >> 7;
+        while (rl > 0) {
+            n = n + 1;
+            rl = rl >> 7;
+        }
+        return n;
+    }
+
+    /// <summary>把 "remaining length" 编码为 MQTT varint 写入
+    /// <paramref name="packet"/> 的 <paramref name="offset"/> 处，
+    /// 返回写入的字节数（1-4）。此前各报文构建器把 remainLen
+    /// 截进单字节，报文一旦超过 127 字节就违反协议、让 broker
+    /// 端的 varint 解码从此错位。</summary>
+    static int WriteRemainLen(byte[] packet, int offset, int remainLen) {
+        int rl = remainLen;
+        int written = 0;
+        while (true) {
+            int digit = rl & 127;
+            rl = rl >> 7;
+            if (rl > 0) {
+                packet[offset + written] = (byte)(digit | 128);
+            } else {
+                packet[offset + written] = (byte)digit;
+                break;
+            }
+            written = written + 1;
+        }
+        return written + 1;
+    }
+
+    /// <summary>读取并丢弃一个完整控制报文（如 SUBACK / PUBACK），
+    /// 返回其报文类型以保持流帧同步。</summary>
+    async int DrainPacketAsync() {
+        int b0 = await ReadByteAsync();
+        if (b0 < 0) {
+            return -1;
+        }
+        int remainLen = await ReadRemainingLenAsync();
+        if (remainLen < 0) {
+            return -1;
+        }
+        // 不设上限时恶意/错乱的 broker 报一个巨大 remainLen 会让
+        // ReadBytesAsync 预分配同等大小的两个缓冲——与 broker 端
+        // 同样的 16 MiB 上限。
+        if (remainLen > 16777216) {
+            this.connected = false;
+            return -1;
+        }
+        if (remainLen > 0) {
+            byte[] _body = await ReadBytesAsync(remainLen);
+        }
+        return (b0 >> 4) & 15;
+    }
+
+    /// <summary>连接 broker 并执行 MQTT CONNECT/CONNACK
+    /// 握手，每个网络步骤都在 IO reactor 上挂起。</summary>
+    static async MqttClient ConnectAsync(string host, int port, string clientId) {
+        MqttClient mqtt = new MqttClient();
+        mqtt.host = host;
+        mqtt.port = port;
+        mqtt.clientId = clientId;
+
+        mqtt.conn = await TcpClient.ConnectAsync(host, port);
+        // 连接失败/超时按文档返回 null：直接解引用是空对象虚调用，
+        // 进程 SIGSEGV。保持 connected=false 由调用方检查。
+        if (mqtt.conn == null) { return mqtt; }
+
+        byte[] packet = mqtt.BuildConnectPacket();
+        int sent = await mqtt.conn.SendBytesAsync(packet, packet.Length);
+
+        // CONNACK：固定头（2 字节）+ 可变头（2 字节）；
+        // body 的第 2 字节为连接返回码（0 = 已接受）。
+        int b0 = await mqtt.ReadByteAsync();
+        int remainLen = await mqtt.ReadRemainingLenAsync();
+        // 未认证的对端也能报出巨大的 remainLen（varint 上限 256 MiB），
+        // ReadBytesAsync 随即预分配两个 remainLen+1 的缓冲——单次连接
+        // 尝试约 512 MiB。套用与 DrainPacketAsync / broker 端一致的
+        // 16 MiB 上限，超过即判流不可信。
+        if (remainLen > 16777216) {
+            mqtt.connected = false;
+            return mqtt;
+        }
+        byte[] body = await mqtt.ReadBytesAsync(remainLen);
+        int packetType = (b0 >> 4) & 15;
+        if (packetType == MqttPacketType.CONNACK && remainLen >= 2) {
+            int returnCode = body[1] & 255;
+            if (returnCode == 0) {
+                mqtt.connected = true;
+            }
+        }
+        return mqtt;
+    }
+
+    /// <summary>发布消息，在 IO reactor 上挂起。QoS 1 时
+    /// 还会等待 PUBACK。返回已发送的字节数。</summary>
+    async int PublishAsync(string topic, string message, int qos) {
+        int topicLen = (int)strlen(topic);
+        int msgLen = (int)strlen(message);
+
+        int byte0 = (MqttPacketType.PUBLISH << 4);
+        if (qos > 0) {
+            byte0 = byte0 + (qos << 1);
+        }
+
+        int remainLen = 2 + topicLen + msgLen;
+        if (qos > 0) {
+            remainLen = remainLen + 2;
+        }
+
+        byte[] packet = new byte[1 + MqttClient.RemainLenBytes(remainLen) + remainLen];
+        int offset = 0;
+        packet[offset] = (byte)(byte0);
+        offset = offset + 1;
+        offset = offset + MqttClient.WriteRemainLen(packet, offset, remainLen);
+
+        packet[offset] = (byte)((topicLen >> 8) & 255);
+        offset = offset + 1;
+        packet[offset] = (byte)(topicLen & 255);
+        offset = offset + 1;
+
+        int i = 0;
+        for (; i < topicLen; i = i + 1) {
+            packet[offset] = (byte)(topic[i]);
+            offset = offset + 1;
+        }
+
+        if (qos > 0) {
+            int pid = this.nextPacketId;
+            this.nextPacketId = this.nextPacketId + 1;
+            packet[offset] = (byte)((pid >> 8) & 255);
+            offset = offset + 1;
+            packet[offset] = (byte)(pid & 255);
+            offset = offset + 1;
+        }
+
+        i = 0;
+        while (i < msgLen) {
+            packet[offset] = (byte)(message[i]);
+            offset = offset + 1;
+            i = i + 1;
+        }
+
+        int sent = await this.conn.SendBytesAsync(packet, offset);
+
+        if (qos == MqttQos.AtLeastOnce) {
+            int acked = await DrainPacketAsync();
+        }
+
+        return sent;
+    }
+
+    /// <summary>订阅主题并等待 SUBACK，在 IO
+    /// reactor 上挂起。返回已发送的字节数。</summary>
+    async int SubscribeAsync(string topic, int qos) {
+        int topicLen = (int)strlen(topic);
+        int pid = this.nextPacketId;
+        this.nextPacketId = this.nextPacketId + 1;
+
+        int remainLen = 2 + 2 + topicLen + 1;
+        byte[] packet = new byte[1 + MqttClient.RemainLenBytes(remainLen) + remainLen];
+        int offset = 0;
+
+        packet[offset] = (byte)((MqttPacketType.SUBSCRIBE << 4) + 2);
+        offset = offset + 1;
+        offset = offset + MqttClient.WriteRemainLen(packet, offset, remainLen);
+
+        packet[offset] = (byte)((pid >> 8) & 255);
+        offset = offset + 1;
+        packet[offset] = (byte)(pid & 255);
+        offset = offset + 1;
+
+        packet[offset] = (byte)((topicLen >> 8) & 255);
+        offset = offset + 1;
+        packet[offset] = (byte)(topicLen & 255);
+        offset = offset + 1;
+
+        for (int i = 0; i < topicLen; i = i + 1) {
+            packet[offset] = (byte)(topic[i]);
+            offset = offset + 1;
+        }
+
+        packet[offset] = (byte)(qos);
+        offset = offset + 1;
+
+        int sent = await this.conn.SendBytesAsync(packet, offset);
+        int acked = await DrainPacketAsync();
+        return sent;
+    }
+
+    /// <summary>取消订阅主题并等待 UNSUBACK，在
+    /// IO reactor 上挂起。返回已发送的字节数。</summary>
+    async int UnsubscribeAsync(string topic) {
+        int topicLen = (int)strlen(topic);
+        int pid = this.nextPacketId;
+        this.nextPacketId = this.nextPacketId + 1;
+
+        int remainLen = 2 + 2 + topicLen;
+        byte[] packet = new byte[1 + MqttClient.RemainLenBytes(remainLen) + remainLen];
+        int offset = 0;
+
+        packet[offset] = (byte)((MqttPacketType.UNSUBSCRIBE << 4) + 2);
+        offset = offset + 1;
+        offset = offset + MqttClient.WriteRemainLen(packet, offset, remainLen);
+
+        packet[offset] = (byte)((pid >> 8) & 255);
+        offset = offset + 1;
+        packet[offset] = (byte)(pid & 255);
+        offset = offset + 1;
+
+        packet[offset] = (byte)((topicLen >> 8) & 255);
+        offset = offset + 1;
+        packet[offset] = (byte)(topicLen & 255);
+        offset = offset + 1;
+
+        for (int i = 0; i < topicLen; i = i + 1) {
+            packet[offset] = (byte)(topic[i]);
+            offset = offset + 1;
+        }
+
+        int sent = await this.conn.SendBytesAsync(packet, offset);
+        int acked = await DrainPacketAsync();
+        return sent;
+    }
+
+    /// <summary>等待下一个传入的 PUBLISH 并返回其负载，
+    /// 在 IO reactor 上挂起直到数据到达。对 broker 的
+    /// PINGREQ 透明响应，并继续等待真正的消息。</summary>
+    async string ReceiveAsync() {
+        // 循环而非递归：恶意 broker 连发 PINGREQ 会把
+        // 递归版本的协程栈打穿。
+        while (true) {
+            int byte0 = await ReadByteAsync();
+            if (byte0 < 0) {
+                this.connected = false;
+                return "";
+            }
+            int remainLen = await ReadRemainingLenAsync();
+            if (remainLen < 0) {
+                this.connected = false;
+                return "";
+            }
+            if (remainLen > 16777216) {
+                // 恶意/错乱 broker 的巨型 remainLen：直接判流不可信，
+                // 不预分配两个 16 MiB+ 的缓冲。
+                this.connected = false;
+                return "";
+            }
+            byte[] body = await ReadBytesAsync(remainLen);
+
+            int packetType = (byte0 >> 4) & 15;
+
+            if (packetType == MqttPacketType.PUBLISH) {
+                // 请求体：主题长度（2）+ 主题 + [qos>0 时的报文 id（2）] + 负载
+                if (remainLen < 2) { return ""; }
+                int topicLen = ((body[0] & 255) << 8) + (body[1] & 255);
+                int offset = 2 + topicLen;
+
+                int qos = (byte0 >> 1) & 3;
+                if (qos > 0) {
+                    offset = offset + 2;
+                }
+
+                // 主题/包标识越界说明对端错位（或恶意）：
+                // 此时流已不可信，断开并返回空。
+                if (offset > remainLen) {
+                    this.connected = false;
+                    return "";
+                }
+
+                int payloadLen = remainLen - offset;
+                return body.ToStr(offset, payloadLen);
+            } else if (packetType == MqttPacketType.PINGREQ) {
+                byte[] pong = new byte[2];
+                pong[0] = (byte)(MqttPacketType.PINGRESP << 4);
+                pong[1] = 0;
+                int sent = await this.conn.SendBytesAsync(pong, 2);
+                continue;
+            }
+
+            return body.ToStr(0, remainLen);
+        }
+    }
+
+    /// <summary>发送 PINGREQ 保活，在 IO reactor 上挂起。
+    /// 返回已发送的字节数。</summary>
+    async int PingAsync() {
+        byte[] packet = new byte[2];
+        packet[0] = (byte)(MqttPacketType.PINGREQ << 4);
+        packet[1] = 0;
+        int sent = await this.conn.SendBytesAsync(packet, 2);
+        return sent;
+    }
+
+    /// <summary>发送 DISCONNECT 并关闭连接，在 IO
+    /// reactor 上等待发送完成。返回已发送的字节数。</summary>
+    async int DisconnectAsync() {
+        byte[] packet = new byte[2];
+        packet[0] = (byte)(MqttPacketType.DISCONNECT << 4);
+        packet[1] = 0;
+        int sent = await this.conn.SendBytesAsync(packet, 2);
+        this.conn.Close();
+        this.connected = false;
+        return sent;
+    }
+
+    /// <summary>连接是否仍存活：CONNACK 返回码为 0 后为 true，
+    /// 对端关闭或 <see cref="DisconnectAsync"/> 后为 false。</summary>
+    bool IsConnected() {
+        return this.connected;
+    }
+
+    /// <summary>编码 CONNECT 报文：协议名 "MQTT"、协议级别 4（3.1.1）、
+    /// clean session 标志、keepAlive 秒数与 client id。</summary>
+    byte[] BuildConnectPacket() {
+        int clientIdLen = (int)strlen(this.clientId);
+        int remainLen = 10 + 2 + clientIdLen;
+
+        byte[] packet = new byte[1 + MqttClient.RemainLenBytes(remainLen) + remainLen];
+        int offset = 0;
+
+        packet[offset] = (byte)(MqttPacketType.CONNECT << 4);
+        offset = offset + 1;
+        offset = offset + MqttClient.WriteRemainLen(packet, offset, remainLen);
+
+        packet[offset] = 0;
+        offset = offset + 1;
+        packet[offset] = 4;
+        offset = offset + 1;
+        packet[offset] = 77;
+        offset = offset + 1;
+        packet[offset] = 81;
+        offset = offset + 1;
+        packet[offset] = 84;
+        offset = offset + 1;
+        packet[offset] = 84;
+        offset = offset + 1;
+
+        packet[offset] = 4;
+        offset = offset + 1;
+
+        packet[offset] = 2;
+        offset = offset + 1;
+
+        packet[offset] = (byte)((this.keepAlive >> 8) & 255);
+        offset = offset + 1;
+        packet[offset] = (byte)(this.keepAlive & 255);
+        offset = offset + 1;
+
+        packet[offset] = (byte)((clientIdLen >> 8) & 255);
+        offset = offset + 1;
+        packet[offset] = (byte)(clientIdLen & 255);
+        offset = offset + 1;
+
+        for (int i = 0; i < clientIdLen; i = i + 1) {
+            packet[offset] = (byte)(this.clientId[i]);
+            offset = offset + 1;
+        }
+
+        return packet;
+    }
+}

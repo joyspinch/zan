@@ -1,0 +1,257 @@
+using System;
+using System.Json;
+
+namespace System.Web;
+
+/// One entry of the per-user menu JSON (MenuBuilder.JsonFor).
+class MenuNodeDoc {
+    string title;
+    string path;
+    string group;
+    string icon;
+    bool active;
+}
+
+/// One navigation entry, already decided for a particular principal.
+class MenuNode {
+    string title;
+    string path;
+    /// Section heading: the name of the first URL segment below /admin.
+    string group;
+    string icon;
+    bool active;
+    /// Where the section sits: its registered position, or after every
+    /// registered one.
+    int groupOrder;
+    /// Position within the section: its URL, so a sub-page follows the page it
+    /// belongs to. Non-routed entries pass a sort key of their own.
+    string order;
+
+    MenuNode() {
+        this.title = "";
+        this.path = "";
+        this.group = "";
+        this.icon = "";
+        this.active = false;
+        this.groupOrder = 0x7FFFFFFF;
+        this.order = "";
+    }
+
+    /// Menu text (the action's [Description]).
+    string Title() { return this.title; }
+    /// Entry URL.
+    string Path() { return this.path; }
+    /// Section segment this entry sits under ("system").
+    string Group() { return this.group; }
+    /// Icon name ([Custom(Icon=...)]), "" when none.
+    string Icon() { return this.icon; }
+    /// Whether the current request URL is this entry.
+    bool Active() { return this.active; }
+}
+
+/// <summary>
+/// Builds the admin navigation out of the route table and the URLs themselves.
+///
+/// An entry is one attribute: [Custom(IsMenu = true)]. Everything else follows
+/// from what the route already says -- its text is the action's [Description],
+/// its section is the first segment of its URL (/admin/system/users sits under
+/// "system", /admin/monitor/history under "monitor"), its position is the URL
+/// itself, and whether it is offered at all is decided by the same resolver the
+/// dispatcher uses to refuse the request.
+///
+/// So there is no menu to write and nothing to keep in step: moving a
+/// controller moves its entry, renaming its [Description] renames it, and a new
+/// screen appears the moment it compiles. The menu is two levels because URLs
+/// are -- a section and its pages -- and a deeper URL is simply a page of that
+/// section.
+///
+/// <see cref="Section"/> is the only place a URL segment gets a display name,
+/// and the order those names are registered in is the order the sections
+/// appear.
+/// </summary>
+class MenuBuilder {
+    /// Display name per URL segment ("system" -> "系统").
+    static StrMap labels = new StrMap();
+    /// Registered segments, in the order the sections should appear.
+    static List<string> sections = new List<string>();
+
+    /// <summary>Names a URL segment and places its section. Called once at
+    /// startup, in the order the sidebar should read; a segment never named
+    /// still gets a section, headed by the segment itself.</summary>
+    static void Section(string segment, string label) {
+        if (!MenuBuilder.labels.Has(segment)) {
+            MenuBuilder.sections.Add(segment);
+        }
+        MenuBuilder.labels.Set(segment, label);
+    }
+
+    /// <summary>The entries `uid` may actually reach, in URL order, with the
+    /// entry serving `activePath` marked. Only GET routes qualify: a menu entry
+    /// is a link, and a POST route sharing the controller's attributes would
+    /// render as one the browser cannot follow.
+    ///
+    /// Visibility asks the installed resolvers, not a second permission list:
+    /// a route whose [Custom(Authorization)] requires a permission is shown only
+    /// when the permission resolver allows it, so an entry can never lead to a
+    /// 403 the menu did not predict. `uid` is "" for an anonymous visitor, which
+    /// drops every route that needs a session.</summary>
+    static async List<MenuNode> ForUser(WebApp app, string uid, string activePath) {
+        List<Route> routes = app.router.All();
+        List<MenuNode> outp = new List<MenuNode>();
+        for (int i = 0; i < routes.Count; i = i + 1) {
+            Route r = routes[i];
+            if (!r.inMenu) { continue; }
+            if (r.method != "GET") { continue; }
+            if ((r.needsLogin || r.needsAuth) && uid.Length == 0) { continue; }
+            if (r.needsAuth && !await app.Allow(uid, r.action)) { continue; }
+
+            MenuNode n = new MenuNode();
+            n.title = r.title;
+            if (n.title.Length == 0) { n.title = r.action; }
+            n.path = r.pattern;
+            n.group = MenuBuilder.GroupOf(r.pattern);
+            n.groupOrder = MenuBuilder.OrderOf(r.pattern);
+            n.order = r.pattern;
+            n.icon = r.meta.Get("Icon");
+            n.active = MenuBuilder.Matches(r.pattern, activePath);
+            outp.Add(n);
+        }
+        MenuBuilder.Sort(outp);
+        return outp;
+    }
+
+    /// <summary>The menu `uid` may reach, as JSON:
+    /// [{"title","path","group","icon","active"}]. This is what a SPA front end
+    /// should render its navigation from -- the server decides what is
+    /// reachable, so the client cannot show a link the API would refuse.</summary>
+    static async string JsonFor(WebApp app, string uid, string activePath) {
+        List<MenuNode> nodes = await MenuBuilder.ForUser(app, uid, activePath);
+        List<MenuNodeDoc> outp = new List<MenuNodeDoc>();
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            MenuNode n = nodes[i];
+            MenuNodeDoc o = new MenuNodeDoc();
+            o.title = n.title;
+            o.path = n.path;
+            o.group = n.group;
+            o.icon = n.icon;
+            o.active = n.active;
+            outp.Add(o);
+        }
+        return Json.Serialize<List<MenuNodeDoc>>(outp);
+    }
+
+    /// <summary>Flattens the menu into template rows: a `group` row opens a
+    /// section and the rows after it carry title/path/icon/active. One flat list
+    /// because the view engine has no nested loops -- and because a section and
+    /// its pages are all the depth a URL gives.</summary>
+    static void Fill(List<StrMap> rows, List<MenuNode> nodes) {
+        string group = "";
+        bool first = true;
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            MenuNode n = nodes[i];
+            if (first || n.group != group) {
+                first = false;
+                group = n.group;
+                if (group.Length > 0) {
+                    StrMap head = new StrMap();
+                    head.Set("group", group);
+                    rows.Add(head);
+                }
+            }
+            StrMap row = new StrMap();
+            row.Set("title", n.title);
+            row.Set("path", n.path);
+            row.Set("icon", n.icon);
+            if (n.active) { row.Set("active", "active"); }
+            rows.Add(row);
+        }
+    }
+
+    /// <summary>The section a URL belongs to: the name of its first segment
+    /// below /admin. A page directly under /admin ("/admin", "/admin/profile")
+    /// belongs to no section and is listed on its own at the top; a section's
+    /// own index page ("/admin/monitor") belongs to that section like its other
+    /// pages do.</summary>
+    static string GroupOf(string path) {
+        List<string> segs = MenuBuilder.Body(path);
+        if (segs.Count == 0) { return ""; }
+        if (segs.Count == 1 && !MenuBuilder.labels.Has(segs[0])) { return ""; }
+        return MenuBuilder.Label(segs[0]);
+    }
+
+    /// <summary>Where that section sits: its registered position, or after every
+    /// registered one. A sectionless page comes first.</summary>
+    static int OrderOf(string path) {
+        List<string> segs = MenuBuilder.Body(path);
+        if (MenuBuilder.GroupOf(path).Length == 0) { return -1; }
+        for (int i = 0; i < MenuBuilder.sections.Count; i = i + 1) {
+            if (MenuBuilder.sections[i] == segs[0]) { return i; }
+        }
+        return 0x7FFFFFFF;
+    }
+
+    /// <summary>Path segments below /admin (or /api), placeholders dropped.
+    /// </summary>
+    static List<string> Body(string pattern) {
+        List<string> raw = Router.SplitPath(pattern);
+        List<string> outp = new List<string>();
+        for (int i = 0; i < raw.Count; i = i + 1) {
+            string s = raw[i];
+            if (s.Length == 0 || s.StartsWith("{")) { continue; }
+            if (outp.Count == 0 && (s == "admin" || s == "api")) { continue; }
+            outp.Add(s);
+        }
+        return outp;
+    }
+
+    /// <summary>A URL segment as a heading: its registered name, or the segment
+    /// with its first letter upper-cased.</summary>
+    static string Label(string s) {
+        if (s.Length == 0) { return s; }
+        string named = MenuBuilder.labels.Get(s);
+        if (named.Length > 0) { return named; }
+        return s.Substring(0, 1).ToUpper() + s.Substring(1);
+    }
+
+    /// <summary>True when a request path is served by this route pattern, so
+    /// "/admin/posts/edit/7" highlights the "/admin/posts" entry. Compared per
+    /// segment, with {placeholder} segments matching anything.</summary>
+    static bool Matches(string pattern, string path) {
+        if (path.Length == 0) { return false; }
+        if (pattern == path) { return true; }
+        List<string> want = Router.SplitPath(pattern);
+        List<string> have = Router.SplitPath(path);
+        if (want.Count == 0 || have.Count < want.Count) { return false; }
+        for (int i = 0; i < want.Count; i = i + 1) {
+            string w = want[i];
+            if (w.Length > 0 && w.Substring(0, 1) == "{") { continue; }
+            if (w != have[i]) { return false; }
+        }
+        return true;
+    }
+
+    /// <summary>Groups the entries by section, sections in registered order and
+    /// entries by URL, so a sub-page follows the page it hangs off. Insertion
+    /// sort: a menu is a handful of entries, so this costs nothing and leaves
+    /// equal entries where they were.</summary>
+    static void Sort(List<MenuNode> list) {
+        for (int i = 1; i < list.Count; i = i + 1) {
+            MenuNode n = list[i];
+            int j = i - 1;
+            while (j >= 0 && MenuBuilder.Before(n, list[j])) {
+                list[j + 1] = list[j];
+                j = j - 1;
+            }
+            list[j + 1] = n;
+        }
+    }
+
+    /// 排序键：节注册序 → 节名字典序 → URL 字典序。
+    static bool Before(MenuNode a, MenuNode b) {
+        if (a.groupOrder != b.groupOrder) { return a.groupOrder < b.groupOrder; }
+        if (a.group != b.group) {
+            return String.CompareOrdinal(a.group, b.group) < 0;
+        }
+        return String.CompareOrdinal(a.order, b.order) < 0;
+    }
+}

@@ -1,0 +1,813 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+/// 从绑定实体中读取某一列的文本：`new ListColumn<File>("Name",`
+/// f => f.name)`.
+delegate string CellOf<T>(T item);
+
+/// 为某个绑定实体构建一行的控件子树，适用于
+/// 行是自定义组件而非文本列的列表。
+delegate Control RowOf<T>(T item);
+
+/// 回答某个实体所在的行是否可选（可用）。返回 false 的行
+/// 视为禁用项：点击、Ctrl+点击、Shift+范围、右键、长按
+/// 全部无反应，悬停/选中带不出现，SelectedIndex 不落在其上。
+delegate bool RowGate<T>(T item);
+
+/// 某行被「拖出列表」时回调（行下标）：在某行上按下、拖到列表
+/// 矩形之外再松开。宿主据此把这一行变成独立窗口（会话拖出成浮窗），
+/// 列表本身不开窗，也不定义「拖到哪里才算拖出」的下游语义。
+delegate void RowDragOut(int index);
+
+/// ListView 的一列：表头显示什么、宽度相对其他列
+/// 如何（0 = 均分），以及如何从实体读取其文本。
+class ListColumn<T> {
+    /// 表头文本。
+    string title;
+    /// 相对宽度权重（0 = 均分）。
+    int weight;
+    /// 文本右对齐（数字、大小、日期）。
+    bool right;
+    /// 从行实体取单元格文本的回调。
+    CellOf<T> cell;
+
+    /// 构造均分宽度的一列。
+    ListColumn(string title, CellOf<T> cell) {
+        this.title = title;
+        this.weight = 0;
+        this.right = false;
+        this.cell = cell;
+    }
+
+    /// 构造指定相对宽度的一列。
+    ListColumn(string title, int weight, CellOf<T> cell) {
+        this.title = title;
+        this.weight = weight;
+        this.right = false;
+        this.cell = cell;
+    }
+
+    /// 让本列文本右对齐（数字、大小、日期）。
+    ListColumn<T> Right() {
+        right = true;
+        return this;
+    }
+
+    /// 读取该行实体在本列的文本；无 cell 回调时为空串。
+    string TextOf(T item) {
+        if (cell == null) { return ""; }
+        return cell(item);
+    }
+}
+
+/// 绑定到调用方自身数据的列表。只需提供三样东西——行
+/// 长什么样、数据、处理器——布局一概不用管：
+/// 控件位于树中，盒子由 CSS 决定，因此调用处无需计算
+/// 矩形或维护行模型。
+///
+///     ListView<FileItem> files = new ListView<FileItem>(cols);
+///     files.Bind(model.files);          // 调用方的 List<FileItem>
+///     files.OnSelect(OpenSelected);
+///     side.Add(files);
+///
+/// 行也可以是独立的组件而非文本列——
+/// 模板返回任意控件即可：
+///
+///     ListView<Msg> feed = new ListView<Msg>(m => MessageCard(m));
+///     feed.Bind(model.inbox);
+///
+/// 处理器被编排到 UI 线程执行（UiEvent.Post），因此后台
+/// 任务修改绑定列表并调用 Refresh() 也是安全的。
+class ListView<T> : Control {
+    /// 调用方的数据。不做任何拷贝：每帧都从中读取行，
+    /// 所以修改列表后，下一次绘制即可生效。
+    List<T> data;
+    /// 文本列（列布局模式用）。
+    List<ListColumn<T>> cols;
+    /// 行模板（模板模式用）；与 cols 二选一。
+    RowOf<T> rowOf;
+    /// 列表无行时居中显示（"" 则不绘制）。
+    string Empty;
+    /// 聚焦/选中行号（-1 = 无）。
+    int sel;
+    /// 本帧悬停的行号（绘制时更新，-1 = 无）。
+    int hover;
+    /// 多选模式（WithMultiSelect）：Ctrl+点击把行加入/移出
+    /// `marks`，Shift+点击从锚点扩展。`sel` 仍是聚焦行，
+    /// 单选调用方不受影响。
+    bool multi;
+    /// 多选命中的行号集合（Ctrl+点击维护，不含聚焦行）。
+    List<int> marks;
+    /// 可选行门（WithSelectable）：null = 全部可选。
+    RowGate<T> onlySelectable;
+    /// 垂直滚动偏移（宿主可读写以驱动/响应滚动）。
+    SignalInt scroll;
+    /// 模板模式：每个构建的子控件分配一个行 id，因此
+    /// 未重建任何行的帧里，选择状态也能保留。
+    bool rowsStale;
+    /// 上次构建模板行时的行数（判断是否需要重建）。
+    int builtFor;
+    /// 模板行独占的 WidgetId 段起点（-1 = 还没建过行）。
+    int rowSeqBase;
+    /// 行命中区的稳定 id 块起点与块长（-1/0 = 未预留）：行 i 的命中
+    /// id = rowHitBase + i。必须整块预留而不能逐帧 AllocId——每帧只有
+    /// 可见行占号，拖动滚动条时可见行数在 n/n+1 间来回变，其后注册
+    /// 的滚动条 id 跟着漂移，pressedId 失配后拖动两三像素就停摆
+    /// （offset 不动 → 可见行数也不翻回 → 直到松手）。
+    int rowHitBase;
+    int rowHitCount;
+    /// 拖出行手势（OnDragOut）的订阅者，与按下那一刻记住的行下标
+    /// （-1 = 当前按下的不是行）。指针拖到列表外时命中测试已经
+    /// 没有行可归属，下标只能在按下那一帧记下。
+    List<RowDragOut> dragOut;
+    int dragOutFrom;
+
+    /// 模板行独占的 id 段长度：够放几百行、每行十来个控件。
+    static int RowIdReserve() { return 4096; }
+
+    /// 某行被选中（读取 SelectedIndex / Selected）。
+    UiEvent Select;
+    /// 选中的行再次被点击（打开 / 深入）。
+    UiEvent Activate;
+    /// 某行被右键点击。
+    UiEvent Context;
+
+    /// 公共初始化（各构造共用）。
+    void InitList() {
+        this.InitControl("list", 5);
+        data = null;
+        cols = new List<ListColumn<T>>();
+        rowOf = null;
+        Empty = "";
+        sel = -1;
+        hover = -1;
+        multi = false;
+        marks = new List<int>();
+        onlySelectable = null;
+        scroll = new SignalInt(0);
+        rowsStale = true;
+        builtFor = -1;
+        rowSeqBase = -1;
+        rowHitBase = -1;
+        rowHitCount = 0;
+        dragOut = new List<RowDragOut>();
+        dragOutFrom = -1;
+        wiresOwnEvents = true;
+        Select = new UiEvent();
+        Activate = new UiEvent();
+        Context = new UiEvent();
+    }
+
+    /// 单列纯文本（不假定 `item.ToString()`：当实体不是字符串时，
+    /// 请绑定一个列）。
+    ListView() { InitList(); }
+
+    /// 常见形式：直接传列。
+    ListView(List<ListColumn<T>> columns) {
+        InitList();
+        if (columns != null) { cols = columns; }
+    }
+
+    /// 单列，用于简单的标签列表。
+    ListView(ListColumn<T> column) {
+        InitList();
+        if (column != null) { cols.Add(column); }
+    }
+
+    /// 自定义行：模板构建每行的控件子树。
+    ListView(RowOf<T> row) {
+        InitList();
+        rowOf = row;
+    }
+
+    /// 声明式构造后再给列（`.zform` 里声明的列表用默认构造函数，
+    /// 列在代码里补上：列标题多是本地化文本，属于代码而非设计）。
+    ListView<T> WithColumns(List<ListColumn<T>> columns) {
+        cols = new List<ListColumn<T>>();
+        if (columns != null) { cols = columns; }
+        rowsStale = true;
+        return this;
+    }
+
+    /// 声明式构造后再给行模板（`.zform` 里声明的列表用
+    /// 默认构造函数，行模板在代码里补上）。
+    ListView<T> WithRow(RowOf<T> row) {
+        rowOf = row;
+        rowsStale = true;
+        return this;
+    }
+
+    /// 控件类型标识（序列化/设计器用）。
+    override string Kind() { return "ListView"; }
+
+    /// 覆写：CSS 类型选择器名（"list"）。
+    override string StyleType() { return "list"; }
+
+    // ---- 数据 ----
+
+    /// 绑定调用方的列表。列表不拷贝，因此这是其实时视图；
+    /// 需要重建自定义行的变更之后，调用 Refresh()。
+    ListView<T> Bind(List<T> src) {
+        if (data == src) { return this; }
+        data = src;
+        rowsStale = true;
+        if (sel >= this.Count()) { sel = -1; }
+        int mi = marks.Count - 1;
+        while (mi >= 0) {
+            if (marks[mi] >= this.Count()) { marks.RemoveAt(mi); }
+            mi = mi - 1;
+        }
+        return this;
+    }
+
+    /// 标记绑定数据已变更，自定义行将在下一帧
+    /// 重建。任意线程调用都安全。
+    void Refresh() { rowsStale = true; }
+
+    /// 当前绑定数据的行数。
+    int Count() {
+        if (data == null) { return 0; }
+        return data.Count;
+    }
+
+    /// 选中行号（-1 = 无选中）。
+    int SelectedIndex() { return sel; }
+
+    /// 是否有一行处于选中状态。
+    bool HasSelection() { return sel >= 0 && sel < this.Count(); }
+
+    /// 选中的实体；仅在 HasSelection() 为真时有效。
+    T Selected() { return data[sel]; }
+
+    /// 当前行总高（模板行 = 实测 prefH 累计，列模式 = 行数×行高）。
+    /// 滚动条几何与拖拽期望的公共推导点，测试与宿主同式复算用。
+    int ContentHeightForTest(App app) { return this.ContentHeight(app); }
+
+    /// `row` 是否在数据范围内。
+    bool Has(int row) { return row >= 0 && row < this.Count(); }
+
+    /// `row` 处的实体；仅在 Has(row) 为真时有效。
+    T ItemAt(int row) { return data[row]; }
+
+    /// 像点击那样移动选中项，发生变化时触发 Select。
+    /// 禁用行不接收：与鼠标路径同一道门。
+    void SelectIndex(int row) {
+        if (row < -1 || row >= this.Count()) { return; }
+        if (row >= 0 && !this.Selectable(row)) { return; }
+        if (sel == row) { return; }
+        sel = row;
+        Select.Post();
+    }
+
+    /// 清空选中与全部多选标记。
+    void ClearSelection() { sel = -1; marks = new List<int>(); }
+
+    /// 启用多选（Ctrl+点击切换、Shift+点击范围选择）。
+    ListView<T> WithMultiSelect() { multi = true; return this; }
+
+    /// 声明哪些行可选（分组标题档、条件未满足的禁用项等非选项）。
+    /// 不可选行对点击/Ctrl+点击/Shift+范围/右键/长按全部无反应，
+    /// 悬停与选中带不出现，文本以 `disabled` 状态弱色呈现；
+    /// 模板模式下行控件自带的 `Disabled` 同样生效。
+    ListView<T> WithSelectable(RowGate<T> gate) {
+        onlySelectable = gate;
+        return this;
+    }
+
+    /// `row` 属于多选集合（或为聚焦行）时为 true。
+    bool IsMarked(int row) {
+        if (row == sel && sel >= 0) { return true; }
+        for (int i = 0; i < marks.Count; i = i + 1) {
+            if (marks[i] == row) { return true; }
+        }
+        return false;
+    }
+
+    /// 所有选中的行索引（标记加聚焦行），升序排列。
+    List<int> SelectedIndices() {
+        List<int> outp = new List<int>();
+        int n = this.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            if (this.IsMarked(i)) { outp.Add(i); }
+        }
+        return outp;
+    }
+
+    /// 选中的行数。
+    int SelectionCount() { return this.SelectedIndices().Count; }
+
+    // ---- 处理器 ----
+
+    /// 某行被选中时回调。
+    ListView<T> OnSelect(Action a) { Select.Add(a); return this; }
+
+    /// 选中的行再次被点击（打开 / 深入）时回调。
+    ListView<T> OnActivate(Action a) { Activate.Add(a); return this; }
+
+    /// 某行被右键点击时回调。
+    ListView<T> OnContext(Action a) { Context.Add(a); return this; }
+
+    /// 订阅「行被拖出列表」手势：在某行上按下、拖到列表矩形之外
+    /// 松开时回调该行下标。列表只识别手势并报告下标，是否开窗、
+    /// 开成什么窗口由宿主决定；在列表矩形内松开不算数（那次手势
+    /// 仍归滚动/选择），右键与长按菜单不受影响。
+    ListView<T> OnDragOut(RowDragOut a) { dragOut.Add(a); return this; }
+
+    /// 列表为空时显示的文本。
+    ListView<T> EmptyText(string text) { Empty = text; return this; }
+
+    // ---- 内部实现 ----
+
+    /// 是否为模板（自定义行）模式。
+    bool Templated() { return rowOf != null; }
+
+    /// 行高：样式 height 优先，否则主题 large。
+    int RowHeight(App app) {
+        StyleBox s = this.ResolveStyleAs(app, "list", Class, Style.SNormal());
+        return s.HeightOr(app.theme.heightLarge);
+    }
+
+    /// 表头高度：≥2 列且未标 headless 时为主题 small，否则 0。
+    int HeaderHeight(App app) {
+        if (cols.Count < 2 || Style.Has(Class, "headless")) { return 0; }
+        return app.theme.heightSmall;
+    }
+
+    /// 通过行模板为每个实体重建一个子控件。子控件
+    /// 在此测量，因为发现需要重建时，树的测量阶段已越过
+    /// 它们。
+    void BuildRows(App app) {
+        if (!rowsStale && builtFor == this.Count()) { return; }
+        // 行控件的 WidgetId 是构造时领的，重建就换一批；而指针目标是
+        // 按上一帧的 id 解析的，所以行内按钮（关闭 ×、开关）会永远
+        // 收不到自己的点击，点击落到行上，看起来就是点了没反应 / 穿透。
+        // 因此首次构建时独占一段 id，每次重建都从这段的起点重新
+        // 发号，行控件的 id 因而跨重建稳定，也不会和别人撞号。
+        int resume = WidgetId.SeqValue();
+        if (rowSeqBase < 0) {
+            rowSeqBase = resume;
+            resume = resume + ListView.RowIdReserve();
+        }
+        WidgetId.SetSeq(rowSeqBase);
+        children = new List<Control>();
+        int n = this.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            Control row = rowOf(data[i]);
+            if (row != null) {
+                row.parent = this;
+                row.dock = 1;
+                children.Add(row);
+            }
+        }
+        rowsStale = false;
+        builtFor = n;
+        // 行用掉的 id 超出预留段时，以实际用量为准往后推，
+        // 宁可丢一次点击也不能把 id 发给两个控件。
+        int used = WidgetId.SeqValue();
+        if (used < resume) { WidgetId.SetSeq(resume); }
+        else { rowSeqBase = used; }
+        // 门判定的禁用行传播到行控件：模板行自己画文本，不传播的
+        // 话禁用行行为上点不动、外观上却和可选项一模一样（列模式
+        // 有 ::cell:disabled 弱色，模板模式靠行控件自己的 disabled
+        // 状态；只置真不复位——控件自身的 Disabled 是模板的语义）。
+        if (onlySelectable != null) {
+            for (int i = 0; i < children.Count; i = i + 1) {
+                if (children[i] != null && !onlySelectable(data[i])) {
+                    children[i].Disabled.Set(true);
+                }
+            }
+        }
+        for (int k = 0; k < children.Count; k = k + 1) {
+            children[k].MeasureTree(app);
+        }
+    }
+
+    /// 行的总高度；当样式表未声明高度时，列布局用它
+    /// 来确定列表尺寸。
+    int ContentHeight(App app) {
+        if (this.Templated()) {
+            int h = 0;
+            for (int i = 0; i < children.Count; i = i + 1) {
+                h = h + this.RowExtent(app, children[i]);
+            }
+            return h;
+        }
+        return this.Count() * this.RowHeight(app);
+    }
+
+    /// 模板行实际占高（prefH 未测出时退回统一行高）。
+    int RowExtent(App app, Control row) {
+        int h = row.prefH;
+        if (h <= 0) { h = this.RowHeight(app); }
+        return h;
+    }
+
+    /// 行命中 id 块：每行一个，作为连续块预留（同 Carousel/Collapse
+    /// 的 EnsureIds），数据超出块长时整块换新——按倍数增长，持续追加
+    /// 的信息流不至于每来一条就换一遍所有行的 id。
+    void EnsureRowIds() {
+        int need = this.Count();
+        if (rowHitBase >= 0 && need <= rowHitCount) { return; }
+        if (need < 64) { need = 64; }
+        if (need < rowHitCount * 2) { need = rowHitCount * 2; }
+        rowHitBase = WidgetId.Block(need);
+        rowHitCount = need;
+    }
+
+    /// 处理某行矩形的选择 / 激活 / 右键菜单。返回其注册的 id，
+    /// 调用方可据此绘制 hover 状态。
+    /// 每帧一次的「拖出行」判定（OnPaint 顶部调用）：按下帧记下行
+    /// 下标，松开帧若指针已在列表矩形之外则回调。下标只在按下帧
+    /// 认，因为拖到窗口外时命中测试里已经没有行可归属。
+    void DragOutTick(App app) {
+        if (dragOut.Count == 0) { return; }
+        int ek = app.EventKind();
+        if (ek == 2) {
+            int hit = app.focus.pressedId;
+            if (rowHitBase >= 0 && hit >= rowHitBase
+                && hit < rowHitBase + rowHitCount) {
+                dragOutFrom = hit - rowHitBase;
+            } else {
+                dragOutFrom = -1;
+            }
+            return;
+        }
+        if (ek != 3 || dragOutFrom < 0) { return; }
+        int from = dragOutFrom;
+        dragOutFrom = -1;
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        bool inside = mx >= bx && mx < bx + bw && my >= by && my < by + bh;
+        if (inside || !this.Has(from)) { return; }
+        for (int i = 0; i < dragOut.Count; i = i + 1) {
+            dragOut[i](from);
+        }
+    }
+
+    int RowInteract(App app, int index, int x, int y, int w, int h) {
+        this.EnsureRowIds();
+        int id = rowHitBase + index;
+        app.hitTester.RegisterRect(id, x, y, w, h, 0);
+        // 禁用行：命中区照常注册（id 块稳定依赖每行都占号），
+        // 但五种选择手势全部不认，悬停高亮也不出现。
+        bool live = this.Selectable(index);
+        if (live && app.focus.IsHovered(id)) { hover = index; }
+        // 触摸长按等价右键：按住行上不动打开上下文菜单。行是
+        // 真实注册 id，无需哨兵；轮询必须赶在下方 ClickTarget
+        // 早退之前——那个目标在按住期间是上一帧的滞留值，会
+        // 把还没成为点击目标的行挡在长按之外。
+        if (live && app.TouchDevice() && app.PollLongPress(id)) {
+            sel = index;
+            Context.Post();
+            this.NoteSelfDamage(app);
+            return id;
+        }
+        // 点击目标由 App 在事件到达时对着「上一帧完整的」命中区解析，
+        // 因此行内的子控件（模板行里的关闭按钮、开关）也在其中。
+        // 行若在这里自己再做一次 HitTest，只能看到本帧已经注册的那
+        // 一半——子控件是行之后才绘制、才注册的——于是行会抢走本该
+        // 属于按钮的那一次点击，按钮看着能按却永远没反应。
+        if (app.ClickTarget() != id && app.RightPressTarget() != id) {
+            return id;
+        }
+        if (live && app.RightPressTarget() == id && app.EventKind() == 2
+            && app.window.EventButton() == 1) {
+            sel = index;
+            Context.Post();
+            this.NoteSelfDamage(app);
+            return id;
+        }
+        if (live && app.ClickTarget() == id && app.ClickAvailable()) {
+            int mods = app.window.EventMods();
+            if (multi && Modifiers.HasCtrl(mods)) {
+                // 把该行加入/移出多选集合。
+                bool was = false;
+                for (int mi = 0; mi < marks.Count; mi = mi + 1) {
+                    if (marks[mi] == index) { marks.RemoveAt(mi); was = true; break; }
+                }
+                if (sel == index) { sel = -1; was = true; }
+                if (!was) { marks.Add(index); if (sel < 0) { sel = index; } }
+                Select.Post();
+            } else if (multi && Modifiers.HasShift(mods) && sel >= 0) {
+                // 把选中项从聚焦行扩展到本行；范围内的禁用行跳过。
+                int a = sel;
+                int b = index;
+                if (b < a) { int tmp = a; a = b; b = tmp; }
+                int r = a;
+                while (r <= b) {
+                    if (this.Selectable(r) && !this.IsMarked(r)) { marks.Add(r); }
+                    r = r + 1;
+                }
+                Select.Post();
+            } else {
+                // 激活 = 同一行的第二次点击，或者一次真正的双击。
+                // 后者也要算，因为两次点击之间行可能被重新绑定（宿主
+                // 每次刷新数据都会重建行），那时 sel 已经不等于 index，
+                // 只看「又点了同一行」会把双击吞掉。
+                bool again = (sel == index) || app.DoubleClickNow();
+                if (multi) { marks = new List<int>(); }
+                sel = index;
+                if (again) { Activate.Post(); }
+                else { Select.Post(); }
+            }
+            this.NoteSelfDamage(app);
+        }
+        return id;
+    }
+
+    /// 选中一行只改变列表自己的像素，因此把损伤限定在控件矩形
+    /// 内，而不是整窗重绘（弹层里的列表会自动退回整窗重绘：
+    /// 覆盖层存在时 NoteDamage 本就不生效）。需要更大范围的宿主
+    /// 在自己的 Select/Activate 处理器里调用 RequestRedraw。
+    void NoteSelfDamage(App app) {
+        app.NoteDamage(bx, by, bw, bh);
+        app.window.Wake();
+    }
+
+    /// `row` 是否可选（可用）：在数据范围内、未被 WithSelectable
+    /// 的门挡下，且（模板模式）行控件自身没有 Disabled。禁用项
+    /// 对一切选择途径关闭——鼠标的五种手势、程序化 SelectIndex、
+    /// 悬停高亮，视觉上以 `disabled` 状态呈现弱色。
+    bool Selectable(int row) {
+        if (!this.Has(row)) { return false; }
+        if (onlySelectable != null && !onlySelectable(data[row])) { return false; }
+        if (this.Templated() && row < children.Count && children[row] != null
+            && children[row].IsDisabled()) { return false; }
+        return true;
+    }
+
+    /// 空列表时居中绘制 Empty 提示文本。
+    void PaintEmpty(App app) {
+        if (Empty == "") { return; }
+        Theme t = app.theme;
+        StyleBox empty = Style.Part(app, "listview", "empty", "", Class, "",
+                                    Style.SNormal());
+        int fs = empty.FontOr(Style.FontFallback(app, "small"));
+        int fw = Canvas.MeasureText(Empty, fs);
+        app.canvas.DrawText(bx + (bw - fw) / 2,
+            Canvas.CenterTextY(by, bh, fs),
+            Empty, empty.FgOr(0),
+            fs);
+    }
+
+    /// 当前盒子的列宽：某列的 weight 是它对整行的占比，
+    /// 权重全为 0 时均分。
+    List<int> ColumnWidths(int rowW) {
+        List<int> res = new List<int>();
+        int total = 0;
+        int i = 0;
+        for (; i < cols.Count; i = i + 1) {
+            int wt = cols[i].weight;
+            if (wt <= 0) { wt = 1; }
+            total = total + wt;
+        }
+        if (total <= 0) { return res; }
+        int used = 0;
+        i = 0;
+        while (i < cols.Count) {
+            int wt = cols[i].weight;
+            if (wt <= 0) { wt = 1; }
+            int cw = rowW * wt / total;
+            if (i == cols.Count - 1) { cw = rowW - used; }
+            used = used + cw;
+            res.Add(cw);
+            i = i + 1;
+        }
+        return res;
+    }
+
+    /// 绘制表头：底色、分隔线与各列标题（超宽省略）。
+    void PaintHeader(App app, int headH) {
+        if (headH <= 0) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox header = Style.Part(app, "listview", "header", "", Class, "",
+                                     Style.SNormal());
+        StyleBox divider = Style.Part(app, "listview", "divider", "", Class, "",
+                                      Style.SNormal());
+        StyleBox column = Style.Part(app, "listview", "column", "", Class, "",
+                                      Style.SNormal());
+        int pad = t.paddingMedium;
+        c.FillRect(bx, by, bw, headH, header.BgOr(0));
+        c.FillRect(bx, by + headH - 1, bw, 1, divider.BgOr(0));
+        List<int> ws = this.ColumnWidths(bw - pad * 2);
+        int cx = bx + pad;
+        int headerFont = column.FontOr(Style.FontFallback(app, "tiny"));
+        int ty = Canvas.CenterTextY(by, headH, headerFont);
+        for (int i = 0; i < ws.Count; i = i + 1) {
+            int cw = ws[i];
+            string label = Ellipsis.Fit(cols[i].title, cw - pad, headerFont);
+            int tx = cx;
+            if (cols[i].right) {
+                tx = cx + cw - pad - Canvas.MeasureText(label, headerFont);
+            }
+            c.DrawText(tx, ty, label, column.FgOr(0),
+                       headerFont);
+            cx = cx + cw;
+        }
+    }
+
+    /// 列布局模式的行区：滚轮/滚动条、逐行命中与单元格文本。
+    void PaintColumnRows(App app, int headH) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox rowNormal = Style.Full(app, "listrow", "", "", Style.SNormal());
+        StyleBox rowSelected = Style.Full(app, "listrow", "", "", Style.SSelected());
+        StyleBox rowHover = Style.Full(app, "listrow", "", "", Style.SHover());
+        StyleBox divider = Style.Part(app, "listview", "divider", "", Class, "",
+                                      Style.SNormal());
+        StyleBox cell = Style.Part(app, "listview", "cell", "", Class, "",
+                                   Style.SNormal());
+        StyleBox secondary = Style.Part(app, "listview", "cell", "", Class + " secondary",
+                                        "", Style.SNormal());
+        StyleBox cellOff = Style.Part(app, "listview", "cell", "", Class, "",
+                                      Style.SDisabled());
+        int cellFont = cell.FontOr(Style.FontFallback(app, "small"));
+        int secondaryFont = secondary.FontOr(cellFont);
+        int cellOffFont = cellOff.FontOr(cellFont);
+        int rowH = this.RowHeight(app);
+        int viewY = by + headH;
+        int viewH = bh - headH;
+        if (viewH <= 0 || rowH <= 0) { return; }
+        int n = this.Count();
+        int contentH = n * rowH;
+        Scrollbar.HandleWheel(app, bx, viewY, bw, viewH, contentH, scroll);
+        int maxOff = contentH - viewH;
+        if (maxOff < 0) { maxOff = 0; }
+        if (scroll.Get() > maxOff) { scroll.Set(maxOff); }
+        if (scroll.Get() < 0) { scroll.Set(0); }
+        int off = scroll.Get();
+        bool overflow = contentH > viewH;
+        // 行区给滚动条让位：条带画在视口右缘，行高亮/文本若仍占满
+        // 整个盒子宽度，就会被轨道压在下面（选中色一直延伸进条带）。
+        int barW = app.Scale(10);
+        int rowW = bw;
+        if (overflow) { rowW = bw - barW; }
+        if (rowW < 0) { rowW = 0; }
+        int pad = t.paddingMedium;
+        List<int> ws = this.ColumnWidths(rowW - pad * 2);
+        // 选中/悬停带与轨道之间留一道缝（同 ArrangeRows）：高亮若
+        // 正好贴着 rowW 右缘，会和紧随其后的滚动条轨道连成一条色带。
+        int hotW = rowW;
+        if (overflow) { hotW = rowW - app.Scale(4); }
+        if (hotW < 0) { hotW = 0; }
+
+        int first = off / rowH;
+        int last = (off + viewH) / rowH;
+        if (last >= n) { last = n - 1; }
+        c.PushClip(bx, viewY, rowW, viewH);
+        int i = first;
+        while (i <= last) {
+            int ry = viewY + i * rowH - off;
+            int id = this.RowInteract(app, i, bx, ry, rowW, rowH);
+            if (i == sel || (multi && this.IsMarked(i))) {
+                c.FillRect(bx, ry, hotW, rowH, rowSelected.BgOr(rowNormal.BgOr(0)));
+            }
+            else if (this.Selectable(i) && app.focus.IsHovered(id)) {
+                c.FillRect(bx, ry, hotW, rowH, rowHover.BgOr(0));
+            }
+            if (i > first || off > 0) { c.FillRect(bx, ry, rowW, 1, divider.BgOr(0)); }
+            int rowFont = cellFont;
+            int ty = Canvas.CenterTextY(ry, rowH, rowFont);
+            int cx = bx + pad;
+            for (int k = 0; k < ws.Count; k = k + 1) {
+                int cw = ws[k];
+                StyleBox cs = k > 0 ? secondary : cell;
+                int csFont = k > 0 ? secondaryFont : cellFont;
+                if (!this.Selectable(i)) { cs = cellOff; csFont = cellOffFont; }
+                string s = Ellipsis.Fit(cols[k].TextOf(data[i]), cw - pad,
+                                        csFont);
+                int color = cs.FgOr(0);
+                int tx = cx;
+                if (cols[k].right) {
+                    tx = cx + cw - pad - Canvas.MeasureText(s, csFont);
+                }
+                c.DrawText(tx, ty, s, color,
+                           csFont);
+                cx = cx + cw;
+            }
+            i = i + 1;
+        }
+        c.PopClip();
+        if (overflow) {
+            Scrollbar.RenderVerticalScrollIn(app, bx + bw - barW, viewY, viewH,
+                viewH, contentH, scroll, bx, viewY, bw, viewH);
+        }
+    }
+
+    /// 在此盒子内按滚动偏移量布局模板行；
+    /// 从 OnPaint 运行，即在子控件绘制自身之前，
+    /// 因此树依然是它们坐标的唯一所有者。
+    void ArrangeRows(App app, int headH) {
+        int viewY = by + headH;
+        int viewH = bh - headH;
+        if (viewH <= 0) { return; }
+        int contentH = this.ContentHeight(app);
+        Scrollbar.HandleWheel(app, bx, viewY, bw, viewH, contentH, scroll);
+        int maxOff = contentH - viewH;
+        if (maxOff < 0) { maxOff = 0; }
+        if (scroll.Get() > maxOff) { scroll.Set(maxOff); }
+        if (scroll.Get() < 0) { scroll.Set(0); }
+        int off = scroll.Get();
+        // 行区给滚动条让位（与 PaintColumnRows 同一规则）：模板行
+        // 的排布宽度与命中矩形都收窄到滚动条带左侧，行的选中/悬停
+        // 高亮就不会延伸进轨道。
+        bool overflow = contentH > viewH;
+        int barW = app.Scale(10);
+        int rowW = bw;
+        if (overflow) { rowW = bw - barW; }
+        if (rowW < 0) { rowW = 0; }
+        Theme t = app.theme;
+        StyleBox rowNormal = Style.Full(app, "listrow", "", "", Style.SNormal());
+        StyleBox rowSelected = Style.Full(app, "listrow", "", "", Style.SSelected());
+        StyleBox rowHover = Style.Full(app, "listrow", "", "", Style.SHover());
+        // 选中/悬停带与轨道之间留一道缝：高亮若正好贴着 rowW 右缘，
+        // 会和紧随其后的滚动条轨道连成一条色带，看着像没让位。
+        int hotW = rowW;
+        if (overflow) { hotW = rowW - app.Scale(4); }
+        if (hotW < 0) { hotW = 0; }
+        int y = viewY - off;
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control row = children[i];
+            int rh = this.RowExtent(app, row);
+            row.Arrange(bx, y, rowW, rh);
+            row.visible = (y + rh > viewY && y < viewY + viewH);
+            if (row.visible) {
+                int id = this.RowInteract(app, i, bx, y, rowW, rh);
+                if (i == sel || (multi && this.IsMarked(i))) {
+                    app.canvas.FillRect(bx, y, hotW, rh,
+                        rowSelected.BgOr(rowNormal.BgOr(0)));
+                }
+                else if (this.Selectable(i) && app.focus.IsHovered(id)) {
+                    app.canvas.FillRect(bx, y, hotW, rh, rowHover.BgOr(0));
+                }
+            }
+            y = y + rh;
+        }
+        if (overflow) {
+            Scrollbar.RenderVerticalScrollIn(app, bx + bw - barW, viewY, viewH,
+                viewH, contentH, scroll, bx, viewY, bw, viewH);
+        }
+    }
+
+    // ---- 保留模式钩子 ----
+
+    /// 覆写：模板行按需重建后，内容高度加表头得出偏好高度。
+    override void OnMeasure(App app) {
+        if (this.Templated()) { this.BuildRows(app); }
+        prefH = this.ContentHeight(app) + this.HeaderHeight(app);
+    }
+
+    /// 覆写：按 `list` 样式画可选表面，再画表头与各行
+    /// （模板行走行控件排布，列模式直接绘制）。
+    override void OnPaint(App app) {
+        StyleBox s = this.ResolveStyleAs(app, "list", Class, Style.SNormal());
+        // 表面由样式表决定：`list` 默认透明，因此
+        // 卡片内的列表会透出卡片（磨砂皮肤下透出玻璃），
+        // 而不是盖上一块不透明面板。皮肤若
+        // 需要表面，声明背景色即可在此生效。
+        if (!Style.Has(Class, "flat") && s.bg != 0) {
+            app.canvas.SurfaceRoundRect(bx, by, bw, bh,
+                s.RadiusOr(app.theme.borderRadiusMedium),
+                s.bg, s.BorderOr(app.theme.borderSecondary), s.BorderWOr(1));
+        }
+        hover = -1;
+        hover = -1;
+        this.DragOutTick(app);
+        int headH = this.HeaderHeight(app);
+        this.PaintHeader(app, headH);
+        if (this.Count() == 0) {
+            this.PaintEmpty(app);
+            return;
+        }
+        if (this.Templated()) {
+            this.BuildRows(app);
+            this.ArrangeRows(app, headH);
+            return;
+        }
+        this.PaintColumnRows(app, headH);
+    }
+
+    /// 覆写：公共事件之外提供 "Select"/"Activate"/"Context"。
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Select");
+        e.Add("Activate");
+        e.Add("Context");
+        return e;
+    }
+
+    /// 将列表的语义事件（Select/Activate/Context）路由到对应的
+    /// UiEvent 字段；其余事件落入 `On` 上的通用事件包
+    /// （其 AddByName 忽略不认识的名称，因此 JSON/设计器中的 `onSelect`
+    /// 处理器不会静默地永远不执行）。
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Select") { Select.Add(a); return; }
+        if (evt == "Activate") { Activate.Add(a); return; }
+        if (evt == "Context") { Context.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+}

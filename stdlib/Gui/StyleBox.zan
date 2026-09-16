@@ -1,0 +1,1077 @@
+using System;
+
+namespace Gui;
+
+/// <summary>
+/// 已解析的视觉样式：主题默认值加上皮肤样式表中
+/// 匹配某个控件某个状态的声明，展平后的结果。
+///
+/// 这是 GUI 唯一知道如何 *paint* 一个带样式 box 的地方，
+/// 控件无需再携带按皮肤分叉的绘制代码，它只解析一次
+/// 然后绘制：
+///
+///     StyleBox s = Style.Eased(app, id, "button", "primary", disabled);
+///     s.Paint(app, x, y, w, h);
+///     s.DrawLabel(app, x, y, w, h, "Save");
+///
+/// 每个字段都是 int（GUI 栈不使用浮点）。`0` 表示颜色"未设置"，
+/// `-1` 表示度量未设置，因此声明可以把任何一项留给主题默认值；
+/// 通过接收回退值的 `*Or` 访问器读取它们。
+/// </summary>
+class StyleBox {
+    /// 设备像素来源标记：每个位（SourceFont 等）对应一个长度属性，
+    /// 置位表示该属性的当前值已是设备像素，ScaleLayout 不再对其二次缩放。
+    int prescaled;
+
+    // ---- fill ---------------------------------------------------------------
+    int bg;          // 背景色（0 = 无）
+    int bgTo;        // 渐变终点色（0 = 纯色）
+    int bgVia;       // 可选的中间渐变断点（0 = 无）
+    int bgDir;       // 0 向下，1 向右，2 右下，3 向上，4 左下
+    int opacity;     // 0..1000 千分比，乘到每个绘制的 alpha 上
+    int blur;        // backdrop-filter 模糊半径（px，0 = 关闭）
+
+    // ---- text ---------------------------------------------------------------
+    int fg;          // 文字/图标颜色
+    int accent;      // 指示符的强调色（下划线、光标、标记）
+    int fontPx;
+    int fontWeight;  // 0 未设置，400 常规，700 加粗（模拟双重绘制）
+    int lineHeight;
+    int letterSpacing;
+    int align;       // -1 未设置，0 左，1 居中，2 右
+    int valign;      // -1 未设置，0 顶，1 居中，2 底
+    int textCase;    // 0 无，1 大写，2 小写
+    int ellipsis;    // 1 = text-overflow: ellipsis
+    int nowrap;      // 1 = white-space: nowrap
+    /// `text-shadow`：文字底下的投影/描边色（0 = 无）。
+    /// 压在图片上的浅色小字（图名、地图标注）靠它保住可读性。
+    int tsColor;
+    int tsDx;
+    int tsDy;
+    /// 1 = 按四向描边绘制（原声明是 ≥3 层零模糊投影，
+    /// 如 `1px 1px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, …`，
+    /// 作者要的是文字描边而不是单侧投影）。
+    int tsOutline;
+
+    // ---- border / corners ---------------------------------------------------
+    int borderColor;
+    int borderW;
+    int borderTopW;    int borderTopColor;
+    int borderRightW;  int borderRightColor;
+    int borderBottomW; int borderBottomColor;
+    int borderLeftW;   int borderLeftColor;
+    int radius;
+    int radiusTL; int radiusTR; int radiusBR; int radiusBL;
+
+    // ---- shadow -------------------------------------------------------------
+    int shadow;      // 颜色（0 = 无）
+    int shadowDx;
+    int shadowDy;
+    int shadowBlur;
+    int shadowInset; // 1 = 内阴影
+
+    // ---- decoration ---------------------------------------------------------
+    // 皮肤按名称请求的外观，绘制 box 的每个控件都会应用
+    // （`border-style: dashed`、`-zan-emboss: raised|inset`、`-zan-specular: 1`），
+    // 因此没有控件需要自带的按变体绘制代码。
+    int borderStyle; // 0 实线，1 虚线
+    int emboss;      // 0 无，1 凸起，2 凹陷（新拟态）
+    int specular;    // 1 = 边框上跟随光标的高光
+    int fxId;        // 高光跟踪悬停所用的控件 id（0 = 无）
+    /// 玻璃光泽（`-zan-sheen`）：盒子内侧的一道自上而下衰减的
+    /// 高光加一圈内缘亮边，强度为 0..1000 千分比（0 = 关闭）。
+    /// 这是真实玻璃“上沿受光、边缘出亮线”的部分，声明在 CSS 里，
+    /// 由绘制盒子的每个控件统一应用。
+    int sheen;
+    int sheenColor;  // 光泽颜色（0 = 白）
+
+    // ---- box metrics --------------------------------------------------------
+    int padL; int padT; int padR; int padB;
+    int marL; int marT; int marR; int marB;
+    int width; int height;
+    int minW; int minH; int maxW; int maxH;
+    /// 上述六种度量的百分比形式，以包含块内容框的
+    /// 千分比表示（-1 未设置）。`width: 34%` 设置 widthPm = 340，布局
+    /// 再针对父级给出的空间解析它。
+    int widthPm; int heightPm;
+    int minWPm; int minHPm; int maxWPm; int maxHPm;
+    int gap;
+    /// 轴向独立的间距（-1 未设置，回退到 `gap`）：换行的选项组
+    /// 需要行距和列距不同（列距贴着标签，行距要拉开）。
+    int rowGap;
+    int colGap;
+    /// 每行的等分列数（-1 未设置 = 按可用宽度自动换行）。
+    int columns;
+
+    // ---- grid（WEB_GUI_ROADMAP P4）------------------------------------------
+    /// 容器轨道模板存原文串（Clone 直拷；repeat()/minmax() 的展开只在
+    /// 排版时用到，不值得驻留在每个 StyleBox 里）。"" = 未声明。
+    string gridCols;     // grid-template-columns
+    string gridRows;     // grid-template-rows
+    string gridAutoCols; // grid-auto-columns（缺省按 auto）
+    string gridAutoRows; // grid-auto-rows
+    /// 条目放置（grid-column/row 系）：线号 1 基，0 = auto；
+    /// span 缺省语义 1（0 = 未声明，消费端 max(1)）。
+    int gColStart; int gColEnd; int gColSpan;
+    int gRowStart; int gRowEnd; int gRowSpan;
+    /// 网格条目在格子内的对齐（同 alignItems 编码）：inline 轴
+    /// （`justify-items`，place-items 的第二词）。
+    int justifyItems;
+
+    // ---- layout -------------------------------------------------------------
+    int display;     // 0 legacy（无 CSS 缺省：dock/手摆），1 flex，2 none，
+                     // 3 flow（真块流，WEB_GUI_ROADMAP P0），4 grid（P4）
+    int flexDir;     // 0 row，1 column
+    int justify;     // 0 start，1 center，2 end，3 space-between，4 space-around
+    int alignItems;  // 0 stretch，1 start，2 center，3 end
+    int wrap;        // 1 = flex-wrap: wrap
+    /// 换行容器里各行在交叉轴上的分布（CSS `align-content`）：
+    /// 0 start，1 center，2 end，3 space-between，4 space-around，5 stretch。
+    /// 默认 start——本框架的容器按内容测量自身高度，若按 CSS
+    /// 的 `stretch` 默认值，一个被停靠成 fill 的换行容器会把两行
+    /// 悄悄撑到上下两端，与作者写下的紧凑排版不符。
+    int alignContent;
+    /// 单个子项覆盖容器的 `align-items`（CSS `align-self`）：
+    /// -1 未声明（跟随容器），0 stretch，1 start，2 center，3 end。
+    int alignSelf;
+    int grow;
+    /// CSS `flex-shrink`：-1 未声明（等同 1，行溢出时按比例收缩），
+    /// 0 = 不参与收缩（固定宽的侧栏、图标不该被挤扁）。
+    int shrink;
+    /// CSS `flex-basis`：主轴基准尺寸，优先于 width/height 与测量
+    /// 偏好。-1 未声明；basisPm 是同一属性的千分比形式（`50%`）。
+    int basis;
+    int basisPm;
+    /// CSS `aspect-ratio`：宽高比的千分比（1778 = 16/9）。0 未声明。
+    /// 只声明了一根轴时，另一根由这个比例推出。
+    int aspect;
+    int order;
+    int position;    // 0 static，1 relative，2 absolute
+    int posT; int posR; int posB; int posL;
+    int overflow;    // 1 = hidden（裁剪子项）
+    /// CSS 意义上的 overflow 真实声明：0 visible，1 hidden/clip/auto/
+    /// scroll，-1 未声明。overflow 字段缺省 1 是引擎渲染裁剪约定，
+    /// 不能当 BFC 判据（声明了 hidden 才是 BFC，CSS 2.1 §9.4.1）。
+    int overflowCss;
+    /// per-axis 滚动语义（P6）：0 visible / 1 hidden(clip) / 2 auto /
+    /// 3 scroll。滚动容器判据、滚动条与滚轮交互都看这两根；单轴声明
+    /// 时另一根 visible 按规范计算成 auto（消费端 StyleOverflow*）。
+    /// 水平轴只裁剪不滚动（台账）。
+    int overflowX;
+    int overflowY;
+    int zIndex;
+    int cursor;      // Cursor.* 代码，0 = 默认
+    // currentColor 记账位（StyleSheet.CcBits）：级联完成后由
+    // StyleSheet.ResolveCurrentColor 替换成最终前景色。
+    int ccMask;
+    int visible;     // 0 = visibility: hidden
+
+    // ---- web 布局扩展（WEB_GUI_ROADMAP P0）---------------------------------
+    /// 行内级标记：1 = inline/inline-block/inline-flex（参与父块流容器
+    /// 的行盒横排）。0 = 块级。
+    int inlineLevel;
+    /// CSS `float`：0 none，1 left，2 right（P3 完成绕排布局）。
+    int floatSide;
+    /// CSS `clear`：0 none，1 left，2 right，3 both。
+    int clearSide;
+    /// CSS `box-sizing`：0 border-box（缺省，声明尺寸含 border+padding），
+    /// 1 content-box（声明尺寸只含内容，布局端反推框宽）。
+    int boxSizing;
+    /// CSS `white-space`：0 normal，1 nowrap，2 pre，3 pre-wrap。
+    /// 旧字段 nowrap 同步维护（绘制端"不折行"位）：nowrap/pre 置 1。
+    int whiteSpace;
+    /// `line-height` 的量纲：0 未声明/normal，1 px（lineHeight），
+    /// 2 千分（lineHeight = 相对 fontPx 的倍数 * 1000，含 % 形式）。
+    int lineHeightKind;
+    /// 块格式化上下文标记（CSS BFC，P1）：`flow-root`/行内级置 1。
+    /// BFC 容器不与首/尾子的 margin 塌陷；`display: block` 的普通
+    /// 容器为 0——与首尾子塌陷（web 语义）。
+    int bfc;
+    /// 行内 `vertical-align`（P2 行盒）：0 baseline，1 middle，
+    /// 2 top，3 bottom。长度/百分比暂按 baseline（audit 报 coerced）。
+    int vaInline;
+
+    // ---- motion -------------------------------------------------------------
+    int transitionMs;
+    int easing;      // 0 ease，1 linear，2 ease-in，3 ease-out，4 ease-in-out
+    int anim;        // Style.Anim* 种类（0 无）
+    int animMs;
+    int tx; int ty;  // transform: translate()
+    int scale;       // transform: scale()，千分比（1000 = 1x）
+    int rotate;      // transform: rotate()，角度
+
+    // ---- CSS 单位环境（长度求值 StyleSheet.Len / calc() 用）----
+    // 样式解析发生在布局之前，容器尺寸还不可知；这里带上的就是
+    // 解析期可得的基准：根字号（rem）与视口逻辑尺寸（vw/vh）。
+    // 未经过 Style.Defaults 的裸盒（头号消费者是无窗口的测试）取
+    // 确定性缺省：16px 字号、1280x720 视口。
+    /// rem 的基准：主题正文字号（px）。
+    int envRemPx;
+    /// vw 的基准：窗口逻辑宽。
+    int envVw;
+    /// vh 的基准：窗口逻辑高。
+    int envVh;
+    /// 媒体查询环境：`prefers-color-scheme: dark` 的求值结果
+    /// （app.isDark）。
+    bool mediaDark;
+    /// 媒体查询环境：`prefers-reduced-motion: reduce`（app.reducedMotion）。
+    bool mediaReduced;
+
+    /// 度量未设置的通用哨兵（-1）。
+    static int Unset() { return 0 - 1; }
+    /// prescaled 位 1：字号已按设备像素。
+    static int SourceFont() { return 1; }
+    /// prescaled 位 2：宽度类度量（width/minW/maxW/basis）已按设备像素。
+    static int SourceWidth() { return 2; }
+    /// prescaled 位 4：高度类度量（height/minH/maxH）已按设备像素。
+    static int SourceHeight() { return 4; }
+    /// prescaled 位 8：间距（gap/rowGap/colGap）已按设备像素。
+    static int SourceGap() { return 8; }
+    /// prescaled 位 16：圆角半径已按设备像素。
+    static int SourceRadius() { return 16; }
+    /// prescaled 位 32：内/外边距已按设备像素。
+    static int SourcePadding() { return 32; }
+    /// prescaled 位 64：图标尺寸已按设备像素。
+    static int SourceIcon() { return 64; }
+
+    /// `source` 位标记的属性是否已是设备像素（无需再缩放）。
+    bool IsPrescaled(int source) {
+        return (prescaled & source) != 0;
+    }
+
+    /// 置位/清位 `source` 属性的设备像素标记。
+    void SetPrescaled(int source, bool value) {
+        if (value) {
+            prescaled = prescaled | source;
+        } else {
+            prescaled = prescaled & (0 - 1 - source);
+        }
+    }
+
+    /// 空 box：什么都不设置，所有访问器都返回其回退值。
+    StyleBox() {
+        this.prescaled = 0;
+        this.bg = 0; this.bgTo = 0; this.bgVia = 0; this.bgDir = 0;
+        this.opacity = 1000; this.blur = 0;
+        this.fg = 0; this.accent = 0;
+        this.fontPx = 0; this.fontWeight = 0; this.lineHeight = 0; this.letterSpacing = 0;
+        this.align = 0 - 1; this.valign = 0 - 1; this.textCase = 0;
+        this.ellipsis = 0; this.nowrap = 0;
+        this.tsColor = 0; this.tsDx = 0; this.tsDy = 0; this.tsOutline = 0;
+        this.borderColor = 0; this.borderW = 0 - 1;
+        this.borderTopW = 0 - 1;    this.borderTopColor = 0;
+        this.borderRightW = 0 - 1;  this.borderRightColor = 0;
+        this.borderBottomW = 0 - 1; this.borderBottomColor = 0;
+        this.borderLeftW = 0 - 1;   this.borderLeftColor = 0;
+        this.radius = 0 - 1;
+        this.radiusTL = 0 - 1; this.radiusTR = 0 - 1; this.radiusBR = 0 - 1; this.radiusBL = 0 - 1;
+        this.shadow = 0; this.shadowDx = 0; this.shadowDy = 0; this.shadowBlur = 0; this.shadowInset = 0;
+        this.borderStyle = 0; this.emboss = 0; this.specular = 0; this.fxId = 0;
+        this.sheen = 0; this.sheenColor = 0;
+        this.padL = 0 - 1; this.padT = 0 - 1; this.padR = 0 - 1; this.padB = 0 - 1;
+        this.marL = 0; this.marT = 0; this.marR = 0; this.marB = 0;
+        this.width = 0 - 1; this.height = 0 - 1;
+        this.minW = 0 - 1; this.minH = 0 - 1; this.maxW = 0 - 1; this.maxH = 0 - 1;
+        this.widthPm = 0 - 1; this.heightPm = 0 - 1;
+        this.minWPm = 0 - 1; this.minHPm = 0 - 1; this.maxWPm = 0 - 1; this.maxHPm = 0 - 1;
+        this.gap = 0 - 1;
+        this.rowGap = 0 - 1; this.colGap = 0 - 1; this.columns = 0 - 1;
+        this.gridCols = ""; this.gridRows = "";
+        this.gridAutoCols = ""; this.gridAutoRows = "";
+        this.gColStart = 0; this.gColEnd = 0; this.gColSpan = 0;
+        this.gRowStart = 0; this.gRowEnd = 0; this.gRowSpan = 0;
+        this.justifyItems = 0;
+        this.display = 0; this.flexDir = 0; this.justify = 0; this.alignItems = 0;
+        this.wrap = 0; this.alignContent = 0; this.alignSelf = 0 - 1;
+        this.grow = 0; this.shrink = 0 - 1;
+        this.basis = 0 - 1; this.basisPm = 0 - 1; this.aspect = 0;
+        this.order = 0;
+        this.position = 0;
+        this.posT = StyleBox.Unset(); this.posR = StyleBox.Unset();
+        this.posB = StyleBox.Unset(); this.posL = StyleBox.Unset();
+        // overflow 缺省 1 = 裁剪（引擎约定：子节点不画出界）；
+        // CSS 的 visible 是显式声明才落 0（放行溢出）。
+        this.overflow = 1; this.zIndex = 0; this.cursor = 0; this.visible = 1;
+        this.overflowCss = 0 - 1;
+        this.overflowX = 0; this.overflowY = 0;
+        this.inlineLevel = 0; this.floatSide = 0; this.clearSide = 0;
+        this.boxSizing = 0; this.whiteSpace = 0; this.lineHeightKind = 0;
+        this.bfc = 0; this.vaInline = 0;
+        this.transitionMs = 0 - 1; this.easing = 0;
+        this.anim = 0; this.animMs = 0;
+        this.tx = 0; this.ty = 0; this.scale = 1000; this.rotate = 0;
+        this.envRemPx = 16; this.envVw = 1280; this.envVh = 720;
+        this.mediaDark = false; this.mediaReduced = false;
+    }
+
+    /// 逐字段复制（解析缓存发放副本，以便控件可以
+    /// 微调自己的 box 而不污染缓存）。
+    StyleBox Clone() {
+        StyleBox d = new StyleBox();
+        d.prescaled = prescaled;
+        d.bg = bg; d.bgTo = bgTo; d.bgVia = bgVia; d.bgDir = bgDir;
+        d.opacity = opacity; d.blur = blur;
+        d.fg = fg; d.accent = accent;
+        d.fontPx = fontPx; d.fontWeight = fontWeight;
+        d.lineHeight = lineHeight; d.letterSpacing = letterSpacing;
+        d.align = align; d.valign = valign; d.textCase = textCase;
+        d.ellipsis = ellipsis; d.nowrap = nowrap;
+        d.tsColor = tsColor; d.tsDx = tsDx; d.tsDy = tsDy;
+        d.tsOutline = tsOutline;
+        d.borderColor = borderColor; d.borderW = borderW;
+        d.borderTopW = borderTopW;       d.borderTopColor = borderTopColor;
+        d.borderRightW = borderRightW;   d.borderRightColor = borderRightColor;
+        d.borderBottomW = borderBottomW; d.borderBottomColor = borderBottomColor;
+        d.borderLeftW = borderLeftW;     d.borderLeftColor = borderLeftColor;
+        d.radius = radius;
+        d.radiusTL = radiusTL; d.radiusTR = radiusTR;
+        d.radiusBR = radiusBR; d.radiusBL = radiusBL;
+        d.shadow = shadow; d.shadowDx = shadowDx; d.shadowDy = shadowDy;
+        d.shadowBlur = shadowBlur; d.shadowInset = shadowInset;
+        d.borderStyle = borderStyle; d.emboss = emboss;
+        d.specular = specular; d.fxId = fxId;
+        d.sheen = sheen; d.sheenColor = sheenColor;
+        d.padL = padL; d.padT = padT; d.padR = padR; d.padB = padB;
+        d.marL = marL; d.marT = marT; d.marR = marR; d.marB = marB;
+        d.width = width; d.height = height;
+        d.minW = minW; d.minH = minH; d.maxW = maxW; d.maxH = maxH;
+        d.widthPm = widthPm; d.heightPm = heightPm;
+        d.minWPm = minWPm; d.minHPm = minHPm; d.maxWPm = maxWPm; d.maxHPm = maxHPm;
+        d.gap = gap;
+        d.rowGap = rowGap; d.colGap = colGap; d.columns = columns;
+        d.display = display; d.flexDir = flexDir; d.justify = justify;
+        d.alignItems = alignItems; d.wrap = wrap; d.alignContent = alignContent;
+        d.alignSelf = alignSelf;
+        d.gridCols = gridCols; d.gridRows = gridRows;
+        d.gridAutoCols = gridAutoCols; d.gridAutoRows = gridAutoRows;
+        d.gColStart = gColStart; d.gColEnd = gColEnd; d.gColSpan = gColSpan;
+        d.gRowStart = gRowStart; d.gRowEnd = gRowEnd; d.gRowSpan = gRowSpan;
+        d.justifyItems = justifyItems;
+        d.grow = grow; d.shrink = shrink;
+        d.basis = basis; d.basisPm = basisPm; d.aspect = aspect;
+        d.order = order;
+        d.position = position;
+        d.posT = posT; d.posR = posR; d.posB = posB; d.posL = posL;
+        d.overflow = overflow; d.zIndex = zIndex; d.cursor = cursor;
+        d.overflowCss = overflowCss;
+        d.overflowX = overflowX; d.overflowY = overflowY;
+        d.ccMask = ccMask;
+        d.visible = visible;
+        d.inlineLevel = inlineLevel; d.floatSide = floatSide;
+        d.clearSide = clearSide; d.boxSizing = boxSizing;
+        d.whiteSpace = whiteSpace; d.lineHeightKind = lineHeightKind;
+        d.bfc = bfc; d.vaInline = vaInline;
+        d.transitionMs = transitionMs; d.easing = easing;
+        d.anim = anim; d.animMs = animMs;
+        d.tx = tx; d.ty = ty; d.scale = scale; d.rotate = rotate;
+        return d;
+    }
+
+    // ---- fallback accessors -------------------------------------------------
+
+    /// 各边 border 实际宽度（px）：四边声明优先，未声明回退统一
+    /// `borderW`。border 参与布局（WEB_GUI_ROADMAP P0）——
+    /// box-sizing: border-box 时内容框 = 框 − border − padding。
+    int BorderTopPx() { return borderTopW > 0 ? borderTopW : this.BorderWOr(0); }
+    int BorderRightPx() { return borderRightW > 0 ? borderRightW : this.BorderWOr(0); }
+    int BorderBottomPx() { return borderBottomW > 0 ? borderBottomW : this.BorderWOr(0); }
+    int BorderLeftPx() { return borderLeftW > 0 ? borderLeftW : this.BorderWOr(0); }
+
+    /// 填充背景色；未设置（0）返回 fb。
+    int BgOr(int fb)      { if (bg != 0) { return bg; } return fb; }
+    /// 文字/图标颜色；未设置返回 fb。
+    int FgOr(int fb)      { if (fg != 0) { return fg; } return fb; }
+    /// 强调色；未设置返回 fb。
+    int AccentOr(int fb)  { if (accent != 0) { return accent; } return fb; }
+    /// 字号（px）；未声明（<= 0）返回 fb。
+    int FontOr(int fb)    { if (fontPx > 0) { return fontPx; } return fb; }
+    /// 统一圆角半径；未声明（< 0）返回 fb。
+    int RadiusOr(int fb)  { if (radius >= 0) { return radius; } return fb; }
+    /// 统一边框宽度；未声明（< 0）返回 fb。
+    int BorderWOr(int fb) { if (borderW >= 0) { return borderW; } return fb; }
+    /// 统一边框颜色；未设置返回 fb。
+    int BorderOr(int fb)  { if (borderColor != 0) { return borderColor; } return fb; }
+    /// 子项间距；未声明（< 0）返回 fb。
+    int GapOr(int fb)     { if (gap >= 0) { return gap; } return fb; }
+    /// 行距；未声明回退 GapOr。
+    int RowGapOr(int fb)  { if (rowGap >= 0) { return rowGap; } return this.GapOr(fb); }
+    /// 列距；未声明回退 GapOr。
+    int ColGapOr(int fb)  { if (colGap >= 0) { return colGap; } return this.GapOr(fb); }
+    /// 每行等分列数；未声明返回 fb。
+    int ColumnsOr(int fb) { if (columns >= 0) { return columns; } return fb; }
+    /// 高度；未声明（< 0）返回 fb。
+    int HeightOr(int fb)  { if (height >= 0) { return height; } return fb; }
+    /// 宽度；未声明（< 0）返回 fb。
+    int WidthOr(int fb)   { if (width >= 0) { return width; } return fb; }
+
+    /// 圆角实际应用的角（Corner.TL|TR|BR|BL）。
+    /// 声明自身圆角为 0 的角是直角，所以 `border-radius:
+    /// 6 6 0 0`（标签页、焊接组的末尾按钮）会绘制成真正的
+    /// 半圆角盒子，而不是四角全圆。
+    int Corners() {
+        if (radiusTL < 0 && radiusTR < 0 && radiusBR < 0 && radiusBL < 0) {
+            return Corner.All();
+        }
+        int m = 0;
+        if (radiusTL != 0) { m = m + Corner.TL(); }
+        if (radiusTR != 0) { m = m + Corner.TR(); }
+        if (radiusBR != 0) { m = m + Corner.BR(); }
+        if (radiusBL != 0) { m = m + Corner.BL(); }
+        return m;
+    }
+
+    /// 把 `m` 之外的角改为直角，其余角保留圆角。
+    void SetCorners(int m) {
+        int r = radius;
+        if (r < 0) { r = 0; }
+        radiusTL = 0; radiusTR = 0; radiusBR = 0; radiusBL = 0;
+        if (m / Corner.TL() % 2 == 1) { radiusTL = r; }
+        if (m / Corner.TR() % 2 == 1) { radiusTR = r; }
+        if (m / Corner.BR() % 2 == 1) { radiusBR = r; }
+        if (m / Corner.BL() % 2 == 1) { radiusBL = r; }
+    }
+
+    /// 按包含块解析度量：百分比优先，其次
+    /// 绝对值声明，最后才是调用方的回退值。`avail <= 0` 在本引擎的
+    /// 约定里是"包含块未定"（测量路径一律传 0），此时百分比按 auto
+    /// 回落 `fb`（css-sizing：内在尺寸计算中百分比视作 auto），
+    /// 而不是解析成 0 把内容尺寸抹掉。
+    static int MetricIn(int pm, int abs, int avail, int fb) {
+        if (pm >= 0 && avail > 0) { return avail * pm / 1000; }
+        if (abs >= 0) { return abs; }
+        return fb;
+    }
+
+    /// 在 `avail` px 的包含块内声明的宽度（样式未声明时用 `fb`），
+    /// 所以 `width: 50%` 和 `width: 200px` 都可用。
+    int WidthIn(int avail, int fb) {
+        return StyleBox.MetricIn(widthPm, width, avail, fb);
+    }
+
+    /// 在 `avail` 像素包含块内解析声明的高度
+    /// （百分比优先、绝对值次之、`fb` 兜底），同 WidthIn。
+    int HeightIn(int avail, int fb) {
+        return StyleBox.MetricIn(heightPm, height, avail, fb);
+    }
+
+    /// `flex-basis` 在 `avail` 像素的主轴包含块内解析出的基准尺寸，
+    /// 未声明时返回 -1（调用方回退到 width/height 或测量偏好）。
+    int BasisIn(int avail) {
+        return StyleBox.MetricIn(basisPm, basis, avail, 0 - 1);
+    }
+
+    /// 将 `v` 限制在 min/max-width 内，百分比边界相对
+    /// containing block 解析。
+    int ClampWIn(int avail, int v) {
+        int r = v;
+        int lo = StyleBox.MetricIn(minWPm, minW, avail, 0 - 1);
+        int hi = StyleBox.MetricIn(maxWPm, maxW, avail, 0 - 1);
+        if (lo >= 0 && r < lo) { r = lo; }
+        if (hi >= 0 && r > hi) { r = hi; }
+        return r;
+    }
+
+    /// 把 `v` 限制在 min/max-height 内，百分比边界相对
+    /// `avail` 的包含块解析。
+    int ClampHIn(int avail, int v) {
+        int r = v;
+        int lo = StyleBox.MetricIn(minHPm, minH, avail, 0 - 1);
+        int hi = StyleBox.MetricIn(maxHPm, maxH, avail, 0 - 1);
+        if (lo >= 0 && r < lo) { r = lo; }
+        if (hi >= 0 && r > hi) { r = hi; }
+        return r;
+    }
+    /// 状态过渡时长（毫秒）；未声明（< 0）返回 fb。
+    int TransitionOr(int fb) { if (transitionMs >= 0) { return transitionMs; } return fb; }
+
+    /// 内容框左内边距；未声明（< 0）返回 fb。
+    int PadLOr(int fb) { if (padL >= 0) { return padL; } return fb; }
+    /// 内容框顶部内边距；未声明（< 0）返回 fb。
+    int PadTOr(int fb) { if (padT >= 0) { return padT; } return fb; }
+    /// 内容框右内边距；未声明（< 0）返回 fb。
+    int PadROr(int fb) { if (padR >= 0) { return padR; } return fb; }
+    /// 内容框底部内边距；未声明（< 0）返回 fb。
+    int PadBOr(int fb) { if (padB >= 0) { return padB; } return fb; }
+
+    /// 将 `w` 限制在盒子的 min/max-width 内（未设置的边界忽略）。
+    int ClampW(int w) {
+        int v = w;
+        if (minW >= 0 && v < minW) { v = minW; }
+        if (maxW >= 0 && v > maxW) { v = maxW; }
+        return v;
+    }
+
+    /// 把 `h` 限制在盒子的 min/max-height 内（未设置的边界忽略）。
+    int ClampH(int h) {
+        int v = h;
+        if (minH >= 0 && v < minH) { v = minH; }
+        if (maxH >= 0 && v > maxH) { v = maxH; }
+        return v;
+    }
+
+    /// 一次设置所有 padding 边（`padding: n` 简写用）。
+    void SetPad(int v) { padL = v; padT = v; padR = v; padB = v; }
+
+    /// 一次设置所有 margin 边。
+    void SetMargin(int v) { marL = v; marT = v; marR = v; marB = v; }
+
+    /// 一次设置四个圆角半径。
+    void SetRadius(int v) {
+        radius = v;
+        radiusTL = v; radiusTR = v; radiusBR = v; radiusBL = v;
+    }
+
+    /// 一次设置统一边框的宽度与颜色。
+    void SetBorder(int w, int color) {
+        borderW = w;
+        borderColor = color;
+    }
+
+    // ---- 插值 -----
+
+    /// 按千分数 `p` 线性混合两个已解析的盒子——`transition` 如何
+    /// 让控件在基础外观与状态外观之间淡入淡出。颜色
+    /// 通过 App.LerpColor 混合（一侧未设置时用 ScaleAlpha 保留 alpha），
+    /// 度量值插值，flags/枚举在
+    /// 中点处切换。
+    static StyleBox Blend(StyleBox a, StyleBox b, int p) {
+        if (p <= 0) { return a; }
+        if (p >= 1000) { return b; }
+        StyleBox d = b.Clone();
+        d.ccMask = a.ccMask | b.ccMask;
+        d.bg = StyleBox.MixColor(a.bg, b.bg, p);
+        d.bgTo = StyleBox.MixColor(a.bgTo, b.bgTo, p);
+        d.bgVia = StyleBox.MixColor(a.bgVia, b.bgVia, p);
+        d.fg = StyleBox.MixColor(a.fg, b.fg, p);
+        d.accent = StyleBox.MixColor(a.accent, b.accent, p);
+        d.borderColor = StyleBox.MixColor(a.borderColor, b.borderColor, p);
+        d.borderTopColor = StyleBox.MixColor(a.borderTopColor, b.borderTopColor, p);
+        d.borderRightColor = StyleBox.MixColor(a.borderRightColor, b.borderRightColor, p);
+        d.borderBottomColor = StyleBox.MixColor(a.borderBottomColor, b.borderBottomColor, p);
+        d.borderLeftColor = StyleBox.MixColor(a.borderLeftColor, b.borderLeftColor, p);
+        d.shadow = StyleBox.MixColor(a.shadow, b.shadow, p);
+        d.tsColor = StyleBox.MixColor(a.tsColor, b.tsColor, p);
+        d.tsDx = App.Lerp(a.tsDx, b.tsDx, p);
+        d.tsDy = App.Lerp(a.tsDy, b.tsDy, p);
+        d.opacity = App.Lerp(a.opacity, b.opacity, p);
+        d.blur = App.Lerp(a.blur, b.blur, p);
+        d.sheen = App.Lerp(a.sheen, b.sheen, p);
+        d.sheenColor = StyleBox.MixColor(a.sheenColor, b.sheenColor, p);
+        d.borderW = StyleBox.MixMetric(a.borderW, b.borderW, p);
+        d.borderTopW = StyleBox.MixMetric(a.borderTopW, b.borderTopW, p);
+        d.borderRightW = StyleBox.MixMetric(a.borderRightW, b.borderRightW, p);
+        d.borderBottomW = StyleBox.MixMetric(a.borderBottomW, b.borderBottomW, p);
+        d.borderLeftW = StyleBox.MixMetric(a.borderLeftW, b.borderLeftW, p);
+        d.radius = StyleBox.MixMetric(a.radius, b.radius, p);
+        d.radiusTL = StyleBox.MixMetric(a.radiusTL, b.radiusTL, p);
+        d.radiusTR = StyleBox.MixMetric(a.radiusTR, b.radiusTR, p);
+        d.radiusBR = StyleBox.MixMetric(a.radiusBR, b.radiusBR, p);
+        d.radiusBL = StyleBox.MixMetric(a.radiusBL, b.radiusBL, p);
+        d.shadowDx = App.Lerp(a.shadowDx, b.shadowDx, p);
+        d.shadowDy = App.Lerp(a.shadowDy, b.shadowDy, p);
+        d.shadowBlur = App.Lerp(a.shadowBlur, b.shadowBlur, p);
+        d.fontPx = StyleBox.MixMetric(a.fontPx, b.fontPx, p);
+        d.lineHeight = StyleBox.MixMetric(a.lineHeight, b.lineHeight, p);
+        d.letterSpacing = App.Lerp(a.letterSpacing, b.letterSpacing, p);
+        d.tx = App.Lerp(a.tx, b.tx, p);
+        d.ty = App.Lerp(a.ty, b.ty, p);
+        d.scale = App.Lerp(a.scale, b.scale, p);
+        d.rotate = App.Lerp(a.rotate, b.rotate, p);
+        d.padL = StyleBox.MixMetric(a.padL, b.padL, p);
+        d.padT = StyleBox.MixMetric(a.padT, b.padT, p);
+        d.padR = StyleBox.MixMetric(a.padR, b.padR, p);
+        d.padB = StyleBox.MixMetric(a.padB, b.padB, p);
+        d.marL = App.Lerp(a.marL, b.marL, p);
+        d.marT = App.Lerp(a.marT, b.marT, p);
+        d.marR = App.Lerp(a.marR, b.marR, p);
+        d.marB = App.Lerp(a.marB, b.marB, p);
+        d.height = StyleBox.MixMetric(a.height, b.height, p);
+        d.width = StyleBox.MixMetric(a.width, b.width, p);
+        d.minW = StyleBox.MixMetric(a.minW, b.minW, p);
+        d.minH = StyleBox.MixMetric(a.minH, b.minH, p);
+        d.maxW = StyleBox.MixMetric(a.maxW, b.maxW, p);
+        d.maxH = StyleBox.MixMetric(a.maxH, b.maxH, p);
+        d.gap = StyleBox.MixMetric(a.gap, b.gap, p);
+        d.rowGap = StyleBox.MixMetric(a.rowGap, b.rowGap, p);
+        d.colGap = StyleBox.MixMetric(a.colGap, b.colGap, p);
+        d.columns = StyleBox.MixMetric(a.columns, b.columns, p);
+        return d;
+    }
+
+    /// 混合两个颜色，把 0（未设置）视为“淡出另一个颜色”，这样
+    /// 只*添加*填充的状态仍会平滑淡入而非突然出现。
+    static int MixColor(int c0, int c1, int p) {
+        if (c0 == c1) { return c0; }
+        if (c0 == 0) { return App.ScaleAlpha(c1, p); }
+        if (c1 == 0) { return App.ScaleAlpha(c0, 1000 - p); }
+        int rgb = App.LerpColor(c0, c1, p);
+        int a0 = StyleBox.AlphaOf(c0);
+        int a1 = StyleBox.AlphaOf(c1);
+        int a = a0 + (a1 - a0) * p / 1000;
+        return App.ScaleAlpha(rgb, a * 1000 / 255);
+    }
+
+    /// 插值一个度量值，-1 表示“未设置”（未设置的一侧保留
+    /// 另一侧的值，而不是从无效的 -1 过渡）。
+    static int MixMetric(int v0, int v1, int p) {
+        if (v0 < 0) { return v1; }
+        if (v1 < 0) { return v0; }
+        return v0 + (v1 - v0) * p / 1000;
+    }
+
+    /// 取打包颜色的 alpha 分量（0..255）。
+    static int AlphaOf(int color) {
+        int rgb = color % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+        int a = (color - rgb) / 16777216;
+        if (a < 0) { a = a + 256; }
+        return a;
+    }
+
+    /// 对颜色应用 `opacity`（完全不透明时不做任何事）。
+    int Fade(int color) {
+        if (color == 0) { return 0; }
+        if (opacity >= 1000) { return color; }
+        return App.ScaleAlpha(color, opacity);
+    }
+
+    // ---- 绘制 -----
+
+    /// 绘制盒子：背景模糊、投影、填充（纯色或渐变）、
+    /// 各边边框，然后叠加任意 `animation`。遵循 `transform`
+    /// （translate/scale）和 `opacity`；`display: none` / `visibility: hidden` 的
+    /// 盒子不绘制任何内容。
+    void Paint(App app, int x, int y, int w, int h) {
+        if (display == 2 || visible == 0) { return; }
+        if (w <= 0 || h <= 0) { return; }
+        Canvas c = app.canvas;
+
+        int rx = x + tx;
+        int ry = y + ty;
+        int rw = w;
+        int rh = h;
+        if (scale != 1000 && scale > 0) {
+            int nw = w * scale / 1000;
+            int nh = h * scale / 1000;
+            rx = rx + (w - nw) / 2;
+            ry = ry + (h - nh) / 2;
+            rw = nw;
+            rh = nh;
+        }
+        int r = this.RadiusOr(0);
+        // CSS 会把圆角限制为盒子的一半，所以 `border-radius: 999px` 就是
+        // 胶囊形状，控件无需自己处理圆角/圆形计算。
+        int rmax = rh / 2;
+        if (rw < rh) { rmax = rw / 2; }
+        if (r > rmax) { r = rmax; }
+
+        if (blur > 0) {
+            // 登记面板矩形：损伤条带跨出本面板时，App 把下一帧的
+            // 裁剪扩到面板并集（而不是整窗重绘），见 App.NoteGlassRect。
+            app.NoteGlassRect(rx, ry, rw, rh);
+            // 把磨砂输出裁进盒子的圆角内：方形模糊会把角落
+            // 的背景一起糊掉，之后的圆角填充再也补不回来。
+            // 缓存槽按元素身份领取：有控件 id 就用它，否则退回
+            // 几何（同一位置/尺寸的面板每帧仍拿回同一个槽）。按
+            // 绘制顺序发槽时，某一帧多画/少画一个玻璃面板会让它
+            // 之后的面板集体换槽、集体重新模糊。
+            int key = app.BlurKeyId(fxId);
+            if (key == 0) { key = app.BlurKey(2, rx, ry, rw, rh); }
+            int slot = app.BlurSlotFor(key);
+            bool bd = app.BackdropDirtyIn(slot, rx, ry, rw, rh);
+            if (r > 0) {
+                c.BlurRoundCached(rx, ry, rw, rh, app.Scale(blur),
+                                  slot, bd, r, this.Corners());
+            } else {
+                c.BlurRectCached(rx, ry, rw, rh, app.Scale(blur),
+                                 slot, bd);
+            }
+        }
+
+        if (shadow != 0 && shadowInset == 0) {
+            this.PaintShadow(app, rx, ry, rw, rh, r);
+        }
+
+        // Neumorphism 效果在填充下方：一对凸起/内陷的柔和边缘。
+        if (emboss != 0) {
+            Fx.Emboss(app, rx, ry, rw, rh, r, emboss == 2);
+        }
+
+        int corners = this.Corners();
+        int fill = this.Fade(bg);
+        // Solid uniform borders share one coverage pass with their fill.
+        // Keep the original ordering when intervening effects paint the surface.
+        bool combined = bgTo == 0 && borderStyle != 1 && sheen <= 0
+            && !(shadow != 0 && shadowInset == 1)
+            && borderTopW <= 0 && borderRightW <= 0
+            && borderBottomW <= 0 && borderLeftW <= 0;
+        if (combined) {
+            c.SurfaceRoundRectIn(rx, ry, rw, rh, r, corners, fill,
+                                  this.Fade(borderColor), this.BorderWOr(0));
+        } else if (bgTo != 0) {
+            this.PaintGradient(app, rx, ry, rw, rh, r);
+        } else if (fill != 0) {
+            if (r > 0) { c.FillRoundRectIn(rx, ry, rw, rh, r, corners, fill); }
+            else { c.FillRect(rx, ry, rw, rh, fill); }
+        }
+
+        if (shadow != 0 && shadowInset == 1) {
+            int ia = 1;
+            while (ia <= 3) {
+                c.DrawRoundRect(rx + ia - 1, ry + ia - 1, rw - (ia - 1) * 2,
+                                rh - (ia - 1) * 2, r,
+                                App.ScaleAlpha(this.Fade(shadow), 1000 - ia * 250), 1);
+                ia = ia + 1;
+            }
+        }
+
+        if (sheen > 0) {
+            this.PaintSheen(app, rx, ry, rw, rh, r);
+        }
+
+        if (!combined) { this.PaintBorders(app, rx, ry, rw, rh, r); }
+        if (specular == 1 && fxId != 0) {
+            Fx.Specular(app, fxId, rx, ry, rw, rh, r, (int)4294967295);
+        }
+        this.PaintAnim(app, rx, ry, rw, rh, r);
+    }
+
+    /// 投影：圆角 SDF 一次出图（见 Canvas.ShadowRoundRect）。
+    /// 以外轮廓到圆角形状的有符号距离在 blur 带上做 smoothstep 衰减，
+    /// 半跨带正好落在轮廓上（半个覆盖），与高斯 box-shadow 的观感一致；
+    /// 衰减连续，角部不会留下逐圈扩张描边的楔形缝/同心弧，每个像素
+    /// 只写一次，半透明阴影色合成到标称 alpha。
+    void PaintShadow(App app, int x, int y, int w, int h, int r) {
+        int col = this.Fade(shadow);
+        int dx = x + app.Scale(shadowDx);
+        int dy = y + app.Scale(shadowDy);
+        int blur = app.Scale(shadowBlur);
+        if (r < 0) { r = 0; }
+        app.canvas.ShadowRoundRect(dx, dy, w, h, r, blur, col);
+    }
+
+    /// 玻璃光泽（`-zan-sheen`）：上半部分一道自上而下衰减到透明的
+    /// 高光带（裁进盒子的上圆角），加一圈 1px 内缘亮边，上沿最亮。
+    /// 这就是液态玻璃“受光面 + 出亮线”的部分，皮肤按强度声明，
+    /// 所有画 box 的控件统一得到同样的质感。
+    void PaintSheen(App app, int x, int y, int w, int h, int r) {
+        Canvas c = app.canvas;
+        int str = sheen;
+        if (opacity < 1000) { str = str * opacity / 1000; }
+        if (str <= 0) { return; }
+        int col = sheenColor;
+        if (col == 0) { col = (int)4294967295; }
+        int corners = this.Corners();
+
+        // 受光带：盒子上半部（至多 120px），顶部最亮、向下淡出。
+        // 用圆角渐变原语画，上圆角由栅格化器按覆盖率抗锯齿（与
+        // 圆角填充同一轮廓），高光既不溢出圆角也不在角上留阶梯；
+        // 端点带 alpha，逐像素混合，磨砂背景仍然透出来。
+        int bandH = h / 2;
+        int cap = app.Scale(120);
+        if (bandH > cap) { bandH = cap; }
+        int peak = App.ScaleAlpha(col, str * 55 / 100);
+        if (bandH > 0) {
+            // 渐变矩形取 2*bandH 高、中间色停靠点设为全透明：在
+            // bandH 处正好淡到 0，其后各行 alpha 为 0（不落像素），
+            // 于此同时矩形足够高，圆角半径不会被原语按半高夹小、
+            // 高光也就不会溢出盒子的圆角。
+            int clear = App.ScaleAlpha(peak, 0);
+            c.FillGradMask(x, y, w, bandH * 2, r, corners & Corner.Top(), 0,
+                           peak, clear, clear);
+        }
+
+        // 内缘亮边：整圈一道细光，上沿再压一条更亮的高光线。
+        c.DrawRoundRectIn(x, y, w, h, r, corners,
+                          App.ScaleAlpha(col, str * 45 / 100), 1);
+        int lipX = x + r;
+        int lipW = w - r * 2;
+        if (lipW > 0) {
+            c.FillRect(lipX, y, lipW, 1, App.ScaleAlpha(col, str * 85 / 100));
+        }
+    }
+
+    /// 带圆角半径的渐变填充：方形不透明渐变直接用 FillVGrad，
+    /// 其余交给抗锯齿的圆角渐变原语 FillGradMask。
+    void PaintGradient(App app, int x, int y, int w, int h, int r) {
+        Canvas c = app.canvas;
+        int from = this.Fade(bg);
+        int to = this.Fade(bgTo);
+        if (bgDir == 3) {
+            int sw = from; from = to; to = sw;
+        }
+        bool opaque = StyleBox.AlphaOf(from) == 255 && StyleBox.AlphaOf(to) == 255;
+        if (r <= 0 && (bgDir == 0 || bgDir == 3) && opaque) {
+            // FillVGrad 直接覆写像素（壁纸/实心按钮要的就是这个），
+            // 是方形不透明渐变的最快路径。
+            c.FillVGrad(x, y, w, h, from, to);
+            return;
+        }
+        // 圆角/半透明/水平渐变都交给 FillGradMask：圆角弧由
+        // 栅格化器按覆盖率抗锯齿（与 FillRoundRect 同一轮廓），
+        // 半透明端点逐像素混合。此前这里用逐行/逐列内缩的
+        // 分带填充近似圆角，边缘是整像素阶梯，再描一圈 1px 弧
+        // 也盖不住，渐变面板/按钮的圆角因此有毛刺。
+        int dirCode = 0;
+        if (bgDir == 1) { dirCode = 1; }
+        else if (bgDir == 2) { dirCode = 2; }   // 右下对角
+        else if (bgDir == 4) { dirCode = 3; }   // 左下对角
+        int via = 0;
+        if (bgVia != 0) { via = this.Fade(bgVia); }
+        c.FillGradMask(x, y, w, h, r, this.Corners(), dirCode, from, via, to);
+    }
+
+    /// 任一侧已设置时绘制各边边框，否则绘制统一边框。
+    void PaintBorders(App app, int x, int y, int w, int h, int r) {
+        Canvas c = app.canvas;
+        bool anySide = borderTopW > 0 || borderRightW > 0
+            || borderBottomW > 0 || borderLeftW > 0;
+        if (!anySide) {
+            int bw = this.BorderWOr(0);
+            int bc = this.Fade(borderColor);
+            if (bw > 0 && bc != 0) {
+                if (borderStyle == 1) { Fx.DashedBorder(app, x, y, w, h, bc); }
+                else if (r > 0) { c.DrawRoundRectIn(x, y, w, h, r, this.Corners(), bc, bw); }
+                else { c.DrawRect(x, y, w, h, bc, bw); }
+            }
+            return;
+        }
+        // 各边边框：圆角处的直条要按半径内缩，缺口用抗锯齿的
+        // 圆角描边（裁剪到该角的方块）补上——否则直条会顶到
+        // 盒子的方角外面，圆角上就露出一段直角毛刺。
+        int cn = this.Corners();
+        int rTL = 0; int rTR = 0; int rBL = 0; int rBR = 0;
+        if (r > 0) {
+            if ((cn / Corner.TL() % 2) == 1) { rTL = r; }
+            if ((cn / Corner.TR() % 2) == 1) { rTR = r; }
+            if ((cn / Corner.BL() % 2) == 1) { rBL = r; }
+            if ((cn / Corner.BR() % 2) == 1) { rBR = r; }
+        }
+        if (borderTopW > 0) {
+            c.FillRect(x + rTL, y, w - rTL - rTR, borderTopW,
+                       this.SideColor(borderTopColor));
+        }
+        if (borderBottomW > 0) {
+            c.FillRect(x + rBL, y + h - borderBottomW, w - rBL - rBR,
+                       borderBottomW, this.SideColor(borderBottomColor));
+        }
+        if (borderLeftW > 0) {
+            c.FillRect(x, y + rTL, borderLeftW, h - rTL - rBL,
+                       this.SideColor(borderLeftColor));
+        }
+        if (borderRightW > 0) {
+            c.FillRect(x + w - borderRightW, y + rTR, borderRightW,
+                       h - rTR - rBR, this.SideColor(borderRightColor));
+        }
+        if (r > 0) {
+            this.PaintSideArc(app, x, y, w, h, r, rTL, x, y,
+                              borderTopW, borderLeftW,
+                              borderTopColor, borderLeftColor);
+            this.PaintSideArc(app, x, y, w, h, r, rTR, x + w - r, y,
+                              borderTopW, borderRightW,
+                              borderTopColor, borderRightColor);
+            this.PaintSideArc(app, x, y, w, h, r, rBL, x, y + h - r,
+                              borderBottomW, borderLeftW,
+                              borderBottomColor, borderLeftColor);
+            this.PaintSideArc(app, x, y, w, h, r, rBR, x + w - r, y + h - r,
+                              borderBottomW, borderRightW,
+                              borderBottomColor, borderRightColor);
+        }
+    }
+
+    /// 补画一个圆角上的边框弧：裁剪到该角的 r×r 方块，再用整盒
+    /// 圆角描边（与圆角填充同一轮廓、已抗锯齿）画出弧段。粗细取
+    /// 相邻两边中较粗的一边，颜色取水平边、缺省用竖直边。
+    void PaintSideArc(App app, int x, int y, int w, int h, int r, int on,
+                      int cx, int cy, int hw, int vw, int hcol, int vcol) {
+        if (on <= 0) { return; }
+        int bw = hw;
+        if (vw > bw) { bw = vw; }
+        if (bw <= 0) { return; }
+        int col = hcol;
+        if (hw <= 0 || col == 0) { col = vcol; }
+        if (col == 0) { col = borderColor; }
+        col = this.Fade(col);
+        if (col == 0) { return; }
+        Canvas c = app.canvas;
+        c.PushClip(cx, cy, r, r);
+        c.DrawRoundRectIn(x, y, w, h, r, this.Corners(), col, bw);
+        c.PopClip();
+    }
+
+    /// 某条边的边框色：该边未单独指定颜色时回退统一
+    /// borderColor；结果做 opacity 衰减。
+    int SideColor(int col) {
+        if (col != 0) { return this.Fade(col); }
+        return this.Fade(borderColor);
+    }
+
+    /// `animation` 层：在盒子内绘制的关键帧式动画，
+    /// 且自触发（运行期间持续请求帧）。
+    void PaintAnim(App app, int x, int y, int w, int h, int r) {
+        if (anim == 0) { return; }
+        int ms = animMs;
+        if (ms <= 0) { ms = 2400; }
+        int tint = this.AccentOr(this.FgOr(0));
+        if (anim == Style.AnimShimmer()) {
+            Fx.CardSheen(app, x, y, w, h, tint, ms);
+        } else if (anim == Style.AnimGlow()) {
+            Fx.BorderGlow(app, x, y, w, h, r, tint, ms, 220);
+        } else if (anim == Style.AnimBreath()) {
+            Fx.CardBreath(app, x, y, w, h, tint, ms);
+        } else if (anim == Style.AnimAurora()) {
+            Fx.CardAurora(app, x, y, w, h, tint);
+        } else if (anim == Style.AnimMotes()) {
+            Fx.CardMotes(app, x, y, w, h, tint);
+        } else if (anim == Style.AnimPulse()) {
+            int a = Fx.Pulse(app, ms) * 140 / 1000;
+            Canvas c = app.canvas;
+            c.FillRoundRect(x, y, w, h, r, App.ScaleAlpha(tint, a * 1000 / 255));
+            app.RequestAnimationFrameIn(32, x, y, w, h);
+        }
+    }
+
+    /// 本帧 `float` 动画贡献的额外偏移（控件把它加到
+    /// 内容原点，使整个控件上下浮动）。
+    int FloatOffset(App app, int x, int y, int w, int h) {
+        if (anim != Style.AnimFloat()) { return 0; }
+        int ms = animMs;
+        if (ms <= 0) { ms = 2600; }
+        app.RequestAnimationFrameIn(32, x, y, w, h);
+        int p = Fx.Pulse(app, ms);
+        return app.Scale(3) * (p - 500) / 500;
+    }
+
+    /// 本帧 `spin` 动画贡献的旋转角度（度）。
+    int SpinDeg(App app, int x, int y, int w, int h) {
+        if (anim != Style.AnimSpin()) { return rotate; }
+        int ms = animMs;
+        if (ms <= 0) { ms = 900; }
+        app.RequestAnimationFrameIn(16, x, y, w, h);
+        return rotate + Fx.Saw(app, ms) * 360 / 1000;
+    }
+
+    // ---- 文本 -----
+
+    /// 在 [x,y,w,h] 内绘制标签，遵循颜色、字号/字重、
+    /// text-align、vertical-align、letter-spacing、text-transform 和
+    /// text-overflow: ellipsis。返回实际绘制的宽度。
+    /// 行高像素：量纲 1 = lineHeight（px）；2 = 千分倍 × 字号
+    /// （`line-height: 1.5` / `150%`）。0 = 未声明/normal。
+    int LineHeightPx(int fs) {
+        if (lineHeightKind == 2) {
+            int f = fs > 0 ? fs : 16;
+            return lineHeight * f / 1000;
+        }
+        return lineHeight;
+    }
+
+    int DrawLabel(App app, int x, int y, int w, int h, string label) {
+        if (label == "" || visible == 0 || display == 2) { return 0; }
+        Canvas c = app.canvas;
+        int fs = this.FontOr(app.theme.fontSizeMedium);
+        int col = this.Fade(this.FgOr(app.theme.textPrimary));
+        string s = label;
+        if (textCase == 1) { s = s.ToUpper(); }
+        else if (textCase == 2) { s = s.ToLower(); }
+
+        int avail = w - this.PadLOr(0) - this.PadROr(0)
+            - this.BorderLeftPx() - this.BorderRightPx();
+        int tw = StyleBox.MeasureSpaced(s, fs, letterSpacing);
+        if (ellipsis == 1 && avail > 0 && tw > avail) {
+            s = StyleBox.Truncate(s, fs, letterSpacing, avail);
+            tw = StyleBox.MeasureSpaced(s, fs, letterSpacing);
+        }
+
+        int tx0 = x + this.PadLOr(0) + this.BorderLeftPx();
+        if (align == 1) { tx0 = x + (w - tw) / 2; }
+        else if (align == 2) {
+            tx0 = x + w - this.PadROr(0) - this.BorderRightPx() - tw;
+        }
+
+        int fh = Canvas.FontHeight(fs);
+        int ty0 = y + this.PadTOr(0) + this.BorderTopPx();
+        if (align >= 0 && valign < 0) { ty0 = y + (h - fh) / 2; }
+        if (valign == 1) { ty0 = y + (h - fh) / 2; }
+        else if (valign == 2) {
+            ty0 = y + h - this.PadBOr(0) - this.BorderBottomPx() - fh;
+        }
+        int lhPx = this.LineHeightPx(fs);
+        if (lhPx > 0) { ty0 = y + (lhPx - fh) / 2; }
+
+        this.DrawRun(c, tx0, ty0, s, col, fs);
+        return tw;
+    }
+
+    /// 在精确原点绘制一段文本（无盒子对齐），应用
+    /// 字间距、`font-weight >= 600` 的模拟加粗，以及 `text-shadow`。
+    ///
+    /// text-shadow 必须在字形之前画：X11/Win32 的文字是直接覆盖
+    /// 合成，先画字再画影子会把影子盖在笔画上而不是垫在下面。
+    /// `tsOutline`（原声明是 ≥3 层零模糊投影）按四向描边绘制——
+    /// 那正是 `1px 1px 0 #000, -1px -1px 0 #000, …` 的意图，
+    /// 单侧偏移会让压在图片上的白字半边发糊。
+    void DrawRun(Canvas c, int x, int y, string s, int color, int fs) {
+        if (tsColor != 0) { this.DrawTextShadow(c, x, y, s, fs); }
+        if (letterSpacing == 0) {
+            c.DrawText(x, y, s, color, fs);
+            if (fontWeight >= 600) { c.DrawText(x + 1, y, s, color, fs); }
+            return;
+        }
+        int cx = x;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            c.DrawText(cx, y, ch, color, fs);
+            if (fontWeight >= 600) { c.DrawText(cx + 1, y, ch, color, fs); }
+            cx = cx + Canvas.MeasureText(ch, fs) + letterSpacing;
+        }
+    }
+
+    /// 文字投影/描边：四向描边（tsOutline）或单侧偏移。
+    ///
+    /// `s` 是已经应用过 text-transform/ellipsis 的最终串，偏移按
+    /// 声明值原样使用（px，不随 DPI 放大——描边宽度 1px 是字形本身
+    /// 的观感，放大到 1.5px 反而糊）。
+    void DrawTextShadow(Canvas c, int x, int y, string s, int fs) {
+        int col = this.Fade(tsColor);
+        int dx = tsDx;
+        int dy = tsDy;
+        if (col == 0) { return; }
+        if (tsOutline == 1) {
+            int r = dx;
+            if (dy > r) { r = dy; }
+            if (r < 0) { r = 0 - r; }
+            if (r < 1) { r = 1; }
+            c.DrawText(x - r, y, s, col, fs);
+            c.DrawText(x + r, y, s, col, fs);
+            c.DrawText(x, y - r, s, col, fs);
+            c.DrawText(x, y + r, s, col, fs);
+            return;
+        }
+        c.DrawText(x + dx, y + dy, s, col, fs);
+    }
+
+    /// 文本宽度：MeasureText 加上 letter-spacing（每字符 spacing 像素）。
+    static int MeasureSpaced(string s, int fs, int spacing) {
+        int w = Canvas.MeasureText(s, fs);
+        if (spacing != 0) { w = w + spacing * s.Length; }
+        return w;
+    }
+
+    /// `s` 的最长前缀加 “...”，且能放入 `avail` px 内。
+    static string Truncate(string s, int fs, int spacing, int avail) {
+        int ell = StyleBox.MeasureSpaced("...", fs, spacing);
+        if (avail <= ell) { return "..."; }
+        // 一次回退一个完整的 UTF-8 字符：逐字节丢弃
+        // 会在切口留下断裂的多字节字符。
+        int keep = s.Length;
+        while (keep > 0) {
+            string head = s.Substring(0, keep);
+            if (StyleBox.MeasureSpaced(head, fs, spacing) + ell <= avail) {
+                return head + "...";
+            }
+            keep = Text.PrevCharStart(s, keep);
+        }
+        return "...";
+    }
+}

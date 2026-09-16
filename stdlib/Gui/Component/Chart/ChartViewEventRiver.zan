@@ -1,0 +1,196 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+partial class ChartView {
+    // ---- Event River（ECharts type 'eventRiver'；时间轴上的堆叠带） ----
+
+    /// 事件带波浪振幅：height/5，钳在 [1, height/2]；h < 2 时
+    /// 无波浪（返回 0）。
+    static int EventRiverWaveAmp(int height) {
+        if (height < 2) { return 0; }
+        int amp = height / 5;
+        if (amp < 1) { amp = 1; }
+        if (amp > height / 2) { amp = height / 2; }
+        return amp;
+    }
+
+    /// bands 按时间排序后，不能再用 band 下标取色；否则输入
+    /// 未按时间升序时图例与实际事件带会交换颜色。按图例去重
+    /// 顺序映射名称，保证图例、带和 tooltip 共用稳定色彩身份。
+    static int EventRiverColorIndex(List<string> names, string name) {
+        for (int i = 0; i < names.Count; i = i + 1) {
+            if (names[i] == name) { return i; }
+        }
+        return 0;
+    }
+
+    /// Event River 渲染入口：events 经 EventRiverLayout 按时间
+    /// 布局成堆叠波浪带，从左向右按 g 揭示；右侧去重图例（上限
+    /// 8 条）与时间轴端点标签；带矩形命中（EventBand 事件，
+    /// dataIndex 用排序前的源 events 下标）+ tooltip。
+    static void DrawEventRiver(App app, int x, int y, int w, int h,
+                               ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+        ChartSeries lead = ChartView.LeadSeries(o);
+        if (lead == null || lead.events.Count < 1) { return; }
+
+        // 图例（可选）：去重事件名，上限 8 条，右侧预留一栏。
+        int legendW = 0;
+        List<string> legNames = new List<string>();
+        for (int i = 0; i < lead.events.Count && legNames.Count <= 8; i = i + 1) {
+            string nm = lead.events[i].name;
+            bool dup = false;
+            for (int k = 0; k < legNames.Count; k = k + 1) {
+                if (legNames[k] == nm) { dup = true; }
+            }
+            if (!dup) { legNames.Add(nm); }
+        }
+        if (o.showLegend && legNames.Count > 0 && legNames.Count <= 8) {
+            legendW = app.Scale(120);
+        }
+
+        int contentH = (y + h - pad) - top;
+        EventRiverLayout layout = EventRiverLayout.Of(
+            lead.events, x, top, w - legendW, contentH, pad);
+        int n = layout.bands.Count;
+        if (n < 1) { return; }
+
+        // 从左向右按 g 揭示：只画 x <= revealFront 的部分。
+        int plotW = (w - legendW) - pad * 2;
+        if (plotW < 4) { plotW = 4; }
+        int revealFront = x + pad + plotW * g / 1000;
+
+        for (int i = 0; i < n; i = i + 1) {
+            EventBand b = layout.bands[i];
+            int x0 = b.x0;
+            int x1 = b.x1;
+            if (x0 >= revealFront) { continue; }
+            if (x1 > revealFront) { x1 = revealFront; }
+            if (x1 <= x0 || b.h < 1) { continue; }
+
+            int col = Chart.Palette(t, ChartView.EventRiverColorIndex(legNames, b.name));
+            c.FillRect(x0, b.y, x1 - x0, b.h, Chart.WithAlpha(col, 200));
+
+            // 波浪轮廓：闭合 polyline（上缘 + 右 + 下缘 + 左）。
+            int steps = (x1 - x0) / 8;
+            if (steps < 4) { steps = 4; }
+            if (steps > 64) { steps = 64; }
+            List<int> px = new List<int>();
+            List<int> py = new List<int>();
+            int period = (b.x1 - b.x0) / 2;
+            if (period < 24) { period = 24; }
+            int amp = ChartView.EventRiverWaveAmp(b.h);
+            int phase = b.row * 40;
+            int yc = b.y + b.h / 2;
+            int topBase = b.y + amp;
+            int bottomBase = b.y + b.h - amp;
+            for (int s = 0; s <= steps; s = s + 1) {
+                int sx = x0 + (x1 - x0) * s / steps;
+                int deg = phase + (sx - b.x0) * 360 / period;
+                int off = amp * ChartView.SinDeg(deg) / 1000;
+                px.Add(sx);
+                py.Add(topBase - off);
+            }
+            for (int s = steps; s >= 0; s = s - 1) {
+                int sx = x0 + (x1 - x0) * s / steps;
+                int deg = phase + (sx - b.x0) * 360 / period;
+                int off = amp * ChartView.SinDeg(deg + 180) / 1000;
+                px.Add(sx);
+                py.Add(bottomBase + off);
+            }
+            // DrawPolyline 没有隐式闭合；补回首点，避免左侧边界断线。
+            if (px.Count > 0) {
+                px.Add(px[0]);
+                py.Add(py[0]);
+            }
+            c.DrawPolyline(px, py, col, 1);
+
+            // 带内标签：名称（放得下时）。
+            string lbl = b.name;
+            int tw = Canvas.MeasureText(lbl, ChartFonts.SeriesLabel(app));
+            int lx = x0 + app.Scale(4);
+            int ly = yc - Canvas.FontHeight(ChartFonts.SeriesLabel(app)) / 2;
+            if (tw + app.Scale(8) <= x1 - x0) {
+                c.DrawText(lx, ly, lbl,
+                    Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0),
+                    ChartFonts.SeriesLabel(app));
+            }
+        }
+
+        // 时间轴端点标签（确定性整数时间）。
+        int axisFs = ChartFonts.AxisLabel(app);
+        string lt = Convert.ToString(layout.t0);
+        string rt = Convert.ToString(layout.t1);
+        StyleBox sAxis = Style.Part(app, "chart", "axis", "", "", "",
+                                    Style.SNormal());
+        int axY = top + contentH - app.Scale(4);
+        c.DrawText(x + pad, axY, lt, sAxis.FgOr(0), axisFs);
+        int rtw = Canvas.MeasureText(rt, axisFs);
+        c.DrawText(x + pad + plotW - rtw, axY, rt, sAxis.FgOr(0), axisFs);
+
+        // 图例（右侧色块栏）。
+        if (legendW > 0) {
+            int lx = x + (w - legendW);
+            int ly = Chart.LegendStartY(app, y, top);
+            int sw = app.Scale(12);
+            int lh = Canvas.FontHeight(axisFs) + app.Scale(6);
+            for (int j = 0; j < legNames.Count; j = j + 1) {
+                int lcol = Chart.Palette(t, j);
+                c.FillRoundRect(lx, ly + app.Scale(2), sw, sw,
+                    t.borderRadiusSmall, lcol);
+                c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1),
+                    legNames[j],
+                    Style.Part(app, "chart", "legend", "", "", "", Style.SNormal()).FgOr(0),
+                    axisFs);
+                ly = ly + lh;
+            }
+        }
+
+        // 命中几何与 tooltip 展示解耦：关闭 tooltip 不能关闭
+        // 事件带的 Hover/MouseOut/Click 事件。
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        // 命中严格对应当前帧已绘出的矩形带：x 不得越过
+        // revealFront，y 不再额外扩张振幅热区。
+        int best = 0 - 1;
+        int bestD = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            EventBand b = layout.bands[i];
+            int visibleX1 = b.x1;
+            if (visibleX1 > revealFront) { visibleX1 = revealFront; }
+            if (visibleX1 <= b.x0) { continue; }
+            if (mx >= b.x0 && mx < visibleX1
+                && my >= b.y && my < b.y + b.h) {
+                int yc = b.y + b.h / 2;
+                int dy = my - yc;
+                if (dy < 0) { dy = 0 - dy; }
+                if (best < 0 || dy < bestD) { best = i; bestD = dy; }
+            }
+        }
+        if (best >= 0) {
+            EventBand hb = layout.bands[best];
+            int col = Chart.Palette(t, ChartView.EventRiverColorIndex(legNames, hb.name));
+            if (ChartView.activeEventView != null) {
+                // dataIndex 用 src（稳定排序前的源 events 下标），
+                // 不随排序结果漂移。
+                ChartHit eh = ChartHit.Of(ChartElementType.EventBand,
+                    ChartView.SeriesIndexOf(o, lead), lead.name,
+                    hb.src, hb.name, hb.value, mx, my);
+                eh.axisIndex = lead.axisIndex;
+                ChartView.OfferActiveHit(eh);
+            }
+            if (o.showTooltip) {
+                List<TooltipRow> rows = new List<TooltipRow>{
+                    TooltipRow.Of(0, o.title),
+                    TooltipRow.Of(col, hb.name + "  " + Convert.ToString(hb.value)) };
+                ChartView.TooltipCard(app, mx, my, x + w, rows);
+            }
+        }
+    }
+}

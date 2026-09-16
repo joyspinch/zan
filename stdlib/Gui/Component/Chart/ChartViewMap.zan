@@ -1,0 +1,895 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+// ---- 地图（ECharts type 'map'；区域多边形 + 洞/多部件） ----
+
+/// 已变换到屏幕坐标的一条环（外环或洞），带 bbox 与质心。
+class MapPolygon {
+    int region;       // 所属区域下标
+    bool hole;        // 洞环（回填背景挖空）
+    List<ChartMapPoint> points;
+    int minX; int minY; int maxX; int maxY;   // 变换后 bbox（命中加速）
+    int cx; int cy;       // 环质心（外环用作标签锚点）
+
+    /// 构造一条已变换的环：points 为屏幕坐标（非空），据此计算
+    /// bbox 与顶点均值质心。
+    static MapPolygon Of(int region, bool hole, List<ChartMapPoint> points) {
+        MapPolygon p = new MapPolygon();
+        p.region = region; p.hole = hole; p.points = points;
+        int n = points.Count;
+        long sx = 0; long sy = 0;
+        p.minX = points[0].x; p.maxX = points[0].x;
+        p.minY = points[0].y; p.maxY = points[0].y;
+        for (int i = 0; i < n; i = i + 1) {
+            ChartMapPoint pt = points[i];
+            if (pt.x < p.minX) { p.minX = pt.x; }
+            if (pt.x > p.maxX) { p.maxX = pt.x; }
+            if (pt.y < p.minY) { p.minY = pt.y; }
+            if (pt.y > p.maxY) { p.maxY = pt.y; }
+            sx = sx + (long)pt.x; sy = sy + (long)pt.y;
+        }
+        p.cx = (int)(sx / n); p.cy = (int)(sy / n);
+        return p;
+    }
+}
+
+/// 地图布局：全局数据边界等比 fit 到绘图区（居中），输出变换
+/// 后的环、缩放（千分比像素/单位）与变换原点。纯几何，不碰
+/// Canvas，命中走 bbox + 整数 point-in-polygon。
+class MapLayout {
+    List<MapPolygon> polys;
+    int regionCount;  // 区域数（RegionAt 用）
+    int scale;        // 千分比像素/单位
+    int minX; int minY; int maxX; int maxY;  // 数据范围
+    int offX; int offY;   // 变换原点（居中后）
+
+    /// 静态布局：等价 OfRoam(zoom=100, pan=(0,0))。
+    static MapLayout Of(List<ChartMapRegion> regions, int x, int y, int w, int h, int pad) {
+        return MapLayout.OfRoam(regions, x, y, w, h, pad, 100, 0, 0);
+    }
+
+    /// 全局数据边界等比 fit 进 (w-2pad)×(h-2pad) 并居中，再按
+    /// zoom（百分比，钳 40..280）放大、平移 (panX,panY)。输出
+    /// 变换后的环列表与 scale（千分比像素/单位）；所有环都退化
+    /// （<3 点）时 scale=0 且 polys 为空。
+    static MapLayout OfRoam(List<ChartMapRegion> regions, int x, int y, int w, int h,
+                            int pad, int zoom, int panX, int panY) {
+        // 全局数据边界（所有环的所有点；<3 点的退化环忽略）。
+        bool any = false;
+        int mnX = 0; int mnY = 0; int mxX = 0; int mxY = 0;
+        for (int r = 0; r < regions.Count; r = r + 1) {
+            List<ChartMapRing> rings = regions[r].rings;
+            for (int k = 0; k < rings.Count; k = k + 1) {
+                List<ChartMapPoint> ps = rings[k].points;
+                if (ps.Count < 3) { continue; }
+                for (int i = 0; i < ps.Count; i = i + 1) {
+                    int px = ps[i].x; int py = ps[i].y;
+                    if (!any) { mnX = px; mxX = px; mnY = py; mxY = py; any = true; }
+                    else {
+                        if (px < mnX) { mnX = px; }
+                        if (px > mxX) { mxX = px; }
+                        if (py < mnY) { mnY = py; }
+                        if (py > mxY) { mxY = py; }
+                    }
+                }
+            }
+        }
+        if (!any) { MapLayout empty = new MapLayout(); empty.polys = new List<MapPolygon>(); empty.scale = 0; return empty; }
+        return MapLayout.OfRoamBox(mnX, mnY, mxX, mxY, regions, x, y, w, h,
+            pad, zoom, panX, panY);
+    }
+
+    /// 显式源框（minX..maxX）版布局：数据边界由调用方给定
+    /// （SVG 地图传 viewBox 框，让折线覆盖与光栅底图共用同一
+    /// contain-fit 仿射）。其余语义同 OfRoam。
+    static MapLayout OfRoamBox(int mnX, int mnY, int mxX, int mxY,
+                               List<ChartMapRegion> regions, int x, int y, int w, int h,
+                               int pad, int zoom, int panX, int panY) {
+        MapLayout l = new MapLayout();
+        l.polys = new List<MapPolygon>();
+        l.regionCount = regions.Count;
+        int pw = w - pad * 2;
+        int ph = h - pad * 2;
+        if (pw < 1) { pw = 1; }
+        if (ph < 1) { ph = 1; }
+        if (zoom < 40) { zoom = 40; }
+        if (zoom > 280) { zoom = 280; }
+        l.minX = mnX; l.minY = mnY; l.maxX = mxX; l.maxY = mxY;
+
+        long bw = (long)mxX - (long)mnX;
+        long bh = (long)mxY - (long)mnY;
+        if (bw < 1) { bw = 1; }
+        if (bh < 1) { bh = 1; }
+        int sc = (int)((long)pw * 1000 / bw);
+        int scH = (int)((long)ph * 1000 / bh);
+        if (scH < sc) { sc = scH; }
+        if (sc < 1) { sc = 1; }
+        sc = sc * zoom / 100;
+        if (sc < 1) { sc = 1; }
+        l.scale = sc;
+
+        // 变换后实际像素宽高，居中偏移，再减漫游平移。
+        int ow = (int)(bw * (long)sc / 1000);
+        int oh = (int)(bh * (long)sc / 1000);
+        int ox = x + pad + (pw - ow) / 2 - panX;
+        int oy = y + pad + (ph - oh) / 2 - panY;
+        l.offX = ox; l.offY = oy;
+
+        for (int r = 0; r < regions.Count; r = r + 1) {
+            List<ChartMapRing> rings = regions[r].rings;
+            for (int k = 0; k < rings.Count; k = k + 1) {
+                List<ChartMapPoint> ps = rings[k].points;
+                if (ps.Count < 3) { continue; }
+                List<ChartMapPoint> tr = new List<ChartMapPoint>();
+                for (int i = 0; i < ps.Count; i = i + 1) {
+                    long dx = (long)ps[i].x - (long)mnX;
+                    long dy = (long)ps[i].y - (long)mnY;
+                    int sx = ox + (int)(dx * (long)sc / 1000);
+                    int sy = oy + (int)(dy * (long)sc / 1000);
+                    tr.Add(ChartMapPoint.Of(sx, sy));
+                }
+                l.polys.Add(MapPolygon.Of(r, rings[k].hole, tr));
+            }
+        }
+        return l;
+    }
+
+    /// 命中：返回包含 (px,py) 的区域下标（在任一外环内且不在
+    /// 任何洞内；区域从后往前先到先得），否则 -1。
+    static int RegionAt(MapLayout l, int px, int py) {
+        for (int r = l.regionCount - 1; r >= 0; r = r - 1) {
+            bool hit = false;
+            for (int i = 0; i < l.polys.Count; i = i + 1) {
+                MapPolygon p = l.polys[i];
+                if (p.region != r || p.hole) { continue; }
+                if (px < p.minX || px > p.maxX || py < p.minY || py > p.maxY) { continue; }
+                if (Chart.PointInPoly(p.points, px, py)) { hit = true; break; }
+            }
+            if (!hit) { continue; }
+            for (int i = 0; i < l.polys.Count; i = i + 1) {
+                MapPolygon p = l.polys[i];
+                if (p.region != r || !p.hole) { continue; }
+                if (px < p.minX || px > p.maxX || py < p.minY || py > p.maxY) { continue; }
+                if (Chart.PointInPoly(p.points, px, py)) { hit = false; break; }
+            }
+            if (hit) { return r; }
+        }
+        return 0 - 1;
+    }
+}
+
+partial class ChartView {
+
+    /// 连续色域：优先 option.rampColors（visualMap）；否则浅蓝 → 深蓝。
+    static int MapRamp(ChartOption o, int value, int vMin, int vMax) {
+        int span = vMax - vMin;
+        if (span < 1) { span = 1; }
+        int t = (value - vMin) * 1000 / span;
+        if (t < 0) { t = 0; }
+        if (t > 1000) { t = 1000; }
+        if (o != null && o.rampColors != null && o.rampColors.Count >= 2) {
+            return Chart.RampAt(o.rampColors, t);
+        }
+        int r = 188 + (42 - 188) * t / 1000;
+        int g = 212 + (66 - 212) * t / 1000;
+        int b = 235 + (140 - 235) * t / 1000;
+        return Chart.Rgb(r, g, b);
+    }
+
+    /// 地图坐标在高 zoom 或大 GeoJSON 数据下可能超过 32 位
+    /// 乘法中间范围；除法方向与 Floordiv 保持一致，最终像素
+    /// 仍收敛为 int。
+    static long FloordivLong(long a, long b) {
+        long q = a / b;
+        if (a % b != 0 && (a < 0) != (b < 0)) { q = q - 1; }
+        return q;
+    }
+
+    /// 扫描线填充任意多边形（even-odd），逐行生成 span 用 FillRect
+    /// 绘制。行 y 半开穿越（与 PointInPoly 同侧判定），交点取在
+    /// 像素中心线 y+0.5（2 倍定点）。
+    static void FillPolygon(Canvas c, List<ChartMapPoint> poly, int color) {
+        int n = poly.Count;
+        if (n < 3) { return; }
+        int minY = poly[0].y;
+        int maxY = poly[0].y;
+        for (int i = 1; i < n; i = i + 1) {
+            if (poly[i].y < minY) { minY = poly[i].y; }
+            if (poly[i].y > maxY) { maxY = poly[i].y; }
+        }
+        List<int> xs = new List<int>();
+        for (int y = minY; y < maxY; y = y + 1) {
+            xs.Clear();
+            int j = n - 1;
+            for (int i = 0; i < n; i = i + 1) {
+                ChartMapPoint pi = poly[i];
+                ChartMapPoint pj = poly[j];
+                if ((pi.y > y) != (pj.y > y)) {
+                    long y2 = (long)y * 2 + 1;
+                    long num = (y2 - (long)pj.y * 2)
+                        * ((long)pi.x - (long)pj.x);
+                    long den = (long)2 * ((long)pi.y - (long)pj.y);
+                    long ix = (long)pj.x + ChartView.FloordivLong(num, den);
+                    xs.Add((int)ix);
+                }
+                j = i;
+            }
+            // 交点排序（插入排序，量级通常 < 8）。
+            for (int a = 1; a < xs.Count; a = a + 1) {
+                int v = xs[a];
+                int b = a - 1;
+                while (b >= 0 && xs[b] > v) { xs[b + 1] = xs[b]; b = b - 1; }
+                xs[b + 1] = v;
+            }
+            // 成对 span：[xs[0], xs[1]] [xs[2], xs[3]] …。
+            for (int e = 0; e + 1 < xs.Count; e = e + 2) {
+                int x0 = xs[e];
+                int x1 = xs[e + 1];
+                if (x1 > x0) { c.FillRect(x0, y, x1 - x0, 1, color); }
+            }
+        }
+    }
+
+    /// 闭合多边形轮廓（DrawPolyline 首尾相接）。
+    static void PolyOutline(Canvas c, List<ChartMapPoint> poly, int color) {
+        int n = poly.Count;
+        if (n < 2) { return; }
+        List<int> px = new List<int>();
+        List<int> py = new List<int>();
+        for (int i = 0; i <= n; i = i + 1) {
+            ChartMapPoint p = poly[i % n];
+            px.Add(p.x);
+            py.Add(p.y);
+        }
+        c.DrawPolyline(px, py, color, 1);
+    }
+
+    /// 地图渲染入口：头部面板 + 可选 visualMap 色条；roam 时处理
+    /// 滚轮缩放与拖拽平移（抛 MapRoam）；区域按系列色/MapRamp
+    /// 填色（dataRange 过滤灰显），g>=1000 时按指纹快照/恢复像素
+    /// 缓存；随后是区域命中、单/多选（抛 MapSelected）、hover
+    /// 强调描边、hoverLink 白描边、tooltip 与 markPoint 图钉。
+    /// A14：本图生效的 geo.label 文本样式（textBorder/textShadow）。
+    /// lead 是合成后的 isGeoBase 载体系列，但 label 样式声明在
+    /// geo 组件上（ParseGeoOne 已存进 ChartGeo.labelSt）；非 geo
+    /// 合成图（type=Map 直配）回落系列自己的 label。都没有 = null。
+    static ChartTextStyle GeoLabelStyle(ChartOption o, ChartSeries lead) {
+        for (int i = 0; i < o.geos.Count; i = i + 1) {
+            if (o.geos[i].labelSt != null) { return o.geos[i].labelSt; }
+        }
+        return lead.label;
+    }
+
+    static void DrawMap(App app, int x, int y, int w, int h, ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+        // 底图几何的载体必须显式选，不能用 LeadSeries：geo 组件形态
+        // （geo-choropleth-scatter / geo-map-scatter / scatter-map-brush）
+        // 的首个可见系列是挂在 geo 上的 scatter，它没有 regions，取它
+        // 会在下一行直接 return，底图与投影点全丢。底图载体是合成出来
+        // 的 isGeoBase 系列（ChartModel 的 geo 合成块），没有它时退回
+        // 首个"真的带几何"的 map 系列（用户直接写 series[].type=map）。
+        ChartSeries lead = ChartView.MapBaseSeries(o);
+        if (lead == null || lead.regions.Count < 1) { return; }
+        // SVG 地图：底图纹理 + 按名覆盖填充（见 DrawSvgMode 语义）。
+        ChartMapEntry mapEntry = lead.mapName.Length > 0
+            ? ChartMaps.Find(lead.mapName) : null;
+        bool svgMode = mapEntry != null && mapEntry.svg.Length > 0;
+        if (svgMode) { ChartMaps.EnsureScanned(mapEntry); }
+
+        int plotX = x;
+        int plotY = top;
+        int plotW = w;
+        int plotH = y + h - top;
+        int barW = 0;
+        if (o.rampColors != null && o.rampColors.Count >= 2) {
+            barW = app.Scale(18);
+            plotX = x + barW + app.Scale(8);
+            plotW = w - barW - app.Scale(8);
+        }
+
+        int zoom = 100;
+        int panX = 0;
+        int panY = 0;
+        bool mapWasDragged = false;
+        if (o.roam && o.iwid != 0) {
+            zoom = app.StateGet(Chart.MapZoomKey(o.iwid), 100);
+            if (zoom < 40) { zoom = 100; app.StateSet(Chart.MapZoomKey(o.iwid), 100); }
+            panX = app.StateGet(Chart.MapPanXKey(o.iwid), 0);
+            panY = app.StateGet(Chart.MapPanYKey(o.iwid), 0);
+            int panId = 7100000 + o.iwid;
+            if (ChartView.activeEventView != null
+                && ChartView.activeEventView.eventHitId >= 0) {
+                panId = ChartView.activeEventView.eventHitId;
+            }
+            app.hitTester.RegisterRect(panId, plotX, plotY, plotW, plotH, 3);
+            // 默认 zoom 消费绘图区滚轮；pass/none 不声明捕获，
+            // 让外层 ScrollView 继续处理页面滚动。CaptureWheel 的
+            // 所有权按帧仲裁，因此模式切换在下一滚轮帧生效。
+            string wheelMode = ChartKinds.RoamWheelModeSanitize(o.roamWheelMode);
+            if (wheelMode == "zoom" && app.CaptureWheel(plotX, plotY, plotW, plotH)) {
+                int ticks = ChartView.WheelTicks(app);
+                int next = ChartView.ZoomByTicks(zoom, ticks, 40, 280);
+                if (next != zoom) {
+                    zoom = next;
+                    app.StateSet(Chart.MapZoomKey(o.iwid), zoom);
+                    ChartInteractionEvent roamEvent = ChartInteractionEvent.Of(
+                        ChartEventType.MapRoam, o.iwid);
+                    roamEvent.value = zoom;
+                    roamEvent.x = app.mouseX;
+                    roamEvent.y = app.mouseY;
+                    ChartView.RaiseActive(roamEvent);
+                    app.RequestRedraw();
+                }
+            }
+            if (Ui.PressedDown(app, panId) && app.window.EventButton() == 0) {
+                if (app.TouchDevice()) { app.ClaimDrag(); }
+                app.StateSet(Chart.MapDragXKey(o.iwid), app.mouseX);
+                app.StateSet(Chart.MapDragYKey(o.iwid), app.mouseY);
+                app.StateSet(Chart.MapDragPanXKey(o.iwid), panX);
+                app.StateSet(Chart.MapDragPanYKey(o.iwid), panY);
+                app.StateSet(Chart.MapDragKey(o.iwid), 1);
+            }
+            bool draggingMap = app.StateGet(Chart.MapDragKey(o.iwid), 0) == 1;
+            if (app.EventKind() == 3) {
+                if (draggingMap) {
+                    int dxUp = app.mouseX - app.StateGet(Chart.MapDragXKey(o.iwid), app.mouseX);
+                    int dyUp = app.mouseY - app.StateGet(Chart.MapDragYKey(o.iwid), app.mouseY);
+                    if (dxUp != 0 || dyUp != 0) {
+                        mapWasDragged = true;
+                        app.ClaimClick();
+                    }
+                }
+                app.StateSet(Chart.MapDragKey(o.iwid), 0);
+            }
+            if (draggingMap && Ui.Pressed(app, panId) && app.EventKind() == 1) {
+                int dxMove = app.mouseX - app.StateGet(Chart.MapDragXKey(o.iwid), app.mouseX);
+                int dyMove = app.mouseY - app.StateGet(Chart.MapDragYKey(o.iwid), app.mouseY);
+                if (dxMove != 0 || dyMove != 0) { mapWasDragged = true; }
+                panX = app.StateGet(Chart.MapDragPanXKey(o.iwid), panX) - dxMove;
+                panY = app.StateGet(Chart.MapDragPanYKey(o.iwid), panY) - dyMove;
+                app.StateSet(Chart.MapPanXKey(o.iwid), panX);
+                app.StateSet(Chart.MapPanYKey(o.iwid), panY);
+                ChartInteractionEvent panEvent = ChartInteractionEvent.Of(
+                    ChartEventType.MapRoam, o.iwid);
+                panEvent.x = panX;
+                panEvent.y = panY;
+                ChartView.RaiseActive(panEvent);
+                app.RequestRedraw();
+            }
+        }
+
+        MapLayout layout;
+        if (svgMode) {
+            // SVG 地图：源框取 viewBox——光栅底图（nanosvg 对整个
+            // viewBox contain-fit）与折线覆盖共用同一仿射，像素对齐。
+            layout = MapLayout.OfRoamBox((int)mapEntry.vx, (int)mapEntry.vy,
+                (int)(mapEntry.vx + mapEntry.vw), (int)(mapEntry.vy + mapEntry.vh),
+                lead.regions, plotX, plotY, plotW, plotH, pad, zoom, panX, panY);
+        } else {
+            layout = MapLayout.OfRoam(lead.regions, plotX, plotY, plotW, plotH,
+                pad, zoom, panX, panY);
+        }
+        int n = layout.polys.Count;
+        if (n < 1) { return; }
+
+        int vMin = 0;
+        int vMax = 0;
+        if (o.rampLo != ChartOption.Auto()) { vMin = o.rampLo; }
+        if (o.rampHi != ChartOption.Auto()) { vMax = o.rampHi; }
+        bool spanSet = o.rampLo != ChartOption.Auto() && o.rampHi != ChartOption.Auto();
+        if (!spanSet) {
+            for (int r = 0; r < lead.regions.Count; r = r + 1) {
+                int v = lead.regions[r].value;
+                if (r == 0) { vMin = v; vMax = v; }
+                else {
+                    if (v < vMin) { vMin = v; }
+                    if (v > vMax) { vMax = v; }
+                }
+            }
+        }
+        if (vMax <= vMin) { vMax = vMin + 1; }
+
+        int alpha = 255;
+        if (g < 1000) { alpha = 60 + 195 * g / 1000; }
+        if (alpha > 255) { alpha = 255; }
+
+        int slot = 220 + ((o.iwid % 20) + 20) % 20;
+        int fp = (layout.scale * 13 + layout.offX * 17 + layout.offY * 19
+            + zoom * 23 + panX * 29 + panY * 31 + vMin * 37 + vMax * 41
+            + plotW * 43 + plotH * 47) % 2000000000;
+        for (int r = 0; r < lead.regions.Count; r = r + 1) {
+            fp = (fp * 31 + lead.regions[r].value) % 2000000000;
+        }
+        // dataRange 交互态进快照指纹：过滤灰显改变了像素。
+        if (o.dataRangeShow && o.iwid != 0) {
+            fp = (fp * 31 + app.StateGet(Chart.DRangeLoKey(o.iwid), 0)
+                + app.StateGet(Chart.DRangeHiKey(o.iwid), 1000) * 7) % 2000000000;
+            for (int bi = 0; bi < o.dataRangeList.Count; bi = bi + 1) {
+                fp = (fp * 31 + app.StateGet(Chart.DRangeBandKey(o.iwid, bi), 0)
+                    + 1) % 2000000000;
+            }
+        }
+        bool cached = g >= 1000 && app.StateGet(Chart.CacheKey(slot), 0) == fp
+            && c.RestoreRect(plotX, plotY, plotW, plotH, slot);
+        int bg = Style.Full(app, "chart", "", "", Style.SNormal()).BgOr(0);
+        c.PushClip(plotX, plotY, plotW, plotH);
+        if (!cached) {
+            c.FillRect(plotX, plotY, plotW, plotH, bg);
+            if (svgMode) {
+                // ① 光栅底图：viewBox contain-fit 进绘图区一次光栅
+                // （ImageLoadSvg 缓存按 地图名@绘图区尺寸 进运行时
+                // mem 图像缓存，逐出后按需重注册，同 IconSvg 契约），
+                // 每帧按布局几何缩放贴图——roam 缩放/平移与折线覆盖
+                // 同源同帧。② 只叠显式覆盖色的区域填充（ECharts SVG
+                // 地图语义：无覆盖的区域保留底图纹理）。
+                string ukey = "mem:chartmap:" + lead.mapName + "@"
+                    + plotW + "x" + plotH;
+                if (Canvas.ImageWidth(ukey) <= 0) {
+                    Canvas.ImageLoadSvg(ukey, mapEntry.svg, plotW, plotH);
+                }
+                if (Canvas.ImageWidth(ukey) > 0) {
+                    long ubw = (long)layout.maxX - (long)layout.minX;
+                    long ubh = (long)layout.maxY - (long)layout.minY;
+                    if (ubw < 1) { ubw = 1; }
+                    if (ubh < 1) { ubh = 1; }
+                    int uw = (int)(ubw * (long)layout.scale / 1000);
+                    int uh = (int)(ubh * (long)layout.scale / 1000);
+                    c.BlitImage(ukey, layout.offX, layout.offY, uw, uh,
+                        0, 0, 0, 0);
+                }
+                for (int i = 0; i < n; i = i + 1) {
+                    MapPolygon p = layout.polys[i];
+                    if (p.hole) { continue; }
+                    int col = lead.regions[p.region].color;
+                    if (col == 0) { continue; }
+                    ChartView.FillPolygon(c, p.points, Chart.WithAlpha(col, alpha));
+                }
+                for (int i = 0; i < n; i = i + 1) {
+                    MapPolygon p = layout.polys[i];
+                    if (!p.hole) { continue; }
+                    if (lead.regions[p.region].color == 0) { continue; }
+                    ChartView.FillPolygon(c, p.points, bg);
+                }
+                // SVG 地图标签默认关（底图自有文字/纹理），label.show
+                // 打开才画（geo.label.show / series.label.show）。
+                if (lead.labelShow) {
+                    int fg2 = Style.Part(app, "chart", "", "", "", "",
+                        Style.SNormal()).FgOr(0);
+                    int fs = ChartFonts.SeriesLabel(app);
+                    // A14：geo.label 的 textBorder/textShadow（geo-graph
+                    // 白字 #fff 描边压在地图上）。
+                    ChartTextStyle gls = ChartView.GeoLabelStyle(o, lead);
+                    for (int i = 0; i < n; i = i + 1) {
+                        MapPolygon p = layout.polys[i];
+                        if (p.hole) { continue; }
+                        string nm = lead.regions[p.region].name;
+                        if (nm.Length == 0) { continue; }
+                        int tw = Canvas.MeasureText(nm, fs);
+                        int th = Canvas.FontHeight(fs);
+                        if (tw + app.Scale(4) <= p.maxX - p.minX
+                            && th + app.Scale(2) <= p.maxY - p.minY) {
+                            int gx = p.cx - tw / 2;
+                            int gy = p.cy - th / 2;
+                            if (gx < plotX) { gx = plotX; }
+                            if (gy < plotY) { gy = plotY; }
+                            if (gx + tw > plotX + plotW) { gx = plotX + plotW - tw; }
+                            if (gy + th > plotY + plotH) { gy = plotY + plotH - th; }
+                            ChartView.DrawTextStyled(c, gx, gy, nm, fg2, fs, gls);
+                        }
+                    }
+                }
+            } else if (g >= 1000) {
+            for (int i = 0; i < n; i = i + 1) {
+                MapPolygon p = layout.polys[i];
+                if (p.hole) { continue; }
+                int col = lead.regions[p.region].color;
+                if (col == 0) { col = ChartView.MapRamp(o, lead.regions[p.region].value, vMin, vMax); }
+                if (!Chart.DRangeOk(app, o, o.iwid, vMin, vMax, lead.regions[p.region].value)) {
+                    col = Chart.Rgb(204, 204, 204);
+                }
+                ChartView.FillPolygon(c, p.points, Chart.WithAlpha(col, alpha));
+            }
+            for (int i = 0; i < n; i = i + 1) {
+                MapPolygon p = layout.polys[i];
+                if (!p.hole) { continue; }
+                ChartView.FillPolygon(c, p.points, bg);
+            }
+            for (int i = 0; i < n; i = i + 1) {
+                MapPolygon p = layout.polys[i];
+                int col = lead.regions[p.region].color;
+                if (col == 0) { col = ChartView.MapRamp(o, lead.regions[p.region].value, vMin, vMax); }
+                if (!Chart.DRangeOk(app, o, o.iwid, vMin, vMax, lead.regions[p.region].value)) {
+                    col = Chart.Rgb(204, 204, 204);
+                }
+                // 同色描边走两遍：相邻省界共享边各画一次，单次
+                // 抗锯齿合成后仍有缝隙（背景透出成「虫洞」），
+                // 两次覆盖后接缝基本密封且轮廓不增粗。
+                if (!p.hole) {
+                    ChartView.PolyOutline(c, p.points, col);
+                    ChartView.PolyOutline(c, p.points, col);
+                }
+                if (!p.hole) {
+                    string nm = lead.regions[p.region].name;
+                    if (nm.Length > 0) {
+                        int fs = ChartFonts.SeriesLabel(app);
+                        int tw = Canvas.MeasureText(nm, fs);
+                        int th = Canvas.FontHeight(fs);
+                        if (tw + app.Scale(4) <= p.maxX - p.minX
+                            && th + app.Scale(2) <= p.maxY - p.minY) {
+                            ChartTextStyle gls2 = ChartView.GeoLabelStyle(o, lead);
+                            int gx = p.cx - tw / 2;
+                            int gy = p.cy - th / 2;
+                            if (gx < plotX) { gx = plotX; }
+                            if (gy < plotY) { gy = plotY; }
+                            if (gx + tw > plotX + plotW) { gx = plotX + plotW - tw; }
+                            if (gy + th > plotY + plotH) { gy = plotY + plotH - th; }
+                            ChartView.DrawTextStyled(c, gx, gy, nm,
+                                Chart.ContrastFg(col), fs, gls2);
+                        }
+                    }
+                }
+            }
+                if (g >= 1000) {
+                    c.SnapshotRect(plotX, plotY, plotW, plotH, slot);
+                    app.StateSet(Chart.CacheKey(slot), fp);
+                }
+            }
+        }
+        c.PopClip();
+
+        // selectedMode：""/"single" = 单区域（沿用 MapSelKey），
+        // "multiple" = 多区域（MapRegionSelKey 逐项），"false"/mapSelect
+        // 关闭 = 不响应点击选中（hover 强调色仍生效）。
+        int mode = 0;
+        if (!ChartKinds.SelectedModeEnabled(lead.selectedMode)) { mode = 0 - 1; }
+        else if (lead.selectedMode == "multiple") { mode = 1; }
+        bool canSelect = o.mapSelect && o.iwid != 0 && mode >= 0;
+        int sel = 0 - 1;
+        List<int> multiSel = new List<int>();
+        if (canSelect && mode == 0) {
+            sel = app.StateGet(Chart.MapSelKey(o.iwid), 0 - 1);
+        } else if (canSelect && mode == 1) {
+            for (int rg = 0; rg < lead.regions.Count; rg = rg + 1) {
+                if (app.StateGet(Chart.MapRegionSelKey(o.iwid, rg), 0) != 0) {
+                    multiSel.Add(rg);
+                }
+            }
+        }
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        bool insidePlot = mx >= plotX && mx < plotX + plotW
+            && my >= plotY && my < plotY + plotH;
+        int hit = insidePlot ? MapLayout.RegionAt(layout, mx, my) : 0 - 1;
+        if (hit >= 0) {
+            ChartHit mh = ChartHit.Of(ChartElementType.MapRegion,
+                ChartView.SeriesIndexOf(o, lead), lead.name, hit,
+                lead.regions[hit].name, lead.regions[hit].value, mx, my);
+            ChartView.OfferActiveHit(mh);
+        }
+        int mapOwnerId = ChartView.activeEventView != null
+            ? ChartView.activeEventView.eventHitId : 0 - 1;
+        if (mapOwnerId < 0 && o.iwid != 0) { mapOwnerId = 7100000 + o.iwid; }
+        if (canSelect && !mapWasDragged
+            && ChartView.OwnsActiveClick(app, mapOwnerId)
+            && hit >= 0) {
+            if (hit >= 0) {
+                if (mode == 1) {
+                    int oldv = app.StateGet(Chart.MapRegionSelKey(o.iwid, hit), 0);
+                    app.StateSet(Chart.MapRegionSelKey(o.iwid, hit), oldv == 0 ? 1 : 0);
+                } else {
+                    if (sel == hit) { sel = 0 - 1; } else { sel = hit; }
+                    app.StateSet(Chart.MapSelKey(o.iwid), sel);
+                }
+                ChartInteractionEvent mapEvent = ChartInteractionEvent.DataPoint(
+                    ChartEventType.MapSelected, o.iwid,
+                    ChartView.SeriesIndexOf(o, lead), lead.name, hit,
+                    lead.regions[hit].name, ChartElementType.MapRegion);
+                mapEvent.value = lead.regions[hit].value;
+                mapEvent.selected = mode == 1
+                    ? app.StateGet(Chart.MapRegionSelKey(o.iwid, hit), 0) == 1
+                    : sel == hit;
+                mapEvent.x = mx;
+                mapEvent.y = my;
+                ChartView.RaiseActive(mapEvent);
+                app.RequestRedraw();
+            }
+        }
+
+        int bg2 = Style.Full(app, "chart", "", "", Style.SNormal()).BgOr(0);
+        int eLine = lead.itemStyle.emphasis.borderColor != 0
+            ? lead.itemStyle.emphasis.borderColor : Chart.Rgb(255, 255, 255);
+        // 需要强调描边的区域集合：hover + 选中（单选取 sel，多选取集合）。
+        List<int> hiRegs = new List<int>();
+        if (sel >= 0) { hiRegs.Add(sel); }
+        for (int mq = 0; mq < multiSel.Count; mq = mq + 1) { hiRegs.Add(multiSel[mq]); }
+        if (hit >= 0) {
+            bool dup = false;
+            for (int dq = 0; dq < hiRegs.Count; dq = dq + 1) {
+                if (hiRegs[dq] == hit) { dup = true; }
+            }
+            if (!dup) { hiRegs.Add(hit); }
+        }
+        c.PushClip(plotX, plotY, plotW, plotH);
+        for (int hq = 0; hq < hiRegs.Count; hq = hq + 1) {
+            int hi = hiRegs[hq];
+            if (hi < 0 || hi >= lead.regions.Count) { continue; }
+            int col = lead.regions[hi].color;
+            if (col == 0) { col = ChartView.MapRamp(o, lead.regions[hi].value, vMin, vMax); }
+            int eFill = lead.itemStyle.emphasis.color != 0
+                ? lead.itemStyle.emphasis.color : col;
+            for (int pi = 0; pi < layout.polys.Count; pi = pi + 1) {
+                MapPolygon pp = layout.polys[pi];
+                if (pp.region != hi) { continue; }
+                if (!pp.hole) {
+                    ChartView.FillPolygon(c, pp.points, Chart.WithAlpha(eFill, alpha));
+                    ChartView.PolyOutline(c, pp.points, eLine);
+                }
+            }
+        }
+        c.PopClip();
+
+        // dataRange.hoverLink：悬停值域条时，值落在当前滑动窗口内的
+        // 区域白描边强调（反色高亮，与 hover 语义一致的逆联动）。
+        if (o.dataRangeHoverLink && o.iwid != 0
+            && app.StateGet(Chart.DRangeHoverKey(o.iwid), 0) == 1) {
+            c.PushClip(plotX, plotY, plotW, plotH);
+            for (int ri2 = 0; ri2 < lead.regions.Count; ri2 = ri2 + 1) {
+                if (!ChartViewDataRange.HoverHighlight(app, o, vMin, vMax,
+                    lead.regions[ri2].value)) { continue; }
+                for (int pi3 = 0; pi3 < layout.polys.Count; pi3 = pi3 + 1) {
+                    MapPolygon pq = layout.polys[pi3];
+                    if (pq.region != ri2 || pq.hole) { continue; }
+                    ChartView.PolyOutline(c, pq.points, Chart.Rgb(255, 255, 255));
+                }
+            }
+            c.PopClip();
+        }
+
+        if (barW > 0) {
+            int bx = x + app.Scale(6);
+            int by = plotY + app.Scale(8);
+            int bh = plotH - app.Scale(24);
+            if (bh < app.Scale(40)) { bh = app.Scale(40); }
+            for (int yi = 0; yi < bh; yi = yi + 1) {
+                int t2 = 1000 - yi * 1000 / bh;
+                c.FillRect(bx, by + yi, app.Scale(10), 1, Chart.RampAt(o.rampColors, t2));
+            }
+            int fs2 = ChartFonts.SeriesLabel(app);
+            int lfg = Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0);
+            c.DrawText(bx, by - Canvas.FontHeight(fs2), "高", lfg, fs2);
+            c.DrawText(bx, by + bh, "低", lfg, fs2);
+        }
+
+        if (o.roam) {
+            int fs3 = ChartFonts.SeriesLabel(app);
+            c.DrawText(plotX + app.Scale(8), plotY + plotH - Canvas.FontHeight(fs3) - app.Scale(4),
+                "滚轮缩放  ·  拖拽平移",
+                Style.Part(app, "chart", "hint", "", "", "", Style.SNormal()).FgOr(0), fs3);
+        }
+
+        if (o.showTooltip && hit >= 0) {
+            ChartMapRegion mr = lead.regions[hit];
+            int col = mr.color;
+            if (col == 0) { col = ChartView.MapRamp(o, mr.value, vMin, vMax); }
+            List<TooltipRow> rows = new List<TooltipRow>{
+                TooltipRow.Of(0, o.title),
+                TooltipRow.Of(col, mr.name + "  " + Convert.ToString(mr.value)) };
+            ChartView.TooltipCard(app, mx, my, x + w, rows);
+        }
+
+        // markPoint：地图叠标注（ECharts map + markPoint）。两种来源：
+        // series.marks 显式点（MapMark 携带屏幕无关的图坐标）；
+        // o.markPoint=true 时在最大值/最小值两个区域的质心标 pin。
+        // 显式点的 x/y 是图坐标系（与 rings 同一坐标系），跟随漫游缩放。
+        if (lead.marks.Count > 0 || o.markPoint) {
+            int fsM = ChartFonts.SeriesLabel(app);
+            int fgM = Style.Part(app, "chart", "value", "", "", "", Style.SNormal()).FgOr(0);
+            // 数据边界（与 MapLayout 一致）用于把图坐标换算到屏幕。
+            int bsX = 0; int bsY = 0;
+            if (lead.marks.Count > 0 && layout.scale > 0) {
+                for (int mi = 0; mi < lead.marks.Count; mi = mi + 1) {
+                    ChartMarkPoint mp = lead.marks[mi];
+                    if (mp.kind != "point") { continue; }
+                    int px = layout.offX + (mp.xValue - layout.minX) * layout.scale / 1000;
+                    int py = layout.offY + (mp.yValue - layout.minY) * layout.scale / 1000;
+                    if (px < plotX || px >= plotX + plotW || py < plotY || py >= plotY + plotH) { continue; }
+                    ChartView.DrawMapMark(app, c, px, py, mp.label, fgM, fsM,
+                        plotX, plotY, plotW, plotH);
+                }
+            }
+            if (o.markPoint && lead.regions.Count > 1) {
+                int bestR = 0 - 1; int worstR = 0 - 1;
+                int bestV = 0 - 2147483647 - 1; int worstV = 2147483647;
+                for (int r2 = 0; r2 < lead.regions.Count; r2 = r2 + 1) {
+                    int v2 = lead.regions[r2].value;
+                    if (v2 > bestV) { bestV = v2; bestR = r2; }
+                    if (v2 < worstV) { worstV = v2; worstR = r2; }
+                }
+                for (int pass = 0; pass < 2; pass = pass + 1) {
+                    int ri = pass == 0 ? bestR : worstR;
+                    if (ri < 0 || ri >= lead.regions.Count) { continue; }
+                    // 区域质心 = 该区域外环变换后质心均值。
+                    int cxm = 0; int cym = 0; int cnt = 0;
+                    for (int pi2 = 0; pi2 < layout.polys.Count; pi2 = pi2 + 1) {
+                        MapPolygon pp = layout.polys[pi2];
+                        if (pp.region != ri || pp.hole) { continue; }
+                        cxm = cxm + pp.cx; cym = cym + pp.cy; cnt = cnt + 1;
+                    }
+                    if (cnt < 1) { continue; }
+                    ChartView.DrawMapMark(app, c, cxm / cnt, cym / cnt,
+                        (pass == 0 ? "max " : "min ") + Convert.ToString(lead.regions[ri].value),
+                        fgM, fsM, plotX, plotY, plotW, plotH);
+                }
+            }
+        }
+
+        // geo 坐标系叠加（ECharts series.coordinateSystem:'geo'）：
+        // lines 折线/迁徙 + 散点，坐标经 GeoProject 按底图同一仿射
+        // 换算（roam 缩放平移联动）。series.geoIndex 选中所属 geo，
+        // 缺省 0（单 geo 场景）。silent 系列不响应命中。
+        ChartView.DrawGeoOverlay(app, o, layout, plotX, plotY, plotW, plotH, g);
+    }
+
+    /// 地图布局 → geo 经纬度（0.01° 定点）的投影换算：lng/lat
+    /// 直接线性映射到像素（注册表 GeoJSON 与 geo 系列坐标同为
+    /// 未投影的线性度坐标，ECharts 默认投影同为线性）。
+    static int GeoProjectX(MapLayout l, int lngQ) {
+        return l.offX + (long)(lngQ - l.minX) * (long)l.scale / 1000;
+    }
+    static int GeoProjectY(MapLayout l, int latQ) {
+        return l.offY + (long)(latQ - l.minY) * (long)l.scale / 1000;
+    }
+
+    /// geo 坐标系叠加渲染（DrawMap 末段调用）：逐系列画 lines
+    /// 折线（curveness 弯曲 / dotted 虚线）与散点（带名标签）。
+    /// 命中经 OfferActiveHit 出 tooltip（silent 系列跳过）。
+    static void DrawGeoOverlay(App app, ChartOption o, MapLayout layout,
+                               int plotX, int plotY, int plotW, int plotH, int g) {
+        if (layout.scale <= 0) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int alpha = 255;
+        if (g < 1000) { alpha = 60 + 195 * g / 1000; }
+        if (alpha > 255) { alpha = 255; }
+        int fs = ChartFonts.SeriesLabel(app);
+        int lblFg = Style.Part(app, "chart", "label", "", "", "",
+            Style.SNormal()).FgOr(0);
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries s = o.series[si];
+            if (s.hidden || s.coordSys != "geo") { continue; }
+            if (s.isGeoBase) { continue; }
+            int col = s.color;
+            if (col == 0) { col = Chart.Palette(t, si); }
+            if (s.itemStyle.normal.lineStyle.color != 0) {
+                col = s.itemStyle.normal.lineStyle.color;
+            }
+            // lines 折线（迁徙/航线/polyline 路径）。
+            for (int li = 0; li < s.geoLines.Count; li = li + 1) {
+                List<ChartPoint> line = s.geoLines[li];
+                int cv = s.forceCurveness;
+                int lw = s.itemStyle.normal.lineStyle.width;
+                if (lw <= 0) { lw = 1; }
+                if (s.itemStyle.normal.lineStyle.transparent) { lw = 0; }
+                if (lw > 0) {
+                    if (cv > 0) {
+                        // 弯曲连线：控制点 = 弦中点垂直偏移
+                        // curveness×弦长（与 force 边同语义）。
+                        int x0 = ChartView.GeoProjectX(layout, line[0].x);
+                        int y0 = ChartView.GeoProjectY(layout, line[0].y);
+                        int x1 = ChartView.GeoProjectX(layout, line[line.Count - 1].x);
+                        int y1 = ChartView.GeoProjectY(layout, line[line.Count - 1].y);
+                        int dxg = x1 - x0;
+                        int dyg = y1 - y0;
+                        int cxq = (x0 + x1) / 2 + (0 - dyg) * cv / 1000;
+                        int cyq = (y0 + y1) / 2 + dxg * cv / 1000;
+                        ChartView.StrokeQuad(c, x0, y0, cxq, cyq, x1, y1,
+                            Chart.WithAlpha(col, alpha), lw);
+                    } else {
+                        List<int> fx = new List<int>();
+                        List<int> fy = new List<int>();
+                        for (int pi = 0; pi < line.Count; pi = pi + 1) {
+                            fx.Add(ChartView.GeoProjectX(layout, line[pi].x) * 256);
+                            fy.Add(ChartView.GeoProjectY(layout, line[pi].y) * 256);
+                        }
+                        string lt = s.itemStyle.normal.lineStyle.type;
+                        if (lt == "dotted" || lt == "dashed") {
+                            List<int> pxl = new List<int>();
+                            List<int> pyl = new List<int>();
+                            for (int pi2 = 0; pi2 < line.Count; pi2 = pi2 + 1) {
+                                pxl.Add(ChartView.GeoProjectX(layout, line[pi2].x));
+                                pyl.Add(ChartView.GeoProjectY(layout, line[pi2].y));
+                            }
+                            int dl = app.Scale(2);
+                            int gl = app.Scale(2);
+                            if (lt == "dashed") { dl = app.Scale(5); gl = app.Scale(3); }
+                            ChartView.DrawDashed(c, pxl, pyl,
+                                Chart.WithAlpha(col, alpha), lw, dl, gl);
+                        } else {
+                            c.DrawPolylineFx(fx, fy, Chart.WithAlpha(col, alpha), lw);
+                        }
+                    }
+                }
+                // 线命中：指针到各线段距离 < 6px。
+                if (!s.silent && line.Count >= 2) {
+                    for (int pi3 = 0; pi3 + 1 < line.Count; pi3 = pi3 + 1) {
+                        int ax = ChartView.GeoProjectX(layout, line[pi3].x);
+                        int ay = ChartView.GeoProjectY(layout, line[pi3].y);
+                        int bx = ChartView.GeoProjectX(layout, line[pi3 + 1].x);
+                        int by = ChartView.GeoProjectY(layout, line[pi3 + 1].y);
+                        int hitP = ChartView.DistToSeg(mx, my, ax, ay, bx, by);
+                        if (hitP < app.Scale(6)) {
+                            string nm = line[0].name.Length > 0 ? line[0].name
+                                : (line[line.Count - 1].name.Length > 0
+                                    ? line[line.Count - 1].name : s.name);
+                            ChartHit lh = ChartHit.Of(ChartElementType.LinePoint,
+                                si, s.name, li, nm, 0, mx, my);
+                            ChartView.OfferActiveHit(lh);
+                            break;
+                        }
+                    }
+                }
+            }
+            // 散点（含 effectScatter 折算）：按 z 值定半径（visualMap
+            // 语义近似），有名且有 label.show 的画名标签。
+            for (int pi4 = 0; pi4 < s.points.Count; pi4 = pi4 + 1) {
+                ChartPoint p = s.points[pi4];
+                int px2 = ChartView.GeoProjectX(layout, p.x);
+                int py2 = ChartView.GeoProjectY(layout, p.y);
+                if (px2 < plotX - app.Scale(20) || px2 >= plotX + plotW + app.Scale(20)
+                    || py2 < plotY - app.Scale(20) || py2 >= plotY + plotH + app.Scale(20)) {
+                    continue;
+                }
+                int pcol = p.color != 0 ? p.color : col;
+                int r = app.Scale(4);
+                if (p.sizeSet && p.size > 0) { r = app.Scale(p.size) / 2; }
+                if (p.z != 0) { r = app.Scale(3) + p.z * app.Scale(14) / 100; }
+                if (r < app.Scale(2)) { r = app.Scale(2); }
+                c.FillCircle(px2, py2, r, Chart.WithAlpha(pcol, alpha));
+                if (s.symbolSize > 0 && p.sizeSet) { r = app.Scale(p.size) / 2; }
+                if (!s.silent && mx >= px2 - r && mx < px2 + r
+                    && my >= py2 - r && my < py2 + r) {
+                    ChartHit ph = ChartHit.Of(ChartElementType.ScatterPoint,
+                        si, s.name, pi4, p.name, p.z, px2, py2);
+                    ph.numberValueSet = true;
+                    ph.numberValue = p.z;
+                    ChartView.OfferActiveHit(ph);
+                }
+                if (s.labelShow && p.name.Length > 0
+                    && (s.labelPos == "right" || s.labelPos.Length == 0)) {
+                    ChartView.DrawTextClamped(c, px2 + r + app.Scale(4),
+                        Canvas.CenterTextYAt(py2, fs), p.name, lblFg, fs,
+                        plotX, plotY, plotW, plotH);
+                }
+            }
+        }
+    }
+
+    /// 地图/弦图共用的 markPoint 图钉：引线 + 圆点 + 文本，
+    /// 文本钳制在绘图区内。
+    static void DrawMapMark(App app, Canvas c, int px, int py, string txt,
+                            int fg, int fs, int clipX, int clipY, int clipW, int clipH) {
+        int off = app.Scale(10);
+        int ey = py - off;
+        c.PushClip(clipX, clipY, clipW, clipH);
+        c.DrawLine(px, py, px, ey, fg, 1);
+        c.FillCircle(px, py, app.Scale(2), fg);
+        c.PopClip();
+        if (txt == null || txt.Length == 0) { return; }
+        int tw = Canvas.MeasureText(txt, fs);
+        int thh = Canvas.FontHeight(fs);
+        int tx = px + app.Scale(4);
+        if (tx + tw > clipX + clipW) { tx = clipX + clipW - tw; }
+        int ty = ey - thh;
+        if (ty < clipY) { ty = clipY; }
+        ChartView.DrawTextClamped(c, tx, ty, txt, fg, fs,
+            clipX, clipY, clipW, clipH);
+    }
+}

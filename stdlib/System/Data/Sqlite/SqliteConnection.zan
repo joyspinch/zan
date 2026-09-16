@@ -1,0 +1,614 @@
+using System;
+using System.Data;
+
+namespace System.Data.Sqlite;
+
+/// <summary>
+/// 原生、无依赖的嵌入式 SQLite 连接（sqlite3 C 库）。
+///
+/// 在需要零外部配置且只需 SQLite 时，优先选择它而非 ODBC 路径。
+/// 构建/运行时需要 sqlite3 共享库。
+///
+/// 用法：
+///   SqliteConnection db = SqliteConnection.Open("app.sqlite3");
+///   db.Execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+///   DbResult r = db.Query("SELECT * FROM users");
+///   db.Close();
+///
+/// 语句失败（语法错、表/列不存在、约束冲突、库被锁超时……）时
+/// 抛出 <see cref="DbException"/>，携带驱动返回码与
+/// sqlite3_errmsg 文本；因此空结果集总意味着「无行」。
+/// 失败不会中断连接，后续语句照常执行。
+/// </summary>
+class SqliteConnection : IDbConnection {
+    nint handle;
+    bool connected;
+    // 单语句准备缓存：同一条 SQL 的 prepare 只做一次，之后每次执行
+    // reset + 重绑。stmtBusy 记录在途标志——并发的两个协程用同一连接
+    // 跑同一条 SQL 时，后来者现场准备一次性语句（与不缓存完全同义），
+    // 不碰缓存句柄。多语句文本不入缓存。
+    Dict<string, nint> stmtCache;
+    Dict<string, bool> stmtBusy;
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_open(string filename, string ppDb);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_close(nint db);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_exec(nint db, string sql, nint callback, nint arg, string errmsg);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_prepare_v2(nint db, string sql, int nByte, string ppStmt, string pzTail);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_step(nint stmt);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_reset(nint stmt);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_clear_bindings(nint stmt);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_finalize(nint stmt);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_column_count(nint stmt);
+
+    [DllImport("sqlite3")]
+    static extern string sqlite3_column_text(nint stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern string sqlite3_column_name(nint stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_column_type(nint stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern string sqlite3_errmsg(nint db);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_bind_int64(nint stmt, int index, long val);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_bind_double(nint stmt, int index, double val);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_bind_text(nint stmt, int index, string val, int nBytes, nint destructor);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_bind_null(nint stmt, int index);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_changes(nint db);
+
+    [DllImport("sqlite3")]
+    static extern long sqlite3_last_insert_rowid(nint db);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_busy_timeout(nint db, int ms);
+
+    [DllImport("sqlite3")]
+    static extern void sqlite3_free(nint ptr);
+
+    /// <summary>一个连接遇到别人持锁时愿意等多久（毫秒，&lt;=0 关闭等待）。
+    /// SQLite 一个库同一时刻只容一个写者，默认行为是立刻返回 SQLITE_BUSY，
+    /// 于是并发写在应用层表现为随机失败而不是排队。等待是连接属性、只能在
+    /// 打开时设置，而池里的连接是惰性打开的、调用方拿不到那一刻，所以由
+    /// Open 统一设置。</summary>
+    static int busyTimeoutMs = 5000;
+
+    /// 私有构造；统一经 <see cref="Open"/> 创建。
+    SqliteConnection() {
+        this.handle = 0;
+        this.connected = false;
+        this.stmtCache = new Dict<string, nint>();
+        this.stmtBusy = new Dict<string, bool>();
+    }
+
+    /// <summary>
+    /// 将 sqlite3 库返回的 C 字符串复制为受 ARC 管理、
+    /// 自有的 Zan 字符串。sqlite3_column_text/_name 返回的指针指向
+    /// libsqlite3 自己的缓冲区，会被下一次 step()/
+    /// finalize() 失效；直接保存会使结果集指向
+    /// 已释放的内存（垃圾行）。与 "" 拼接会分配一份新的
+    /// 托管副本，而此时源指针仍有效。
+    /// </summary>
+    static string CopyText(string s) {
+        return "" + s;
+    }
+
+    /// 从 8 字节缓冲区按小端重组出指针值（sqlite3_open/prepare_v2
+    /// 的句柄出参经此取回）。
+    static nint HandleFromBuf(string p) {
+        long v = 0;
+        v = v + (p[0] & 255);
+        v = v + ((long)(p[1] & 255) << 8);
+        v = v + ((long)(p[2] & 255) << 16);
+        v = v + ((long)(p[3] & 255) << 24);
+        v = v + ((long)(p[4] & 255) << 32);
+        v = v + ((long)(p[5] & 255) << 40);
+        v = v + ((long)(p[6] & 255) << 48);
+        v = v + ((long)(p[7] & 255) << 56);
+        return (nint)v;
+    }
+
+    /// <summary>打开（或创建）SQLite 数据库文件。
+    ///
+    /// 失败时 sqlite3_open 依然会回填一个句柄（用于取错误信息），
+    /// 该句柄必须由调用方 close，否则每次失败的打开都会
+    /// 泄漏一整个 sqlite3 连接对象（约 1.5KB）。数据库不可达时
+    /// 连接池每个请求都会尝试打开一次，泄漏便随请求线性增长。</summary>
+    static SqliteConnection Open(string filename) {
+        SqliteConnection conn = new SqliteConnection();
+        byte[] ppDb = new byte[8];
+        int rc = sqlite3_open(filename, ppDb);
+        nint h = HandleFromBuf(ppDb);
+        if (rc == 0) {
+            conn.handle = h;
+            conn.connected = true;
+            if (SqliteConnection.busyTimeoutMs > 0) {
+                int _bt = sqlite3_busy_timeout(h, SqliteConnection.busyTimeoutMs);
+            }
+        } else if (h != 0) {
+            int _rc = sqlite3_close(h);
+        }
+        return conn;
+    }
+
+    /// <summary>将 <paramref name="prms"/> 中的每个参数按其原生类型绑定到
+    /// 预编译语句，序号从 1 开始。SQLITE_TRANSIENT (-1) 让
+    /// sqlite3 立即复制文本，这样 Zan 字符串可随时被回收。
+    /// 返回 0，或首个绑定失败的驱动返回码。</summary>
+    static int BindAll(nint stmt, DbParams prms) {
+        int n = prms.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            int rc = 0;
+            int k = prms.KindAt(i);
+            if (k == 1) {
+                rc = sqlite3_bind_int64(stmt, i + 1, prms.IntAt(i));
+            } else if (k == 2) {
+                rc = sqlite3_bind_double(stmt, i + 1, prms.DoubleAt(i));
+            } else if (k == 3) {
+                string t = prms.TextAt(i);
+                if (t == null) {
+                    rc = sqlite3_bind_null(stmt, i + 1);
+                } else {
+                    rc = sqlite3_bind_text(stmt, i + 1, t, t.Length, -1);
+                }
+            } else {
+                rc = sqlite3_bind_null(stmt, i + 1);
+            }
+            if (rc != 0) { return rc; }
+        }
+        return 0;
+    }
+
+    /// <summary>抛出记录的失败：文本来自 sqlite3_errmsg（服务器
+    /// 自身的说明），错误号是驱动返回码（如 SQLITE_CONSTRAINT）。
+    /// 空结果从此总意味着「无行」，而不是掩盖了一次失败。</summary>
+    void Fail(int rc) {
+        string why = "the statement failed";
+        if (this.handle != 0) {
+            string msg = SqliteConnection.CopyText(sqlite3_errmsg(this.handle));
+            if (msg.Length > 0 && msg != "not an error") {
+                why = msg;
+            }
+        }
+        throw new DbException(why, rc, DbProvider.SQLite);
+    }
+
+    /// <summary>执行非查询语句（INSERT/UPDATE/DELETE/DDL）。
+    /// 失败时抛出 <see cref="DbException"/>。</summary>
+    int Execute(string sql) {
+        if (!this.connected) {
+            throw new DbException("not connected", 0, DbProvider.SQLite);
+        }
+        byte[] errmsg = new byte[8];
+        int rc = sqlite3_exec(this.handle, sql, 0, 0, errmsg);
+        if (rc == 0) {
+            return sqlite3_changes(this.handle);
+        }
+        // sqlite3_exec 失败时会 malloc 一条错误消息挂到出参上；
+        // 消息本身已能从 sqlite3_errmsg 拿到，这里只需释放，
+        // 否则每次失败的执行都泄漏一份。
+        nint pMsg = HandleFromBuf(errmsg);
+        if (pMsg != 0) { sqlite3_free(pMsg); }
+        this.Fail(rc);
+        return 0 - 1;
+    }
+
+    /// <summary>执行带参数的非查询语句。值按原生方式绑定
+    /// （绝不内联进 SQL 文本），因此无需转义，
+    /// 也无法通过值进行注入。占位符为 `?`。
+    /// 失败时抛出 <see cref="DbException"/>。</summary>
+    int Execute(string sql, DbParams prms) {
+        if (!this.connected) {
+            throw new DbException("not connected", 0, DbProvider.SQLite);
+        }
+        nint stmt = 0;
+        bool cached = false;
+        byte[] ppStmt = new byte[8];
+        byte[] pzTail = new byte[8];
+        nint hit = 0;
+        if (this.stmtCache.TryGetValue(sql, out hit)) {
+            bool busy = false;
+            if (!this.stmtBusy.TryGetValue(sql, out busy) || !busy) {
+                cached = true;
+                stmt = hit;
+                sqlite3_reset(stmt);
+                sqlite3_clear_bindings(stmt);
+                this.stmtBusy.Add(sql, true);
+            }
+        }
+        if (stmt == 0) {
+            int rc = sqlite3_prepare_v2(this.handle, sql, sql.Length,
+                                        ppStmt, pzTail);
+            if (rc != 0) { this.Fail(rc); }
+            stmt = HandleFromBuf(ppStmt);
+            // pzTail 非空 = 文本里还有第二条语句；或同一 SQL 已被并发
+            // 调用临时占用——都按一次性语句处理，不动缓存。
+            nint ignore = 0;
+            if (HandleFromBuf(pzTail) == 0
+                && !this.stmtCache.TryGetValue(sql, out ignore)) {
+                this.stmtCache.Add(sql, stmt);
+                this.stmtBusy.Add(sql, true);
+                cached = true;
+            }
+        }
+        int brc = BindAll(stmt, prms);
+        if (brc != 0) {
+            this.ReleaseStmt(sql, stmt, cached);
+            this.Fail(brc);
+        }
+        int step = sqlite3_step(stmt);
+        this.ReleaseStmt(sql, stmt, cached);
+        if (step != 101) {   // SQLITE_DONE = 101
+            if (step == 100) {
+                throw new DbException(
+                    "the statement returned rows; use Query to read them",
+                    step, DbProvider.SQLite);
+            }
+            this.Fail(step);
+        }
+        return sqlite3_changes(this.handle);
+    }
+
+    /// <summary>执行查询并返回结果集。</summary>
+    DbResult Query(string sql) {
+        return Query(sql, new DbParams());
+    }
+
+    /// <summary>执行带参数的查询（`?` 占位符）并返回
+    /// 结果集。值通过 sqlite3_bind_* 按原生方式绑定。
+    /// 失败时抛出 <see cref="DbException"/>——包括取行
+    /// 中途的 step 错误，不再把截短的结果集当成功返回。</summary>
+    DbResult Query(string sql, DbParams prms) {
+        if (!this.connected) {
+            throw new DbException("not connected", 0, DbProvider.SQLite);
+        }
+        DbResult result = new DbResult();
+
+        nint stmt = 0;
+        bool cached = false;
+        byte[] ppStmt = new byte[8];
+        byte[] pzTail = new byte[8];
+        nint hit = 0;
+        if (this.stmtCache.TryGetValue(sql, out hit)) {
+            bool busy = false;
+            if (!this.stmtBusy.TryGetValue(sql, out busy) || !busy) {
+                cached = true;
+                stmt = hit;
+                sqlite3_reset(stmt);
+                sqlite3_clear_bindings(stmt);
+                this.stmtBusy.Add(sql, true);
+            }
+        }
+        if (stmt == 0) {
+            int rc = sqlite3_prepare_v2(this.handle, sql, sql.Length,
+                                        ppStmt, pzTail);
+            if (rc != 0) { this.Fail(rc); }
+            stmt = HandleFromBuf(ppStmt);
+            // pzTail 非空 = 文本里还有第二条语句；或同一 SQL 已被并发
+            // 调用临时占用——都按一次性语句处理，不动缓存。
+            nint ignore = 0;
+            if (HandleFromBuf(pzTail) == 0
+                && !this.stmtCache.TryGetValue(sql, out ignore)) {
+                this.stmtCache.Add(sql, stmt);
+                this.stmtBusy.Add(sql, true);
+                cached = true;
+            }
+        }
+        int brc = BindAll(stmt, prms);
+        if (brc != 0) {
+            this.ReleaseStmt(sql, stmt, cached);
+            this.Fail(brc);
+        }
+
+        int colCount = sqlite3_column_count(stmt);
+        result.SetColumnCount(colCount);
+
+        int c = 0;
+        for (; c < colCount; c = c + 1) {
+            result.AddColumnName(CopyText(sqlite3_column_name(stmt, c)));
+        }
+
+        int step = sqlite3_step(stmt);
+        while (step == 100) {  // SQLITE_ROW = 100
+            List<string> row = new List<string>();
+            List<bool> nullFlags = new List<bool>();
+            c = 0;
+            while (c < colCount) {
+                if (sqlite3_column_type(stmt, c) == 5) {  // SQLITE_NULL
+                    row.Add("");
+                    nullFlags.Add(true);
+                } else {
+                    row.Add(CopyText(sqlite3_column_text(stmt, c)));
+                    nullFlags.Add(false);
+                }
+                c = c + 1;
+            }
+            result.AddRowNulls(row, nullFlags);
+            step = sqlite3_step(stmt);
+        }
+
+        this.ReleaseStmt(sql, stmt, cached);
+        if (step != 101) {   // SQLITE_DONE = 101
+            this.Fail(step);
+        }
+        return result;
+    }
+
+    /// <summary>执行标量查询（第一行第一列）。</summary>
+    string ExecuteScalar(string sql) {
+        DbResult result = Query(sql);
+        if (result.RowCount() > 0) {
+            return result.GetString(0, 0);
+        }
+        return "";
+    }
+
+    /// <summary>执行带参数的标量查询。</summary>
+    string ExecuteScalar(string sql, DbParams prms) {
+        DbResult result = Query(sql, prms);
+        if (result.RowCount() > 0) {
+            return result.GetString(0, 0);
+        }
+        return "";
+    }
+
+    /// <summary>获取最后插入行的 ID。</summary>
+    long LastInsertId() {
+        return sqlite3_last_insert_rowid(this.handle);
+    }
+
+    /// <summary>获取最后一条错误消息。</summary>
+    string GetError() {
+        return CopyText(sqlite3_errmsg(this.handle));
+    }
+
+    // ===== 协程孪生方法 =====
+    // Prepare/bind and result processing stay on the reactor. Only the
+    // non-cancellable sqlite3_step crosses the blocking-offload boundary.
+    /// <see cref="Query(string)"/> 的协程版本。
+    async DbResult QueryAsync(string sql) {
+        return await this.QueryAsync(sql, new DbParams());
+    }
+
+    /// <see cref="Query(string, DbParams)"/> 的协程版本：准备/绑定留在
+    /// reactor 上，仅 sqlite3_step 跨阻塞卸载边界；失败抛
+    /// <see cref="DbException"/>。
+    async DbResult QueryAsync(string sql, DbParams prms) {
+        if (!this.connected) {
+            throw new DbException("not connected", 0, DbProvider.SQLite);
+        }
+        DbResult result = new DbResult();
+        nint stmt = 0;
+        bool cached = false;
+        byte[] ppStmt = new byte[8];
+        byte[] pzTail = new byte[8];
+        nint hit = 0;
+        if (this.stmtCache.TryGetValue(sql, out hit)) {
+            bool busy = false;
+            if (!this.stmtBusy.TryGetValue(sql, out busy) || !busy) {
+                cached = true;
+                stmt = hit;
+                sqlite3_reset(stmt);
+                sqlite3_clear_bindings(stmt);
+                this.stmtBusy.Add(sql, true);
+            }
+        }
+        if (stmt == 0) {
+            int rc = sqlite3_prepare_v2(this.handle, sql, sql.Length,
+                                        ppStmt, pzTail);
+            if (rc != 0) { this.Fail(rc); }
+            stmt = HandleFromBuf(ppStmt);
+            // pzTail 非空 = 文本里还有第二条语句；或同一 SQL 已被并发
+            // 调用临时占用——都按一次性语句处理，不动缓存。
+            nint ignore = 0;
+            if (HandleFromBuf(pzTail) == 0
+                && !this.stmtCache.TryGetValue(sql, out ignore)) {
+                this.stmtCache.Add(sql, stmt);
+                this.stmtBusy.Add(sql, true);
+                cached = true;
+            }
+        }
+        int brc = BindAll(stmt, prms);
+        if (brc != 0) {
+            this.ReleaseStmt(sql, stmt, cached);
+            this.Fail(brc);
+        }
+        int colCount = sqlite3_column_count(stmt);
+        result.SetColumnCount(colCount);
+        int c = 0;
+        for (; c < colCount; c = c + 1) {
+            result.AddColumnName(CopyText(sqlite3_column_name(stmt, c)));
+        }
+
+        int step = await sqlite3_step(stmt);
+        while (step == 100) {
+            List<string> row = new List<string>();
+            List<bool> nullFlags = new List<bool>();
+            c = 0;
+            while (c < colCount) {
+                if (sqlite3_column_type(stmt, c) == 5) {
+                    row.Add("");
+                    nullFlags.Add(true);
+                } else {
+                    row.Add(CopyText(sqlite3_column_text(stmt, c)));
+                    nullFlags.Add(false);
+                }
+                c = c + 1;
+            }
+            result.AddRowNulls(row, nullFlags);
+            step = await sqlite3_step(stmt);
+        }
+        this.ReleaseStmt(sql, stmt, cached);
+        if (step != 101) {   // SQLITE_DONE = 101
+            this.Fail(step);
+        }
+        return result;
+    }
+
+    /// <see cref="Execute(string)"/> 的协程版本。
+    async int ExecuteAsync(string sql) {
+        return await this.ExecuteAsync(sql, new DbParams());
+    }
+
+    /// <summary>协程版多语句执行：按 `pzTail` 逐条 prepare/step，
+    /// 参数只绑定到第一条语句。失败时抛出
+    /// <see cref="DbException"/>，停在首条失败的语句上。</summary>
+    async int ExecuteAsync(string sql, DbParams prms) {
+        if (!this.connected) {
+            throw new DbException("not connected", 0, DbProvider.SQLite);
+        }
+        string remaining = sql;
+        int affected = 0;
+        bool firstStatement = true;
+        while (remaining.Length > 0) {
+            byte[] ppStmt = new byte[8];
+            byte[] pzTail = new byte[8];
+            int rc = sqlite3_prepare_v2(this.handle, remaining, remaining.Length,
+                ppStmt, pzTail);
+            nint stmt = HandleFromBuf(ppStmt);
+            if (rc != 0) { this.Fail(rc); }
+            if (stmt == 0) { break; }   // whitespace/comments after the last statement
+
+            // As with the synchronous prepare+bind path, parameters belong to
+            // the first prepared statement only. Callers combining parameters
+            // with multiple statements must put placeholders in that statement;
+            // later statements have SQLite's normal unbound-parameter behavior.
+            if (firstStatement) {
+                int brc = BindAll(stmt, prms);
+                if (brc != 0) {
+                    sqlite3_finalize(stmt);
+                    this.Fail(brc);
+                }
+            }
+            int step = await sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+            if (step != 101) {   // SQLITE_DONE = 101
+                if (step == 100) {
+                    throw new DbException(
+                        "the statement returned rows; use Query to read them",
+                        step, DbProvider.SQLite);
+                }
+                this.Fail(step);
+            }
+            affected = sqlite3_changes(this.handle);
+            firstStatement = false;
+
+            nint tail = HandleFromBuf(pzTail);
+            int offset = (int)(tail - (nint)remaining);
+            if (offset <= 0 || offset >= remaining.Length) { break; }
+            remaining = remaining.Substring(offset, remaining.Length - offset);
+        }
+        return affected;
+    }
+
+    /// <see cref="ExecuteScalar(string)"/> 的协程版本。
+    async string ExecuteScalarAsync(string sql) {
+        return await this.ExecuteScalarAsync(sql, new DbParams());
+    }
+
+    /// <see cref="ExecuteScalar(string, DbParams)"/> 的协程版本。
+    async string ExecuteScalarAsync(string sql, DbParams prms) {
+        DbResult result = await this.QueryAsync(sql, prms);
+        if (result.RowCount() > 0) {
+            return result.GetString(0, 0);
+        }
+        return "";
+    }
+
+    /// 协程版事务：执行 BEGIN TRANSACTION，恒返回 true。
+    async bool BeginTransactionAsync() {
+        await this.ExecuteAsync("BEGIN TRANSACTION");
+        return true;
+    }
+
+    /// 协程版提交：执行 COMMIT，恒返回 true。
+    async bool CommitAsync() {
+        await this.ExecuteAsync("COMMIT");
+        return true;
+    }
+
+    /// 协程版回滚：执行 ROLLBACK，恒返回 true。
+    async bool RollbackAsync() {
+        await this.ExecuteAsync("ROLLBACK");
+        return true;
+    }
+
+    /// <summary>开始一个事务。</summary>
+    void BeginTransaction() { Execute("BEGIN TRANSACTION"); }
+
+    /// <summary>提交当前事务。</summary>
+    void Commit() { Execute("COMMIT"); }
+
+    /// <summary>回滚当前事务。</summary>
+    void Rollback() { Execute("ROLLBACK"); }
+
+    /// <summary>关闭数据库连接。</summary>
+    /// <summary>单语句执行的收尾：缓存语句 reset 后留待复用并清忙
+    /// 标志；一次性语句立即 finalize。所有退出路径（绑定失败、step
+    /// 失败、成功）都必须先走这里再抛错/返回。</summary>
+    void ReleaseStmt(string sql, nint stmt, bool cached) {
+        if (cached) {
+            sqlite3_reset(stmt);
+            this.stmtBusy.Add(sql, false);
+        } else {
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    /// 关闭连接：先 finalize 全部缓存语句（否则 sqlite3_close 返回
+    /// SQLITE_BUSY），再关闭连接句柄。
+    void Close() {
+        // 缓存的语句句柄必须先于连接句柄销毁，否则 sqlite3_close
+        // 对未 finalize 的语句返回 SQLITE_BUSY，连接就关不上了。
+        if (this.stmtCache != null) {
+            foreach (string k in this.stmtCache.Keys) {
+                nint cachedStmt = 0;
+                if (this.stmtCache.TryGetValue(k, out cachedStmt)
+                    && cachedStmt != 0) {
+                    sqlite3_finalize(cachedStmt);
+                }
+            }
+            this.stmtCache = new Dict<string, nint>();
+            this.stmtBusy = new Dict<string, bool>();
+        }
+        // 同 Postgres：句柄在就释放，不依赖 connected 标志。
+        if (this.connected || this.handle != 0) {
+            sqlite3_close(this.handle);
+            this.connected = false;
+            this.handle = 0;
+        }
+    }
+
+    /// <summary>返回连接是否已打开。</summary>
+    bool IsConnected() { return this.connected; }
+
+    /// <summary>返回 provider id（DbProvider.SQLite）。</summary>
+    int GetProvider() { return DbProvider.SQLite; }
+}

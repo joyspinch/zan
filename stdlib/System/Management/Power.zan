@@ -1,0 +1,167 @@
+using System;
+
+namespace System.Management;
+
+/// <summary>
+/// 机器及其电池的电源状态。
+/// </summary>
+class PowerStatus {
+    /// 使用电池供电（未接交流电）时为 True。
+    public bool onBattery;
+    /// 电池电量百分比（0..100；无电池时为 -1）。
+    public int batteryPercent;
+    /// 剩余电池续航时间（秒；未知/无限时为 -1）。
+    public long batteryLifeSeconds;
+}
+
+/// <summary>
+/// 电源/电池状态。Windows 调用 GetSystemPowerStatus；Linux 读取
+/// /sys/class/power_supply（BAT* 条目）。其他平台抛出
+/// PlatformNotSupportedException.
+/// </summary>
+class Power {
+    /// <summary>当前电源状态快照。</summary>
+    static PowerStatus GetStatus() {
+        #if WINDOWS
+        return Power.WinStatus();
+        #elif LINUX
+        return Power.LinuxStatus();
+        #else
+        throw new PlatformNotSupportedException(
+            "Power.GetStatus is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>机器正在使用电池供电时为 True。</summary>
+    static bool OnBattery() {
+        return Power.GetStatus().onBattery;
+    }
+
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetSystemPowerStatus")]
+    static extern int WinGetSystemPowerStatus(nint buf);
+
+    /// Windows 实现：解析 GetSystemPowerStatus 的 SYSTEM_POWER_STATUS；
+    /// 无电池或数值未知时 percent/life 为 -1。
+    static PowerStatus WinStatus() {
+        // SYSTEM_POWER_STATUS: ACLineStatus(1) BatteryFlag(1)
+        // BatteryLifePercent(1) SystemStatusFlag(1) BatteryLifeTime(4)
+        // BatteryFullLifeTime(4).
+        nint buf = NativeMemory.Alloc(16);
+        Power.WinGetSystemPowerStatus(buf);
+        Span<byte> b = new Span<byte>(buf, 16);
+        Span<int> w = new Span<int>(buf + 4, 2);
+        PowerStatus s = new PowerStatus();
+        int ac = b[0];
+        int flag = b[1];
+        int pct = b[2];
+        // ACLineStatus：1 = 在线（AC），0 = 离线（电池）。
+        s.onBattery = ac != 1;
+        if (pct == 255) { s.batteryPercent = -1; }   // 未知
+        else { s.batteryPercent = pct; }
+        if (flag == 255) {
+            // 系统没有电池。
+            s.batteryPercent = -1;
+        }
+        int life = w[0];
+        if (life == 0xFFFFFFFF) { s.batteryLifeSeconds = -1; }
+        else { s.batteryLifeSeconds = life; }
+        NativeMemory.Free(buf);
+        return s;
+    }
+    #endif
+
+    #if LINUX
+    /// Linux 实现：读 /sys/class/power_supply 的第一个 BAT* 电源；
+    /// 没有电池时 onBattery=false 且 percent/life 为 -1。
+    static PowerStatus LinuxStatus() {
+        PowerStatus s = new PowerStatus();
+        s.batteryPercent = -1;
+        s.batteryLifeSeconds = -1;
+        string type = Power.SysClass("type");
+        if (type != "Battery") {
+            // 没有电池；正在使用交流电。
+            s.onBattery = false;
+            return s;
+        }
+        string status = Power.SysClass("status");
+        s.onBattery = status == "Discharging";
+        int energyNow = Power.SysInt("energy_now");
+        int energyFull = Power.SysInt("energy_full");
+        int powerNow = Power.SysInt("power_now");
+        if (energyFull > 0 && energyNow >= 0) {
+            s.batteryPercent = energyNow * 100 / energyFull;
+            if (s.batteryPercent > 100) { s.batteryPercent = 100; }
+        }
+        if (powerNow > 0 && energyNow > 0) {
+            // energy_now 单位为 µWh，power_now 单位为 µW -> 先得到小时，再换算为秒。
+            s.batteryLifeSeconds = (long)energyNow * 3600 / powerNow;
+        }
+        return s;
+    }
+
+    /// 第一个 BAT* 电源：从 /sys/class/power_supply 读取 `field`。
+    static string SysField(string field) {
+        string txt = "";
+        try {
+            txt = File.ReadAllText("/sys/class/power_supply/BAT0/" + field);
+        } catch {
+            return "";
+        }
+        return txt.Trim();
+    }
+
+    /// 读第一个可用电池（BAT0 优先）的 `field` 属性；全缺时返回 ""。
+    static string SysClass(string field) {
+        string v = Power.SysField(field);
+        if (v != "") { return v; }
+        return Power.SysField2(field);
+    }
+
+    /// BAT0 不存在时依次尝试 BAT1..BAT9。
+    static string SysField2(string field) {
+        int i = 1;
+        while (i <= 9) {
+            string path = "/sys/class/power_supply/BAT" + Convert.ToString(i)
+                + "/" + field;
+            try {
+                return File.ReadAllText(path).Trim();
+            } catch {
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// 读数字属性；缺失或非法时为 -1。
+    static int SysInt(string field) {
+        string v = Power.SysClass(field);
+        if (v == "") { return -1; }
+        return Power.ParseInt(v);
+    }
+
+    /// 十进制解析为 int；空串或含非数字返回 -1。
+    static int ParseInt(string s) {
+        if (s.Length == 0) { return -1; }
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            int c = Power.CodeOf(ch);
+            if (c < 0x30 || c > 0x39) { return -1; }
+            v = v * 10 + (c - 0x30);
+        }
+        return v;
+    }
+
+    /// 取 `ch` 编码后首字节的值（用于判断 ASCII 数字）。
+    static int CodeOf(string ch) {
+        if (ch.Length == 0) { return 0; }
+        nint buf = NativeMemory.Alloc(8);
+        NativeMemory.PutString(buf, 0, ch, ch.Length);
+        Span<byte> b = new Span<byte>(buf, 4);
+        int c0 = b[0];
+        NativeMemory.Free(buf);
+        return c0;
+    }
+    #endif
+}

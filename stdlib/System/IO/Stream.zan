@@ -1,0 +1,167 @@
+using System;
+
+namespace System.IO;
+
+/// <summary>
+/// 面向字节的流：<see cref="FileStream"/> 和
+/// <see cref="MemoryStream"/> 的公共基类，也是 <see cref="StreamReader"/> /
+/// <see cref="StreamWriter"/> 读写所经由的对象。
+///
+/// 子类只需覆写四个原语方法（ReadInto / WriteFrom / Seek /
+/// Close）以及能力与长度查询；其余所有方法都基于它们实现，
+/// 因此新流类型可免费获得整套辅助方法；
+/// 无需额外编码：
+///   FileStream fs = FileStream.OpenRead("data.bin");
+///   string head = fs.Read(16);
+///   fs.Close();
+///
+/// 字节数据以 `string` 形式传递：zan 字符串带有显式长度，
+/// 因此内嵌的 NUL 字节也能保留。裸地址（nint，来自 NativeMemory 或
+/// ByteBuffer.Raw）同样被接受，用于零拷贝路径。
+/// </summary>
+class Stream {
+    /// <summary>流可读时为真。</summary>
+    virtual bool CanRead() { return false; }
+
+    /// <summary>流可写时为真。</summary>
+    virtual bool CanWrite() { return false; }
+
+    /// <summary>流支持 Seek/Position 时为真。</summary>
+    virtual bool CanSeek() { return false; }
+
+    /// <summary>流中的总字节数，未知时为 -1。</summary>
+    virtual long Length() { return -1; }
+
+    /// <summary>当前字节偏移，未知时为 -1。</summary>
+    virtual long Position() { return -1; }
+
+    /// <summary>移动游标。`origin`：0 = 开头，1 = 当前，2 = 末尾。
+    /// 返回新的绝对位置，不可定位时返回 -1。</summary>
+    virtual long Seek(long offset, int origin) { return -1; }
+
+    /// <summary>读取最多 `count` 字节到裸地址 `buf`。
+    /// 返回读取的字节数；0 表示流结束。</summary>
+    virtual int ReadInto(nint buf, int count) { return 0; }
+
+    /// <summary>从裸地址 `buf` 写入 `count` 字节。
+    /// 返回写入的字节数。</summary>
+    virtual int WriteFrom(nint buf, int count) { return 0; }
+
+    /// <summary>将缓冲的写入推送到底层设备。</summary>
+    virtual void Flush() { }
+
+    /// <summary>释放流。可安全地重复调用。</summary>
+    virtual void Close() { }
+
+    /// <summary>读取最多 `count` 字节；流结束时返回 ""。</summary>
+    string Read(int count) {
+        if (count <= 0) {
+            return "";
+        }
+        nint buf = NativeMemory.Alloc(count + 1);
+        int n = this.ReadInto(buf, count);
+        string s = "";
+        if (n > 0) {
+            s = NativeMemory.GetString(buf, 0, n);
+        }
+        NativeMemory.Free(buf);
+        return s;
+    }
+
+    /// <summary>写入 `data` 的全部字节。返回实际写入的字节数。</summary>
+    int Write(string data) {
+        int n = data.Length;
+        if (n <= 0) {
+            return 0;
+        }
+        nint buf = NativeMemory.Alloc(n + 1);
+        NativeMemory.PutString(buf, 0, data, n);
+        int w = 0;
+        while (w < n) {
+            int k = this.WriteFrom(buf + w, n - w);
+            if (k <= 0) {
+                break;
+            }
+            w = w + k;
+        }
+        NativeMemory.Free(buf);
+        return w;
+    }
+
+    /// <summary>读取一个字节，流结束时返回 -1。</summary>
+    int ReadByte() {
+        nint buf = NativeMemory.Alloc(1);
+        int n = this.ReadInto(buf, 1);
+        int v = -1;
+        if (n == 1) {
+            v = new Span<byte>(buf, 1)[0];
+        }
+        NativeMemory.Free(buf);
+        return v;
+    }
+
+    /// <summary>写入一个字节（`b` 的低 8 位）。</summary>
+    void WriteByte(int b) {
+        nint buf = NativeMemory.Alloc(1);
+        new Span<byte>(buf, 1)[0] = b & 255;
+        this.WriteFrom(buf, 1);
+        NativeMemory.Free(buf);
+    }
+
+    /// <summary>读取流中剩余的全部内容（二进制安全）。</summary>
+    string ReadToEnd() {
+        ByteBuffer acc = ByteBuffer.Alloc(4096);
+        int chunk = 65536;
+        nint buf = NativeMemory.Alloc(chunk);
+        int n = this.ReadInto(buf, chunk);
+        while (n > 0) {
+            acc.WriteBytes(buf, n);
+            n = this.ReadInto(buf, chunk);
+        }
+        NativeMemory.Free(buf);
+        string all = acc.ToStr();
+        acc.Free();
+        return all;
+    }
+
+    /// <summary>把本流中剩余的内容复制到 `dest`。
+    /// 返回复制的字节数。</summary>
+    long CopyTo(Stream dest) {
+        int chunk = 65536;
+        nint buf = NativeMemory.Alloc(chunk);
+        long total = 0;
+        int n = this.ReadInto(buf, chunk);
+        while (n > 0) {
+            int off = 0;
+            while (off < n) {
+                int w = dest.WriteFrom(buf + off, n - off);
+                if (w <= 0) {
+                    break;
+                }
+                off = off + w;
+                total = total + w;
+            }
+            if (off < n) {
+                break;
+            }
+            n = this.ReadInto(buf, chunk);
+        }
+        NativeMemory.Free(buf);
+        return total;
+    }
+
+    /// <summary>定位到绝对偏移（Seek(pos, 0) 的简写）。</summary>
+    long SeekTo(long position) {
+        return this.Seek(position, 0);
+    }
+
+    /// <summary>游标到末尾之间的字节数，未知时为 -1。</summary>
+    long Remaining() {
+        long len = this.Length();
+        long pos = this.Position();
+        if (len < 0 || pos < 0) {
+            return -1;
+        }
+        return len - pos;
+    }
+}

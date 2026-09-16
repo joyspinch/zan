@@ -1,0 +1,959 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+partial class ChartView {
+    // ---- 极坐标 / 雷达图（角度类别上的序列多边形） ----
+
+    /// 雷达图第 j 轴的上限（ECharts radar.indicator.max）：
+    /// radarMax[j] > 0 用显式值，否则从各系列该轴数据推导并取
+    /// 友好刻度。纯函数，供 chart_option_behavior 直接断言。
+    static int RadarAxisMax(List<ChartSeries> series, List<int> radarMax, int j) {
+        int m = 0;
+        if (j < radarMax.Count && radarMax[j] > 0) { m = radarMax[j]; }
+        else {
+            for (int si = 0; si < series.Count; si = si + 1) {
+                ChartSeries s = series[si];
+                if (s.hidden) { continue; }
+                if (j < s.Count() && s.Value(j) > m) { m = s.Value(j); }
+            }
+            m = Chart.NiceMax(m);
+        }
+        if (m < 1) { m = 1; }
+        return m;
+    }
+
+    /// 指针角度（0=正上，顺时针）映射到最近的雷达轴。
+    /// 角度在 0/360 接缝处必须环回到轴 0，不能把四舍五入后的
+    /// n 夹到 n-1，否则正上方左侧的小扇区会显示错误轴数据。
+    static int RadarAxisAt(int angle, int n) {
+        if (n < 1) { return 0 - 1; }
+        int a = angle % 360;
+        if (a < 0) { a = a + 360; }
+        int axis = (a * n + 180) / 360;
+        return axis % n;
+    }
+
+    /// 雷达图入场动画按数据半径从中心向外展开；tooltip 的可见
+    /// 命中域必须跟随同一半径，否则 g=0 时中心外的不可见数据也会
+    /// 提前响应。容差只在已有可见半径时生效。
+    static int RadarTooltipRadius(int radius, int progress, int tolerance) {
+        if (radius < 0) { radius = 0; }
+        if (progress < 0) { progress = 0; }
+        if (progress > 1000) { progress = 1000; }
+        if (tolerance < 0) { tolerance = 0; }
+        if (progress == 0) { return 0 - 1; }
+        return radius * progress / 1000 + tolerance;
+    }
+
+    /// 极坐标/雷达图渲染入口：同心环（circle/polygon 两种
+    /// radarShape）+ 可选 splitArea 交替色带 + 轴线与标签；系列画
+    /// 闭合多边形（可选 areaStyle 半透明填充与符号点）。轴扇区
+    /// 命中（RadarAxis 事件，dataIndex = 轴下标）与 tooltip，命中
+    /// 半径跟随入场动画进度。
+    /// option.polars 非空时走多 polar 路径（DrawPolarMulti），
+    /// 系列按 polarIndex 分组；空 = 下方单 polar 历史路径原样。
+    static void DrawPolar(App app, int x, int y, int w, int h,
+                          ChartOption o, int g) {
+        if (o.polars.Count > 0) {
+            ChartView.DrawPolarMulti(app, x, y, w, h, o, g);
+            return;
+        }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = Chart.DrawPanelI(app, x, y, w, h, o.title, o.series, o.iwid, o.showLegend);
+        List<string> labels = o.XCategories();
+        int n = labels.Count;
+        if (n < 1 && o.series.Count > 0) { n = o.series[0].Count(); }
+        if (n < 1) { return; }
+
+        // 每轴独立上限：radarMax[j] > 0 用显式值（ECharts
+        // radar.indicator.max），否则从各系列该轴的数据推导
+        // 并取友好刻度。
+        List<int> maxV = new List<int>();
+        for (int ai = 0; ai < n; ai = ai + 1) {
+            maxV.Add(ChartView.RadarAxisMax(o.series, o.radarMax, ai));
+        }
+
+        int areaW = w - pad * 2;
+        int areaH = (y + h - pad - Chart.legendBottomReserve) - top;
+        int r = ChartView.RadialRadius(areaW, areaH, 62);
+        if (r < app.Scale(10)) { r = app.Scale(10); }
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+        int boxX = x + pad;
+        int boxY = top;
+        int boxW = areaW;
+        int boxH = areaH;
+
+        StyleBox sGrid = Style.Part(app, "chart", "grid", "", "", "",
+                                    Style.SNormal());
+        bool polyShape = o.radarShape == "polygon";
+        int rings = 4;
+        // splitArea：环带交替色（先画带再画环线，轮廓压在带上）。
+        if (o.radarSplitArea) {
+            int areaCol = Style.Part(app, "chart", "split-area", "", "", "",
+                                     Style.SNormal()).BgOr(0);
+            if (areaCol == 0) { areaCol = sGrid.BgOr(0); }
+            for (int rb = 2; rb <= rings; rb = rb + 2) {
+                int r1 = r * rb / rings;
+                int r0 = r * (rb - 1) / rings;
+                if (polyShape) {
+                    // 外环顶点 + 内环逆序顶点 = 偶奇规则下的环形带。
+                    List<int> bx = new List<int>();
+                    List<int> by = new List<int>();
+                    for (int a = 0; a < n; a = a + 1) {
+                        int ang = a * 360 / n - 90;
+                        bx.Add(cx + ChartView.CosDeg(ang) * r1 / 1000);
+                        by.Add(cy + ChartView.SinDeg(ang) * r1 / 1000);
+                    }
+                    for (int a = n - 1; a >= 0; a = a - 1) {
+                        int ang = a * 360 / n - 90;
+                        bx.Add(cx + ChartView.CosDeg(ang) * r0 / 1000);
+                        by.Add(cy + ChartView.SinDeg(ang) * r0 / 1000);
+                    }
+                    ChartView.FillPolyAlpha(c, bx, by, areaCol, 26);
+                } else {
+                    c.FillSector(cx, cy, r0, r1, 0, 360, Chart.WithAlpha(areaCol, 26));
+                }
+            }
+        }
+        int rr = 1;
+        while (rr <= rings) {
+            if (polyShape) {
+                // polygon 环：按轴角度连成的闭合多边形。
+                List<int> gx = new List<int>();
+                List<int> gy = new List<int>();
+                for (int a = 0; a < n; a = a + 1) {
+                    int ang = a * 360 / n - 90;
+                    gx.Add(cx + ChartView.CosDeg(ang) * r * rr / rings / 1000);
+                    gy.Add(cy + ChartView.SinDeg(ang) * r * rr / rings / 1000);
+                }
+                gx.Add(gx[0]);
+                gy.Add(gy[0]);
+                c.DrawPolyline(gx, gy, sGrid.BgOr(0), 1);
+            } else {
+                ChartView.RingOutline(c, cx, cy, r * rr / rings, sGrid.BgOr(0));
+            }
+            rr = rr + 1;
+        }
+        for (int a = 0; a < n; a = a + 1) {
+            int ang = a * 360 / n - 90;
+            int ex = cx + ChartView.CosDeg(ang) * r / 1000;
+            int ey = cy + ChartView.SinDeg(ang) * r / 1000;
+            c.DrawLine(cx, cy, ex, ey, sGrid.BgOr(0), 1);
+            string lbl = "";
+            if (a < labels.Count) { lbl = labels[a]; }
+            if (lbl.Length > 0) {
+                ChartView.DrawPolarLabel(app, c, cx, cy, r, ang, lbl,
+                    Style.Part(app, "chart", "axis", "", "", "", Style.SNormal()).FgOr(0),
+                    ChartFonts.SeriesLabel(app), boxX, boxY, boxW, boxH);
+            }
+        }
+
+        ChartView.PushPlotClip(app, boxX, boxY, boxW, boxH);
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries s = o.series[si];
+            if (s.hidden) { continue; }
+            int col = s.color;
+            // 整个雷达多边形（含闭合边）是单次描边，
+            // 顶点为平滑的圆角连接，而非逐段接缝。
+            List<int> lx = new List<int>();
+            List<int> ly = new List<int>();
+            for (int j = 0; j < n && j < s.Count(); j = j + 1) {
+                int ang = j * 360 / n - 90;
+                int rad = (int)((long)s.Value(j) * g * r / ((long)maxV[j] * 1000L));
+                int px = cx + ChartView.CosDeg(ang) * rad / 1000;
+                int py = cy + ChartView.SinDeg(ang) * rad / 1000;
+                lx.Add(px);
+                ly.Add(py);
+                if (s.showSymbol != 0) {
+                    Chart.DrawSymbol(c, px, py,
+                        s.symbolSize > 0
+                            ? app.Scale(Chart.SymbolRadius(s.symbolSize, 0))
+                            : app.Scale(3),
+                        s.symbol, col, 0, 0);
+                }
+            }
+            if (n > 1 && s.Count() >= n && lx.Count > 0) {
+                lx.Add(lx[0]);
+                ly.Add(ly[0]);
+            }
+            // areaStyle（ECharts radar.areaStyle）：半透明填充
+            // 多边形内部（描边之前，使轮廓保持清晰）。
+            if (s.areaStyle && lx.Count > 2) {
+                ChartView.FillPolyAlpha(c, lx, ly, col, 70);
+            }
+            if (lx.Count > 1) {
+                List<int> fx = new List<int>();
+                List<int> fy = new List<int>();
+                for (int pi = 0; pi < lx.Count; pi = pi + 1) {
+                    fx.Add(lx[pi] * 256);
+                    fy.Add(ly[pi] * 256);
+                }
+                c.DrawPolylineFx(fx, fy, col, app.Scale(2));
+            }
+        }
+        c.PopClip();
+
+        // 命中几何与 tooltip 展示解耦：关闭 tooltip 不能关闭
+        // 雷达轴扇区的 Hover/MouseOut/Click 事件。
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        int ddx = mx - cx;
+        int ddy = my - cy;
+        int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
+        int hitR = ChartView.RadarTooltipRadius(r, g, app.Scale(8));
+        if (dist <= hitR) {
+            int ang = ChartView.AngleOf(ddx, ddy);
+            int axis = ChartView.RadarAxisAt(ang, n);
+            if (axis >= 0 && ChartView.activeEventView != null
+                && axis < maxV.Count) {
+                string nm = "";
+                if (axis < labels.Count) { nm = labels[axis]; }
+                // 值取主导系列在该轴上的数据；dataIndex = 轴下标。
+                ChartSeries leadS = ChartView.LeadSeries(o);
+                int val = 0;
+                string sName = "";
+                if (leadS != null) {
+                    sName = leadS.name;
+                    if (axis < leadS.Count()) { val = leadS.Value(axis); }
+                }
+                ChartHit rh = ChartHit.Of(ChartElementType.RadarAxis,
+                    ChartView.SeriesIndexOf(o, leadS), sName, axis, nm,
+                    val, mx, my);
+                if (leadS != null) { rh.axisIndex = leadS.axisIndex; }
+                ChartView.OfferActiveHit(rh);
+            }
+            if (o.showTooltip) {
+                List<TooltipRow> rows = new List<TooltipRow>();
+                string hdr = "Axis " + Convert.ToString(axis + 1);
+                if (axis < labels.Count) { hdr = labels[axis]; }
+                rows.Add(TooltipRow.Of(0, hdr));
+                for (int si2 = 0; si2 < o.series.Count; si2 = si2 + 1) {
+                    ChartSeries s2 = o.series[si2];
+                    if (!s2.hidden && axis < s2.Count()) {
+                        rows.Add(TooltipRow.Of(s2.color,
+                            s2.name + "  " + Convert.ToString(s2.Value(axis))));
+                    }
+                }
+                ChartView.TooltipCard(app, mx, my, x + w, rows);
+            }
+        }
+    }
+
+    /// 多 polar 路径（ECharts2 polar[] + series.polarIndex）：每个
+    /// 坐标系独立画网格/轴线/指示器名，系列按 polarIndex 分组
+    /// 各自绑定圆心/半径/轴上限。线型 solid/dashed/dotted 与
+    /// 符号形状（含 star5 别名）按系列生效；轴命中与 tooltip
+    /// 落到最近的 polar。
+    static void DrawPolarMulti(App app, int x, int y, int w, int h,
+                               ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = Chart.DrawPanelI(app, x, y, w, h, o.title, o.series, o.iwid, o.showLegend);
+        List<string> labels = o.XCategories();
+        int areaW = w - pad * 2;
+        int areaH = (y + h - pad - Chart.legendBottomReserve) - top;
+        int baseSize = areaW;
+        if (areaH < baseSize) { baseSize = areaH; }
+        int boxX = x + pad;
+        int boxY = top;
+        int boxW = areaW;
+        int boxH = areaH;
+
+        StyleBox sGrid = Style.Part(app, "chart", "grid", "", "", "",
+                                    Style.SNormal());
+        int themeAxisFg = Style.Part(app, "chart", "axis", "", "", "",
+                                     Style.SNormal()).FgOr(0);
+        int smallFont = ChartFonts.SeriesLabel(app);
+
+        int pn = o.polars.Count;
+        // 逐 polar 预解析几何与样式（并行数组，下标 = polar 序号）。
+        List<int> pcx = new List<int>();
+        List<int> pcy = new List<int>();
+        List<int> pr = new List<int>();
+        List<int> paxN = new List<int>();
+        List<int> pbase = new List<int>();   // 首轴的 top 角（90-startAngle）
+        List<bool> ppoly = new List<bool>();
+        List<int> prings = new List<int>();
+        List<int> paxisCol = new List<int>();
+        List<int> paxisW = new List<int>();
+        List<int> psplitCol = new List<int>();
+        List<int> psplitW = new List<int>();
+        List<List<int>> pmax = new List<List<int>>();
+        List<List<string>> plabels = new List<List<string>>();
+        List<List<int>> pseries = new List<List<int>>();
+        List<List<int>> psplitArea = new List<List<int>>();
+        List<int> pnameCol = new List<int>();
+        List<string> pnameFmt = new List<string>();
+        for (int pi = 0; pi < pn; pi = pi + 1) {
+            RadarPolar p = o.polars[pi];
+            List<string> lbls = labels;
+            if (p.indicatorText.Count > 0) {
+                lbls = p.indicatorText;
+            }
+            int n = lbls.Count;
+            if (n < 1 && o.series.Count > 0) { n = o.series[0].Count(); }
+            if (n < 1) { n = 1; }
+
+            // 系列按 polarIndex 分组（越界归 0），hidden 跳过。
+            List<int> sis = new List<int>();
+            for (int si = 0; si < o.series.Count; si = si + 1) {
+                ChartSeries s = o.series[si];
+                if (s.hidden) { continue; }
+                int own = s.polarIndex;
+                if (own < 0 || own >= pn) { own = 0; }
+                if (own == pi) { sis.Add(si); }
+            }
+
+            // 每轴上限：indicatorMax[j] > 0 显式优先，否则从本 polar
+            // 的系列推导（与单 polar 同一套友好刻度）。
+            List<int> maxV = new List<int>();
+            List<ChartSeries> sub = new List<ChartSeries>();
+            for (int si = 0; si < sis.Count; si = si + 1) {
+                sub.Add(o.series[sis[si]]);
+            }
+            for (int ai = 0; ai < n; ai = ai + 1) {
+                int m = 0;
+                if (ai < p.indicatorMax.Count && p.indicatorMax[ai] > 0) {
+                    m = p.indicatorMax[ai];
+                } else {
+                    m = ChartView.RadarAxisMax(sub, new List<int>(), ai);
+                }
+                maxV.Add(m);
+            }
+
+            int cx = x + pad + areaW / 2;
+            int cy = top + areaH / 2;
+            if (p.center != null) {
+                cx = x + ChartView.GaugeScalar(app, p.center.x, w);
+                cy = y + ChartView.GaugeScalar(app, p.center.y, h);
+            }
+            int r = ChartView.RadialRadius(areaW, areaH, 62);
+            if (p.radius.amount != 0) {
+                r = ChartView.GaugeScalar(app, p.radius, baseSize / 2);
+            }
+            if (r < app.Scale(10)) { r = app.Scale(10); }
+
+            pcx.Add(cx); pcy.Add(cy); pr.Add(r);
+            paxN.Add(n);
+            pbase.Add(90 - p.startAngle);
+            string shape = p.type.Length > 0 ? p.type : o.radarShape;
+            ppoly.Add(shape == "polygon");
+            prings.Add(p.splitNumber > 0 ? p.splitNumber : 4);
+            paxisCol.Add(p.axisLineColor != 0 ? p.axisLineColor : sGrid.BgOr(0));
+            paxisW.Add(p.axisLineWidth > 0 ? app.Scale(p.axisLineWidth) : 1);
+            psplitCol.Add(p.splitLineColor != 0 ? p.splitLineColor : sGrid.BgOr(0));
+            psplitW.Add(p.splitLineWidth > 0 ? app.Scale(p.splitLineWidth) : 1);
+            pmax.Add(maxV);
+            plabels.Add(lbls);
+            pseries.Add(sis);
+            psplitArea.Add(p.splitAreaColors);
+            pnameCol.Add(p.nameColor != 0 ? p.nameColor : themeAxisFg);
+            pnameFmt.Add(p.nameFormat);
+        }
+
+        // ---- 网格层：splitArea 交替带 -> 分隔环线 -> 轴线与指示器名。
+        for (int pi = 0; pi < pn; pi = pi + 1) {
+            int cx = pcx[pi]; int cy = pcy[pi]; int r = pr[pi];
+            int n = paxN[pi];
+            bool polyShape = ppoly[pi];
+            int rings = prings[pi];
+            List<int> areaCols = psplitArea[pi];
+            if (areaCols.Count > 0) {
+                for (int rb = 1; rb <= rings; rb = rb + 1) {
+                    int col = areaCols[(rb - 1) % areaCols.Count];
+                    int r1 = r * rb / rings;
+                    int r0 = r * (rb - 1) / rings;
+                    if (polyShape) {
+                        List<int> bx = new List<int>();
+                        List<int> by = new List<int>();
+                        for (int a = 0; a < n; a = a + 1) {
+                            int ang = a * 360 / n - 90;
+                            bx.Add(cx + ChartView.CosDeg(ang) * r1 / 1000);
+                            by.Add(cy + ChartView.SinDeg(ang) * r1 / 1000);
+                        }
+                        for (int a = n - 1; a >= 0; a = a - 1) {
+                            int ang = a * 360 / n - 90;
+                            bx.Add(cx + ChartView.CosDeg(ang) * r0 / 1000);
+                            by.Add(cy + ChartView.SinDeg(ang) * r0 / 1000);
+                        }
+                        ChartView.FillPolyAlpha(c, bx, by, col, 300);
+                    } else {
+                        c.FillSector(cx, cy, r0, r1, 0, 360,
+                                     Chart.WithAlpha(col, 300));
+                    }
+                }
+            }
+            int rr = 1;
+            while (rr <= rings) {
+                if (polyShape) {
+                    List<int> gx = new List<int>();
+                    List<int> gy = new List<int>();
+                    for (int a = 0; a < n; a = a + 1) {
+                        int ang = a * 360 / n - 90;
+                        gx.Add(cx + ChartView.CosDeg(ang) * r * rr / rings / 1000);
+                        gy.Add(cy + ChartView.SinDeg(ang) * r * rr / rings / 1000);
+                    }
+                    gx.Add(gx[0]);
+                    gy.Add(gy[0]);
+                    c.DrawPolyline(gx, gy, psplitCol[pi], psplitW[pi]);
+                } else {
+                    c.DrawCircle(cx, cy, r * rr / rings,
+                                 psplitCol[pi], psplitW[pi]);
+                }
+                rr = rr + 1;
+            }
+            for (int a = 0; a < n; a = a + 1) {
+                int ang = a * 360 / n - 90;
+                int ex = cx + ChartView.CosDeg(ang) * r / 1000;
+                int ey = cy + ChartView.SinDeg(ang) * r / 1000;
+                c.DrawLine(cx, cy, ex, ey, paxisCol[pi], paxisW[pi]);
+                string lbl = "";
+                if (a < plabels[pi].Count) { lbl = plabels[pi][a]; }
+                if (lbl.Length > 0 && pnameFmt[pi].Length > 0) {
+                    lbl = pnameFmt[pi].Replace("{value}", lbl);
+                }
+                if (lbl.Length > 0) {
+                    ChartView.DrawPolarLabel(app, c, cx, cy, r, ang, lbl,
+                        pnameCol[pi], smallFont, boxX, boxY, boxW, boxH);
+                }
+            }
+        }
+
+        // ---- 系列层：逐 polar 画多边形（areaStyle/线型/符号点）。
+        ChartView.PushPlotClip(app, boxX, boxY, boxW, boxH);
+        for (int pi = 0; pi < pn; pi = pi + 1) {
+            int cx = pcx[pi]; int cy = pcy[pi]; int r = pr[pi];
+            int n = paxN[pi];
+            List<int> maxV = pmax[pi];
+            List<int> sis = pseries[pi];
+            // 极坐标柱（ECharts2 风格 polar[] + coordinateSystem:"polar"）：
+            // 本 polar 的全部柱系列一起交给极坐标柱渲染器——堆叠累加与
+            // 列宽解算都需要看到同组的全部系列，逐系列单独调用会各自
+            // 独占一条列、堆叠失效。
+            ChartPolarBarFrame bf = new ChartPolarBarFrame();
+            bf.cx = cx; bf.cy = cy;
+            bf.r0Px = ChartView.GaugeScalar(app, p.radiusInner, baseSize / 2);
+            bf.r1Px = r;
+            PolarAxisSpec bax = ChartView.PolarAxisFor(o.angleAxes, pi);
+            PolarAxisSpec brx = ChartView.PolarAxisFor(o.radiusAxes, pi);
+            bf.aCat = bax != null && bax.type == ChartAxisType.Category;
+            bf.rCat = brx != null && brx.type == ChartAxisType.Category;
+            bf.aCats = bax != null ? bax.cats : new List<string>();
+            bf.rCats = brx != null ? brx.cats : new List<string>();
+            bf.startAngle = bax != null ? bax.startAngle : 90;
+            bf.endAngle = bax != null ? bax.endAngle : 0;
+            bf.endAngleSet = bax != null && bax.endAngleSet;
+            bf.clockwise = bax == null || bax.clockwise;
+            bf.aOnBand = bax == null || bax.boundaryGap;
+            bf.rOnBand = brx == null || brx.boundaryGap;
+            ChartView.PolarBarsValueExtentAt(o, true, pi, out bf.aLo, out bf.aHi);
+            ChartView.PolarBarsValueExtentAt(o, false, pi, out bf.rLo, out bf.rHi);
+            List<ChartSeries> bBars = new List<ChartSeries>();
+            List<int> bSi = new List<int>();
+            for (int si = 0; si < sis.Count; si = si + 1) {
+                ChartSeries bs = o.series[sis[si]];
+                if (bs.type != ChartType.Bar) { continue; }
+                bBars.Add(bs);
+                bSi.Add(sis[si]);
+            }
+            if (bBars.Count > 0) {
+                ChartView.DrawPolarBarSeries(app, c, o, bBars, bSi, bf, g);
+            }
+            for (int si = 0; si < sis.Count; si = si + 1) {
+                ChartSeries s = o.series[sis[si]];
+                if (s.type == ChartType.Bar) { continue; }
+                int col = s.color;
+                if (col == 0 && s.itemStyle != null && s.itemStyle.normal.color != 0) {
+                    col = s.itemStyle.normal.color;
+                }
+                if (col == 0) { col = Chart.Palette(t, sis[si]); }
+                string ltype = s.itemStyle.normal.lineStyle.type;
+                bool dashed = ltype == "dashed" || ltype == "dotted";
+                int dashLen = app.Scale(5);
+                int gapLen = app.Scale(3);
+                if (ltype == "dotted") { dashLen = app.Scale(2); gapLen = app.Scale(2); }
+                List<int> lx = new List<int>();
+                List<int> ly = new List<int>();
+                for (int j = 0; j < n && j < s.Count(); j = j + 1) {
+                    int ang = j * 360 / n - 90;
+                    int rad = (int)((long)s.Value(j) * g * r / ((long)maxV[j] * 1000L));
+                    int px = cx + ChartView.CosDeg(ang) * rad / 1000;
+                    int py = cy + ChartView.SinDeg(ang) * rad / 1000;
+                    lx.Add(px);
+                    ly.Add(py);
+                    if (s.showSymbol != 0) {
+                        Chart.DrawSymbol(c, px, py,
+                            s.symbolSize > 0
+                                ? app.Scale(Chart.SymbolRadius(s.symbolSize, 0))
+                                : app.Scale(3),
+                            s.symbol, col, 0, 0);
+                    }
+                }
+                if (n > 1 && s.Count() >= n && lx.Count > 0) {
+                    lx.Add(lx[0]);
+                    ly.Add(ly[0]);
+                }
+                if (s.areaStyle && lx.Count > 2) {
+                    ChartView.FillPolyAlpha(c, lx, ly, col, 70);
+                }
+                if (lx.Count > 1) {
+                    // lineStyle.width 可覆写默认 2（官方 radar.html 的
+                    // 28 年细线扇面用 width 1）。
+                    int lw = app.Scale(2);
+                    if (s.itemStyle.normal.lineStyle.width > 0) {
+                        lw = app.Scale(s.itemStyle.normal.lineStyle.width);
+                    }
+                    if (dashed) {
+                        ChartView.DrawDashed(c, lx, ly, col, lw,
+                                             dashLen, gapLen);
+                    } else {
+                        List<int> fx = new List<int>();
+                        List<int> fy = new List<int>();
+                        for (int k = 0; k < lx.Count; k = k + 1) {
+                            fx.Add(lx[k] * 256);
+                            fy.Add(ly[k] * 256);
+                        }
+                        c.DrawPolylineFx(fx, fy, col, lw);
+                    }
+                }
+            }
+        }
+        c.PopClip();
+
+        // ---- 命中层：取最近 polar 的轴扇区；tooltip 行取该 polar
+        // 的系列分区（与单 polar 相同的事件类型）。
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        int near = 0 - 1;
+        int nearDist = 0 - 1;
+        int axis = 0 - 1;
+        for (int pi = 0; pi < pn; pi = pi + 1) {
+            int ddx = mx - pcx[pi];
+            int ddy = my - pcy[pi];
+            int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
+            int hitR = ChartView.RadarTooltipRadius(pr[pi], g, app.Scale(8));
+            if (dist > hitR) { continue; }
+            if (near < 0 || dist < nearDist) {
+                near = pi;
+                nearDist = dist;
+                int ang = ChartView.AngleOf(ddx, ddy);
+                axis = ChartView.RadarAxisAt(ang - pbase[pi], paxN[pi]);
+            }
+        }
+        if (near >= 0 && axis >= 0 && ChartView.activeEventView != null
+            && axis < pmax[near].Count) {
+            string nm = "";
+            if (axis < plabels[near].Count) { nm = plabels[near][axis]; }
+            ChartSeries leadS = null;
+            if (pseries[near].Count > 0) { leadS = o.series[pseries[near][0]]; }
+            int val = 0;
+            string sName = "";
+            if (leadS != null) {
+                sName = leadS.name;
+                if (axis < leadS.Count()) { val = leadS.Value(axis); }
+            }
+            ChartHit rh = ChartHit.Of(ChartElementType.RadarAxis,
+                ChartView.SeriesIndexOf(o, leadS), sName, axis, nm,
+                val, mx, my);
+            if (leadS != null) { rh.axisIndex = leadS.axisIndex; }
+            ChartView.OfferActiveHit(rh);
+        }
+        if (near >= 0 && axis >= 0 && o.showTooltip) {
+            List<TooltipRow> rows = new List<TooltipRow>();
+            string hdr = "Axis " + Convert.ToString(axis + 1);
+            if (axis < plabels[near].Count) { hdr = plabels[near][axis]; }
+            rows.Add(TooltipRow.Of(0, hdr));
+            for (int si2 = 0; si2 < pseries[near].Count; si2 = si2 + 1) {
+                ChartSeries s2 = o.series[pseries[near][si2]];
+                if (axis < s2.Count()) {
+                    rows.Add(TooltipRow.Of(s2.color,
+                        s2.name + "  " + Convert.ToString(s2.Value(axis))));
+                }
+            }
+            ChartView.TooltipCard(app, mx, my, x + w, rows);
+        }
+    }
+
+    // ---- ECharts 5/6 极坐标（angleAxis/radiusAxis 值-值圆框） ----
+
+    /// angleAxes/radiusAxes 中绑定 polar 0 的轴（未声明 = null）。
+    static PolarAxisSpec PolarAxisOf(List<PolarAxisSpec> list) {
+        if (list == null || list.Count < 1) { return null; }
+        return list[0];
+    }
+
+    /// 绑定第 `pi` 个 polar 的轴。ECharts 的极轴按 `polarIndex` 归属
+    /// （缺省用数组槽位，见 ParsePolarAxisOne），多 polar 时不能都取
+    /// [0]——polar-endAngle 的两个 polar 各有自己的 angleAxis。
+    static PolarAxisSpec PolarAxisFor(List<PolarAxisSpec> list, int pi) {
+        if (list == null) { return null; }
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i] != null && list[i].polarIndex == pi) { return list[i]; }
+        }
+        if (pi < list.Count) { return list[pi]; }
+        return null;
+    }
+
+    /// milliunit（×1000）刻度文本：去尾零（90000→"90"、500→"0.5"、
+    /// 250→"0.25"），PointText 的定长三位小数不适合角度/半径刻度。
+    static string PolarTickText(int v) {
+        string sign = v < 0 ? "-" : "";
+        int av = v < 0 ? 0 - v : v;
+        int ip = av / 1000;
+        int fr = av - ip * 1000;
+        if (fr == 0) { return sign + Convert.ToString(ip); }
+        int digits = 3;
+        while (fr % 10 == 0) { fr = fr / 10; digits = digits - 1; }
+        string fs = Convert.ToString(fr);
+        while (fs.Length < digits) { fs = "0" + fs; }
+        return sign + Convert.ToString(ip) + "." + fs;
+    }
+
+    /// 极坐标投影：数学角 m（度，逆时针、0=3 点钟）+ 半径 rr 像素
+    /// → 屏幕点。ECharts 角度逆时针为正、屏幕 y 向下，故 sin 取负。
+    static int PolarScreenX(int cx, int rr, int mathA) {
+        return cx + ChartView.CosDeg(mathA) * rr / 1000;
+    }
+
+    static int PolarScreenY(int cy, int rr, int mathA) {
+        return cy - ChartView.SinDeg(mathA) * rr / 1000;
+    }
+
+    /// sin(deg×10)：整数度值线性内插（1° 内 sin 曲率误差
+    /// < 0.02%，远小于像素）。极坐标数据投影角度不是整度，直接
+    /// 取整会在外圈抖出半像素以上的锯齿。
+    static int SinDegX10(int degX10) {
+        int d = degX10 / 10;
+        int f = degX10 - d * 10;
+        if (f < 0) { f = f + 10; d = d - 1; }
+        return ChartView.SinDeg(d)
+            + (ChartView.SinDeg(d + 1) - ChartView.SinDeg(d)) * f / 10;
+    }
+
+    static int CosDegX10(int degX10) {
+        return ChartView.SinDegX10(degX10 + 900);
+    }
+
+    /// ECharts 5/6 极坐标渲染（coordinateSystem:"polar"）：圆框网格
+    /// （半径环 + 角度辐条 + 刻度标注）+ line/scatter/custom 系列的
+    /// 角度投影 + bar 系列的扇形柱（bar-polar 族，见
+    /// ChartViewPolarBar.zan）。
+    ///
+    /// 角度约定：ECharts 角度轴**顺时针为正**（angleAxis 缺省
+    /// clockwise:true → inverse，polarCreator.ts:115-118），所以值越大
+    /// 屏幕角越小。旧实现把跨度往正方向加，全部极坐标 demo 是镜像的。
+    /// 本引擎内部统一用"ECharts coord 角"（顺时针为正的度），只在
+    /// 最后投影时换成数学角交给 PolarScreenX/Y。
+    static void DrawPolarCoord(App app, int x, int y, int w, int h,
+                               ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = Chart.DrawPanelI(app, x, y, w, h, o.title, o.series,
+                                   o.iwid, o.showLegend);
+        int areaW = w - pad * 2;
+        int areaH = (y + h - pad - Chart.legendBottomReserve) - top;
+        if (areaW < app.Scale(30) || areaH < app.Scale(30)) { return; }
+
+        // 圆心/外径：polar[0] 的 center/radius 声明优先（polar:{}
+        // 对象形态落 RadarPolar），缺省居中、外径 80%
+        // （ECharts PolarModel.defaultOption radius:'80%'，
+        //  按 min(areaW,areaH)/2 折算；polarCreator.ts:63-76）。
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+        int R = ChartView.RadialRadius(areaW, areaH, 80);
+        if (o.polars.Count > 0 && o.polars[0].radius.amount != 0) {
+            int radBase = areaW < areaH ? areaW : areaH;
+            R = ChartView.GaugeScalar(app, o.polars[0].radius, radBase / 2);
+        }
+        if (o.polars.Count > 0 && o.polars[0].center != null) {
+            cx = x + ChartView.GaugeScalar(app, o.polars[0].center.x, w);
+            cy = y + ChartView.GaugeScalar(app, o.polars[0].center.y, h);
+        }
+        if (R < app.Scale(10)) { R = app.Scale(10); }
+        // 内径基准：polar.radius 的百分比同样相对 min(areaW,areaH)/2。
+        int baseSizeHalf = (areaW < areaH ? areaW : areaH) / 2;
+        int boxX = x + pad;
+        int boxY = top;
+        int boxW = areaW;
+        int boxH = areaH;
+
+        StyleBox sGrid = Style.Part(app, "chart", "grid", "", "", "",
+                                    Style.SNormal());
+        int gridCol = sGrid.BgOr(0);
+        int axisFg = Style.Part(app, "chart", "axis", "", "", "",
+                                Style.SNormal()).FgOr(0);
+        int fs = ChartFonts.AxisLabel(app);
+
+        PolarAxisSpec ax = ChartView.PolarAxisOf(o.angleAxes);
+        PolarAxisSpec rx = ChartView.PolarAxisOf(o.radiusAxes);
+        int startA = ax != null ? ax.startAngle : 90;
+        bool aCat = ax != null && ax.type == ChartAxisType.Category;
+        bool aGap = !(ax != null && !ax.boundaryGap);
+        int aN = aCat && ax.cats.Count > 0 ? ax.cats.Count : 0;
+        int rN = rx != null && rx.type == ChartAxisType.Category
+            && rx.cats.Count > 0 ? rx.cats.Count : 0;
+
+        // ---- 角度跨度与域。两件**不同**的事，别混：
+        //   * 跨度（span）：轴在屏幕上的几何张角，缺省 ±360（clockwise
+        //     时为 −360，polarCreator.ts:115-118）；类目轴 offBand 时还要
+        //     缩掉一个槽（polarCreator.ts:96-99）。
+        //   * 域（aLo/aHi）：值轴的**数据**量程，从数据推导后 nice 对齐
+        //     （splitNumber 12）。bar-polar-stack 的角度域是 0..16
+        //     （4 类目堆叠和 4/8/12/16），不是 360。
+        // 旧实现把域当成"0..max(360,数据)"，于是值轴角度柱张角整体
+        // 偏小一个数量级。
+        bool aClock = ax == null || ax.clockwise;
+        bool aEndSet = ax != null && ax.endAngleSet;
+        int aEnd = ax != null ? ax.endAngle : 0;
+        double aSpanD = ChartView.PolarAngleSpan(startA, aEnd, aEndSet, aClock);
+        if (aCat) { aSpanD = ChartView.PolarCatSpan(aSpanD, aN, aGap, aClock); }
+        int aSpanX1000 = (int)(aSpanD * 1000.0 + (aSpanD < 0.0 ? -0.5 : 0.5));
+        // 值轴角度域：柱系列按 stack 组累加和（bar-polar-stack 的 4 类目
+        // 堆叠和 4/8/12/16 → 域 0..16），折线/散点按点坐标。全程 ×1000
+        // 定点（milliunit）——提前除回整数会把 0..0.5 这类小数域炸成 0..5。
+        int aLo = 0;
+        int aHi = 1000;
+        if (!aCat) {
+            if (ChartView.PolarHasBars(o)) {
+                double bLo = 0.0;
+                double bHi = 0.0;
+                ChartView.PolarBarsValueExtent(o, true, out bLo, out bHi);
+                aLo = (int)(bLo * 1000.0 + (bLo < 0.0 ? -0.5 : 0.5));
+                aHi = (int)(bHi * 1000.0 + (bHi < 0.0 ? -0.5 : 0.5));
+            } else {
+                int dHi = 1000;
+                for (int si = 0; si < o.series.Count; si = si + 1) {
+                    ChartSeries s = o.series[si];
+                    if (s.hidden || s.coordSys != "polar") { continue; }
+                    for (int i = 0; i < s.points.Count; i = i + 1) {
+                        if (s.points[i].y > dHi) { dHi = s.points[i].y; }
+                    }
+                }
+                // 值轴角度缺省 0..360 四分（旧行为，line-polar 等值对
+                // 系列的既有观感），仅当数据超出时才抬高。
+                aHi = dHi > 360000 ? dHi : 360000;
+            }
+            if (aHi <= aLo) { aHi = aLo + 1000; }
+        }
+        int rLo = 0;
+        int rHi = 1000;
+        int rTicks = 5;
+        if (rN > 0) {
+            rHi = rN;
+        } else {
+            int dHi = 1000;
+            if (ChartView.PolarHasBars(o)) {
+                double bLo = 0.0;
+                double bHi = 0.0;
+                ChartView.PolarBarsValueExtent(o, false, out bLo, out bHi);
+                dHi = (int)((bHi > bLo ? bHi : bLo) * 1000.0 + 0.5);
+            } else {
+                for (int si = 0; si < o.series.Count; si = si + 1) {
+                    ChartSeries s = o.series[si];
+                    if (s.hidden || s.coordSys != "polar") { continue; }
+                    for (int i = 0; i < s.points.Count; i = i + 1) {
+                        if (s.points[i].x > dHi) { dHi = s.points[i].x; }
+                    }
+                }
+            }
+            if (rx != null && rx.minSet) { rLo = rx.min * 1000; }
+            if (rx != null && rx.maxSet) {
+                rHi = rx.max * 1000;
+            } else {
+                ChartSpan rs = Chart.NiceRange(rLo, dHi);
+                rLo = rs.lo; rHi = rs.hi; rTicks = rs.ticks;
+            }
+            if (rHi <= rLo) { rHi = rLo + 1000; }
+        }
+
+        // ---- 网格层：半径环 → 角度辐条 → 半径标签（竖直向上）→
+        // 角度标签（外圈按象限对齐）。
+        int rSec = rN > 0 ? rN : rTicks;
+        int rr = 1;
+        while (rr <= rSec) {
+            c.DrawCircle(cx, cy, R * rr / rSec, gridCol, 1);
+            rr = rr + 1;
+        }
+        // 角度辐条：值轴按四分角（满圈时 360 与 0 重合不重复画）；
+        // 类目轴按槽位角（boundaryGap:false）或带边界（缺省）。
+        int spokes = 0;
+        if (aCat) {
+            spokes = aN;
+        } else {
+            spokes = (aHi - aLo) == 360000 ? 4 : 5;
+        }
+        int sp = 0;
+        while (sp <= spokes) {
+            if (!aCat && (aHi - aLo) == 360000 && sp == spokes) { break; }
+            double frac = spokes > 0 ? (double)sp / (double)spokes : 0.0;
+            int mathAx10 = ChartView.PolarAngleAt(startA, aSpanX1000 / 100, frac);
+            c.DrawLine(cx, cy, cx + ChartView.CosDegX10(mathAx10) * R / 1000,
+                       cy - ChartView.SinDegX10(mathAx10) * R / 1000,
+                       gridCol, 1);
+            sp = sp + 1;
+        }
+        // 半径刻度标签：沿竖直向上轴（ECharts 缺省把半径轴画在
+        // 12 点方向），文本压在环线上居中。
+        int rv2 = 1;
+        while (rv2 <= rSec) {
+            int ringR = R * rv2 / rSec;
+            string lbl = "";
+            if (rN > 0) {
+                lbl = rv2 - 1 < rx.cats.Count ? rx.cats[rv2 - 1] : "";
+            } else {
+                lbl = ChartView.PolarTickText(
+                    rLo + (int)(((long)(rHi - rLo)) * rv2 / rSec));
+            }
+            if (lbl.Length > 0) {
+                int tw = Canvas.MeasureText(lbl, fs);
+                int th2 = Canvas.FontHeight(fs);
+                ChartView.DrawTextClamped(c, cx - tw / 2, cy - ringR - th2 / 2,
+                                          lbl, axisFg, fs,
+                                          boxX, boxY, boxW, boxH);
+            }
+            rv2 = rv2 + 1;
+        }
+        // 角度刻度标签：DrawPolarLabel 取屏幕角（y 不翻转），传负值
+        // 把数学角转回屏幕角。
+        int lb = 0;
+        while (lb < spokes) {
+            string lbl = "";
+            int lblA;
+            if (aCat) {
+                double pos = ChartView.PolarCatFrac(lb, spokes, aGap);
+                int mathAx10 = ChartView.PolarAngleAt(startA, aSpanX1000 / 100, pos);
+                lblA = 0 - mathAx10 / 10;
+                lbl = lb < ax.cats.Count ? ax.cats[lb] : "";
+            } else {
+                double frac = (double)lb / (double)spokes;
+                int mathAx10 = ChartView.PolarAngleAt(startA, aSpanX1000 / 100, frac);
+                lblA = 0 - mathAx10 / 10;
+                lbl = ChartView.PolarTickText(
+                    aLo + (int)((double)(aHi - aLo) * frac + 0.5));
+            }
+            if (lbl.Length > 0) {
+                ChartView.DrawPolarLabel(app, c, cx, cy, R,
+                                         lblA, lbl, axisFg, fs,
+                                         boxX, boxY, boxW, boxH);
+            }
+            lb = lb + 1;
+        }
+
+        // ---- 系列层：bar 扇形柱先行（背景层），再 line 连线（＋显式
+        // symbol）、scatter/custom 逐点（custom 的第三维经 CalendarRamp
+        // 映色，热力点阵语义）。
+        bool hasBars = ChartView.PolarHasBars(o);
+        if (hasBars) {
+            ChartPolarBarFrame bf = new ChartPolarBarFrame();
+            bf.cx = cx; bf.cy = cy;
+            bf.r0Px = ChartView.GaugeScalar(app,
+                (o.polars.Count > 0 ? o.polars[0].radiusInner
+                                    : ChartScalar.Px(0)), baseSizeHalf);
+            bf.r1Px = R;
+            bf.aCat = aCat;
+            bf.rCat = rN > 0;
+            bf.aLo = (double)aLo / 1000.0;
+            bf.aHi = (double)aHi / 1000.0;
+            bf.rLo = (double)rLo / 1000.0;
+            bf.rHi = (double)rHi / 1000.0;
+            bf.aCats = ax != null ? ax.cats : new List<string>();
+            bf.rCats = rx != null ? rx.cats : new List<string>();
+            bf.startAngle = startA;
+            bf.endAngle = aEnd;
+            bf.endAngleSet = aEndSet;
+            bf.clockwise = aClock;
+            bf.aOnBand = aGap;
+            bf.rOnBand = rx == null || rx.boundaryGap;
+            List<ChartSeries> bBars = new List<ChartSeries>();
+            List<int> bSi = new List<int>();
+            for (int si = 0; si < o.series.Count; si = si + 1) {
+                ChartSeries s = o.series[si];
+                if (s.hidden || s.coordSys != "polar"
+                    || s.type != ChartType.Bar) { continue; }
+                bBars.Add(s);
+                bSi.Add(si);
+            }
+            ChartView.DrawPolarBarSeries(app, c, o, bBars, bSi, bf, g);
+        }
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries s = o.series[si];
+            if (s.hidden || s.coordSys != "polar") { continue; }
+            if (s.type == ChartType.Bar) { continue; }
+            int col = ChartView.SeriesColorAt(app, o, si);
+            int lw = s.itemStyle.normal.lineStyle.width;
+            if (lw <= 0) { lw = 2; }
+            lw = app.Scale(lw);
+            bool isLine = s.type == ChartType.Line;
+            int zLo = 0;
+            int zHi = 0;
+            bool seenZ = false;
+            if (!isLine) {
+                for (int i = 0; i < s.points.Count; i = i + 1) {
+                    int zv = Chart.PointV(s.points[i].z, s.pointG);
+                    if (!seenZ) { zLo = zv; zHi = zv; seenZ = true; }
+                    else {
+                        if (zv < zLo) { zLo = zv; }
+                        if (zv > zHi) { zHi = zv; }
+                    }
+                }
+            }
+            List<int> pxs = new List<int>();
+            List<int> pys = new List<int>();
+            int dotR = app.Scale(s.symbolSize > 0 ? s.symbolSize / 2 : 4);
+            if (dotR < 1) { dotR = 1; }
+            for (int i = 0; i < s.points.Count; i = i + 1) {
+                // 定点直通：半径/角度都保持 ×1000 定点参与运算，除回
+                // 放在最后一步——提前除回整数会把半径量化成 rTicks
+                // 个台阶、角度放大千倍再 mod 360（锯齿的两个来源）。
+                int rvp = s.points[i].x;
+                int tvp = s.points[i].y;
+                int mathAx10;
+                int rrPx;
+                if (aCat) {
+                    int idx = Chart.PointV(tvp, s.pointG);
+                    mathAx10 = ChartView.PolarAngleAt(startA, aSpanX1000 / 100,
+                        ChartView.PolarCatFrac(idx, aN, aGap));
+                } else {
+                    // 值轴角度：沿跨度按归一化位置插值（clockwise 时跨度
+                    // 为负，角度随值增大而减小）。
+                    double frac = (aHi > aLo)
+                        ? (double)(tvp - aLo) / (double)(aHi - aLo) : 0.0;
+                    mathAx10 = ChartView.PolarAngleAt(startA, aSpanX1000 / 100,
+                        frac);
+                }
+                if (rN > 0) {
+                    int idx = Chart.PointV(rvp, s.pointG);
+                    rrPx = (int)(((double)idx + 0.5) * (double)R / (double)rN);
+                } else {
+                    rrPx = (int)(((long)(rvp - rLo)) * R / (long)(rHi - rLo));
+                }
+                if (rrPx < 0) { rrPx = 0; }
+                if (rrPx > R) { rrPx = R; }
+                pxs.Add(cx + ChartView.CosDegX10(mathAx10) * rrPx / 1000);
+                pys.Add(cy - ChartView.SinDegX10(mathAx10) * rrPx / 1000);
+            }
+            if (isLine && pxs.Count > 1) {
+                c.DrawPolyline(pxs, pys, col, lw);
+            }
+            if (!isLine || (s.symbol.Length > 0 && s.symbol != "none"
+                            && s.showSymbol != 0)) {
+                for (int i = 0; i < pxs.Count; i = i + 1) {
+                    int dcol = col;
+                    if (!isLine && zHi > zLo && s.points[i].z != 0) {
+                        dcol = ChartView.CalendarRamp(
+                            o, Chart.PointV(s.points[i].z, s.pointG), zLo, zHi);
+                    }
+                    c.FillCircle(pxs[i], pys[i], dotR, dcol);
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,1993 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+/// 组件化、带动画的图表控件（Chart 控件的现代形态）。
+/// 一次性绑定 ChartOption（ECharts 风格：标题 + 轴 + 系列，
+/// 每个系列携带自己的类型），然后每帧调用 Render。
+/// 它会播放增长入场动画，绘制渐变/平滑系列和可选的悬停
+/// 十字线 + 数值工具提示。多级控制对应 ECharts：option.*
+/// （全局）< series.*（逐系列）< data[i].*（逐项），因此混合图表
+/// 只是共享同一坐标系的不同类型系列。
+partial class ChartView {
+    ChartOption option;
+    ChartOption sourceOption;
+    ChartOption initialOption;
+    ChartController controller;
+    string directStatus;
+    string directStatusMessage;
+    ResolvedChart resolved;
+    bool staticFrame;
+    /// 每个图表稳定的动画键。默认为新 WidgetId，但
+    /// 即时模式/虚拟化列表中的调用方（控件 id 顺序随
+    /// 行滚动进出而变动）应通过 Keyed() 传入自有稳定键，
+    /// 避免增长入场动画每帧被重置为 0。
+    int wid;
+
+    /// 保留式生命周期通知。图表仍由 Render 驱动，但调用方
+    /// 可以在创建后订阅，不必改写每个 renderer 的交互分支。
+    UiEvent Rendered;
+    UiEvent Resized;
+    UiEvent Updated;
+    UiEvent Disposed;
+    int lastRenderW;
+    int lastRenderH;
+    int directVersion;
+    int lastControllerVersion;
+    int lastDirectVersion;
+    bool hasRendered;
+    bool disposed;
+    ChartEventHub eventHub;
+    int eventHitId;
+    bool pointerWasOver;
+    ChartHit currentHit;
+    ChartHit previousHit;
+    int lastZoomLo;
+    int lastZoomHi;
+    int lastEventStateWid;
+    static ChartView activeEventView;
+
+    /// 初始化保留式生命周期字段（事件、动画/版本跟踪、事件 hub）。
+    void InitLifecycle() {
+        Rendered = new UiEvent();
+        Resized = new UiEvent();
+        Updated = new UiEvent();
+        Disposed = new UiEvent();
+        lastRenderW = 0;
+        lastRenderH = 0;
+        directVersion = 1;
+        lastControllerVersion = 0 - 1;
+        lastDirectVersion = 0 - 1;
+        hasRendered = false;
+        disposed = false;
+        eventHub = new ChartEventHub();
+        eventHitId = 0 - 1;
+        pointerWasOver = false;
+        currentHit = null;
+        previousHit = null;
+        lastZoomLo = 0 - 1;
+        lastZoomHi = 0 - 1;
+        lastEventStateWid = 0 - 1;
+        directStatus = "ready";
+        directStatusMessage = "";
+    }
+
+    /// 把图例开关写回 data.hidden（多数据项）或 series.hidden（单值系列）。
+    /// 画廊每帧重建 option，必须从 App 状态恢复，否则点了等于没点。
+    static void ApplyDataLegend(App app, ChartOption o) {
+        if (o.iwid == 0) { return; }
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries s = o.series[si];
+            if (s.data.Count > 1) {
+                for (int di = 0; di < s.data.Count; di = di + 1) {
+                    s.data[di].hidden = app.StateGet(
+                        Chart.LegendSliceKey(o.iwid, si, di), 0) == 1;
+                    int sel0 = 0;
+                    if (s.data[di].selected) { sel0 = 1; }
+                    s.data[di].selected = app.StateGet(
+                        Chart.PieSelKey(o.iwid, si, di), sel0) == 1;
+                }
+            } else {
+                s.hidden = app.StateGet(Chart.LegendKey(o.iwid, si), 0) == 1;
+            }
+        }
+    }
+
+    /// 层级图表（treemap/sunburst）最近一次的悬停命中。
+    /// 由命中追踪辅助函数设置，调用方立即读取以绘制工具提示，
+    /// 因此不会跨帧存留。
+    static string ttName;
+    static int ttVal;
+    static int ttX;        // treemap：命中单元格矩形
+    static int ttY;
+    static int ttW;
+    static int ttH;
+    static int ttRadius;
+    static ChartNode ttNode;
+    static int ttA0;       // sunburst：命中扇区扫掠 + 环深度
+    static int ttA1;
+    static int ttDepth;
+    static ChartNode ttSunNode; // sunburst：命中的叶子节点（typed hit 用）
+
+    /// 绑定一个选项（内部深复制为 initialOption 供 Restore 用），
+    /// 动画/交互键取新 WidgetId。
+    static ChartView Of(ChartOption o) {
+        if (o == null) { o = ChartOption.Create(); }
+        ChartView v = new ChartView();
+        v.InitLifecycle();
+        v.option = o;
+        v.sourceOption = o;
+        v.initialOption = ChartOption.Clone(o);
+        v.staticFrame = false;
+        v.wid = WidgetId.Next();
+        return v;
+    }
+
+    /// 绑定一个选项及调用方所有的稳定动画键。
+    static ChartView Keyed(ChartOption o, int key) {
+        if (o == null) { o = ChartOption.Create(); }
+        ChartView v = new ChartView();
+        v.InitLifecycle();
+        v.option = o;
+        v.controller = null;
+        v.sourceOption = o;
+        v.initialOption = ChartOption.Clone(o);
+        v.staticFrame = false;
+        v.wid = key;
+        return v;
+    }
+
+    /// 静态首绘的 Keyed 变体：跳过增长入场动画，首帧即最终
+    /// 形态（对齐 ECharts 官方示例站的静态示例）。文档预览、
+    /// 虚拟化单元格与滚动路径上的图表用它，避免卡片滚入视口时
+    /// 入场动画触发数百毫秒的连续重绘突发。
+    static ChartView KeyedStatic(ChartOption o, int key) {
+        ChartView v = ChartView.Keyed(o, key);
+        v.staticFrame = true;
+        return v;
+    }
+
+    /// 将 ChartView 绑定到可变 controller。Render 时读取 controller 的当前 option。
+    static ChartView Bind(ChartController controller) {
+        ChartView v = new ChartView();
+        v.InitLifecycle();
+        v.controller = controller;
+        if (controller != null) {
+            v.option = controller.Option(); v.sourceOption = v.option;
+            v.initialOption = controller.GetOption();
+        } else {
+            v.option = ChartOption.Create(); v.sourceOption = v.option;
+            v.initialOption = ChartOption.Clone(v.option);
+        }
+        v.staticFrame = false;
+        v.wid = WidgetId.Next();
+        return v;
+    }
+
+    /// 带稳定交互键的 controller 绑定，适合列表和虚拟化单元格。
+    static ChartView BindKeyed(ChartController controller, int key) {
+        ChartView v = ChartView.Bind(controller);
+        v.wid = key;
+        return v;
+    }
+
+    /// 生命周期事件：在保留的 ChartView 实例上订阅。
+    ChartView OnRendered(Action a) { Rendered.Add(a); return this; }
+    /// 尺寸回调：Render 帧检测到本图表宽高变化时触发。
+    ChartView OnResize(Action a) { Resized.Add(a); return this; }
+    /// 更新回调：Render 帧检测到 option/数据版本变化时触发。
+    ChartView OnUpdated(Action a) { Updated.Add(a); return this; }
+    /// 释放回调：Dispose 时触发一次，随后清空全部回调列表。
+    ChartView OnDisposed(Action a) { Disposed.Add(a); return this; }
+
+    /// 注册/移除带载荷的图表交互事件。
+    ChartView On(ChartEventType type, ChartInteractionHandler handler) {
+        if (!this.disposed) { this.eventHub.On(type, handler); }
+        return this;
+    }
+
+    /// 注销一个交互事件处理器（按引用匹配最近一个；disposed 后 no-op）。
+    ChartView Off(ChartEventType type, ChartInteractionHandler handler) {
+        if (!this.disposed) { this.eventHub.Off(type, handler); }
+        return this;
+    }
+
+    /// 注销全部交互事件处理器；disposed 后为 no-op。返回 this 便于链式。
+    ChartView ClearEvents() {
+        if (!this.disposed) { this.eventHub.Clear(); }
+        return this;
+    }
+
+    /// 派发交互事件：先发给自身 eventHub 订阅者，controller 绑定
+    /// 模式下再转发给 controller（DataChanged 除外，避免回环）。
+    void RaiseInteraction(ChartInteractionEvent eventArgs) {
+        if (this.disposed || eventArgs == null) { return; }
+        this.eventHub.Raise(eventArgs);
+        if (this.controller != null
+            && eventArgs.type != ChartEventType.DataChanged) {
+            this.controller.RaiseEvent(eventArgs);
+        }
+    }
+
+    /// 只派发给自身 eventHub，不转发 controller（本地回声用）。
+    void RaiseLocal(ChartInteractionEvent eventArgs) {
+        if (this.disposed || eventArgs == null) { return; }
+        this.eventHub.Raise(eventArgs);
+    }
+
+    /// 渲染器侧事件出口：转发给当前帧的 activeEventView
+    ///（即时模式渲染器没有 view 引用时使用）。
+    static void RaiseActive(ChartInteractionEvent eventArgs) {
+        if (ChartView.activeEventView != null) {
+            ChartView.activeEventView.RaiseInteraction(eventArgs);
+        }
+    }
+
+    /// 构造仅带类型/wid/像素坐标的图表级事件载荷。
+    static ChartInteractionEvent EventAt(ChartEventType type, int wid,
+                                         int px, int py) {
+        ChartInteractionEvent e = ChartInteractionEvent.Of(type, wid);
+        e.x = px;
+        e.y = py;
+        return e;
+    }
+
+    /// 由命中结果构造数据点事件载荷；hit 为 null 时退化为
+    /// Of(type, wid)（图表级事件）。
+    static ChartInteractionEvent EventFromHit(ChartEventType type, int wid,
+                                               ChartHit hit) {
+        if (hit == null) { return ChartInteractionEvent.Of(type, wid); }
+        ChartInteractionEvent e = ChartInteractionEvent.DataPoint(type, wid,
+            hit.seriesIndex, hit.seriesName, hit.dataIndex, hit.dataName,
+            hit.elementType);
+        e.value = hit.value;
+        e.numberValueSet = hit.numberValueSet;
+        e.numberValue = hit.numberValue;
+        e.xValueSet = hit.xValueSet;
+        e.xValue = hit.xValue;
+        e.yValueSet = hit.yValueSet;
+        e.yValue = hit.yValue;
+        e.x = hit.pixelX;
+        e.y = hit.pixelY;
+        e.axisIndex = hit.axisIndex;
+        return e;
+    }
+
+    /// 当前帧由 renderer 提供的命中候选。renderer 按绘制顺序调用，
+    /// 后来的具体图元覆盖早先的候选，但不会产生额外事件。
+    static void OfferActiveHit(ChartHit hit) {
+        if (ChartView.activeEventView != null && hit != null) {
+            ChartView.activeEventView.currentHit = hit;
+        }
+    }
+
+    /// 指针被上层弹层/抽屉/遮罩接管时，图表悬停命中整体静默：
+    /// 命中点的 tooltip 卡在 PresentFrame 末尾统一绘制，会叠到
+    /// 弹层上面（悬停穿透）。入口在此统一拦截，各 Offer*/PointsHover
+    /// 无需重复判断。
+    static bool HoverBlocked(App app) {
+        return app == null || app.PointerCaptured();
+    }
+
+    /// 混合 Cartesian 图在渲染结束后才复算部分 overlay 命中。
+    /// 系列索引与主体绘制顺序一致：后面的系列视觉上覆盖前面的
+    /// 系列；较早系列的延迟命中不能反过来遮掉已经命中的后层。
+    static void OfferTopmostCategoryHit(ChartHit hit) {
+        if (ChartView.activeEventView == null || hit == null) { return; }
+        ChartHit old = ChartView.activeEventView.currentHit;
+        if (old == null || hit.seriesIndex >= old.seriesIndex) {
+            ChartView.activeEventView.currentHit = hit;
+        }
+    }
+
+    /// 构造数据点命中：数据项名取 s.data[dataIndex].name（无则用
+    /// fallbackName），并携带 number 值与系列 axisIndex。
+    /// s 为 null 时返回 null。
+    static ChartHit MakeDataHit(ChartSeries s, int seriesIndex, int dataIndex,
+                                string fallbackName, ChartElementType elementType,
+                                int px, int py, int value) {
+        if (s == null) { return null; }
+        string dataName = fallbackName;
+        if (dataIndex >= 0 && dataIndex < s.data.Count
+            && s.data[dataIndex].name.Length > 0) {
+            dataName = s.data[dataIndex].name;
+        }
+        ChartHit h = ChartHit.Of(elementType, seriesIndex, s.name,
+            dataIndex, dataName, value, px, py);
+        h.axisIndex = s.axisIndex;
+        if (dataIndex >= 0 && dataIndex < s.data.Count) {
+            ChartData d = s.data[dataIndex];
+            h.numberValueSet = d.numberSet;
+            h.numberValue = d.number;
+        }
+        return h;
+    }
+
+    /// 折线数据点的 proximity 命中：在绘图区内找最近可见 Line
+    /// 系列点（命中半径 Scale(10)），命中后经 OfferActiveHit /
+    /// OfferTopmostCategoryHit 提交。baseIdx 为 dataZoom 窗口基址。
+    static void OfferCategoryPointHits(App app, ChartFrame f,
+                                       List<string> labels,
+                                       List<ChartSeries> series, int baseIdx,
+                                       int g, ChartElementType elementType,
+                                       bool forceTopmost) {
+        if (f == null || labels == null || labels.Count < 1 || series == null) { return; }
+        if (ChartView.HoverBlocked(app)) { return; }
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        if (mx < f.plotX || mx >= f.plotX + f.plotW
+            || my < f.plotY || my >= f.plotY + f.plotH) { return; }
+        int n = labels.Count;
+        int bestD = 0;
+        ChartHit best = null;
+        for (int si = 0; si < series.Count; si = si + 1) {
+            ChartSeries s = series[si];
+            if (s == null || s.hidden || s.type != ChartType.Line) { continue; }
+            for (int vi = 0; vi < n; vi = vi + 1) {
+                int oi = baseIdx + vi;
+                if (oi < 0 || oi >= s.Count()) { continue; }
+                int px = f.CatX(vi, n);
+                int py = f.YOf((int)((long)s.Value(oi) * g / 1000L), s.axisIndex);
+                int dx = mx - px;
+                int dy = my - py;
+                int d2 = dx * dx + dy * dy;
+                if (best == null || d2 < bestD) {
+                    bestD = d2;
+                    best = ChartView.MakeDataHit(s, si, oi, labels[vi],
+                        elementType, px, py, s.Value(oi));
+                }
+            }
+        }
+        int hitR = app.Scale(10);
+        if (best != null && bestD <= hitR * hitR) {
+            best.pixelX = mx;
+            best.pixelY = my;
+            if (forceTopmost) { ChartView.OfferActiveHit(best); }
+            else { ChartView.OfferTopmostCategoryHit(best); }
+        }
+    }
+
+    /// 该图（自身 hub 或其 controller）是否订阅了 type 事件。
+    static bool HasInteraction(ChartView v, ChartEventType type) {
+        if (v == null) { return false; }
+        if (v.eventHub != null && v.eventHub.Count(type) > 0) { return true; }
+        if (v.controller != null && v.controller.HasEvent(type)) { return true; }
+        return false;
+    }
+
+    /// id 是否属于当前 activeEventView 的可点击命中（id < 0 恒假）；
+    /// 渲染器用它仲裁扇区/区域点击归属。
+    static bool OwnsActiveClick(App app, int id) {
+        if (ChartView.activeEventView == null || id < 0) { return false; }
+        return Ui.OwnsClick(app, id);
+    }
+
+    /// 帧尾指针事件派发：进入/离开、Hover/MouseOut（命中变化时）、
+    /// Click/DoubleClick（经 eventHitId），随后清空 activeEventView。
+    /// statusNow != "ready" 时不产生指针事件。
+    void DispatchPointerEvents(App app, int x, int y, int w, int h,
+                               string statusNow) {
+        bool over = statusNow == "ready"
+            && app.mouseX >= x && app.mouseX < x + w
+            && app.mouseY >= y && app.mouseY < y + h;
+        ChartHit hit = over ? this.currentHit : null;
+        if (hit != null) {
+            hit.pixelX = app.mouseX;
+            hit.pixelY = app.mouseY;
+        }
+        bool entered = over && !this.pointerWasOver;
+        bool left = !over && this.pointerWasOver;
+        bool hitChanged = !ChartHit.Same(this.previousHit, hit);
+        if ((hitChanged || left) && this.previousHit != null) {
+            ChartInteractionEvent me = ChartView.EventFromHit(
+                ChartEventType.MouseOut, this.wid, this.previousHit);
+            this.RaiseInteraction(me);
+        }
+        if ((hitChanged || entered) && hit != null) {
+            ChartInteractionEvent he = ChartView.EventFromHit(
+                ChartEventType.Hover, this.wid, hit);
+            this.RaiseInteraction(he);
+        } else if (entered && hit == null) {
+            ChartInteractionEvent he2 = ChartView.EventAt(
+                ChartEventType.Hover, this.wid, app.mouseX, app.mouseY);
+            this.RaiseInteraction(he2);
+        } else if (left && hit == null && this.previousHit == null) {
+            ChartInteractionEvent me2 = ChartView.EventAt(
+                ChartEventType.MouseOut, this.wid, app.mouseX, app.mouseY);
+            this.RaiseInteraction(me2);
+        }
+        this.pointerWasOver = over;
+        if (statusNow == "ready" && this.eventHitId >= 0
+            && Ui.Clicked(app, this.eventHitId)) {
+            if (hit != null) {
+                ChartInteractionEvent ce = ChartView.EventFromHit(
+                    ChartEventType.Click, this.wid, hit);
+                this.RaiseInteraction(ce);
+            } else {
+                ChartInteractionEvent ce2 = ChartView.EventAt(
+                    ChartEventType.Click, this.wid, app.mouseX, app.mouseY);
+                this.RaiseInteraction(ce2);
+            }
+        }
+        if (statusNow == "ready" && this.eventHitId >= 0
+            && !app.ClickClaimed()
+            && Ui.DoubleClicked(app, this.eventHitId)) {
+            ChartInteractionEvent de = hit != null
+                ? ChartView.EventFromHit(ChartEventType.DoubleClick, this.wid, hit)
+                : ChartView.EventAt(ChartEventType.DoubleClick, this.wid,
+                                    app.mouseX, app.mouseY);
+            this.RaiseInteraction(de);
+        }
+        this.previousHit = ChartHit.Copy(hit);
+        ChartView.activeEventView = null;
+    }
+
+    /// 按事件类型注册交互处理器（Click/Hover/LegendSelected/…），
+    /// 组文档覆盖以下 17 个链式方法，各自对应一个 ChartEventType。
+    ChartView OnClick(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.Click, handler);
+    }
+    /// 注册 DoubleClick 交互事件：双击时派发，命中元素或整图坐标。
+    ChartView OnDoubleClick(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.DoubleClick, handler);
+    }
+    /// 注册 Hover 交互事件：指针悬停时派发，命中元素或整图坐标。
+    ChartView OnHover(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.Hover, handler);
+    }
+    /// 注册 MouseOut 交互事件：指针移出上一命中元素时派发。
+    ChartView OnMouseOut(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.MouseOut, handler);
+    }
+    /// 注册 LegendSelected 交互事件：图例项被选中。
+    ChartView OnLegendSelected(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.LegendSelected, handler);
+    }
+    /// 注册 PieSelected 交互事件：饼图扇区被选中。
+    ChartView OnPieSelected(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.PieSelected, handler);
+    }
+    /// 注册 MapSelected 交互事件：地图区域被选中。
+    ChartView OnMapSelected(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.MapSelected, handler);
+    }
+    /// 注册 MapRoam 交互事件：地图漫游（平移/缩放）。
+    ChartView OnMapRoam(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.MapRoam, handler);
+    }
+    /// 注册 TimelineChanged 交互事件：时间轴播放位置切换。
+    ChartView OnTimelineChanged(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.TimelineChanged, handler);
+    }
+    /// 注册 MagicTypeChanged 交互事件：magic type 切换。
+    ChartView OnMagicTypeChanged(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.MagicTypeChanged, handler);
+    }
+    /// 注册 Refresh 交互事件。
+    ChartView OnRefresh(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.Refresh, handler);
+    }
+    /// 注册 ForceLayoutEnd 交互事件：力导向布局收敛结束。
+    ChartView OnForceLayoutEnd(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.ForceLayoutEnd, handler);
+    }
+    /// 注册 DataZoom 交互事件：缩放区间变化，事件携带 zoomStart/zoomEnd。
+    ChartView OnDataZoom(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.DataZoom, handler);
+    }
+    /// 注册 DataRange 交互事件：数据区间选择变化。
+    ChartView OnDataRange(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.DataRange, handler);
+    }
+    /// 注册 Restore 交互事件：还原初始 option 时派发。
+    ChartView OnRestore(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.Restore, handler);
+    }
+    /// 注册 Resize 交互事件：图表尺寸变化，事件携带新宽高。
+    ChartView OnResizeEvent(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.Resize, handler);
+    }
+    /// 注册 DataChanged 交互事件：option/数据版本变化时派发。
+    ChartView OnDataChanged(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.DataChanged, handler);
+    }
+
+    /// 返回 option 快照；controller 绑定和直接 option 两种模式都不暴露
+    /// 内部可变对象。
+    ChartOption GetOption() {
+        if (this.controller != null) { return this.controller.GetOption(); }
+        return ChartOption.Clone(this.sourceOption);
+    }
+
+    /// 状态字符串："ready" / "loading" / "empty" / "error" /
+    /// "disposed"（controller 绑定模式透传 controller 状态）。
+    string Status() {
+        if (this.disposed) { return "disposed"; }
+        if (this.controller != null) { return this.controller.Status(); }
+        return this.directStatus;
+    }
+
+    /// 伴随状态的补充消息（SetEmptyMessage/SetErrorMessage 等设置）。
+    string StatusMessage() {
+        if (this.disposed) { return ""; }
+        if (this.controller != null) { return this.controller.StatusMessage(); }
+        return this.directStatusMessage;
+    }
+
+    /// 实例是否已释放（Dispose 后为真；disposed 后所有操作为 no-op）。
+    bool IsDisposed() { return this.disposed; }
+
+    /// 替换 option；绑定 controller 时保留 controller 身份。
+    ChartView SetOption(ChartOption next) {
+        if (this.disposed || next == null) { return this; }
+        if (this.controller != null) { this.controller.SetOption(next); }
+        else {
+            this.sourceOption = next; this.option = next;
+            this.initialOption = ChartOption.Clone(next);
+            this.directStatus = "ready"; this.directStatusMessage = "";
+            this.directVersion = this.directVersion + 1;
+        }
+        return this;
+    }
+
+    /// 立即模式的显式刷新入口。Render 每帧都会读取最新 option，
+    /// 因此这里仅提供与 ECharts refresh() 对齐的可链式语义。
+    ChartView Refresh() { return this; }
+
+    /// 还原为创建/最近一次 SetOption 时的 initialOption 深拷贝，
+    /// 并触发 Restore 事件（controller 模式转发 controller.Restore）。
+    ChartView Restore() {
+        if (this.disposed) { return this; }
+        if (this.controller != null) { this.controller.Restore(); }
+        else {
+            this.sourceOption = ChartOption.Clone(this.initialOption); this.option = this.sourceOption;
+            this.directStatus = "ready"; this.directStatusMessage = "";
+            this.directVersion = this.directVersion + 1;
+            ChartInteractionEvent re = ChartInteractionEvent.Of(
+                ChartEventType.Restore, this.wid);
+            this.RaiseInteraction(re);
+        }
+        return this;
+    }
+
+    /// 清空所有系列的 data 列表并把状态置 "empty"（不销毁系列外壳）。
+    ChartView Clear() {
+        if (this.disposed) { return this; }
+        if (this.controller != null) { this.controller.Clear(); }
+        else {
+            for (int i = 0; i < this.sourceOption.series.Count; i = i + 1) {
+                this.sourceOption.series[i].data = new List<ChartData>();
+            }
+            this.directStatus = "empty"; this.directStatusMessage = "";
+            this.directVersion = this.directVersion + 1;
+        }
+        return this;
+    }
+
+    /// 置 "loading" 状态并显示 message（Render 时由状态层覆盖呈现）。
+    ChartView ShowLoading(string message) {
+        if (this.disposed) { return this; }
+        if (this.controller != null) { this.controller.ShowLoading(message); }
+        else {
+            this.directStatus = "loading"; this.directStatusMessage = message;
+            this.directVersion = this.directVersion + 1;
+        }
+        return this;
+    }
+
+    /// 结束 loading，恢复 "ready"。
+    ChartView HideLoading() {
+        if (this.disposed) { return this; }
+        if (this.controller != null) { this.controller.HideLoading(); }
+        else {
+            this.directStatus = "ready"; this.directStatusMessage = "";
+            this.directVersion = this.directVersion + 1;
+        }
+        return this;
+    }
+
+    /// 置 "empty" 状态并自定义空态文案。
+    ChartView SetEmptyMessage(string message) {
+        if (this.disposed) { return this; }
+        if (this.controller != null) { this.controller.SetEmptyMessage(message); }
+        else {
+            this.directStatus = "empty"; this.directStatusMessage = message;
+            this.directVersion = this.directVersion + 1;
+        }
+        return this;
+    }
+
+    /// 置 "error" 状态并自定义错误文案。
+    ChartView SetErrorMessage(string message) {
+        if (this.disposed) { return this; }
+        if (this.controller != null) { this.controller.SetErrorMessage(message); }
+        else {
+            this.directStatus = "error"; this.directStatusMessage = message;
+            this.directVersion = this.directVersion + 1;
+        }
+        return this;
+    }
+
+    /// 释放 view 的事件订阅并使后续 Render/操作失效。
+    /// controller 的生命周期由创建它的调用方拥有，view 不会替其 Dispose。
+    void Dispose() {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        this.directStatus = "disposed"; this.directStatusMessage = "";
+        if (this.Disposed.Count() > 0) { this.Disposed.Raise(); }
+        this.Rendered.Clear(); this.Resized.Clear(); this.Updated.Clear();
+        if (ChartView.activeEventView == this) { ChartView.activeEventView = null; }
+        this.eventHub.Clear();
+    }
+
+    /// RenderCached 的动态快照槽位分配器：运行时池按需增长
+    /// （ZAN_SNAP_CACHE_MAX_SLOTS = 512），任意数量的缓存
+    /// 图表可以共存；将图表嵌入会滚走的单元格的调用方
+    /// 应 ReleaseCached(slot) 归还像素缓冲区。
+    static int cacheSeq = 16;
+    /// 分配下一个快照槽位（16..511 循环复用，不做占用检查）。
+    static int AllocCacheSlot() {
+        int s = ChartView.cacheSeq;
+        ChartView.cacheSeq = ChartView.cacheSeq + 1;
+        if (s >= 512) { ChartView.cacheSeq = 16; s = 16; }
+        return s;
+    }
+
+    /// 释放 RenderCached 槽位拥有的像素缓冲区（在区域
+    /// 离开视口时调用，如网格单元格滚走）。槽位稍后
+    /// 可复用——指纹键按槽位区分，过期的快照
+    /// 直接失配并重新渲染。
+    static void ReleaseCached(Canvas c, int slot) {
+        c.ReleaseSlot(slot);
+    }
+
+    /// 静态且光栅化成本高的图表的缓存区域渲染（热力图、
+    /// 密集系列）：首次调用把最终形态（关闭动画）绘制进
+    /// 快照槽位 0-7 并记录数据指纹；后续调用以单次拷贝
+    /// 恢复缓存像素而非重新光栅化，
+    /// 因此 100x50 热力图每帧成本为 O(区域) 而非 O(单元格)。
+    /// 缓存对任何数据 / 可见性 / 缩放 / 主题 /
+    /// 几何变化自动失效（指纹比较 + 几何匹配）。
+    /// 悬停反馈（如 HeatmapHover）由调用方在命中*之后*绘制，
+    /// 使工具提示保持活跃。帧由缓存提供时返回 true。
+    /// 交互事件由每槽位的持久 owner view 承载：缓存命中帧也
+    /// 设置 activeEventView 并派发 Hover/MouseOut/Click/
+    /// DoubleClick，调用方补画的命中层（HeatmapHover 等）的
+    /// OfferActiveHit 由此到达持久 view，handler 不再丢失。
+    static bool RenderCached(App app, ChartOption o, int slot,
+                             int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        // 由槽位推导的稳定交互 id，使指纹读取的
+        // dataZoom 窗口状态与渲染器读取的一致。
+        int zwid = 300000 + slot;
+        ResolvedChart resolved = ResolvedChart.Resolve(o, app.theme, app, zwid);
+        int fp = ChartView.CacheFingerprint(app, o, resolved, x, y, w, h);
+        bool cached = app.StateGet(Chart.CacheKey(slot), 0) == fp
+            && c.RestoreRect(x, y, w, h, slot);
+        if (cached) {
+            // 缓存命中帧：像素来自快照，但交互仍走持久 owner view。
+            ChartView owner = ChartView.CachedOwner(o, zwid, x, y, w, h);
+            owner.BeginCachedEventFrame(app, x, y, w, h);
+            return true;
+        }
+        ChartView view = ChartView.Keyed(o, zwid);
+        view.staticFrame = true;          // 快照始终是最终形态
+        view.Render(app, x, y, w, h);
+        c.SnapshotRect(x, y, w, h, slot);
+        app.StateSet(Chart.CacheKey(slot), fp);
+        ChartView.SetCachedOwner(zwid, view, x, y, w, h);
+        return false;
+    }
+
+    /// RenderCached 每槽位的持久 owner view。Keyed 临时实例在
+    /// 缓存 miss 帧产生，这里把它保留下来：后续缓存命中帧复用
+    /// 同一实例，previousHit 连续性与事件订阅归属由此成立。
+    /// 平行数组按槽位序存放（slot 数量少且有限）。
+    static List<ChartView> cachedOwners;
+    static List<int> cachedOwnerKeys;
+    static List<int> cachedOwnerRects;
+
+    /// 登记 key（zwid）对应的持久 owner view 及其矩形
+    ///（平行数组按 key 首次出现顺序存放；重复 key 原位更新）。
+    static void SetCachedOwner(int key, ChartView v, int x, int y, int w, int h) {
+        if (ChartView.cachedOwnerKeys == null) {
+            ChartView.cachedOwners = new List<ChartView>();
+            ChartView.cachedOwnerKeys = new List<int>();
+            ChartView.cachedOwnerRects = new List<int>();
+        }
+        for (int i = 0; i < ChartView.cachedOwnerKeys.Count; i = i + 1) {
+            if (ChartView.cachedOwnerKeys[i] == key) {
+                ChartView.cachedOwners[i] = v;
+                ChartView.cachedOwnerRects[i * 4] = x;
+                ChartView.cachedOwnerRects[i * 4 + 1] = y;
+                ChartView.cachedOwnerRects[i * 4 + 2] = w;
+                ChartView.cachedOwnerRects[i * 4 + 3] = h;
+                return;
+            }
+        }
+        ChartView.cachedOwnerKeys.Add(key);
+        ChartView.cachedOwners.Add(v);
+        ChartView.cachedOwnerRects.Add(x);
+        ChartView.cachedOwnerRects.Add(y);
+        ChartView.cachedOwnerRects.Add(w);
+        ChartView.cachedOwnerRects.Add(h);
+    }
+
+    /// 取 key 的持久 owner view 并刷新其缓存矩形；不存在或已
+    /// disposed 时现建一个 Keyed view 并登记返回。
+    static ChartView CachedOwner(ChartOption o, int key, int x, int y,
+                                 int w, int h) {
+        if (ChartView.cachedOwnerKeys != null) {
+            for (int i = 0; i < ChartView.cachedOwnerKeys.Count; i = i + 1) {
+                if (ChartView.cachedOwnerKeys[i] == key) {
+                    ChartView v = ChartView.cachedOwners[i];
+                    if (v != null && !v.disposed) {
+                        ChartView.cachedOwnerRects[i * 4] = x;
+                        ChartView.cachedOwnerRects[i * 4 + 1] = y;
+                        ChartView.cachedOwnerRects[i * 4 + 2] = w;
+                        ChartView.cachedOwnerRects[i * 4 + 3] = h;
+                        return v;
+                    }
+                }
+            }
+        }
+        // 没有可用 owner（首帧即命中、或 owner 已释放）：现建一个
+        // 并登记，事件订阅虽然只能由后续帧补上，但命中层立即生效。
+        ChartView nv = ChartView.Keyed(o, key);
+        ChartView.SetCachedOwner(key, nv, x, y, w, h);
+        return nv;
+    }
+
+    /// 缓存命中帧的事件帧开销等价于 Render 的尾部：注册根命中
+    /// 区、设置 activeEventView，由调用方补画的命中层填
+    /// currentHit，最后统一派发。像素不被触碰——快照已经恢复。
+    void BeginCachedEventFrame(App app, int x, int y, int w, int h) {
+        if (this.disposed) { return; }
+        ChartView.activeEventView = this;
+        this.currentHit = null;
+        if (this.eventHitId < 0) {
+            this.eventHitId = 9700000 + this.wid;
+        }
+        if (this.Status() == "ready") {
+            app.hitTester.RegisterRect(this.eventHitId, x, y, w, h, 0);
+        }
+        this.DispatchPointerEvents(app, x, y, w, h, this.Status());
+    }
+
+    /// RenderCached 的数据指纹：系列值 + 类型/轴/隐藏、
+    /// dataZoom 窗口、当前主题，以及全部专用数据
+    /// （links/tree/points/candles/bubbles/boxes/errors/events/
+    /// regions/marks/gauge/radarMax）。任何会改变
+    /// 像素的因素都使缓存快照失效；悬停位置刻意不
+    /// 不（悬停层在缓存命中后绘制于其上）。
+    static int CacheFingerprint(App app, ChartOption o, ResolvedChart resolved,
+                                int x, int y, int w, int h) {
+        int zoomLo = 0;
+        int zoomHi = 0;
+        if (o.zoom) {
+            zoomLo = app.StateGet(Chart.ZoomLoKey(resolved.stateWid), o.zoomStart * 10);
+            zoomHi = app.StateGet(Chart.ZoomHiKey(resolved.stateWid), o.zoomEnd * 10);
+        }
+        int fp = ChartView.FingerprintCore(
+            app.ThemeMenuIndex() * 7919 + app.bgThemeGen, zoomLo, zoomHi, o, resolved);
+        // dataRange 交互态（滑条 q + 分段隐藏位）会改快照像素
+        // （条本体也在快照里），故折入缓存指纹。
+        if (o.dataRangeShow && resolved.stateWid != 0) {
+            fp = (fp * 31 + app.StateGet(Chart.DRangeLoKey(resolved.stateWid), 0)
+                + app.StateGet(Chart.DRangeHiKey(resolved.stateWid), 1000) * 7
+                + 1) % 2000000000;
+            for (int bi = 0; bi < o.dataRangeList.Count; bi = bi + 1) {
+                fp = (fp * 31 + app.StateGet(Chart.DRangeBandKey(resolved.stateWid, bi), 0)
+                    + 3) % 2000000000;
+            }
+        }
+        // 视口：快照槽位绑定像素矩形；控件移动 / 缩放而
+        // 复用旧快照会画出错位像素，因此矩形进入指纹。
+        fp = (fp * 31 + x * 7 + y * 13 + w * 17 + h * 19) % 2000000000;
+        return fp;
+    }
+
+    /// 把字符串内容折叠进指纹。Zan 没有 char 值类型，但
+    /// s[i] 给出字符编码（UTF-8 字节）；逐字节折叠使长度相同、
+    /// 内容不同的标签/名称折叠出不同值，避免陈旧缓存。
+    /// 空串返回 h 原值。
+    static int FoldStr(int h, string s, int seed) {
+        for (int i = 0; i < s.Length; i = i + 1) {
+            h = (h * 31 + (s[i] & 255) + i * 5 + seed) % 2000000000;
+        }
+        return h;
+    }
+
+    /// 指纹的纯核心。主题代（themeGen）与 dataZoom 状态
+    /// （zoomLo/zoomHi）作为整数注入，使 conformance 测试
+    /// 无需 App 即可验证数据/可见性/主题/缩放变化都会改变指纹；
+    /// CacheFingerprint 从 App 读取这两个状态，语义与旧版完全一致。
+    static int FingerprintCore(int themeGen, int zoomLo, int zoomHi,
+                               ChartOption o, ResolvedChart resolved) {
+        int h = themeGen;
+        h = (h * 31 + resolved.wid) % 2000000000;
+        // connect 组改变交互键基址（状态随组长 wid 存取），
+        // 指纹须随组号变化以正确失效缓存。
+        h = (h * 31 + o.connectGroup * 7) % 2000000000;
+        if (resolved.animate) { h = (h * 31 + 17) % 2000000000; }
+        h = (h * 31 + o.zoomStart + o.zoomEnd + o.backgroundColor) % 2000000000;
+        h = (h * 31 + o.donutPct + (o.pieRings ? 1 : 0) + (o.pieLabels ? 1 : 0)
+            + o.gaugeMax) % 2000000000;
+        // 改变布局/像素的 option 开关与边距。
+        h = (h * 31 + (o.showLegend ? 1 : 0) + (o.showGrid ? 1 : 0)
+            + (o.showValues ? 1 : 0) + (o.smooth ? 1 : 0)) % 2000000000;
+        h = (h * 31 + (o.gradient ? 1 : 0) + (o.rounded ? 1 : 0)
+            + o.markLine + o.markLo + o.markHi) % 2000000000;
+        h = ChartView.FoldStr(h, o.markLabel, 1);
+        h = ChartView.FoldStr(h, o.title, 2);
+        h = (h * 31 + o.gridLeft + o.gridRight + o.gridTop + o.gridBottom) % 2000000000;
+        for (int ri = 0; ri < o.radarMax.Count; ri = ri + 1) {
+            h = (h * 31 + o.radarMax[ri]) % 2000000000;
+        }
+        h = ChartView.FoldStr(h, o.radarShape, 26);
+        h = (h * 31 + (o.radarSplitArea ? 1 : 0)) % 2000000000;
+        // 多 polar（polar[]）：几何/样式与指示器都改像素。
+        for (int pi = 0; pi < o.polars.Count; pi = pi + 1) {
+            RadarPolar p = o.polars[pi];
+            h = (h * 31 + p.startAngle + p.splitNumber + p.axisLineWidth
+                + p.splitLineWidth) % 2000000000;
+            if (p.center != null) {
+                h = (h * 31 + p.center.x.amount + (p.center.x.percent ? 7 : 0)
+                    + p.center.y.amount + (p.center.y.percent ? 11 : 0)) % 2000000000;
+            }
+            h = (h * 31 + p.radius.amount + (p.radius.percent ? 13 : 0)) % 2000000000;
+            h = (h * 31 + p.nameColor + p.axisLineColor + p.splitLineColor) % 2000000000;
+            h = ChartView.FoldStr(h, p.type, 27);
+            h = ChartView.FoldStr(h, p.nameFormat, 28);
+            for (int mi = 0; mi < p.indicatorMax.Count; mi = mi + 1) {
+                h = (h * 31 + p.indicatorMax[mi]) % 2000000000;
+            }
+            for (int ai = 0; ai < p.indicatorText.Count; ai = ai + 1) {
+                h = ChartView.FoldStr(h, p.indicatorText[ai], 29);
+            }
+            for (int ci = 0; ci < p.splitAreaColors.Count; ci = ci + 1) {
+                h = (h * 31 + p.splitAreaColors[ci]) % 2000000000;
+            }
+        }
+        // legend 布局/格式与 dataRange 配置改像素，须入指纹。
+        h = ChartView.FoldStr(h, o.legendOrient, 32);
+        h = ChartView.FoldStr(h, o.legendFormatter, 33);
+        h = (h * 31 + (o.dataRangeShow ? 1 : 0) + (o.dataRangeCalculable ? 2 : 0)
+            + o.dataRangeLo + o.dataRangeHi + o.dataRangeSplit) % 2000000000;
+        for (int di = 0; di < o.dataRangeList.Count; di = di + 1) {
+            h = ChartView.FoldStr(h, o.dataRangeList[di].label, 34);
+            h = (h * 31 + o.dataRangeList[di].lo + o.dataRangeList[di].hi) % 2000000000;
+        }
+        // 轴配置：类型/范围/翻转/刻度/网格/标题 + 分类标签
+        // （标签直接决定绘制文字，长度哈希与系列名约定一致）。
+        for (int ai = 0; ai < o.xAxes.Count; ai = ai + 1) {
+            ChartAxis ax = o.xAxes[ai];
+            h = (h * 31 + ax.type + ax.min + ax.max + ax.ticks) % 2000000000;
+            h = (h * 31 + (ax.reversed ? 1 : 0) + (ax.showGrid ? 1 : 0)) % 2000000000;
+            h = ChartView.FoldStr(h, ax.title, 3);
+            h = (h * 31 + ax.labelRotate + ax.labelInterval) % 2000000000;
+            h = ChartView.FoldStr(h, ax.nameLocation, 23);
+            h = (h * 31 + ax.nameGap + ax.labelMargin) % 2000000000;
+            // axisLine 三态/颜色 + 轴级 position（T3b：决定轴线画不
+            // 画/骑到哪，进指纹防配置变化吃旧缓存）。
+            h = (h * 31 + ax.axisLineShow + ax.onZero + ax.axisLineColor) % 2000000000;
+            h = ChartView.FoldStr(h, ax.position, 29);
+            for (int cj = 0; cj < ax.categories.Count; cj = cj + 1) {
+                h = ChartView.FoldStr(h, ax.categories[cj], cj * 31);
+            }
+        }
+        for (int ai = 0; ai < o.yAxes.Count; ai = ai + 1) {
+            ChartAxis ay = o.yAxes[ai];
+            h = (h * 31 + ay.type + ay.min + ay.max + ay.ticks) % 2000000000;
+            h = (h * 31 + (ay.reversed ? 1 : 0) + (ay.showGrid ? 1 : 0)) % 2000000000;
+            h = ChartView.FoldStr(h, ay.title, 4);
+            h = ChartView.FoldStr(h, ay.nameLocation, 24);
+            h = (h * 31 + ay.nameGap + (ay.position == "right" ? 1 : 0)) % 2000000000;
+            h = (h * 31 + ay.axisLineShow + ay.onZero + ay.axisLineColor) % 2000000000;
+            h = ChartView.FoldStr(h, ay.position, 30);
+        }
+        h = (h * 31 + o.series.Count) % 2000000000;
+        for (int s = 0; s < o.series.Count; s = s + 1) {
+            ChartSeries cs = o.series[s];
+            ResolvedSeries rs = resolved.series[s];
+            h = (h * 31 + cs.type + cs.axisIndex) % 2000000000;
+            h = ChartView.FoldStr(h, cs.name, 5);
+            h = (h * 31 + cs.stack + cs.innerPct) % 2000000000;
+            h = ChartView.FoldStr(h, cs.stackName, 6);
+            h = ChartView.FoldStr(h, cs.custom, 7);
+            h = ChartView.FoldStr(h, cs.selectedMode, 27);
+            h = (h * 31 + rs.color + rs.lineColor + rs.lineWidth + rs.areaColor) % 2000000000;
+            h = (h * 31 + rs.labelColor + rs.labelFontSize) % 2000000000;
+            h = (h * 31 + cs.itemStyle.normal.borderColor
+                + cs.itemStyle.normal.borderWidth) % 2000000000;
+            h = ChartView.FoldStr(h, cs.itemStyle.normal.lineStyle.type, 8);
+            // 逐系列绘制开关：平滑覆盖 / 面积填充 / 阶梯 /
+            // 漏斗排序 / 玫瑰 / 水平柱 / 树方向。
+            h = (h * 31 + cs.smooth + (cs.areaStyle ? 1 : 0)) % 2000000000;
+            h = ChartView.FoldStr(h, cs.step, 9);
+            h = ChartView.FoldStr(h, cs.sort, 10);
+            h = ChartView.FoldStr(h, cs.roseType, 11);
+            h = (h * 31 + (cs.hbar ? 1 : 0)) % 2000000000;
+            h = ChartView.FoldStr(h, cs.treeOrient, 12);
+            // symbol 形状族 / 尺寸 / 点显隐改像素，须入指纹。
+            h = ChartView.FoldStr(h, cs.symbol, 21);
+            h = (h * 31 + cs.symbolSize + cs.showSymbol) % 2000000000;
+            h = ChartView.FoldStr(h, cs.symbolSizeFn, 46);
+            // 批 6：force/chord/funnel/wordCloud 参数化字段全部入指纹。
+            h = (h * 31 + cs.forceScaling + cs.forceGravity * 3
+                + cs.forceMinRadius * 7 + cs.forceMaxRadius * 13
+                + cs.chordSort * 17 + (cs.chordSortSub ? 1 : 0)
+                + cs.chordGapDeg * 19 + cs.chordRingWidthPct * 23
+                + cs.funnelGap * 31) % 2000000000;
+            h = ChartView.FoldStr(h, cs.chordRibbonType, 38);
+            h = ChartView.FoldStr(h, cs.funnelAlign, 39);
+            h = ChartView.FoldStr(h, cs.wcRotate, 40);
+            h = ChartView.FoldStr(h, cs.wcRotateList, 47);
+            h = (h * 31 + cs.wcMinFontSize * 5 + cs.wcMaxFontSize * 11) % 2000000000;
+            if (cs.funnelPercent) { h = (h * 31 + 3) % 2000000000; }
+            h = (h * 31 + cs.forceNodeColor + cs.forceLinkColor * 3) % 2000000000;
+            if (cs.labelShow) { h = (h * 31 + 13) % 2000000000; }
+            // 饼标矩阵字段（label.show 三态 / labelLine / alignTo 族）
+            // 改外标几何与显隐，须入指纹。
+            h = (h * 31 + cs.labelShowT + cs.labelLineShow * 3
+                + cs.labelLineLen * 7 + cs.labelLineLen2 * 11
+                + cs.labelDist * 13 + cs.labelEdgeDist * 17
+                + cs.labelAlignTo * 19) % 2000000000;
+            h = ChartView.FoldStr(h, cs.labelPos, 48);
+            h = ChartView.FoldStr(h, cs.labelFmt, 49);
+            // 富文本声明改标签排版（块高进去重叠），入指纹。
+            if (cs.label != null && cs.label.rich != null) {
+                h = (h * 31 + 23) % 2000000000;
+            }
+            if (rs.hidden) { h = (h * 31 + 7) % 2000000000; }
+            for (int v = 0; v < cs.Count(); v = v + 1) {
+                h = (h * 31 + cs.Value(v)) % 2000000000;
+            }
+            for (int di = 0; di < cs.data.Count; di = di + 1) {
+                if (cs.data[di].color != 0) {
+                    h = (h * 31 + cs.data[di].color) % 2000000000;
+                }
+                if (cs.data[di].sizeSet) {
+                    h = (h * 31 + 29 + cs.data[di].size) % 2000000000;
+                }
+            }
+            for (int li = 0; li < cs.links.Count; li = li + 1) {
+                h = ChartView.FoldStr(h, cs.links[li].from, 13);
+                h = ChartView.FoldStr(h, cs.links[li].to, 14);
+                h = (h * 31 + cs.links[li].val) % 2000000000;
+            }
+            for (int pi = 0; pi < cs.points.Count; pi = pi + 1) {
+                h = (h * 31 + cs.points[pi].x + cs.points[pi].y
+                    + cs.points[pi].color) % 2000000000;
+                if (cs.points[pi].sizeSet) {
+                    h = (h * 31 + 31 + cs.points[pi].size) % 2000000000;
+                }
+            }
+            for (int ci = 0; ci < cs.candles.Count; ci = ci + 1) {
+                h = (h * 31 + cs.candles[ci].open + cs.candles[ci].high
+                    + cs.candles[ci].low + cs.candles[ci].close) % 2000000000;
+            }
+            for (int bi = 0; bi < cs.bubbles.Count; bi = bi + 1) {
+                h = (h * 31 + cs.bubbles[bi].x + cs.bubbles[bi].y + cs.bubbles[bi].weight) % 2000000000;
+            }
+            for (int xi = 0; xi < cs.boxes.Count; xi = xi + 1) {
+                h = ChartView.FoldStr(h, cs.boxes[xi].label, 15);
+                h = (h * 31 + cs.boxes[xi].lo + cs.boxes[xi].q1
+                    + cs.boxes[xi].med + cs.boxes[xi].q3 + cs.boxes[xi].hi) % 2000000000;
+            }
+            for (int ei = 0; ei < cs.errors.Count; ei = ei + 1) {
+                h = ChartView.FoldStr(h, cs.errors[ei].label, 16);
+                h = (h * 31 + cs.errors[ei].y + cs.errors[ei].err) % 2000000000;
+            }
+            for (int ti = 0; ti < cs.tree.Count; ti = ti + 1) {
+                h = ChartView.FoldStr(h, cs.tree[ti].name, 17);
+                h = (h * 31 + cs.tree[ti].Total()) % 2000000000;
+                // 力导向逐节点形状（series.tree 携带）改像素，入指纹。
+                h = ChartView.FoldStr(h, cs.tree[ti].symbol, 22);
+                h = (h * 31 + cs.tree[ti].size) % 2000000000;
+            }
+            for (int vi = 0; vi < cs.events.Count; vi = vi + 1) {
+                h = ChartView.FoldStr(h, cs.events[vi].name, 18);
+                h = (h * 31 + cs.events[vi].start + cs.events[vi].end
+                    + cs.events[vi].value) % 2000000000;
+            }
+            for (int gi = 0; gi < cs.regions.Count; gi = gi + 1) {
+                h = ChartView.FoldStr(h, cs.regions[gi].name, 19);
+                h = (h * 31 + cs.regions[gi].value
+                    + cs.regions[gi].rings.Count) % 2000000000;
+            }
+            for (int mi = 0; mi < cs.marks.Count; mi = mi + 1) {
+                h = ChartView.FoldStr(h, cs.marks[mi].kind, 20);
+                h = (h * 31 + cs.marks[mi].dataIndex
+                    + cs.marks[mi].xValue + cs.marks[mi].yValue) % 2000000000;
+            }
+            for (int mi2 = 0; mi2 < cs.markLines.Count; mi2 = mi2 + 1) {
+                h = ChartView.FoldStr(h, cs.markLines[mi2].kind, 24);
+                h = (h * 31 + cs.markLines[mi2].yValue
+                    + cs.markLines[mi2].xValue) % 2000000000;
+                h = ChartView.FoldStr(h, cs.markLines[mi2].lineType, 25);
+            }
+            h = (h * 31 + cs.gauge.min + cs.gauge.max + cs.gauge.precision
+                + cs.gauge.splitNumber + cs.gauge.innerRadius.amount) % 2000000000;
+        }
+        if (o.zoom) {
+            h = (h * 31 + zoomLo) % 2000000000;
+            h = (h * 31 + zoomHi) % 2000000000;
+        }
+        return h;
+    }
+
+    /// 第一个可见序列（整图系列族从中选取布局
+    /// 标志位 —— innerPct、roseType、sort、hbar、custom）。
+    static ChartSeries LeadSeries(ChartOption o) {
+        if (o.series.Count < 1) { return null; }
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            if (!o.series[i].hidden) { return o.series[i]; }
+        }
+        return o.series[0];
+    }
+
+    /// 地图底图的几何载体。geo 组件形态下用户系列是挂在 geo 上的
+    /// scatter/lines/graph/custom（coordSys == "geo"，没有 regions），
+    /// 真正的区域表在 ChartModel 合成的 isGeoBase 系列里；直接写
+    /// series[].type="map" 的形态则由该系列自己带几何。优先取可见的
+    /// isGeoBase，其次取首个可见且真的带 regions 的 Map 系列。
+    static ChartSeries MapBaseSeries(ChartOption o) {
+        if (o == null || o.series.Count < 1) { return null; }
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            ChartSeries s = o.series[i];
+            if (!s.hidden && s.isGeoBase && s.regions.Count > 0) { return s; }
+        }
+        for (int j = 0; j < o.series.Count; j = j + 1) {
+            ChartSeries s2 = o.series[j];
+            if (!s2.hidden && s2.type == ChartType.Map
+                && s2.regions.Count > 0) { return s2; }
+        }
+        return ChartView.LeadSeries(o);
+    }
+
+    /// 第一个可见系列的下标；全部隐藏时返回 0，无系列返回 -1。
+    static int LeadSeriesIndex(ChartOption o) {
+        if (o == null || o.series.Count < 1) { return 0 - 1; }
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            if (!o.series[i].hidden) { return i; }
+        }
+        return 0;
+    }
+
+    /// target 系列在 o.series 中的下标（引用相等）；无则 -1。
+    static int SeriesIndexOf(ChartOption o, ChartSeries target) {
+        if (o == null || target == null) { return 0 - 1; }
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            if (o.series[i] == target) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    /// 主导图表族：第一个可见序列的类型（
+    /// 整图系列族 —— pie、gauge、heatmap 等 —— 从中选择布局，
+    /// 笛卡尔系列族则逐序列混用）。全部隐藏时仍用首条系列类型，
+    /// 保留坐标轴/图例，而不是整图变成空状态。
+    static ChartType LeadType(ChartOption o) {
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            if (!o.series[i].hidden) { return o.series[i].type; }
+        }
+        if (o.series.Count > 0) { return o.series[0].type; }
+        return ChartType.Line;
+    }
+
+    /// 渲染器分发键：每个 ChartType 和 custom kind 都映射到
+    /// 一个显式渲染器；没有未知类型回退为折线图。
+    /// 未知/空 kind 返回 "empty"（渲染明确的空状态）。
+    /// 这是 chart_kinds_complete 测试的确定性锚点。
+    static string DispatchKind(ChartOption o) {
+        // 无系列才画空状态。图例关掉最后一条系列时仍按原类型
+        // 分发，只是渲染器跳过隐藏序列（坐标轴/图例还在）。
+        if (o.series.Count < 1) { return "empty"; }
+        // calendar 坐标系优先于系列类型分发：日历网格是面板骨架，
+        // 子系列（heatmap/scatter/graph/pie）都是叠在格上的装饰。
+        if (o.calendars.Count > 0) { return "calendar"; }
+        // 极坐标同理（ECharts5/6 angleAxis/radiusAxis 圆框）：
+        // coordinateSystem:"polar" 的 line/scatter 系列按角度投影。
+        for (int psi = 0; psi < o.series.Count; psi = psi + 1) {
+            if (o.series[psi].coordSys == "polar") { return "polarCoord"; }
+        }
+        // geo 组件同理，且必须是**组件级**判定：geo 底图是面板骨架，
+        // 挂在它上面的 scatter/lines/graph/custom/pie 都是投影装饰。
+        // 按首个可见系列分发会翻车——geo-choropleth-scatter /
+        // geo-map-scatter / scatter-map-brush 的 series[0] 是
+        // coordinateSystem:"geo" 的 scatter，LeadType 判成 scatter，
+        // 于是 DrawMap/DrawGeoOverlay 永不执行，底图与全部投影点丢失，
+        // 只剩一个空散点坐标系。scatter-map 之所以正常，只是因为它的
+        // series[0] 恰好是合成底图载体（isGeoBase）而走 map。
+        if (o.geos.Count > 0) { return "map"; }
+        ChartType t = ChartView.LeadType(o);
+        ChartSeries leadS = ChartView.LeadSeries(o);
+        if (t == ChartType.Pie && leadS != null && leadS.piePerPoint) {
+            // 以饼代点（mix7）：饼几何由散点面板按点坐标逐个绘制，
+            // 面板本身仍是散点坐标系。
+            t = ChartType.Scatter;
+        }
+        if (t == ChartType.Pie) {
+            if (leadS != null && leadS.roseType.Length > 0) { return "rose"; }
+            return "pie";
+        }
+        if (t == ChartType.Gauge) { return "gauge"; }
+        if (t == ChartType.Heatmap) { return "heatmap"; }
+        if (t == ChartType.WordCloud) { return "wordCloud"; }
+        if (t == ChartType.Radar) { return "radar"; }
+        if (t == ChartType.Funnel) { return "funnel"; }
+        if (t == ChartType.Treemap) { return "treemap"; }
+        if (t == ChartType.Tree) { return "tree"; }
+        if (t == ChartType.K) { return "k"; }
+        if (t == ChartType.Chord) { return "chord"; }
+        if (t == ChartType.Force) { return "force"; }
+        if (t == ChartType.Map) { return "map"; }
+        if (t == ChartType.EventRiver) { return "eventRiver"; }
+        if (t == ChartType.Custom) {
+            string ck = "";
+            if (leadS != null) { ck = leadS.custom; }
+            if (ck == "sankey") { return "sankey"; }
+            if (ck == "box") { return "box"; }
+            if (ck == "error") { return "error"; }
+            if (ck == "waterfall") { return "waterfall"; }
+            if (ck == "sunburst") { return "sunburst"; }
+            if (ck == "radialBars") { return "radialBars"; }
+            if (ck == "venn") { return "venn"; }
+            if (ck == "pictorialBar") { return "pictorialBar"; }
+            if (ck == "parallel") { return "parallel"; }
+            if (ck == "themeRiver") { return "themeRiver"; }
+            if (ck == "lines") { return "linesCustom"; }
+            return "empty";
+        }
+        if (t == ChartType.Bar) {
+            // ECharts stack 是系列级声明：任一柱系列带堆叠组即按
+            // 堆叠布局走（DrawBars 按 stackName 分组，未入组的系列
+            // 各自成列）——不能只看 lead（mix2 lead 直接访问未入组）。
+            bool stacked = (leadS != null && leadS.stack != 0);
+            if (!stacked) {
+                for (int si = 0; si < o.series.Count; si = si + 1) {
+                    if (!o.series[si].hidden && o.series[si].type == ChartType.Bar
+                        && (o.series[si].stack != 0
+                            || o.series[si].stackName.Length > 0)) {
+                        stacked = true;
+                        break;
+                    }
+                }
+            }
+            bool hbar = (leadS != null && leadS.hbar);
+            if (stacked && hbar) { return "barStackedHbar"; }
+            if (stacked) { return "barStacked"; }
+            if (hbar) { return "hbar"; }
+            return "bar";
+        }
+        if (t == ChartType.Scatter) {
+            if (leadS != null && leadS.bubbles.Count > 0) { return "bubbles"; }
+            return "scatter";
+        }
+        // 点系列（OfPoints / JSON 的 data:[[x,y],...]）带 Line 类型：
+        // ECharts line7 双数值轴——连线画在散点空间里，x 与 y 都按
+        // 数值映射。特征是 data 为空而 points 非空；分类轴折线
+        // 渲染器只读 data，会缩放成默认 0-5 空轴、什么都不画。
+        // DrawScatterCore 把 Line 类型的点系列画成折线，
+        // ScatterHover 提示 x/y 数值。
+        if (leadS != null && leadS.data.Count == 0
+            && leadS.points.Count > 0) {
+            // ECharts type:'line' 的值对系列（line7 双数值轴）走折线
+            // 渲染器：连线 + 符号 + markLine/markPoint 全套；
+            // type:'scatter' 的点云仍走散点渲染器（只画点不连线）。
+            if (leadS.type == ChartType.Line) { return "lines"; }
+            return "scatter";
+        }
+        // 折线族：堆叠的引导序列渲染累计填充带，其余绘制折线。
+        if (leadS != null && leadS.stack != 0) { return "stackedArea"; }
+        return "lines";
+    }
+
+    /// 未知 / 空 kind 的明确空状态：不绘制错误的图表。
+    static void DrawEmptyState(App app, int x, int y, int w, int h, ChartOption o) {
+        Theme t = app.theme;
+        StyleBox sPanel = Style.Full(app, "chart", "", "", Style.SNormal());
+        app.canvas.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, sPanel.BgOr(0), sPanel.BorderOr(0), 1);
+        if (o.title.Length > 0) {
+            app.canvas.DrawText(x + t.paddingMedium, y + t.paddingMedium,
+                o.title, sPanel.FgOr(0), Style.FontFallback(app, "large"));
+        }
+        string msg = "(no data)";
+        int mw = Canvas.MeasureText(msg, Style.FontFallback(app, "small"));
+        app.canvas.DrawText(x + w / 2 - mw / 2,
+            Canvas.CenterTextYAt(y + h / 2, Style.FontFallback(app, "small")),
+            msg, Style.Part(app, "chart", "hint", "", "", "", Style.SNormal()).FgOr(0),
+            Style.FontFallback(app, "small"));
+    }
+
+    /// 非.ready 状态的整面覆盖绘制（loading/empty/error 文案；
+    /// "ready" 为空操作）。
+    static void DrawStatusState(App app, int x, int y, int w, int h,
+                                string status, string message) {
+        if (status == "ready") { return; }
+        Theme t = app.theme;
+        StyleBox panel = Style.Full(app, "chart", "", "", Style.SNormal());
+        int bg = panel.BgOr(0);
+        int fg = panel.FgOr(0);
+        if (status == "loading") { bg = 0xCCFFFFFF; }
+        if (status == "error") { fg = 0xFFC0392B; }
+        app.canvas.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, bg,
+            panel.BorderOr(0), 1);
+        string msg = message;
+        if (msg.Length == 0) {
+            if (status == "loading") { msg = "Loading..."; }
+            else if (status == "empty") { msg = "(no data)"; }
+            else if (status == "error") { msg = "Chart error"; }
+            else { msg = "(disposed)"; }
+        }
+        int fs = Style.FontFallback(app, "small");
+        int mw = Canvas.MeasureText(msg, fs);
+        app.canvas.DrawText(x + w / 2 - mw / 2,
+            Canvas.CenterTextYAt(y + h / 2, fs), msg, fg, fs);
+    }
+
+    /// 任一序列为面积线时返回 true（对应 ECharts line.areaStyle.show）。
+    static bool HasArea(ChartOption o) {
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            if (o.series[i].areaStyle) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// 折线族类型以折线绘制（可选填充 / 阶梯 /
+    /// 堆叠 —— 目前均为 Line 类型；它们是序列的子实体）。
+    static bool IsLineFamily(ChartType t) {
+        return t == ChartType.Line;
+    }
+
+    /// 柱状族类型占据一个柱位（分组 / 堆叠 / 水平）。
+    static bool IsBarFamily(ChartType t) {
+        return t == ChartType.Bar;
+    }
+
+    /// 堆叠组名称的索引，无则 -1（柱状图按 stackName 分组）。
+    /// ECharts stackStrategy 的组内累加（processor/dataStack.ts:112-165）。
+    /// 对一组共享 stack 的系列，逐系列算它在**本点**的堆叠顶端值，写进
+    /// into（与 rawVals 同序同长）。语义逐条对抄：
+    ///   sum 从**本系列自己的值**起算（源码 `let sum = targetData.get(
+    ///   stackedDimension, dataIndex)`）；
+    ///   再从本系列往前扫前驱 j = idx-1 .. 0，取第一个满足策略条件的
+    ///   前驱**结果**（不是原始值——链上前驱的结果已是它那条链的和）
+    ///   累加后 break（源码单次 break，不是全累加）；
+    ///   条件：all 恒真；positive 要求 val > 0；negative 要求 val < 0；
+    ///   samesign（缺省）要求“当前和与前驱值同号”（sum>=0&&val>0 或
+    ///   sum<=0&&val<0）。
+    /// **策略按系列各自取**：源码用 `targetStackInfo.seriesModel.get(
+    /// stackStrategy)`，即算第 idx 条时用第 idx 条自己的声明——同一
+    /// 堆叠组里各系列可以声明不同策略，故 strategies 是逐下标数组。
+    /// 找不到合格前驱时结果就是自己的值（源码 stackedOver = NaN）。
+    /// 于是“段的基线”= 结果 − 自己的值（无前驱时恰为 0），调用方不必
+    /// 再分辨正负累加器。
+    static void StackResults(List<double> rawVals, List<int> strategies,
+                             List<double> into) {
+        int n = rawVals.Count;
+        for (int idx = 0; idx < n; idx = idx + 1) {
+            int strategy = idx < strategies.Count ? strategies[idx] : 0;
+            double sum = rawVals[idx];
+            for (int j = idx - 1; j >= 0; j = j - 1) {
+                double val = into[j];
+                bool ok = false;
+                if (strategy == 1) { ok = true; }
+                else if (strategy == 2) { ok = val > 0.0; }
+                else if (strategy == 3) { ok = val < 0.0; }
+                else { ok = (sum >= 0.0 && val > 0.0) || (sum <= 0.0 && val < 0.0); }
+                if (ok) { sum = sum + val; break; }
+            }
+            into.Add(sum);
+        }
+    }
+
+    /// 整幅系列在**某一点**的堆叠顶端值（按 series 序，未堆叠系列即自身
+    /// 值）。分组口径与各渲染器一致：同 `stackName` 成一组（空 stackName
+    /// 也自成一组，与既有累加器行为一致）。逐系列沿组内前驱跑一次
+    /// StackResults，取末项。系列数很小（典型 2..10），每点 O(n²) 可接受。
+    /// 调用方拿 `top[si] − 自身值` 即该段基线。
+    static void StackTopAll(List<ChartSeries> series, int oi,
+                            List<double> into) {
+        int ns = series.Count;
+        for (int si = 0; si < ns; si = si + 1) {
+            into.Add(ChartView.StackTopAt(series, si, oi));
+        }
+    }
+
+    /// 同组内到 si 为止的堆叠链结果（= 该系列的堆叠顶端值）。
+    /// 未堆叠系列（无合格前驱）即自身值。
+    static double StackTopAt(List<ChartSeries> series, int si, int oi) {
+        ChartSeries sc = series[si];
+        if (!ChartView.IsStackedSeries(sc)) { return sc.Number(oi); }
+        List<double> raw = new List<double>();
+        List<int> sts = new List<int>();
+        for (int j = 0; j <= si; j = j + 1) {
+            ChartSeries sj = series[j];
+            if (sj.hidden || !ChartView.IsStackedSeries(sj)) { continue; }
+            if (sj.stackName != sc.stackName) { continue; }
+            raw.Add(sj.Number(oi));
+            sts.Add(sj.stackStrategy);
+        }
+        List<double> res = new List<double>();
+        ChartView.StackResults(raw, sts, res);
+        if (res.Count < 1) { return sc.Number(oi); }
+        return res[res.Count - 1];
+    }
+
+    /// 第 si 条系列在第 oi 点上的**堆叠基线**（= 该段应从哪条水平/垂直
+    /// 线起画）。语义 = ECharts processor/dataStack.ts 的 resultVal 减
+    /// 自身原始值：无合格前驱时恰为 0（段从零轴起画）。
+    /// 分组口径与各渲染器一致：同 `stackName` 成一组（空 stackName 也
+    /// 自成一组）。组内只算到 si 为止（含），策略逐系列取自各自声明。
+    /// 返回原始值单位（调用方按需 ×1000 转定点）。
+    static double StackBaseAt(List<ChartSeries> series, int si, int oi) {
+        ChartSeries sc = series[si];
+        if (!ChartView.IsStackedSeries(sc)) { return 0.0; }
+        return ChartView.StackTopAt(series, si, oi) - sc.Number(oi);
+    }
+
+    /// 本系列是否声明了堆叠组。ECharts dataStack.ts:44 的
+    /// `if (stack)` ——空 stack 的系列**不进任何堆叠组**（既不参与
+    /// 累加，也不作为前驱被后续系列读取），而不是“空名自成一组”。
+    /// 空名成组只对**列布局**（并排柱分组）成立。
+    static bool IsStackedSeries(ChartSeries s) {
+        return s.stackName.Length > 0 || s.stack != 0;
+    }
+
+    static int GroupIndex(List<string> groups, string name) {
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            if (groups[i] == name) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    /// 每帧渲染入口：解析 option（ResolvedChart）、按需播放入场
+    /// 动画（AnimIntroIn，键 5000000+wid；map/heatmap/wordCloud/
+    /// force/treemap 恒静态）、分发渲染器、画工具箱/状态层/dataRange，
+    /// 并派发指针交互与 Rendered/Resized/Updated/DataChanged 事件。
+    void Render(App app, int x, int y, int w, int h) {
+        if (this.disposed) { return; }
+        bool resized = this.hasRendered && (this.lastRenderW != w || this.lastRenderH != h);
+        bool updated = false;
+        if (this.controller != null) {
+            int cv = this.controller.Version();
+            updated = this.hasRendered && cv != this.lastControllerVersion;
+            ChartOption current = this.controller.Option();
+            // Controller.Dispose() 清空其 option，但 view 仍可把最后一帧
+            // 作为背景绘出，并由状态层显示 disposed，而不是把 null
+            // 传给 resolved/layout。
+            if (current != null) { this.sourceOption = current; }
+        } else {
+            updated = this.hasRendered && this.directVersion != this.lastDirectVersion;
+        }
+        if (this.sourceOption == null) { this.sourceOption = ChartOption.Create(); }
+        Theme t = app.theme;
+        this.resolved = ResolvedChart.Resolve(this.sourceOption, t, app, wid);
+        bool animate = this.resolved.animate;
+        if (this.staticFrame) { animate = false; }
+        string kind0 = ChartView.DispatchKind(this.sourceOption);
+        if (kind0 == "map" || kind0 == "heatmap" || kind0 == "wordCloud"
+            || kind0 == "force" || kind0 == "treemap") {
+            animate = false;
+        }
+        if (this.sourceOption.backgroundColor != 0) {
+            app.canvas.FillRect(x, y, w, h, this.sourceOption.backgroundColor);
+        }
+
+        int g = 1000;
+        if (animate) {
+            g = app.AnimIntroIn(5000000 + wid, this.sourceOption.animMs,
+                                x, y, w, h);
+        }
+
+        ChartOption drawOption = this.resolved.DrawOption(wid, animate);
+        if (app.StateGet(Chart.TbZoomKey(wid), 0) != 0) { drawOption.zoom = true; }
+        ChartView.ApplyMagic(drawOption, app.StateGet(Chart.TbMagicKey(wid), 0));
+        // connect() 联动：drawOption.iwid 已是组共享基址（组长 wid，
+        // 由 Resolve 期登记），渲染器的全部交互键同帧落到组键上。
+        option = drawOption;
+        Chart.toolReserve = 0;
+        Chart.legendOpt = drawOption;   // 图例 orient/selectedMode/formatter 的帧内来源
+        if (drawOption.toolboxShow) {
+            Chart.toolReserve = ChartToolbox.Width(app, drawOption);
+        }
+        // dataRange 条固定在控件底部：分派前把高度扣掉，面板与
+        // 绘图区只在剩余矩形里布局（同 toolReserve 的帧内约定）。
+        int drH = ChartViewDataRange.Height(app, drawOption);
+        int innerH = h - drH;
+        if (drH > 0 && innerH < app.Scale(80)) { drH = 0; innerH = h; }
+
+        // 把每种图表裁剪到自己的矩形，防止绘图线、柱条、
+        // 轴标签和图例溢出到相邻控件。
+        // emphasis.focus='series' 渐隐的帧内状态源：下面的渲染会
+        // 重置并重测命中，先把上一帧悬停系列记进 Chart 帧内静态；
+        // 该系列声明 focus:'series' 时渲染器把其余系列乘残透明
+        // （官方 bump 图"鼠标经过其余线渐变"的观感）。
+        Chart.fadeFocusIdx = -1;
+        if (this.currentHit != null && this.currentHit.seriesIndex >= 0
+            && this.currentHit.seriesIndex < drawOption.series.Count
+            && drawOption.series[this.currentHit.seriesIndex].emphasisFocus
+                == "series") {
+            Chart.fadeFocusIdx = this.currentHit.seriesIndex;
+        }
+        ChartView.activeEventView = this;
+        this.currentHit = null;
+        string pointerKind = ChartView.DispatchKind(drawOption);
+        bool selectionSurface = (pointerKind == "pie" || pointerKind == "rose")
+            ? drawOption.iwid != 0
+            : (pointerKind == "map" && drawOption.mapSelect && drawOption.iwid != 0);
+        if (this.eventHitId < 0 && (ChartView.HasInteraction(this, ChartEventType.Click)
+            || ChartView.HasInteraction(this, ChartEventType.DoubleClick)
+            || ChartView.HasInteraction(this, ChartEventType.Hover)
+            || ChartView.HasInteraction(this, ChartEventType.MouseOut)
+            || ChartView.HasInteraction(this, ChartEventType.PieSelected)
+            || ChartView.HasInteraction(this, ChartEventType.MapSelected)
+            || selectionSurface)) {
+            // 独立高位段，不随即时模式控件的分配顺序漂移。
+            this.eventHitId = 9700000 + this.wid;
+        }
+        if (this.eventHitId >= 0 && this.Status() == "ready") {
+            // 根命中区放在所有 renderer 之前；系列、图例和工具箱
+            // 后续注册的区域优先，未被更具体区域命中的空白点击
+            // 才到达图表级 Click。
+            app.hitTester.RegisterRect(this.eventHitId, x, y, w, h, 0);
+        }
+        app.canvas.PushClip(x, y, w, h);
+        this.DispatchRender(app, x, y, w, innerH, g);
+        if (drH > 0) {
+            ChartViewDataRange.Draw(app, x, y + innerH, w, drH, drawOption);
+        }
+        app.canvas.PopClip();
+
+        // ECharts 工具箱：右上角。o.toolboxShow 关闭时不画。
+        if (drawOption.toolboxShow) {
+            ChartView.DrawToolbox(app, x, y, w, h, this.wid, drawOption);
+            ChartView.FlushToolboxSave(app, this.wid);
+        }
+        ChartView.DrawStatusState(app, x, y, w, h,
+            this.Status(), this.StatusMessage());
+
+        string statusNow = this.Status();
+        this.DispatchPointerEvents(app, x, y, w, h, statusNow);
+        int zlo = statusNow == "ready"
+            ? app.StateGet(Chart.ZoomLoKey(this.wid), 0) : 0;
+        int zhi = statusNow == "ready"
+            ? app.StateGet(Chart.ZoomHiKey(this.wid), 1000) : 1000;
+        if (this.lastZoomLo >= 0 && (zlo != this.lastZoomLo || zhi != this.lastZoomHi)) {
+            ChartInteractionEvent ze = ChartInteractionEvent.Of(
+                ChartEventType.DataZoom, this.wid);
+            ze.zoomStart = zlo;
+            ze.zoomEnd = zhi;
+            ze.x = app.mouseX;
+            ze.y = app.mouseY;
+            this.RaiseInteraction(ze);
+        }
+        this.lastZoomLo = zlo;
+        this.lastZoomHi = zhi;
+        if (resized && this.Resized.Count() > 0) { this.Resized.Raise(); }
+        if (resized) {
+            ChartInteractionEvent re = ChartView.EventAt(
+                ChartEventType.Resize, this.wid, w, h);
+            this.RaiseInteraction(re);
+        }
+        if (updated && this.Updated.Count() > 0) { this.Updated.Raise(); }
+        if (updated && this.controller == null) {
+            ChartInteractionEvent ue = ChartInteractionEvent.Of(
+                ChartEventType.DataChanged, this.wid);
+            this.RaiseInteraction(ue);
+        }
+        if (updated && this.controller != null) {
+            ChartInteractionEvent ue2 = ChartInteractionEvent.Of(
+                ChartEventType.DataChanged, this.wid);
+            this.RaiseLocal(ue2);
+        }
+        if (this.Rendered.Count() > 0) { this.Rendered.Raise(); }
+        this.lastRenderW = w;
+        this.lastRenderH = h;
+        if (this.controller != null) { this.lastControllerVersion = this.controller.Version(); }
+        else { this.lastDirectVersion = this.directVersion; }
+        this.hasRendered = true;
+        ChartView.activeEventView = null;
+    }
+
+    /// connect() 组交互键重定向：组内第一张到达的图把「组长 wid」
+    /// 记到组登记键（ConnectGroupKey(groupId)），组内所有图（含
+    /// 组长自己）的交互态键都以组长 wid 为基——任意一张图里改的
+    /// dataZoom 窗口/图例开关/悬停类别，组内其余图同帧读到。
+    /// 未入组（group == 0）返回图自己的 wid（无联动）。
+    /// 主路径在 ResolvedChart.Resolve（stateWid）；此处保留给无
+    /// Resolve 的轻量调用方。
+    static int ConnectedWid(App app, int wid, int group) {
+        if (group == 0 || wid == 0) { return wid; }
+        int gk = Chart.ConnectGroupKey(group);
+        int leader = app.StateGet(gk, 0);
+        if (leader == 0) {
+            app.StateSet(gk, wid);
+            app.StateSet(Chart.ConnectHoverKey(wid), 0 - 1);
+            return wid;
+        }
+        return leader;
+    }
+
+    /// 工具箱「魔法类型」落地：magic 1/2 把全部 Line/Bar 系列的
+    /// type 就地改为 Line/Bar（切柱状时关掉 areaStyle）；其余值
+    /// 空操作。
+    static void ApplyMagic(ChartOption o, int magic) {
+        if (magic != 1 && magic != 2) { return; }
+        ChartType t = ChartType.Line;
+        if (magic == 2) { t = ChartType.Bar; }
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            ChartSeries s = o.series[i];
+            if (s.type == ChartType.Line || s.type == ChartType.Bar) {
+                s.type = t;
+                if (t == ChartType.Bar) { s.areaStyle = false; }
+            }
+        }
+    }
+
+    /// 显式分发：每个 kind 都有一个明确的分支。没有未知
+    /// kind 回退为折线图；未知/空 kind 绘制明确空状态。
+    void DispatchRender(App app, int x, int y, int w, int h, int g) {
+        ChartOption option = this.option;
+        // 多 grid 布局（grid[] ≥ 2）全 kind 通用拆分：按 series.
+        // xAxisIndex 分组，每组在自己的 grid 矩形里重入分发链；
+        // 标题/图例只在全局面板坐标画一次。
+        if (option.grids.Count > 1 && !option.overlay) {
+            ChartView.DrawMultiGridPanels(app, x, y, w, h, option, g);
+            return;
+        }
+        ChartView.RenderOnce(app, x, y, w, h, option, g);
+    }
+
+    /// 分发链本体：DispatchRender 与多 grid 子面板共用（子 option
+    /// 的 kind 按组内系列重算，蜡烛+成交量、行/列布局混排各自
+    /// 落到正确的渲染器）。
+    static void RenderOnce(App app, int x, int y, int w, int h,
+                           ChartOption option, int g) {
+        string kind = ChartView.DispatchKind(option);
+        ChartSeries leadS = ChartView.LeadSeries(option);
+        // 底部图例占位每图清零（不经 DrawPanelI 的视图不背上一图的值）。
+        Chart.legendBottomReserve = 0;
+        if (kind == "pie") {
+            ChartView.DrawPie(app, x, y, w, h, option, option.pieLabels, g);
+        } else if (kind == "calendar") {
+            ChartView.DrawCalendar(app, x, y, w, h, option, g);
+        } else if (kind == "polarCoord") {
+            ChartView.DrawPolarCoord(app, x, y, w, h, option, g);
+        } else if (kind == "rose") {
+            // 玫瑰图 = pie 系列 + roseType（ECharts2 无独立渲染器）：
+            // 与 pie 同一条 DrawPie 路径（roseP 逐扇区半径、逐环
+            // center/radius 覆盖、sort/clockWise 全部内建）。
+            ChartView.DrawPie(app, x, y, w, h, option, option.pieLabels, g);
+        } else if (kind == "gauge") {
+            ChartView.DrawGauge(app, x, y, w, h, option, g);
+        } else if (kind == "heatmap") {
+            ChartView.DrawHeatmap(app, x, y, w, h, option, g);
+        } else if (kind == "wordCloud") {
+            ChartView.DrawWordCloud(app, x, y, w, h, option, g);
+        } else if (kind == "radar") {
+            ChartView.DrawPolar(app, x, y, w, h, option, g);
+        } else if (kind == "funnel") {
+            bool pyramid = false;
+            if (leadS != null && leadS.sort == "ascending") { pyramid = true; }
+            ChartView.DrawFunnel(app, x, y, w, h, option, g, pyramid);
+        } else if (kind == "treemap") {
+            ChartView.DrawTreemap(app, x, y, w, h, option, g);
+        } else if (kind == "tree") {
+            ChartView.DrawTree(app, x, y, w, h, option, g);
+        } else if (kind == "k") {
+            ChartView.DrawCandles(app, x, y, w, h, option, g);
+        } else if (kind == "chord") {
+            ChartView.DrawChord(app, x, y, w, h, option, g);
+        } else if (kind == "force") {
+            ChartView.DrawForce(app, x, y, w, h, option, g);
+        } else if (kind == "map") {
+            ChartView.DrawMap(app, x, y, w, h, option, g);
+        } else if (kind == "eventRiver") {
+            ChartView.DrawEventRiver(app, x, y, w, h, option, g);
+        } else if (kind == "sankey") {
+            ChartView.DrawSankey(app, x, y, w, h, option, g);
+        } else if (kind == "box") {
+            ChartView.DrawBox(app, x, y, w, h, option, g);
+        } else if (kind == "error") {
+            ChartView.DrawError(app, x, y, w, h, option, g);
+        } else if (kind == "waterfall") {
+            ChartView.DrawWaterfall(app, x, y, w, h, option, g);
+        } else if (kind == "sunburst") {
+            ChartView.DrawSunburst(app, x, y, w, h, option, g);
+        } else if (kind == "radialBars") {
+            ChartView.DrawRadialBars(app, x, y, w, h, option, g);
+        } else if (kind == "venn") {
+            ChartView.DrawVenn(app, x, y, w, h, option, g);
+        } else if (kind == "pictorialBar") {
+            ChartView.DrawPictorialBar(app, x, y, w, h, option, g);
+        } else if (kind == "parallel") {
+            ChartView.DrawParallel(app, x, y, w, h, option, g);
+        } else if (kind == "themeRiver") {
+            ChartView.DrawThemeRiver(app, x, y, w, h, option, g);
+        } else if (kind == "linesCustom") {
+            ChartView.DrawLinesCustom(app, x, y, w, h, option, g);
+        } else if (kind == "bar" || kind == "hbar"
+                   || kind == "barStacked" || kind == "barStackedHbar") {
+            bool stacked = kind == "barStacked" || kind == "barStackedHbar";
+            bool hbar = kind == "hbar" || kind == "barStackedHbar";
+            ChartView.DrawBars(app, x, y, w, h, option, g, stacked, hbar);
+        } else if (kind == "scatter") {
+            ChartView.DrawScatter(app, x, y, w, h, option, g);
+        } else if (kind == "bubbles") {
+            ChartView.DrawBubbles(app, x, y, w, h, option, g);
+        } else if (kind == "stackedArea") {
+            ChartView.DrawStackedArea(app, x, y, w, h, option, g);
+        } else if (kind == "lines") {
+            ChartView.DrawLines(app, x, y, w, h, option, g);
+        } else {
+            ChartView.DrawEmptyState(app, x, y, w, h, option);
+        }
+        // 同 option 混搭（ECharts2 每系列自带坐标系/几何）：面板按
+        // 主导系列画完后，pie / gauge / funnel 系列按自身 center/
+        // radius 叠加绘制（mix2 柱状饼、mix3 地图玫瑰饼、mix11
+        // 仪表盘+双漏斗、mix12 折线饼图）。
+        ChartView.DrawOverlaySeries(app, x, y, w, h, option, g, kind);
+    }
+
+    /// 混搭覆盖层：把与面板主导类型不同的 pie/gauge/funnel 系列
+    /// 逐条再画一遍。覆盖层 option 置 overlay=true（渲染器跳过
+    /// 面板底/头），交互键沿用 o.iwid（悬停/命中与整板一致）。
+    static void DrawOverlaySeries(App app, int x, int y, int w, int h,
+                                  ChartOption o, int g, string kind) {
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            ChartSeries s = o.series[i];
+            if (s.hidden) { continue; }
+            bool pieMain = kind == "pie" || kind == "rose";
+            if (s.type == ChartType.Pie && !pieMain && !s.piePerPoint) {
+                ChartOption tmp = ChartOption.Create();
+                tmp.overlay = true;
+                tmp.iwid = o.iwid;
+                tmp.showLegend = false;
+                tmp.showTooltip = o.showTooltip;
+                tmp.pieLabels = o.pieLabels;
+                tmp.series = new List<ChartSeries>();
+                tmp.series.Add(s);
+                ChartView.DrawPie(app, x, y, w, h, tmp, tmp.pieLabels, g);
+            } else if (s.type == ChartType.Gauge && kind != "gauge") {
+                ChartOption tmp = ChartOption.Create();
+                tmp.overlay = true;
+                tmp.iwid = o.iwid;
+                tmp.showLegend = false;
+                tmp.showTooltip = o.showTooltip;
+                tmp.series = new List<ChartSeries>();
+                tmp.series.Add(s);
+                ChartView.DrawGauge(app, x, y, w, h, tmp, g);
+            } else if (s.type == ChartType.Funnel && kind != "funnel"
+                       && s.center != null && s.radius != null) {
+                // ECharts funnel.x/width 折算为「中心 x + 全宽 radius」
+                //（mix11 预期/实际双漏斗并列在右半区）。
+                ChartOption tmp = ChartOption.Create();
+                tmp.overlay = true;
+                tmp.iwid = o.iwid;
+                tmp.showLegend = false;
+                tmp.showTooltip = o.showTooltip;
+                tmp.series = new List<ChartSeries>();
+                tmp.series.Add(s);
+                int fw = ChartView.GaugeScalar(app, s.radius, w);
+                if (fw < app.Scale(40)) { fw = app.Scale(40); }
+                int fcx = x + ChartView.GaugeScalar(app, s.center.x, w);
+                ChartView.DrawFunnel(app, fcx - fw / 2, y, fw, h, tmp, g,
+                    s.sort == "ascending");
+            }
+        }
+    }
+
+    // ---- 富文本排版与绘制（Chart.RichTokenize 的下游） ----
+
+    /// 量测排版：段表 → 整块盒（含外层 label.padding）。语义按官方
+    /// SSR 实测钉死（pie-nest：盒高 55 = 22+0+33）：
+    ///  - 行高 = 各段 max(声明 lineHeight, 声明 height + 纵 padding,
+    ///    字号行盒 + 纵 padding)；整行无任何声明才回退缺省行盒
+    ///    （hr 的 height:0 行高就是 0，不吃回退）。
+    ///  - 段盒在行内垂直居中（饼名/横线/数值三行的文本中线 = 行中线）。
+    ///  - width:'100%' → 全块宽，x 归行首（pie-rich-text 的 abg 底板
+    ///    同行共享：{title|..}{abg|} 底板盖整行、标题文字压在其上）。
+    ///  - 声明 width 的段：盒 = width + 横向 padding（padding 在外），
+    ///    align 在盒内排文字（表格列）。
+    ///  - 未声明 width 的 align 段：整行内容在块宽内对齐（左/中/右，
+    ///    取行内第一个这类段的 align；pie-nest a 居中：两标签块宽
+    ///    61/140，内容整体中线都是块中线）。
+    ///  - 绘制见 RichDraw：底色全部先画（abg 底板压在同行文字下）。
+    static RichBlock RichLayout(App app, List<RichSeg> segs,
+                                ChartTextStyle st, int defFs) {
+        RichBlock b = new RichBlock();
+        b.segs = segs;
+        b.st = st;
+        b.lines = 0;
+        int padT = 0;
+        int padR = 0;
+        int padB = 0;
+        int padL = 0;
+        if (st != null) {
+            if (st.padT >= 0) { padT = app.Scale(st.padT); }
+            if (st.padR >= 0) { padR = app.Scale(st.padR); }
+            if (st.padB >= 0) { padB = app.Scale(st.padB); }
+            if (st.padL >= 0) { padL = app.Scale(st.padL); }
+        }
+        for (int i = 0; i < segs.Count; i = i + 1) {
+            RichSeg sg = segs[i];
+            sg.fsPx = sg.st != null && sg.st.fontSize > 0
+                ? app.Scale(sg.st.fontSize) : defFs;
+            sg.tw = Canvas.MeasureText(sg.text, sg.fsPx);
+            int padL2 = sg.st != null && sg.st.padL >= 0 ? app.Scale(sg.st.padL) : 0;
+            int padR2 = sg.st != null && sg.st.padR >= 0 ? app.Scale(sg.st.padR) : 0;
+            if (sg.st != null && sg.st.width >= 0) {
+                // 官方 width 是内容宽，padding 加在外面（zrender token
+                // 盒 = width + 横向 padding；pie-rich-text 的 value 列
+                // width:20 + padding [0,20,0,30]）。
+                sg.w = app.Scale(sg.st.width) + padL2 + padR2;
+            } else if (sg.st != null && sg.st.width == 0 - 2) {
+                sg.w = 0 - 1;   // '100%'，第二趟展开
+            } else {
+                sg.w = sg.tw + padL2 + padR2;
+            }
+            if (sg.line + 1 > b.lines) { b.lines = sg.line + 1; }
+        }
+        // 第一趟：自然宽（百分比/撑满段计 0）定块宽。
+        int blockW = 0;
+        List<int> lineW = new List<int>();
+        for (int i = 0; i < b.lines; i = i + 1) { lineW.Add(0); }
+        for (int i = 0; i < segs.Count; i = i + 1) {
+            RichSeg sg = segs[i];
+            if (sg.w >= 0) { lineW[sg.line] = lineW[sg.line] + sg.w; }
+        }
+        for (int i = 0; i < b.lines; i = i + 1) {
+            if (lineW[i] > blockW) { blockW = lineW[i]; }
+        }
+        if (blockW <= 0) { blockW = 1; }
+        // 第二趟：'100%' 展开为全块宽。
+        for (int i = 0; i < segs.Count; i = i + 1) {
+            RichSeg sg = segs[i];
+            if (sg.w == 0 - 1) { sg.w = blockW; }
+        }
+        // 行高累计 + 段位：x 逐段累计（百分比段 x 归零），段盒在行内
+        // 垂直居中。
+        int yCur = 0;
+        int segI = 0;
+        while (segI < segs.Count) {
+            int ln = segs[segI].line;
+            int lhLine = 0;
+            bool declared = false;
+            int j = segI;
+            while (j < segs.Count && segs[j].line == ln) {
+                RichSeg sg = segs[j];
+                int hDecl = sg.st != null && sg.st.height >= 0
+                    ? sg.st.height : 0 - 1;
+                // 段未声明自身 lineHeight 时回落 label 级 lineHeight
+                // （gauge-speed detail.lineHeight 40：两段都没声明，
+                // 行高 40 来自 detail 级）。
+                int lhDecl = sg.st != null && sg.st.lineHeight >= 0
+                    ? sg.st.lineHeight
+                    : (st.lineHeight >= 0 ? st.lineHeight : 0 - 1);
+                if (hDecl >= 0 || lhDecl >= 0) { declared = true; }
+                int padT2 = sg.st != null && sg.st.padT >= 0 ? app.Scale(sg.st.padT) : 0;
+                int padB2 = sg.st != null && sg.st.padB >= 0 ? app.Scale(sg.st.padB) : 0;
+                int hh = Chart.RichSegH(hDecl, Canvas.FontHeight(sg.fsPx),
+                    padT2, padB2);
+                if (lhDecl >= 0) {
+                    int lhD = app.Scale(lhDecl);
+                    if (lhD > lhLine) { lhLine = lhD; }
+                }
+                if (hh > lhLine) { lhLine = hh; }
+                sg.h = hh;
+                j = j + 1;
+            }
+            if (lhLine <= 0 && !declared) { lhLine = Canvas.FontHeight(defFs); }
+            // 行内容整体在块内对齐：行内第一个"声明了 align 且未声明
+            // width"的段决定对齐（SSR 实测 pie-nest：'a' 居中时两标签
+            // 块宽 61/140，内容整体中线都落块中线；pie-rich-text 表头
+            // 的 valueHead 有 width，align 只在盒内生效不触发行对齐）。
+            int contentW = 0;
+            int lineAlign = 0 - 1;
+            for (int k = segI; k < j; k = k + 1) {
+                RichSeg sg = segs[k];
+                // '100%' 底板是覆盖层不算行内容（title|abg 同行时
+                // contentW 只算文字，标题才能在底板上居中）。
+                if (!(sg.w == blockW && sg.st != null
+                      && sg.st.width == 0 - 2)) {
+                    contentW = contentW + sg.w;
+                }
+                if (lineAlign < 0 && sg.st != null && sg.st.align >= 0
+                    && sg.st.width < 0) {
+                    lineAlign = sg.st.align;
+                }
+            }
+            int xShift = 0;
+            if (lineAlign == 1) { xShift = (blockW - contentW) / 2; }
+            else if (lineAlign == 2) { xShift = blockW - contentW; }
+            if (xShift < 0) { xShift = 0; }
+            int xCur = 0;
+            for (int k = segI; k < j; k = k + 1) {
+                RichSeg sg = segs[k];
+                sg.x = xCur + xShift;
+                sg.y = yCur + (lhLine - sg.h) / 2;
+                sg.lh = lhLine;
+                if (sg.w == blockW && sg.st != null && sg.st.width == 0 - 2) {
+                    sg.x = 0;   // '100%' 底板恒从行首铺到块尾（不随行对齐）
+                } else {
+                    xCur = xCur + sg.w;
+                }
+            }
+            yCur = yCur + lhLine;
+            segI = j;
+        }
+        b.w = blockW + padL + padR;
+        b.h = yCur + padT + padB;
+        // 外层 padding 位移进段坐标（绘制端直接加块原点）。
+        for (int i = 0; i < segs.Count; i = i + 1) {
+            segs[i].x = segs[i].x + padL;
+            segs[i].y = segs[i].y + padT;
+        }
+        return b;
+    }
+
+    /// A14：带 textBorder/textShadow 的纯文本绘制（ECharts
+    /// labelStyle.ts:550——zrender 对 textBorderColor/Width 走 stroke
+    /// 字形、SVG 输出里是 `paint-order:stroke`，即**描边在填充之下**；
+    /// textShadow 是 filter: drop-shadow）。
+    ///
+    /// Canvas 无模糊/无字形描边原语，移植口径：
+    ///  - textBorder → 描边色按 width 圈 4 向（width>=2 加对角 4 向）
+    ///    各画一遍字形，再画填充字（描边永远垫底）。
+    ///  - textShadow → 无模糊退化为偏移影子；纯 blur（无偏移）近似
+    ///    为四向 1px 晕圈。垫在描边与填充之下。
+    /// 无样式文本直接 DrawText（零开销快路）。
+    static void DrawTextStyled(Canvas c, int x, int y, string text,
+                               int color, int fs,
+                               int tbColor, int tbWidth,
+                               int tsColor, int tsBlur, int tsDx, int tsDy) {
+        if (text.Length == 0) { return; }
+        if (tsColor != 0) {
+            int dx = tsDx;
+            int dy = tsDy;
+            if (tsBlur > 0 && dx == 0 && dy == 0) {
+                c.DrawText(x - 1, y, text, tsColor, fs);
+                c.DrawText(x + 1, y, text, tsColor, fs);
+                c.DrawText(x, y - 1, text, tsColor, fs);
+                c.DrawText(x, y + 1, text, tsColor, fs);
+            } else {
+                c.DrawText(x + dx, y + dy, text, tsColor, fs);
+            }
+        }
+        if (tbColor != 0 && tbWidth > 0) {
+            int r = tbWidth;
+            if (r >= 2) {
+                c.DrawText(x - r, y - r, text, tbColor, fs);
+                c.DrawText(x + r, y - r, text, tbColor, fs);
+                c.DrawText(x - r, y + r, text, tbColor, fs);
+                c.DrawText(x + r, y + r, text, tbColor, fs);
+            }
+            c.DrawText(x - r, y, text, tbColor, fs);
+            c.DrawText(x + r, y, text, tbColor, fs);
+            c.DrawText(x, y - r, text, tbColor, fs);
+            c.DrawText(x, y + r, text, tbColor, fs);
+        }
+        c.DrawText(x, y, text, color, fs);
+    }
+
+    /// DrawTextStyled 的 ChartTextStyle 版（label 级声明）。
+    static void DrawTextStyled(Canvas c, int x, int y, string text,
+                               int color, int fs, ChartTextStyle st) {
+        if (st == null || (st.tbColor == 0 && st.tsColor == 0)) {
+            c.DrawText(x, y, text, color, fs);
+            return;
+        }
+        ChartView.DrawTextStyled(c, x, y, text, color, fs,
+            st.tbColor, st.tbWidth, st.tsColor, st.tsBlur, st.tsDx, st.tsDy);
+    }
+
+    /// 绘制富文本块：整块底板（boxBg/border/圆角）→ 全部段底色片
+    /// 与线块 → 全部文字（两趟：abg 这类同行底板必须压在同行文字
+    /// 之下——zrender 段底色先于本段文字，但跨段的 title|abg 需要底
+    /// 在所有文字下）。文字垂直居中在段盒内。
+    static void RichDraw(App app, Canvas c, int ox, int oy, RichBlock b,
+                         int defCol) {
+        ChartTextStyle st = b.st;
+        if (st != null && st.boxBg != 0 && b.w > 0 && b.h > 0) {
+            int rad = st.boxRadius > 0 ? app.Scale(st.boxRadius) : 0;
+            c.FillRoundRect(ox, oy, b.w, b.h, rad, st.boxBg);
+        }
+        if (st != null && st.boxBorder != 0 && st.boxBorderW > 0
+            && b.w > 0 && b.h > 0) {
+            int rad = st.boxRadius > 0 ? app.Scale(st.boxRadius) : 0;
+            c.DrawRoundRect(ox, oy, b.w, b.h, rad, st.boxBorder,
+                st.boxBorderW);
+        }
+        for (int i = 0; i < b.segs.Count; i = i + 1) {
+            RichSeg sg = b.segs[i];
+            ChartRichStyle rs = sg.st;
+            int sx = ox + sg.x;
+            int sy = oy + sg.y;
+            if (rs == null) { continue; }
+            if (rs.backgroundColor != 0 && sg.w > 0 && sg.h > 0) {
+                int mask = (rs.radTL > 0 ? Corner.TL() : 0)
+                    | (rs.radTR > 0 ? Corner.TR() : 0)
+                    | (rs.radBR > 0 ? Corner.BR() : 0)
+                    | (rs.radBL > 0 ? Corner.BL() : 0);
+                int rad = rs.radTL > 0 ? app.Scale(rs.radTL)
+                    : (rs.radTR > 0 ? app.Scale(rs.radTR)
+                       : (rs.radBR > 0 ? app.Scale(rs.radBR)
+                          : (rs.radBL > 0 ? app.Scale(rs.radBL) : 0)));
+                if (mask == Corner.All()) {
+                    c.FillRoundRect(sx, sy, sg.w, sg.h, rad, rs.backgroundColor);
+                } else {
+                    c.FillRoundRectIn(sx, sy, sg.w, sg.h, rad, mask,
+                        rs.backgroundColor);
+                }
+                if (rs.borderColor != 0 && rs.borderWidth > 0) {
+                    c.DrawRoundRect(sx, sy, sg.w, sg.h, rad, rs.borderColor,
+                        rs.borderWidth);
+                }
+            } else if (rs.borderColor != 0 && rs.borderWidth > 0
+                       && sg.text.Length == 0 && sg.w > 0) {
+                // hr 线块：height 0、只有边框——画一条 borderWidth 粗
+                // 的横线（zrender 0 高盒的边框）。
+                int bw = rs.borderWidth > 0 ? rs.borderWidth : 1;
+                c.FillRect(sx, sy + (sg.h - bw) / 2, sg.w, bw, rs.borderColor);
+            }
+        }
+        for (int i = 0; i < b.segs.Count; i = i + 1) {
+            RichSeg sg = b.segs[i];
+            ChartRichStyle rs = sg.st;
+            if (sg.text.Length == 0) { continue; }
+            int padL2 = rs != null && rs.padL >= 0 ? app.Scale(rs.padL) : 0;
+            int padR2 = rs != null && rs.padR >= 0 ? app.Scale(rs.padR) : 0;
+            int col = rs != null && rs.color != 0 ? rs.color : defCol;
+            int fh = Canvas.FontHeight(sg.fsPx);
+            int tx = ox + sg.x + padL2;
+            if (rs != null && rs.align == 1) {
+                tx = ox + sg.x + (sg.w - sg.tw) / 2;
+            } else if (rs != null && rs.align == 2) {
+                tx = ox + sg.x + sg.w - padR2 - sg.tw;
+            }
+            int ty = oy + sg.y + (sg.h - fh) / 2;
+            // A14：段级 textShadow 先垫（zrender 影子在最下）、
+            // textBorder 描边次之、填充字最后（paint-order:stroke）。
+            if (rs != null && rs.tsColor != 0) {
+                int sdx = rs.tsDx;
+                int sdy = rs.tsDy;
+                if (rs.tsBlur > 0 && sdx == 0 && sdy == 0) {
+                    c.DrawText(tx - 1, ty, sg.text, rs.tsColor, sg.fsPx);
+                    c.DrawText(tx + 1, ty, sg.text, rs.tsColor, sg.fsPx);
+                    c.DrawText(tx, ty - 1, sg.text, rs.tsColor, sg.fsPx);
+                    c.DrawText(tx, ty + 1, sg.text, rs.tsColor, sg.fsPx);
+                } else {
+                    c.DrawText(tx + sdx, ty + sdy, sg.text, rs.tsColor, sg.fsPx);
+                }
+            }
+            bool bold = rs != null && (rs.fontWeight == "bold"
+                || rs.fontWeight == "bolder" || rs.fontWeight == "600"
+                || rs.fontWeight == "700" || rs.fontWeight == "800");
+            if (rs != null && rs.tbColor != 0 && rs.tbWidth > 0) {
+                int r = rs.tbWidth;
+                if (r >= 2) {
+                    c.DrawText(tx - r, ty - r, sg.text, rs.tbColor, sg.fsPx);
+                    c.DrawText(tx + r, ty - r, sg.text, rs.tbColor, sg.fsPx);
+                    c.DrawText(tx - r, ty + r, sg.text, rs.tbColor, sg.fsPx);
+                    c.DrawText(tx + r, ty + r, sg.text, rs.tbColor, sg.fsPx);
+                }
+                c.DrawText(tx - r, ty, sg.text, rs.tbColor, sg.fsPx);
+                c.DrawText(tx + r, ty, sg.text, rs.tbColor, sg.fsPx);
+                c.DrawText(tx, ty - r, sg.text, rs.tbColor, sg.fsPx);
+                c.DrawText(tx, ty + r, sg.text, rs.tbColor, sg.fsPx);
+            }
+            if (bold) {
+                c.DrawTextBold(tx, ty, sg.text, col, sg.fsPx);
+            } else {
+                c.DrawText(tx, ty, sg.text, col, sg.fsPx);
+            }
+        }
+    }
+}

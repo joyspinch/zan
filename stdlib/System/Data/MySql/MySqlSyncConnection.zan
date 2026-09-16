@@ -1,0 +1,913 @@
+using System;
+using System.Data;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+
+namespace System.Data.MySql;
+
+/// <summary>
+/// 同步的原生 MySQL / MariaDB 客户端，直接实现 MySQL wire
+/// 协议（阻塞套接字），无需 ODBC 驱动、libmariadb 或原生
+/// 数据库 DLL。<see cref="DbConnection.OpenMySQL"/> 默认使用此驱动，
+/// 因此 ORM（Model / QueryBuilder / Migration）在只装有
+/// MySQL server（而无 ODBC 驱动）的机器上即可开箱即用，
+/// 无需任何额外原生驱动。
+///
+/// 认证实现了 <c>caching_sha2_password</c> 快速认证（MySQL
+/// 8.x 的默认方式），并提供完整认证（使用服务器公钥的 RSA-OAEP）以应对
+/// 凭据缓存冷启动的情况，以及 <c>mysql_native_password</c> 认证切换——全部
+/// 用纯 Zan 实现（System.Security.Cryptography 中的 Sha256/Sha1/Rsa）。
+///
+/// 参数化语句使用 COM_STMT_PREPARE / COM_STMT_EXECUTE，值
+/// 通过二进制协议带外传输，因此通过值进行注入
+/// 是不可能的。
+///
+/// 用法（推荐使用标准工厂）：
+///   IDbConnection db = DbConnection.OpenMySQL("127.0.0.1", 3306,
+///       "app", "root", "secret");
+///   db.Execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(64))");
+///   DbResult r = db.Query("SELECT * FROM t");
+///   db.Close();
+/// </summary>
+class MySqlSyncConnection : IDbConnection {
+    nint sock;
+    bool connected;
+    string lastError;
+    int lastNumber;             // 服务器返回的错误码，无错误时为 0
+    int lastLen;                // 最近读取的数据包的有效载荷长度
+    int lastSeq;                // 最近读取的数据包的序号
+    int lastAffected;           // 上一条语句影响的行数
+    bool hadError;              // 上一条语句是否返回了 ERR 数据包
+    List<PreparedStmt> stmtCache;  // 预编译语句缓存（SQL -> 服务器 id）
+
+    /// 空连接；外部经 <see cref="OpenParams"/> 构造。
+    MySqlSyncConnection() {
+        this.sock = -1;
+        this.connected = false;
+        this.lastError = "";
+        this.lastLen = 0;
+        this.lastSeq = 0;
+        this.lastAffected = 0;
+        this.hadError = false;
+        this.stmtCache = new List<PreparedStmt>();
+    }
+
+    // ============================================================
+    // 字节 / 数据包辅助函数（同步）
+    // ============================================================
+
+    /// <summary>将 <paramref name="need"/> 字节读入
+    /// <paramref name="dst"/> 的 <paramref name="off"/> 偏移处。返回实际
+    /// 读到的字节数（对端关闭时 &lt; need）。</summary>
+    int recvExact(byte[] dst, int off, int need) {
+        int got = 0;
+        while (got < need) {
+            byte[] tmp = new byte[need - got + 1];
+            int n = Socket.Recv(this.sock, tmp, need - got);
+            if (n <= 0) { return got; }
+            for (int j = 0; j < n; j = j + 1) { dst[off + got + j] = tmp[j]; }
+            got = got + n;
+        }
+        return got;
+    }
+
+    /// <summary>读取一个协议数据包，返回其有效载荷，
+    /// 长度记录在 <c>lastLen</c>；连接关闭时返回 null。</summary>
+    byte[] readPacket() {
+        byte[] hdr = new byte[5];
+        int got = this.recvExact(hdr, 0, 4);
+        if (got < 4) { this.lastLen = -1; return null; }
+        int len = (hdr[0]&255) | ((hdr[1]&255)<<8) | ((hdr[2]&255)<<16);
+        this.lastSeq = hdr[3] & 255;
+        this.lastLen = len;
+        byte[] pay = new byte[len + 1];
+        if (len > 0) {
+            int g2 = this.recvExact(pay, 0, len);
+            if (g2 < len) { this.lastLen = -1; return null; }
+        }
+        return pay;
+    }
+
+    /// <summary>写入一个协议数据包（4 字节包头 + 有效载荷）。</summary>
+    int writePacket(string payload, int len, int seq) {
+        byte[] buf = new byte[len + 5];
+        buf[0]=(byte)(len&255); buf[1]=(byte)((len>>8)&255); buf[2]=(byte)((len>>16)&255); buf[3]=(byte)(seq&255);
+        for (int i = 0; i < len; i = i + 1) { buf[i+4] = (byte)(payload[i] & 255); }
+        return Socket.Send(this.sock, buf, len + 4);
+    }
+
+    /// <summary>将缓冲区中的 <paramref name="len"/> 字节复制到新的
+    /// Zan 字符串。</summary>
+
+    /// <summary>在游标 <c>cur[0]</c> 处解码长度编码整数，
+    /// 并推进游标；NULL 标记（0xFB）返回 -1。</summary>
+
+    /// <summary>在游标 <c>cur[0]</c> 处解码长度编码字符串。
+    /// NULL（0xFB）返回空字符串。
+
+    /// 是否为 EOF 包（0xFE 首字节且负载短于 9 字节，以区分行首恰为 0xFE 的长负载）。
+    bool isEof(byte[] pkt) {
+        return (pkt[0] & 255) == 254 && this.lastLen < 9;
+    }
+
+    // ============================================================
+    // 认证（与异步客户端共享的纯逻辑）
+    // ============================================================
+
+    /// <summary>caching_sha2_password 快速认证混淆：
+    /// SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) . nonce )，32 字节。</summary>
+    static byte[] scramble41(string pw, string nonce20) {
+        byte[] a = Sha256.Hash(pw, pw.Length);
+        byte[] b = Sha256.Hash(a, 32);
+        byte[] cat = new byte[53];
+        int i = 0;
+        for (; i < 32; i = i + 1) { cat[i] = b[i]; }
+        i = 0;
+        while (i < 20) { cat[32 + i] = (byte)(nonce20[i] & 255); i = i + 1; }
+        byte[] c = Sha256.Hash(cat, 52);
+        byte[] tok = new byte[33];
+        i = 0;
+        while (i < 32) { tok[i] = (byte)((a[i] ^ c[i]) & 255); i = i + 1; }
+        return tok;
+    }
+
+    /// <summary>mysql_native_password 混淆：
+    /// SHA1(pw) XOR SHA1( nonce . SHA1(SHA1(pw)) )，20 字节。</summary>
+    static byte[] scrambleNative(string pw, string nonce20) {
+        byte[] a = Sha1.Hash(pw, pw.Length);
+        byte[] b = Sha1.Hash(a, 20);
+        byte[] cat = new byte[41];
+        int i = 0;
+        for (; i < 20; i = i + 1) { cat[i] = (byte)(nonce20[i] & 255); }
+        i = 0;
+        while (i < 20) { cat[20 + i] = b[i]; i = i + 1; }
+        byte[] c = Sha1.Hash(cat, 40);
+        byte[] tok = new byte[21];
+        i = 0;
+        while (i < 20) { tok[i] = (byte)((a[i] ^ c[i]) & 255); i = i + 1; }
+        return tok;
+    }
+
+    /// 按服务器要求的认证插件生成令牌：空密码返回空令牌；
+    /// caching_sha2_password 走 scramble41，mysql_native_password 走
+    /// scrambleNative；其他插件返回 null（outLen 置 -1）。
+    static byte[] authToken(string plugin, string pw, string nonce20, List<int> outLen) {
+        if (pw.Length == 0) {
+            outLen[0] = 0;
+            return new byte[1];
+        }
+        if (plugin == "caching_sha2_password") {
+            outLen[0] = 32;
+            return scramble41(pw, nonce20);
+        }
+        if (plugin == "mysql_native_password") {
+            outLen[0] = 20;
+            return scrambleNative(pw, nonce20);
+        }
+        outLen[0] = -1;
+        return null;
+    }
+
+    /// 取 n 字节加密随机数（RSA 全量认证的 OAEP seed）。
+    static byte[] genSeed(int n) {
+        return RandomNumberGenerator.GetBytes(n);
+    }
+
+
+    /// 剥掉 PEM 头尾与换行后 base64 解码，返回服务器公钥的 DER 编码。
+    static byte[] pemToDer(string pem, int pemLen, List<int> outLen) {
+        int begin = MySqlWire.findSub(pem, pemLen, "-----BEGIN", 10, 0);
+        if (begin < 0) { return null; }
+        int hb = begin;
+        while (hb < pemLen && (pem[hb] & 255) != 10) { hb = hb + 1; }
+        hb = hb + 1;
+        int end = MySqlWire.findSub(pem, pemLen, "-----END", 8, hb);
+        if (end < 0) { end = pemLen; }
+        int blen = end - hb;
+        // PEM 正文按 64 列折行（RFC 7468 软换行）。严格 base64
+        // 解码前只剥离换行，正文中的其他字符仍保持严格校验。
+        byte[] b64 = new byte[blen + 1];
+        int o = 0;
+        for (int i = 0; i < blen; i = i + 1) {
+            int c = pem[hb + i] & 255;
+            if (c != 10 && c != 13) { b64[o] = (byte)c; o = o + 1; }
+        }
+        List<int> dl = new List<int>(); dl.Add(0);
+        byte[] der = Base64.Decode(b64.ToStr(0, o), dl);
+        outLen[0] = dl[0];
+        return der;
+    }
+
+
+    /// 解析 DER 公钥中的模数 n 与指数 e，用 RSA-OAEP 加密
+    /// （XOR nonce 混淆后的密码 + NUL），模数长度写入 kOut。
+    static byte[] fullAuthCipher(string der, int derLen, string obf, int obfLen, string seed, List<int> kOut) {
+        List<int> c = new List<int>(); c.Add(0);
+        c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);
+        c[0] = c[0] + 1; int algLen = MySqlWire.readDerLen(der, c); c[0] = c[0] + algLen;
+        c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);
+        c[0] = c[0] + 1;
+        c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);
+        c[0] = c[0] + 1; int nLen = MySqlWire.readDerLen(der, c);
+        int origStart = c[0]; int origLen = nLen;
+        int nStart = origStart; int useLen = origLen;
+        if ((der[nStart] & 255) == 0) { nStart = nStart + 1; useLen = useLen - 1; }
+        c[0] = origStart + origLen;
+        c[0] = c[0] + 1; int eLen = MySqlWire.readDerLen(der, c);
+        int eStart = c[0];
+        byte[] nBuf = new byte[useLen + 1];
+        int i = 0; for (; i < useLen; i = i + 1) { nBuf[i] = (byte)(der[nStart + i] & 255); }
+        byte[] eBuf = new byte[eLen + 1];
+        i = 0; while (i < eLen) { eBuf[i] = (byte)(der[eStart + i] & 255); i = i + 1; }
+        byte[] cph = Rsa.EncryptOaep(obf, obfLen, nBuf, useLen, eBuf, eLen, 1, seed);
+        kOut[0] = useLen;
+        return cph;
+    }
+
+    // ============================================================
+    // 连接（同步握手 + 认证）
+    // ============================================================
+
+    /// <summary>使用 wire 协议在阻塞套接字上打开原生 MySQL/MariaDB 连接。
+    /// 成功时连接已通过握手认证；失败时返回的对象 connected=false，
+    /// <see cref="GetError"/> 携带失败原因。常规入口是
+    /// <see cref="DbConnection.OpenMySQL"/> 工厂，本方法用于显式构造。</summary>
+    static MySqlSyncConnection OpenParams(string host, int port,
+            string database, string user, string password) {
+        Socket.Initialize();
+        MySqlSyncConnection conn = new MySqlSyncConnection();
+        bool ok = conn.doConnect(host, port, database, user, password);
+        conn.connected = ok;
+        if (!ok) {
+            conn.Close();
+        }
+        return conn;
+    }
+
+    /// 完整握手与认证：解析握手包（含 auth-switch / RSA 全量认证）、
+    /// 发送握手响应并等待结果。返回认证是否成功；失败原因写入 lastError。
+    bool doConnect(string host, int port, string db, string user, string pw) {
+        this.sock = Socket.CreateTcp();
+        if (this.sock < 0) { this.lastError = "socket create failed"; return false; }
+        int cr = Socket.Connect(this.sock, host, port);
+        if (cr != 0) { this.lastError = "connect failed: " + Convert.ToString(cr); return false; }
+
+        // --- 读取并解析握手包（数据包序号 0） ---
+        byte[] hs = this.readPacket();
+        if (hs == null) { this.lastError = "no handshake from server"; return false; }
+        int proto = hs[0] & 255;
+        if (proto == 255) {
+            int code = (hs[1]&255)|((hs[2]&255)<<8);
+            this.lastError = "handshake err " + Convert.ToString(code) + ": "
+                + MySqlWire.bytesToStr(hs, 3, this.lastLen - 3);
+            return false;
+        }
+        int p = 1;
+        while ((hs[p] & 255) != 0) { p = p + 1; }   // 服务器版本（NUL 结尾）
+        p = p + 1;
+        p = p + 4;                                    // 线程 id
+        byte[] nonce = new byte[21];
+        int i = 0;
+        for (; i < 8; i = i + 1) { nonce[i] = (byte)(hs[p+i] & 255); }
+        p = p + 8;
+        p = p + 1;                                    // 填充
+        int capLow = (hs[p]&255)|((hs[p+1]&255)<<8);
+        p = p + 2;                                    // 能力标志（低位）
+        p = p + 1;                                    // 字符集
+        // 状态标志（2 字节）必须跳过——此前漏读它导致 capHigh 读到的是
+        // 状态字、authLen 落进保留零区（=0），nonce 第二段从未拷入，
+        // scramble 只覆盖 8 个真实字节：任何非空密码的认证必然失败。
+        p = p + 2;                                    // 状态标志
+        int capHigh = (hs[p]&255)|((hs[p+1]&255)<<8);
+        int caps = capLow | (capHigh << 16);
+        int capPluginAuth = (caps & 524288) != 0 ? 1 : 0;
+        p = p + 2;                                    // 能力标志（高位）
+        int authLen = hs[p] & 255;
+        p = p + 1;                                    // 认证插件数据长度
+        p = p + 10;                                   // 保留字段
+        // 规范：part2 长度 = max(13, authlen - 8)；缓冲只有 12+8=20，
+        // 实际最多拷 12 字节（与异步版一致）。
+        int part2 = authLen - 8;
+        if (part2 < 13) { part2 = 13; }
+        int copy2 = part2;
+        if (copy2 > 12) { copy2 = 12; }
+        i = 0;
+        while (i < copy2) { nonce[8 + i] = (byte)(hs[p+i] & 255); i = i + 1; }
+        p = p + part2;
+        string plugin = "mysql_native_password";
+        if (capPluginAuth != 0) {
+            int pluginEnd = p;
+            while (pluginEnd < this.lastLen && (hs[pluginEnd] & 255) != 0) {
+                pluginEnd = pluginEnd + 1;
+            }
+            if (pluginEnd > p) { plugin = MySqlWire.bytesToStr(hs, p, pluginEnd - p); }
+        }
+        // --- 构造并发送握手响应（序号 1） ---
+        // CLIENT_FOUND_ROWS (2) 使 UPDATE/DELETE 报告匹配的行数（类似 SQLite），
+        // 而不只是实际发生变更的行——
+        // 所以 `points=points-0` 仍算命中，ORM 的
+        // 受影响行数检查在各引擎间保持一致。
+        int caps2 = 1 | 2 | 4 | 512 | 8192 | 32768 | 524288;
+        bool hasDb = db.Length > 0;
+        if (hasDb) { caps2 = caps2 | 8; }
+        List<int> tokenLenOut = new List<int>(); tokenLenOut.Add(0);
+        byte[] token = authToken(plugin, pw, nonce, tokenLenOut);
+        int tokenLen = tokenLenOut[0];
+        if (token == null || tokenLen < 0) {
+            this.lastError = "unsupported auth plugin: " + plugin;
+            return false;
+        }
+        int userLen = user.Length;
+        int respLen = 4 + 4 + 1 + 23 + userLen + 1 + 1 + tokenLen;
+        if (hasDb) { respLen = respLen + db.Length + 1; }
+        respLen = respLen + plugin.Length + 1;
+        byte[] resp = new byte[respLen + 1];
+        int q = 0;
+        resp[q] = (byte)(caps2&255); resp[q+1] = (byte)((caps2>>8)&255); resp[q+2] = (byte)((caps2>>16)&255); resp[q+3] = (byte)((caps2>>24)&255); q=q+4;
+        resp[q] = (byte)(0); resp[q+1] = (byte)(0); resp[q+2] = (byte)(0); resp[q+3] = (byte)(1); q=q+4;
+        resp[q] = (byte)(45); q=q+1;
+        q = q + 23;
+        i = 0; while (i < userLen) { resp[q+i] = (byte)(user[i] & 255); i = i + 1; } q = q + userLen;
+        resp[q] = (byte)(0); q=q+1;
+        resp[q] = (byte)(tokenLen); q=q+1;
+        i = 0; while (i < tokenLen) { resp[q+i] = (byte)(token[i] & 255); i = i + 1; } q = q + tokenLen;
+        if (hasDb) {
+            i = 0; while (i < db.Length) { resp[q+i] = (byte)(db[i] & 255); i = i + 1; } q = q + db.Length;
+            resp[q] = (byte)(0); q=q+1;
+        }
+        i = 0; while (i < plugin.Length) { resp[q+i] = (byte)(plugin[i] & 255); i = i + 1; } q = q + plugin.Length;
+        resp[q] = (byte)(0); q=q+1;
+        this.writePacket(resp, respLen, 1);
+        // --- 认证结果 ---
+        while (true) {
+            byte[] r = this.readPacket();
+            if (r == null) { this.lastError = "connection closed during auth"; return false; }
+            int b0 = r[0] & 255;
+            if (b0 == 0) { return true; }
+            if (b0 == 255) {
+                int code = (r[1]&255)|((r[2]&255)<<8);
+                this.lastError = "auth err " + Convert.ToString(code) + ": "
+                    + MySqlWire.bytesToStr(r, 9, this.lastLen - 9);
+                return false;
+            }
+            if (b0 == 1) {
+                int more = r[1] & 255;
+                if (more == 3) { continue; }
+                if (more == 4) {
+                    byte[] req = new byte[2]; req[0] = 2;
+                    this.writePacket(req, 1, this.lastSeq + 1);
+                    byte[] pk = this.readPacket();
+                    if (pk == null) { this.lastError = "no RSA public key from server"; return false; }
+                    int pemLen = this.lastLen - 1;
+                    byte[] pem = new byte[pemLen + 1];
+                    i = 0; while (i < pemLen) { pem[i] = (byte)(pk[1 + i] & 255); i = i + 1; }
+                    List<int> derLen = new List<int>(); derLen.Add(0);
+                    byte[] der = pemToDer(pem, pemLen, derLen);
+                    if (der == null) { this.lastError = "bad RSA public key PEM"; return false; }
+                    int pwLen = pw.Length;
+                    int obfLen = pwLen + 1;
+                    byte[] obf = new byte[obfLen + 1];
+                    i = 0; while (i < obfLen) { obf[i] = (byte)((pw[i] & 255) ^ (nonce[i % 20] & 255)); i = i + 1; }
+                    byte[] seed = genSeed(20);
+                    if (seed == null) {
+                        this.lastError = "secure RNG unavailable for full-auth";
+                        return false;
+                    }
+                    List<int> kOut = new List<int>(); kOut.Add(0);
+                    byte[] cipher = fullAuthCipher(der, derLen[0], obf, obfLen, seed, kOut);
+                    this.writePacket(cipher, kOut[0], this.lastSeq + 1);
+                    continue;
+                }
+                this.lastError = "unexpected auth-more-data " + Convert.ToString(more);
+                return false;
+            }
+            if (b0 == 254) {
+                int pluginEnd = 1;
+                while (pluginEnd < this.lastLen && (r[pluginEnd] & 255) != 0) {
+                    pluginEnd = pluginEnd + 1;
+                }
+                string switchPlugin = MySqlWire.bytesToStr(r, 1, pluginEnd - 1);
+                int nonceStart = pluginEnd + 1;
+                int switchNonceLen = this.lastLen - nonceStart;
+                if (switchNonceLen > 20) { switchNonceLen = 20; }
+                byte[] switchNonce = new byte[21];
+                i = 0;
+                while (i < switchNonceLen) {
+                    switchNonce[i] = (byte)(r[nonceStart + i] & 255);
+                    i = i + 1;
+                }
+                List<int> switchLenOut = new List<int>(); switchLenOut.Add(0);
+                byte[] switchToken = authToken(switchPlugin, pw, switchNonce, switchLenOut);
+                int switchLen = switchLenOut[0];
+                if (switchToken == null || switchLen < 0) {
+                    this.lastError = "unsupported auth-switch plugin: " + switchPlugin;
+                    return false;
+                }
+                nonce = switchNonce;
+                this.writePacket(switchToken, switchLen, this.lastSeq + 1);
+                continue;
+            }
+            this.lastError = "unexpected auth packet " + Convert.ToString(b0);
+            return false;
+        }
+        return false;
+    }
+
+    // ============================================================
+    // 文本查询（COM_QUERY）
+    // ============================================================
+
+    /// 发送 COM_QUERY 文本查询。
+    int comQuery(string sql) {
+        int len = sql.Length + 1;
+        byte[] pay = new byte[len + 1];
+        pay[0] = (byte)(3);
+        for (int i = 0; i < sql.Length; i = i + 1) { pay[i+1] = (byte)(sql[i] & 255); }
+        return this.writePacket(pay, len, 0);
+    }
+
+    /// 执行 COM_QUERY 并收集文本结果集；语句出错或连接断开时
+    /// hadError=true 且结果为空。SELECT 的行数记入 lastAffected。
+    DbResult querySync(string sql) {
+        DbResult result = new DbResult();
+        this.hadError = false;
+        this.lastAffected = 0;
+        this.lastError = "";
+        if (!this.connected) {
+            this.hadError = true;
+            this.lastError = "not connected";
+            return result;
+        }
+        this.comQuery(sql);
+        byte[] first = this.readPacket();
+        if (first == null) {
+            this.hadError = true;
+            this.lastError = "connection closed";
+            this.connected = false;
+            return result;
+        }
+        int b0 = first[0] & 255;
+        if (b0 == 255) {
+            int code = (first[1]&255)|((first[2]&255)<<8);
+            this.lastError = "err " + Convert.ToString(code) + ": "
+                + MySqlWire.bytesToStr(first, 9, this.lastLen - 9);
+            this.hadError = true;
+            this.lastNumber = code;
+            return result;
+        }
+        if (b0 == 0 || b0 == 254) {
+            List<int> cur = new List<int>(); cur.Add(1);
+            this.lastAffected = (int)MySqlWire.readLenenc(first, cur);
+            return result;
+        }
+        List<int> cc = new List<int>(); cc.Add(0);
+        int ncols = (int)MySqlWire.readLenenc(first, cc);
+        result.SetColumnCount(ncols);
+        int c = 0;
+        for (; c < ncols; c = c + 1) {
+            byte[] cd = this.readPacket();
+            List<int> cur = new List<int>(); cur.Add(0);
+            MySqlWire.readLenencStr(cd, cur);
+            MySqlWire.readLenencStr(cd, cur);
+            MySqlWire.readLenencStr(cd, cur);
+            MySqlWire.readLenencStr(cd, cur);
+            result.AddColumnName(MySqlWire.readLenencStr(cd, cur));
+        }
+        byte[] colEof = this.readPacket();
+        int rowCount = 0;
+        while (true) {
+            byte[] row = this.readPacket();
+            if (row == null) { break; }
+            if (this.isEof(row)) { break; }
+            List<int> cur = new List<int>(); cur.Add(0);
+            List<string> outRow = new List<string>();
+            List<bool> nullFlags = new List<bool>();
+            c = 0;
+            while (c < ncols) {
+                if ((row[cur[0]] & 255) == 251) {
+                    cur[0] = cur[0] + 1;
+                    outRow.Add("");
+                    nullFlags.Add(true);
+                } else {
+                    outRow.Add(MySqlWire.readLenencStr(row, cur));
+                    nullFlags.Add(false);
+                }
+                c = c + 1;
+            }
+            result.AddRowNulls(outRow, nullFlags);
+            rowCount = rowCount + 1;
+        }
+        this.lastAffected = rowCount;
+        return result;
+    }
+
+    // ============================================================
+    // 预编译语句（COM_STMT_PREPARE / COM_STMT_EXECUTE）
+    // ============================================================
+
+
+
+
+
+    /// 按列类型解码二进制协议行值，返回其文本形式（整型带符号处理，
+    /// 日期/时间/浮点按 wire 格式渲染，其余按 lenenc 字符串）。
+    static string readBinValue(string buf, List<int> cur, int type, int flags) {
+        int p = cur[0];
+        bool uns = (flags & 32) != 0;
+        if (type == 1) {
+            int v = buf[p] & 255; cur[0] = p + 1;
+            if (!uns && v > 127) { v = v - 256; }
+            return Convert.ToString(v);
+        }
+        if (type == 2 || type == 13) {
+            int v = (buf[p]&255) | ((buf[p+1]&255) << 8); cur[0] = p + 2;
+            if (!uns && v > 32767) { v = v - 65536; }
+            return Convert.ToString(v);
+        }
+        if (type == 3 || type == 9) {
+            long v = (long)(buf[p]&255) | ((long)(buf[p+1]&255)<<8)
+                   | ((long)(buf[p+2]&255)<<16) | ((long)(buf[p+3]&255)<<24);
+            cur[0] = p + 4;
+            if (!uns && v > 2147483647) { v = v - 4294967296; }
+            return Convert.ToString(v);
+        }
+        if (type == 8) {
+            long v = 0; 
+            for (int i = 0; i < 8; i = i + 1) { v = v | ((long)(buf[p+i]&255) << (8*i)); }
+            cur[0] = p + 8;
+            return Convert.ToString(v);
+        }
+        if (type == 4) {
+            long bits = (long)(buf[p]&255) | ((long)(buf[p+1]&255)<<8)
+                      | ((long)(buf[p+2]&255)<<16) | ((long)(buf[p+3]&255)<<24);
+            cur[0] = p + 4;
+            return MySqlWire.ieeeToText((int)((bits >> 31) & 1), (int)((bits >> 23) & 255),
+                              bits & 8388607, 127, 23);
+        }
+        if (type == 5) {
+            long bits = 0; 
+            for (int i = 0; i < 8; i = i + 1) { bits = bits | ((long)(buf[p+i]&255) << (8*i)); }
+            cur[0] = p + 8;
+            return MySqlWire.ieeeToText((int)((bits >> 63) & 1), (int)((bits >> 52) & 2047),
+                              bits & 4503599627370495, 1023, 52);
+        }
+        if (type == 10 || type == 12 || type == 7) {
+            int len = buf[p] & 255; p = p + 1;
+            int y = 0; int mo = 0; int d = 0; int h = 0; int mi = 0; int s = 0;
+            if (len >= 4) {
+                y = (buf[p]&255) | ((buf[p+1]&255)<<8);
+                mo = buf[p+2] & 255; d = buf[p+3] & 255;
+            }
+            if (len >= 7) { h = buf[p+4] & 255; mi = buf[p+5] & 255; s = buf[p+6] & 255; }
+            cur[0] = cur[0] + 1 + len;
+            string date = Convert.ToString(y) + "-" + MySqlWire.pad2(mo) + "-" + MySqlWire.pad2(d);
+            if (type == 10) { return date; }
+            return date + " " + MySqlWire.pad2(h) + ":" + MySqlWire.pad2(mi) + ":" + MySqlWire.pad2(s);
+        }
+        if (type == 11) {
+            int len = buf[p] & 255; p = p + 1;
+            int h = 0; int mi = 0; int s = 0; string sign = "";
+            if (len >= 8) {
+                if ((buf[p] & 255) == 1) { sign = "-"; }
+                int days = (buf[p+1]&255) | ((buf[p+2]&255)<<8) | ((buf[p+3]&255)<<16) | ((buf[p+4]&255)<<24);
+                h = (buf[p+5] & 255) + days * 24; mi = buf[p+6] & 255; s = buf[p+7] & 255;
+            }
+            cur[0] = cur[0] + 1 + len;
+            return sign + MySqlWire.pad2(h) + ":" + MySqlWire.pad2(mi) + ":" + MySqlWire.pad2(s);
+        }
+        return MySqlWire.readLenencStr(buf, cur);
+    }
+
+    /// 发送 COM_STMT_PREPARE；成功时把语句 id、列数、参数数依次写入 outIds，
+    /// 并读掉随后的参数/列定义包。
+    bool stmtPrepare(string sql, List<int> outIds) {
+        int len = sql.Length + 1;
+        byte[] pay = new byte[len + 1];
+        pay[0] = (byte)(22);
+        for (int i = 0; i < sql.Length; i = i + 1) { pay[i+1] = (byte)(sql[i] & 255); }
+        this.writePacket(pay, len, 0);
+        byte[] r = this.readPacket();
+        if (r == null) { this.lastError = "connection closed"; this.connected = false; return false; }
+        int b0 = r[0] & 255;
+        if (b0 == 255) {
+            int code = (r[1]&255)|((r[2]&255)<<8);
+            this.lastError = "prepare err " + Convert.ToString(code) + ": "
+                + MySqlWire.bytesToStr(r, 9, this.lastLen - 9);
+            return false;
+        }
+        int stmtId = (r[1]&255) | ((r[2]&255)<<8) | ((r[3]&255)<<16) | ((r[4]&255)<<24);
+        int numCols = (r[5]&255) | ((r[6]&255)<<8);
+        int numParams = (r[7]&255) | ((r[8]&255)<<8);
+        outIds.Add(stmtId); outIds.Add(numCols); outIds.Add(numParams);
+        int skip = 0;
+        if (numParams > 0) { skip = numParams + 1; }
+        if (numCols > 0) { skip = skip + numCols + 1; }
+        for (int k = 0; k < skip; k = k + 1) {
+            byte[] d = this.readPacket();
+            if (d == null) { this.connected = false; return false; }
+        }
+        return true;
+    }
+
+    /// 发送 COM_STMT_EXECUTE：NULL 位图、每参数类型（NULL/8 字节整数/
+    /// lenenc 文本）与二进制参数值。
+    int stmtExecute(int stmtId, DbParams prms) {
+        int n = prms.Count();
+        int bitmapLen = (n + 7) / 8;
+        int total = 1 + 4 + 1 + 4;
+        if (n > 0) {
+            total = total + bitmapLen + 1 + 2 * n;
+            for (int i = 0; i < n; i = i + 1) {
+                if (prms.KindAt(i) == DbParams.KindInt) { total = total + 8; }
+                else if (!prms.IsNull(i)) { total = total + 4 + prms.AsText(i).Length; }
+            }
+        }
+        byte[] pay = new byte[total + 1];
+        pay[0] = (byte)(23);
+        pay[1] = (byte)(stmtId&255); pay[2] = (byte)((stmtId>>8)&255); pay[3] = (byte)((stmtId>>16)&255); pay[4] = (byte)((stmtId>>24)&255);
+        pay[5] = (byte)(0);
+        pay[6] = (byte)(1); pay[7] = (byte)(0); pay[8] = (byte)(0); pay[9] = (byte)(0);
+        int q = 10;
+        if (n > 0) {
+            int i = 0;
+            for (; i < n; i = i + 1) {
+                if (prms.IsNull(i)) {
+                    int off = q + i / 8;
+                    pay[off] = (byte)((pay[off] & 255) | (1 << (i % 8)));
+                }
+            }
+            q = q + bitmapLen;
+            pay[q] = (byte)(1); q = q + 1;
+            i = 0;
+            while (i < n) {
+                if (prms.IsNull(i)) { pay[q] = (byte)(6); }
+                else if (prms.KindAt(i) == DbParams.KindInt) { pay[q] = (byte)(8); }
+                else { pay[q] = (byte)(253); }
+                pay[q+1] = (byte)(0);
+                q = q + 2;
+                i = i + 1;
+            }
+            i = 0;
+            while (i < n) {
+                if (prms.IsNull(i)) { i = i + 1; continue; }
+                if (prms.KindAt(i) == DbParams.KindInt) {
+                    long v = prms.IntAt(i);
+                    for (int j = 0; j < 8; j = j + 1) {
+                        pay[q+j] = (byte)((v >> (j * 8)) & 255);
+                    }
+                    q = q + 8;
+                } else {
+                    string t = prms.AsText(i);
+                    q = MySqlWire.writeLenenc(pay, q, t.Length);
+                    for (int j = 0; j < t.Length; j = j + 1) { pay[q+j] = (byte)(t[j] & 255); }
+                    q = q + t.Length;
+                }
+                i = i + 1;
+            }
+        }
+        return this.writePacket(pay, q, 0);
+    }
+
+    /// 发送 COM_STMT_CLOSE，释放服务器端的语句句柄。
+    int stmtClose(int stmtId) {
+        byte[] pay = new byte[6];
+        pay[0] = (byte)(25);
+        pay[1] = (byte)(stmtId&255); pay[2] = (byte)((stmtId>>8)&255); pay[3] = (byte)((stmtId>>16)&255); pay[4] = (byte)((stmtId>>24)&255);
+        return this.writePacket(pay, 5, 0);
+    }
+
+    /// 按 SQL 文本在语句缓存中查下标；未命中返回 -1。
+    int stmtCacheFind(string sql) {
+        for (int i = 0; i < this.stmtCache.Count; i = i + 1) {
+            if (this.stmtCache[i].sql == sql) { return i; }
+        }
+        return -1;
+    }
+
+    /// 把语句加入缓存；满 32 条时先关闭并淘汰最旧的一条。
+    void stmtCacheAdd(string sql, int stmtId) {
+        if (this.stmtCache.Count >= 32) {
+            this.stmtClose(this.stmtCache[0].id);
+            this.stmtCache.RemoveAt(0);
+        }
+        this.stmtCache.Add(new PreparedStmt(sql, stmtId));
+    }
+
+    /// 按语句 id 把出错/失效的语句从缓存移除。
+    void stmtCacheRemove(int stmtId) {
+        for (int i = 0; i < this.stmtCache.Count; i = i + 1) {
+            if (this.stmtCache[i].id == stmtId) {
+                this.stmtCache.RemoveAt(i);
+                return;
+            }
+        }
+    }
+
+    /// 参数化查询：SQL 首次出现时预编译并缓存句柄，随后 COM_STMT_EXECUTE
+    /// 执行并解码二进制结果集；语句出错时 hadError=true 并从缓存剔除。
+    DbResult queryParams(string sql, DbParams prms) {
+        DbResult result = new DbResult();
+        this.hadError = false;
+        this.lastAffected = 0;
+        this.lastError = "";
+        if (!this.connected) {
+            this.hadError = true;
+            this.lastError = "not connected";
+            return result;
+        }
+        int stmtId = 0;
+        int hit = this.stmtCacheFind(sql);
+        if (hit >= 0) {
+            stmtId = this.stmtCache[hit].id;
+        } else {
+            List<int> ids = new List<int>();
+            bool ok = this.stmtPrepare(sql, ids);
+            if (!ok) { this.hadError = true; return result; }
+            stmtId = ids[0];
+            this.stmtCacheAdd(sql, stmtId);
+        }
+        this.stmtExecute(stmtId, prms);
+        byte[] first = this.readPacket();
+        if (first == null) {
+            this.hadError = true;
+            this.lastError = "connection closed";
+            this.connected = false;
+            return result;
+        }
+        int b0 = first[0] & 255;
+        if (b0 == 255) {
+            int code = (first[1]&255)|((first[2]&255)<<8);
+            this.lastError = "err " + Convert.ToString(code) + ": "
+                + MySqlWire.bytesToStr(first, 9, this.lastLen - 9);
+            this.hadError = true;
+            this.stmtCacheRemove(stmtId);
+            this.stmtClose(stmtId);
+            return result;
+        }
+        if (b0 == 0 || b0 == 254) {
+            List<int> cur = new List<int>(); cur.Add(1);
+            this.lastAffected = (int)MySqlWire.readLenenc(first, cur);
+            return result;
+        }
+        List<int> cc = new List<int>(); cc.Add(0);
+        int ncols = (int)MySqlWire.readLenenc(first, cc);
+        result.SetColumnCount(ncols);
+        List<int> colTypes = new List<int>();
+        List<int> colFlags = new List<int>();
+        int c = 0;
+        for (; c < ncols; c = c + 1) {
+            byte[] cd = this.readPacket();
+            List<int> cur = new List<int>(); cur.Add(0);
+            MySqlWire.readLenencStr(cd, cur);
+            MySqlWire.readLenencStr(cd, cur);
+            MySqlWire.readLenencStr(cd, cur);
+            MySqlWire.readLenencStr(cd, cur);
+            result.AddColumnName(MySqlWire.readLenencStr(cd, cur));
+            MySqlWire.readLenencStr(cd, cur);
+            MySqlWire.readLenenc(cd, cur);
+            int p = cur[0];
+            int ctype = cd[p + 6] & 255;
+            int cflags = (cd[p+7]&255) | ((cd[p+8]&255) << 8);
+            colTypes.Add(ctype);
+            colFlags.Add(cflags);
+        }
+        byte[] colEof = this.readPacket();
+        int rowCount = 0;
+        while (true) {
+            byte[] row = this.readPacket();
+            if (row == null) { break; }
+            if (this.isEof(row)) { break; }
+            int bmLen = (ncols + 9) / 8;
+            List<int> cur = new List<int>(); cur.Add(1 + bmLen);
+            List<string> outRow = new List<string>();
+            List<bool> nullFlags = new List<bool>();
+            c = 0;
+            while (c < ncols) {
+                int bit = c + 2;
+                int nb = row[1 + bit / 8] & 255;
+                if (((nb >> (bit % 8)) & 1) == 1) {
+                    outRow.Add("");
+                    nullFlags.Add(true);
+                } else {
+                    outRow.Add(readBinValue(row, cur, colTypes[c], colFlags[c]));
+                    nullFlags.Add(false);
+                }
+                c = c + 1;
+            }
+            result.AddRowNulls(outRow, nullFlags);
+            rowCount = rowCount + 1;
+        }
+        this.lastAffected = rowCount;
+        return result;
+    }
+
+    // ============================================================
+    // IDbExecutor / IDbConnection
+    // ============================================================
+
+    /// <summary>带参数的查询：走 COM_STMT_PREPARE / COM_STMT_EXECUTE
+    /// 二进制协议，值带外传输、注入免疫。SQL 文本首次出现时预编译并
+    /// 缓存（每连接最多 32 条，超出后 LRU 淘汰并关闭最旧语句），同一
+    /// SQL 再次执行直接复用服务器语句句柄。</summary>
+    DbResult Query(string sql, DbParams prms) {
+        return this.queryParams(sql, prms);
+    }
+
+    /// <summary>执行语句，返回受影响行数；语句出错时返回 -1
+    /// （错误详情见 <see cref="GetError"/>）。受 CLIENT_FOUND_ROWS
+    /// 影响，UPDATE/DELETE 报告匹配行数（值未变也算命中）。</summary>
+    int Execute(string sql, DbParams prms) {
+        DbResult r = this.queryParams(sql, prms);
+        if (this.hadError) { return -1; }
+        return this.lastAffected;
+    }
+
+    /// <summary>无参数查询，走 COM_QUERY 文本协议。SELECT 返回结果集，
+    /// 行数记入受影响行数；出错时结果为空且 hadError=true。</summary>
+    DbResult Query(string sql) {
+        return this.querySync(sql);
+    }
+
+    /// <summary>执行语句，返回受影响行数（语义同带参版本）；
+    /// 出错时返回 -1。</summary>
+    int Execute(string sql) {
+        DbResult r = this.querySync(sql);
+        if (this.hadError) { return -1; }
+        return this.lastAffected;
+    }
+
+    /// <summary>取结果集第一行第一列的值（字符串形式）；无行或值为
+    /// NULL 时返回 ""。</summary>
+    string ExecuteScalar(string sql) {
+        DbResult r = this.querySync(sql);
+        if (r.RowCount() > 0) { return r.GetString(0, 0); }
+        return "";
+    }
+
+    /// <summary>带参数的 ExecuteScalar（语义同无参版本）。</summary>
+    string ExecuteScalar(string sql, DbParams prms) {
+        DbResult r = this.queryParams(sql, prms);
+        if (r.RowCount() > 0) { return r.GetString(0, 0); }
+        return "";
+    }
+
+    /// <summary>驱动标识，恒为 <see cref="DbProvider.MySQL"/>。</summary>
+    int GetProvider() {
+        return DbProvider.MySQL;
+    }
+
+    /// <summary>此连接上记录的最后一条错误消息。</summary>
+    string GetError() {
+        return this.lastError;
+    }
+
+    /// <summary>在当前会话上开启事务（START TRANSACTION）。</summary>
+    // ===== 协程孪生方法 =====
+    // 该驱动的 IO 是同步的，所以这里仅转发。提供这些方法是为了让调用方
+    // （以及生成的 ORM 终端）能对所有驱动统一使用异步调用链，
+    // 在驱动支持的情况下获得真正的非阻塞 IO。
+    /// <see cref="Query"/> 的协程孪生：本驱动 IO 为同步，直接转发。
+    async DbResult QueryAsync(string sql) { return this.Query(sql); }
+    /// <see cref="Query"/> 的协程孪生：本驱动 IO 为同步，直接转发。
+    async DbResult QueryAsync(string sql, DbParams prms) { return this.Query(sql, prms); }
+    /// <see cref="Execute"/> 的协程孪生：本驱动 IO 为同步，直接转发。
+    async int ExecuteAsync(string sql) { return this.Execute(sql); }
+    /// <see cref="Execute"/> 的协程孪生：本驱动 IO 为同步，直接转发。
+    async int ExecuteAsync(string sql, DbParams prms) { return this.Execute(sql, prms); }
+    /// <see cref="ExecuteScalar"/> 的协程孪生：本驱动 IO 为同步，直接转发。
+    async string ExecuteScalarAsync(string sql) { return this.ExecuteScalar(sql); }
+    /// <see cref="ExecuteScalar"/> 的协程孪生：本驱动 IO 为同步，直接转发。
+    async string ExecuteScalarAsync(string sql, DbParams prms) { return this.ExecuteScalar(sql, prms); }
+    /// <see cref="BeginTransaction"/> 的协程孪生，恒返回 true。
+    async bool BeginTransactionAsync() { this.BeginTransaction(); return true; }
+    /// <see cref="Commit"/> 的协程孪生，恒返回 true。
+    async bool CommitAsync() { this.Commit(); return true; }
+    /// <see cref="Rollback"/> 的协程孪生，恒返回 true。
+    async bool RollbackAsync() { this.Rollback(); return true; }
+
+    /// 在当前会话上开启事务（START TRANSACTION）。
+    void BeginTransaction() { this.Execute("START TRANSACTION"); }
+
+    /// <summary>提交当前事务。</summary>
+    void Commit() { this.Execute("COMMIT"); }
+
+    /// <summary>回滚当前事务。</summary>
+    void Rollback() { this.Execute("ROLLBACK"); }
+
+    /// <summary>连接是否仍处于打开状态。查询中途服务器断开也会把
+    /// 状态置为 false。</summary>
+    bool IsConnected() {
+        return this.connected;
+    }
+
+    /// <summary>关闭套接字并清空预编译语句缓存。重复调用安全；
+    /// 未连接时也只做缓存清理。</summary>
+    void Close() {
+        if (this.connected || this.sock >= 0) {
+            Socket.Close(this.sock);
+            this.connected = false;
+            this.sock = -1;
+        }
+        this.stmtCache = new List<PreparedStmt>();
+    }
+}

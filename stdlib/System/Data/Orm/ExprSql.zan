@@ -1,0 +1,107 @@
+using System;
+using System.Data;
+using System.Linq;
+
+namespace System.Data.Orm;
+
+/// <summary>
+/// 纯 Zan 的表达式树转 SQL 构建器。遍历 dbgen 阶段生成的 <see cref="ExprNode"/> 树
+/// （即将 lambda 降级为可检查的节点），
+/// 并将参数化 SQL 片段追加到 StringBuilder，同时把
+/// 常量绑定到 DbParams 列表。类型化 ORM 的所有 WHERE 子句 SQL 构造都在这里——
+/// 编译器只把 `Where(o => ...)` lambda 降级为
+/// Expr 树；C 通道不会生成任何 SQL 形式的内容。
+///
+/// 列引用将成员名映射为 `t.<name>`（列 = 字段名，
+/// ORM 默认约定）。支持：
+///   member / const（int、double、string、bool）
+///   binary: == != &lt; &gt; &lt;= &gt;= + - * / %  && (AND)  || (OR)
+///   not: !expr
+///   调用：StartsWith / EndsWith / Contains → 转换为带绑定模式的 LIKE
+/// </summary>
+class ExprSql {
+    /// <summary>将常量节点渲染为文本（用于组装 LIKE 模式）。</summary>
+    static string EvalText(ExprNode n) {
+        if (n == null) { return ""; }
+        if (n.Kind == 1 && n.TVal == 2) { return n.SVal; }
+        if (n.Kind == 1 && n.TVal == 0) { return Convert.ToString(n.IVal); }
+        return "";
+    }
+
+    /// <summary>Zan 比较运算符对应的 SQL 写法。SQLite 恰好
+    /// 接受 `==` 和 `!=`，但标准 SQL（MySQL、PostgreSQL、SQL Server）
+    /// 不接受——未转换的运算符在那里是语法错误，因此
+    /// 运算符必须做映射，不能直接透传。</summary>
+    static string SqlOp(string op) {
+        if (op == "==") { return "="; }
+        if (op == "!=") { return "<>"; }
+        return op;
+    }
+
+    /// <summary>为以 n 为根的树构建 WHERE 片段。</summary>
+    static void Build(ExprNode n, StringBuilder sb, DbParams ps) {
+        if (n == null) { return; }
+        if (n.Kind == 4) {
+            Build(n.A, sb, ps);
+        } else if (n.Kind == 0) {
+            sb.Append("t.");
+            sb.Append(n.Name);
+        } else if (n.Kind == 1) {
+            if (n.TVal == 2) {
+                ps.Add(n.SVal);
+            } else if (n.TVal == 3) {
+                ps.AddInt(n.BVal ? 1 : 0);
+            } else if (n.TVal == 1) {
+                ps.AddDouble(n.DVal);
+            } else {
+                ps.AddInt(n.IVal);
+            }
+            sb.Append("?");
+        } else if (n.Kind == 2) {
+            if (n.Name == "&&") {
+                sb.Append("(");
+                Build(n.A, sb, ps);
+                sb.Append(" AND ");
+                Build(n.B, sb, ps);
+                sb.Append(")");
+            } else if (n.Name == "||") {
+                sb.Append("(");
+                Build(n.A, sb, ps);
+                sb.Append(" OR ");
+                Build(n.B, sb, ps);
+                sb.Append(")");
+            } else {
+                sb.Append("(");
+                Build(n.A, sb, ps);
+                sb.Append(" ");
+                sb.Append(SqlOp(n.Name));
+                sb.Append(" ");
+                Build(n.B, sb, ps);
+                sb.Append(")");
+            }
+        } else if (n.Kind == 5) {
+            sb.Append("NOT (");
+            Build(n.A, sb, ps);
+            sb.Append(")");
+        } else if (n.Kind == 3) {
+            if (n.Name == "StartsWith" || n.Name == "EndsWith" ||
+                n.Name == "Contains") {
+                Build(n.A, sb, ps);
+                sb.Append(" LIKE ?");
+                string pat = EvalText(n.B);
+                if (n.Name == "StartsWith") {
+                    pat = pat + "%";
+                } else if (n.Name == "EndsWith") {
+                    pat = "%" + pat;
+                } else {
+                    pat = "%" + pat + "%";
+                }
+                ps.Add(pat);
+            } else {
+                sb.Append("1=1");
+            }
+        } else {
+            sb.Append("1=1");
+        }
+    }
+}

@@ -1,0 +1,162 @@
+using System;
+using System.Data;
+using System.Threading;
+
+namespace System.Data.Firebird;
+
+/// <summary>
+/// 面向协程的 <see cref="FirebirdConnection"/> 连接池。
+///
+/// 与 <see cref="DbPool"/> 契约一致——惰性增长至 <c>maxSize</c>，
+/// 由 <see cref="Gate"/> 驱动等待而非轮询，淘汰失效
+/// 连接——但类型化，因此协程查询 API（<c>QueryAsync</c>、
+/// <c>ExecuteAsync</c>）仍可访问。一次 attach 需要一次 SRP 握手和
+/// 多轮往返，这就是要复用会话而非
+/// 每条语句开一个新会话的原因。
+///
+/// 用法：
+///   FirebirdPool pool = new FirebirdPool("127.0.0.1", 3050,
+///       "/var/lib/firebird/data/test.fdb", "SYSDBA", "secret", 8);
+///   FirebirdConnection db = await pool.AcquireAsync();
+///   DbResult r = await db.QueryAsync("SELECT id, name FROM t1");
+///   pool.Release(db);
+///   pool.Close();
+/// </summary>
+class FirebirdPool {
+    string host;
+    int port;
+    string database;
+    string user;
+    string password;
+    bool wireCrypt;
+    PoolCore<FirebirdConnection> core;
+
+    /// 完整构造：显式指定是否启用 wire 协议加密。
+    FirebirdPool(string host, int port, string database, string user,
+            string password, bool wireCrypt, int maxSize) {
+        this.host = host;
+        this.port = port;
+        this.database = database;
+        this.user = user;
+        this.password = password;
+        this.wireCrypt = wireCrypt;
+        this.core = new PoolCore<FirebirdConnection>(maxSize);
+    }
+
+    /// 以默认配置（启用 wire 加密）构造。
+    FirebirdPool(string host, int port, string database, string user,
+            string password, int maxSize) : this(host, port, database, user,
+                    password, true, maxSize) {
+    }
+
+    /// 新建一个连接（attach + SRP 认证握手）；失败返回 null。
+    async FirebirdConnection OpenOne() {
+        return await FirebirdConnection.OpenAsync(this.host, this.port,
+                                                  this.database, this.user,
+                                                  this.password,
+                                                  this.wireCrypt);
+    }
+
+    /// <summary>借出一个连接：复用空闲的，未达上限则新建，
+    /// 否则挂起协程，直到有连接被释放。饱和等待有硬上限
+    /// （见 <see cref="PoolWait"/>）：超时返回 null，绝不定死。
+    /// 连接池关闭后返回 null。</summary>
+    async FirebirdConnection AcquireAsync() {
+        PoolWait wait = new PoolWait();
+        while (true) {
+            if (this.core.IsClosed()) {
+                return null;
+            }
+            FirebirdConnection pooled = this.core.TakeIdle();
+            while (pooled != null) {
+                // 连接在池中停置期间可能失效（服务器重启、空闲
+                // 超时）：将其剔除，腾出位置给等待者。
+                if (pooled.IsConnected()) {
+                    return pooled;
+                }
+                this.core.Drop(pooled);
+                pooled = this.core.TakeIdle();
+            }
+            // 上一次建连失败后退避：后端不可达时，若每次获取都重试建连，
+            // 失败本身就成了每请求的固定开销（失败的本地 open 也要约
+            // 125us），足以让命中路由的吞吐掉一个数量级。
+            if (this.core.OpenBlocked()) {
+                return null;
+            }
+            if (this.core.TryReserve()) {
+                FirebirdConnection opened = await this.OpenOne();
+                if (opened == null || !opened.IsConnected()) {
+                    this.core.NoteOpenFailed();
+                    this.core.UndoReserve();
+                    return null;
+                }
+                this.core.NoteOpenOk();
+                this.core.Borrow(opened);
+                return opened;
+            }
+            // 连接池已满：交给共享的有界等待（见 PoolWait），
+            // 预算耗尽以 null 快速失败。
+            if (!await this.core.WaitForRelease(wait)) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>将连接归还连接池。已损坏或 Close() 之后
+    /// 的连接会直接关闭丢弃，而非放回池中。</summary>
+    void Release(FirebirdConnection c) {
+        if (c == null) {
+            return;
+        }
+        if (this.core.IsClosed() || !c.IsConnected()) {
+            c.Close();
+            this.core.Drop(c);
+            return;
+        }
+        this.core.Pool(c);
+    }
+
+    /// <summary>空闲（已入池、可立即使用）连接数。</summary>
+    int IdleCount() {
+        return this.core.IdleCount();
+    }
+
+    /// <summary>存活连接总数（空闲 + 已借出）。</summary>
+    int LiveCount() {
+        return this.core.LiveCount();
+    }
+
+    /// <summary>当前挂起等待连接的协程数。</summary>
+    int WaitingCount() {
+        return this.core.WaitingCount();
+    }
+
+    /// <summary>最大并发存活连接数。</summary>
+    int MaxSize() {
+        return this.core.MaxSize();
+    }
+
+    /// <summary><see cref="Close"/> 调用过后为 true。</summary>
+    bool IsClosed() {
+        return this.core.IsClosed();
+    }
+
+    /// 池的 provider id（恒为 <see cref="DbProvider.Firebird"/>）。
+    int GetProvider() {
+        return DbProvider.Firebird;
+    }
+
+    /// <summary>关闭所有空闲连接并将连接池标记为已关闭。仍被
+    /// 借出的连接在归还时才会被关闭。</summary>
+    void Close() {
+        this.core.MarkClosed();
+        FirebirdConnection c = this.core.TakeIdle();
+        while (c != null) {
+            c.Close();
+            this.core.Drop(c);
+            c = this.core.TakeIdle();
+        }
+        this.core.WakeAll();
+    }
+}

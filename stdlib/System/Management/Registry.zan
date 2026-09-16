@@ -1,0 +1,382 @@
+using System;
+
+namespace System.Management;
+
+/// <summary>
+/// 一个注册表值：`name`（默认值为 ""）、`type`（
+/// <see cref="Registry"/> 的类型常量之一）以及原始字节负载。
+/// 用带类型的 getter 进行解码。
+/// </summary>
+class RegistryValue {
+    /// 值名；键的默认（未命名）值为 ""。
+    public string name;
+    /// 值类型（<see cref="Registry"/> 的 Type* 常量之一）。
+    public int type;
+    /// 原始字节负载，按 `type` 解释。
+    public byte[] data;
+}
+
+/// <summary>
+/// Windows 注册表访问：打开/创建键、读写常用值类型
+/// （DWORD/QWORD/SZ/EXPAND_SZ/MULTI_SZ/BINARY）、枚举子键和值、
+/// 删除键和值。根键以 HKLM/HKCU/... 常量传入。
+/// 该模块仅支持 Windows；其他平台抛出
+/// PlatformNotSupportedException.
+///
+///   int k = Registry.OpenKey(Registry.Hkcu(), "Software\\MyApp", true);
+///   Registry.SetDword(k, "Count", 3);
+///   int n = Registry.GetDword(k, "Count");
+///   Registry.CloseKey(k);
+/// </summary>
+class Registry {
+    /// 根键句柄 HKEY_CLASSES_ROOT（advapi32 预定义键）。
+    static nint Hkcr() { return (nint)0x80000000; }
+    /// 根键句柄 HKEY_CURRENT_USER。
+    static nint Hkcu() { return (nint)0x80000001; }
+    /// 根键句柄 HKEY_LOCAL_MACHINE。
+    static nint Hklm() { return (nint)0x80000002; }
+    /// 根键句柄 HKEY_USERS。
+    static nint Hkusers() { return (nint)0x80000003; }
+    /// 根键句柄 HKEY_CURRENT_CONFIG。
+    static nint HkcurrentConfig() { return (nint)0x80000005; }
+
+    /// 值类型常量 REG_NONE（reg.h）。
+    static int TypeNone() { return 0; }
+    /// 值类型常量 REG_SZ。
+    static int TypeSz() { return 1; }
+    /// 值类型常量 REG_EXPAND_SZ。
+    static int TypeExpandSz() { return 2; }
+    /// 值类型常量 REG_BINARY。
+    static int TypeBinary() { return 3; }
+    /// 值类型常量 REG_DWORD。
+    static int TypeDword() { return 4; }
+    /// 值类型常量 REG_MULTI_SZ。
+    static int TypeMultiSz() { return 7; }
+    /// 值类型常量 REG_QWORD。
+    static int TypeQword() { return 11; }
+
+    #if WINDOWS
+    [DllImport("advapi32", EntryPoint = "RegOpenKeyExW")]
+    static extern int RegOpenKeyExW(nint hKey, nint subKey, int options,
+                                    int access, nint result);
+
+    [DllImport("advapi32", EntryPoint = "RegCreateKeyExW")]
+    static extern int RegCreateKeyExW(nint hKey, nint subKey, int reserved,
+                                      nint classBuf, int options, int access,
+                                      nint secAttrs, nint result, nint disp);
+
+    [DllImport("advapi32", EntryPoint = "RegCloseKey")]
+    static extern int RegCloseKey(nint hKey);
+
+    [DllImport("advapi32", EntryPoint = "RegQueryValueExW")]
+    static extern int RegQueryValueExW(nint hKey, nint name, nint reserved,
+                                       nint type, nint data, nint dataSize);
+
+    [DllImport("advapi32", EntryPoint = "RegSetValueExW")]
+    static extern int RegSetValueExW(nint hKey, nint name, int reserved,
+                                     int type, nint data, int dataSize);
+
+    [DllImport("advapi32", EntryPoint = "RegDeleteValueW")]
+    static extern int RegDeleteValueW(nint hKey, nint name);
+
+    [DllImport("advapi32", EntryPoint = "RegDeleteKeyW")]
+    static extern int RegDeleteKeyW(nint hKey, nint subKey);
+
+    [DllImport("advapi32", EntryPoint = "RegDeleteTreeW")]
+    static extern int RegDeleteTreeW(nint hKey, nint subKey);
+
+    [DllImport("advapi32", EntryPoint = "RegEnumKeyExW")]
+    static extern int RegEnumKeyExW(nint hKey, int index, nint nameBuf,
+                                    nint nameSize, nint reserved, nint classBuf,
+                                    nint classSize, nint lastWrite);
+
+    [DllImport("advapi32", EntryPoint = "RegEnumValueW")]
+    static extern int RegEnumValueW(nint hKey, int index, nint nameBuf,
+                                    nint nameSize, nint reserved, nint type,
+                                    nint data, nint dataSize);
+    #endif
+
+    /// <summary>以读权限打开已有键（`write` 为 true 时为写权限）。
+    /// 返回键句柄（非零）；当键
+    /// 不存在或访问被拒绝时返回 0。用 <see cref="CloseKey"/> 关闭。</summary>
+    static nint OpenKey(nint root, string subKey, bool write) {
+        #if WINDOWS
+        int access = 0x20019;   // KEY_READ
+        if (write) { access = 0x2001F; }   // KEY_READ | KEY_WRITE
+        nint wkey = Wide.Of(subKey);
+        nint result = NativeMemory.Alloc(8);
+        int r = Registry.RegOpenKeyExW(root, wkey, 0, access, result);
+        Wide.Free(wkey);
+        nint h = 0;
+        if (r == 0) { h = new Span<nint>(result, 1)[0]; }
+        NativeMemory.Free(result);
+        return h;
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>创建（或打开）一个键，缺失的父键会自动创建。</summary>
+    /// 返回键句柄（非零），失败时返回 0。</summary>
+    static nint CreateKey(nint root, string subKey) {
+        #if WINDOWS
+        nint wkey = Wide.Of(subKey);
+        nint result = NativeMemory.Alloc(8);
+        int r = Registry.RegCreateKeyExW(root, wkey, 0, 0, 0,
+            0x2001F /*KEY_READ | KEY_WRITE*/, 0, result, 0);
+        Wide.Free(wkey);
+        nint h = 0;
+        if (r == 0) { h = new Span<nint>(result, 1)[0]; }
+        NativeMemory.Free(result);
+        return h;
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>关闭 OpenKey/CreateKey 打开的键句柄。</summary>
+    static void CloseKey(nint key) {
+        #if WINDOWS
+        if (key != 0) { Registry.RegCloseKey(key); }
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>读取 DWORD 值。当值缺失或类型不同时
+    /// 返回 `fallback`。</summary>
+    static int GetDword(nint key, string name, int fallback) {
+        #if WINDOWS
+        nint wname = Wide.Of(name);
+        nint data = NativeMemory.Alloc(4);
+        nint size = NativeMemory.Alloc(4);
+        nint type = NativeMemory.Alloc(4);
+        new Span<int>(size, 1)[0] = 4;
+        int r = Registry.RegQueryValueExW(key, wname, 0, type, data, size);
+        int v = fallback;
+        if (r == 0 && new Span<int>(type, 1)[0] == 4) {
+            v = new Span<int>(data, 1)[0];
+        }
+        NativeMemory.Free(data);
+        NativeMemory.Free(size);
+        NativeMemory.Free(type);
+        Wide.Free(wname);
+        return v;
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>写入 DWORD 值（不存在则创建）。</summary>
+    static void SetDword(nint key, string name, int val) {
+        #if WINDOWS
+        nint wname = Wide.Of(name);
+        nint data = NativeMemory.Alloc(4);
+        new Span<int>(data, 1)[0] = val;
+        Registry.RegSetValueExW(key, wname, 0, 4, data, 4);
+        NativeMemory.Free(data);
+        Wide.Free(wname);
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>读取 QWORD（64 位）值。缺失或类型错误时为 0。</summary>
+    static long GetQword(nint key, string name) {
+        #if WINDOWS
+        nint wname = Wide.Of(name);
+        nint data = NativeMemory.Alloc(8);
+        nint size = NativeMemory.Alloc(4);
+        nint type = NativeMemory.Alloc(4);
+        new Span<int>(size, 1)[0] = 8;
+        int r = Registry.RegQueryValueExW(key, wname, 0, type, data, size);
+        long v = 0;
+        if (r == 0 && new Span<int>(type, 1)[0] == 11) {
+            v = new Span<long>(data, 1)[0];
+        }
+        NativeMemory.Free(data);
+        NativeMemory.Free(size);
+        NativeMemory.Free(type);
+        Wide.Free(wname);
+        return v;
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>写入 QWORD（64 位）值。</summary>
+    static void SetQword(nint key, string name, long val) {
+        #if WINDOWS
+        nint wname = Wide.Of(name);
+        nint data = NativeMemory.Alloc(8);
+        new Span<long>(data, 1)[0] = val;
+        Registry.RegSetValueExW(key, wname, 0, 11, data, 8);
+        NativeMemory.Free(data);
+        Wide.Free(wname);
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>读取 REG_SZ 值。缺失时返回 ""。</summary>
+    static string GetString(nint key, string name) {
+        #if WINDOWS
+        nint wname = Wide.Of(name);
+        nint data = NativeMemory.Alloc(4096);
+        nint size = NativeMemory.Alloc(4);
+        nint type = NativeMemory.Alloc(4);
+        new Span<int>(size, 1)[0] = 4096;
+        int r = Registry.RegQueryValueExW(key, wname, 0, type, data, size);
+        string s = "";
+        int t = 0;
+        if (r == 0) { t = new Span<int>(type, 1)[0]; }
+        if (r == 0 && (t == 1 || t == 2)) {
+            int bytes = new Span<int>(size, 1)[0];
+            if (bytes > 2) { s = Wide.Read(data); }
+        }
+        NativeMemory.Free(data);
+        NativeMemory.Free(size);
+        NativeMemory.Free(type);
+        Wide.Free(wname);
+        return s;
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>写入 REG_SZ 值。</summary>
+    static void SetString(nint key, string name, string val) {
+        #if WINDOWS
+        nint wname = Wide.Of(name);
+        nint wval = Wide.Of(val);
+        // RegSetValueExW 需要的是含 NUL 终止符在内的宽字符长度。
+        int len = Registry.WideLen(wval);
+        Registry.RegSetValueExW(key, wname, 0, 1, wval, len);
+        Wide.Free(wval);
+        Wide.Free(wname);
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>删除一个值（不存在时无操作）。</summary>
+    static void DeleteValue(nint key, string name) {
+        #if WINDOWS
+        nint wname = Wide.Of(name);
+        Registry.RegDeleteValueW(key, wname);
+        Wide.Free(wname);
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>删除子键及其下所有内容。成功返回 0，
+    /// 失败返回非零（键仍被打开，或不存在）。
+    /// 使用 RegDeleteTreeW，因此含嵌套子键的键树
+    /// 可一次调用删除（仅 RegDeleteKeyW 在
+    /// Vista+ 上会因 ERROR_ACCESS_DENIED 拒绝非空键树）。</summary>
+    static int DeleteKey(nint root, string subKey) {
+        #if WINDOWS
+        nint wkey = Wide.Of(subKey);
+        int r = Registry.RegDeleteTreeW(root, wkey);
+        Wide.Free(wkey);
+        return r;
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>`key` 的所有子键名称。无子键时为空。</summary>
+    static List<string> EnumKeys(nint key) {
+        List<string> list = new List<string>();
+        #if WINDOWS
+        nint nameBuf = NativeMemory.Alloc(512 * 2 + 2);
+        nint nameSize = NativeMemory.Alloc(4);
+        int index = 0;
+        bool done = false;
+        while (!done) {
+            new Span<int>(nameSize, 1)[0] = 512;
+            int r = Registry.RegEnumKeyExW(key, index, nameBuf, nameSize,
+                0, 0, 0, 0);
+            if (r == 0) {
+                list.Add(Wide.Read(nameBuf));
+                index = index + 1;
+            } else {
+                done = true;
+            }
+        }
+        NativeMemory.Free(nameBuf);
+        NativeMemory.Free(nameSize);
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+        return list;
+    }
+
+    /// <summary>`key` 的所有值（名称/类型/原始字节）。无值时为空。</summary>
+    static List<RegistryValue> EnumValues(nint key) {
+        List<RegistryValue> list = new List<RegistryValue>();
+        #if WINDOWS
+        nint nameBuf = NativeMemory.Alloc(512 * 2 + 2);
+        nint nameSize = NativeMemory.Alloc(4);
+        nint type = NativeMemory.Alloc(4);
+        nint data = NativeMemory.Alloc(65536);
+        nint dataSize = NativeMemory.Alloc(4);
+        int index = 0;
+        bool done = false;
+        while (!done) {
+            new Span<int>(nameSize, 1)[0] = 512;
+            new Span<int>(dataSize, 1)[0] = 65536;
+            int r = Registry.RegEnumValueW(key, index, nameBuf, nameSize,
+                0, type, data, dataSize);
+            if (r == 0 || r == 234 /*ERROR_MORE_DATA*/) {
+                RegistryValue v = new RegistryValue();
+                v.name = Wide.Read(nameBuf);
+                v.type = new Span<int>(type, 1)[0];
+                int bytes = new Span<int>(dataSize, 1)[0];
+                v.data = new byte[bytes];
+                for (int k = 0; k < bytes; k = k + 1) {
+                    v.data[k] = new Span<byte>(data, bytes)[k];
+                }
+                list.Add(v);
+                index = index + 1;
+            } else {
+                done = true;
+            }
+        }
+        NativeMemory.Free(nameBuf);
+        NativeMemory.Free(nameSize);
+        NativeMemory.Free(type);
+        NativeMemory.Free(data);
+        NativeMemory.Free(dataSize);
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+        return list;
+    }
+
+    #if WINDOWS
+    /// 宽缓冲区中 NUL 终止符之前的 UTF-16 码元数
+    /// （即 RegSetValueExW 所需的字节数，含终止符）。
+    static int WideLen(nint p) {
+        int n = 0;
+        for (; new Span<ushort>(p + n * 2, 1)[0] != 0; n = n + 1) { }
+        return (n + 1) * 2;
+    }
+    #endif
+}
+
+

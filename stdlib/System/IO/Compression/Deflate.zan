@@ -1,0 +1,660 @@
+using System;
+
+namespace System.IO.Compression;
+
+/// <summary>
+/// 纯 Zan 实现的 RFC 1951 DEFLATE —— 不依赖 zlib 或任何外部
+/// 依赖，可在所有平台运行。
+///
+/// Inflate 支持解码 stored、固定 Huffman 和动态 Huffman 块。
+/// Deflate 对不可压缩输入输出 stored 块；对可压缩输入，
+/// 使用带 LZ77 哈希表匹配器的固定 Huffman 块（级别
+/// 1-9 选择哈希链长度；格式与 zlib 默认输出一致，
+/// 因此可与任何标准 inflate 实现互通）。
+/// </summary>
+class Deflate {
+    // ---- bit reader ------------------------------------------------------
+
+    /// 从位流读 n 位（LSB 优先）；输入耗尽返回 -1，绝不越过 end 读取。
+    static int ReadBits(byte[] src, ref int pos, ref int bit, int n, int end) {
+        int v = 0;
+        int shift = 0;
+        while (shift < n) {
+            if (bit == 8) {
+                pos = pos + 1;
+                bit = 0;
+            }
+            if (pos >= end) { return -1; }   // 输入耗尽：绝不越过 end 读取
+            int b = src[pos] & 255;
+            int take = 8 - bit;
+            if (take > n - shift) { take = n - shift; }
+            v = v | ((b >> bit) & ((1 << take) - 1)) << shift;
+            bit = bit + take;
+            shift = shift + take;
+        }
+        return v;
+    }
+
+    /// 从位流读 1 位；输入耗尽返回 -1。
+    static int ReadBit(byte[] src, ref int pos, ref int bit, int end) {
+        if (bit == 8) {
+            pos = pos + 1;
+            bit = 0;
+        }
+        if (pos >= end) { return -1; }   // 输入耗尽：绝不越过 end 读取
+        int v = (src[pos] >> bit) & 1;
+        bit = bit + 1;
+        return v;
+    }
+
+    /// 丢弃字节内的位偏移，对齐到下一字节边界（stored 块用）。
+    static void AlignByte(ref int bit) {
+        if (bit > 0) { bit = 0; }
+    }
+
+    // ---- Huffman decoding tables -----------------------------------------
+
+    /// 长度码 257..285 -> 附加位。
+    static int[] LengthExtra = new int[] {
+        0,0,0,0,0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3, 4,4,4,4, 5,5,5,5, 0
+    };
+    /// 各长度码的基准长度。
+    static int[] LengthBase = new int[] {
+        3,4,5,6,7,8,9,10, 11,13,15,17, 19,23,27,31, 35,43,51,59, 67,83,99,115, 131,163,195,227, 258
+    };
+    /// 距离码 0..29 -> 附加位。
+    static int[] DistExtra = new int[] {
+        0,0,0,0,1,1,2,2, 3,3,4,4,5,5,6,6, 7,7,8,8,9,9,10,10, 11,11,12,12,13,13
+    };
+    /// 各距离码的基准距离。
+    static int[] DistBase = new int[] {
+        1,2,3,4,5,7,9,13, 17,25,33,49,65,97,129,193, 257,385,513,769,1025,1537,2049,3073, 4097,6145,8193,12289,16385,24577
+    };
+
+    /// 根据码长数组构建规范 Huffman 解码表。
+    /// `lengths` 保存每个符号的位长；`n` 为符号总数。
+    /// 成功返回 0，码集无效时返回 -1。
+    static int BuildHuffman(int[] count, int[] symbol, int[] lengths, int n) {
+        int i = 0;
+        for (; i < 16; i = i + 1) { count[i] = 0; }
+        i = 0;
+        while (i < n) {
+            int l = lengths[i];
+            if (l > 15) { return -1; }
+            if (l > 0) { count[l] = count[l] + 1; }
+            i = i + 1;
+        }
+        // 左对齐编码；拒绝不完整/过度订阅的码集。
+        int left = 1;
+        int len = 1;
+        while (len <= 15) {
+            left = left << 1;
+            left = left - count[len];
+            if (left < 0) { return -1; }
+            len = len + 1;
+        }
+        // 规范顺序：相同长度的符号按值递增排列。
+        int[] offs = new int[16];
+        offs[1] = 0;
+        int l2 = 1;
+        while (l2 < 15) {
+            offs[l2 + 1] = offs[l2] + count[l2];
+            l2 = l2 + 1;
+        }
+        i = 0;
+        while (i < n) {
+            if (lengths[i] > 0) {
+                symbol[offs[lengths[i]]] = i;
+                offs[lengths[i]] = offs[lengths[i]] + 1;
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    /// 从规范表中解码一个符号。`count`/`symbol` 来自
+    /// BuildHuffman；`src`/`pos`/`bit` 为位流。输入耗尽时
+    /// 返回 -1（ReadBit 的 -1 绝不能被当作位参与索引计算）。
+    static int DecodeSymbol(int[] count, int[] symbol, byte[] src,
+                            ref int pos, ref int bit, int end) {
+        int code = 0;
+        int first = 0;
+        int index = 0;
+        int len = 1;
+        while (len <= 15) {
+            int b = Deflate.ReadBit(src, ref pos, ref bit, end);
+            if (b < 0) { return -1; }
+            code = (code << 1) | b;
+            int cnt = count[len];
+            if (code - first < cnt) {
+                return symbol[index + (code - first)];
+            }
+            index = index + cnt;
+            first = (first + cnt) << 1;
+            len = len + 1;
+        }
+        return -1;
+    }
+
+    /// 固定（RFC 1951 §3.2.6）字面量/长度与距离表。
+    static void FixedTables(int[] litCount, int[] litSymbol, int[] distCount,
+                            int[] distSymbol) {
+        int[] litLen = new int[288];
+        int i = 0;
+        for (; i < 144; i = i + 1) { litLen[i] = 8; }
+        while (i < 256) { litLen[i] = 9; i = i + 1; }
+        while (i < 280) { litLen[i] = 7; i = i + 1; }
+        while (i < 288) { litLen[i] = 8; i = i + 1; }
+        Deflate.BuildHuffman(litCount, litSymbol, litLen, 288);
+        int[] distLen = new int[30];
+        i = 0;
+        while (i < 30) { distLen[i] = 5; i = i + 1; }
+        Deflate.BuildHuffman(distCount, distSymbol, distLen, 30);
+    }
+
+    // ---- inflate -----------------------------------------------------------
+
+    /// <summary>
+    /// 解压从 `src[offset]` 开始的 `len` 字节 DEFLATE 数据。
+    /// `maxOut` 限制输出大小（超出返回 null）；传 0 表示
+    /// 允许最大 256 MB 的任意大小。
+    /// </summary>
+    static byte[] Inflate(byte[] src, int offset, int len, int maxOut) {
+        int consumed = 0;
+        return Deflate.InflateConsumed(src, offset, len, maxOut, ref consumed);
+    }
+
+    /// <summary>与 Inflate 类似，但会报告已消耗的输入字节数
+    /// （截至并包括最后一个块的 EOB 符号）。</summary>
+    static byte[] InflateConsumed(byte[] src, int offset, int len, int maxOut,
+                                  ref int consumed) {
+        if (maxOut <= 0) { maxOut = 268435456; }
+        if (maxOut > 268435456) { maxOut = 268435456; }   // 硬性上限，防压缩炸弹
+        byte[] out2 = new byte[4096];
+        int outLen = 0;
+        int pos = offset;
+        int bit = 0;
+        int end = offset + len;
+
+        int[] litCount = new int[16];
+        int[] litSymbol = new int[288];
+        int[] distCount = new int[16];
+        int[] distSymbol = new int[32];
+
+        while (true) {
+            if (pos >= end) { return null; }
+            int bfinal = Deflate.ReadBit(src, ref pos, ref bit, end);
+            int btype = Deflate.ReadBits(src, ref pos, ref bit, 2, end);
+            if (btype == 0) {
+                // Stored 块：跳过到下一个字节边界。
+                if (bit > 0) {
+                    pos = pos + 1;
+                    bit = 0;
+                }
+                if (pos + 4 > end) { return null; }
+                int n = (src[pos] & 255) | ((src[pos + 1] & 255) << 8);
+                pos = pos + 4;
+                if (pos + n > end) { return null; }
+                out2 = Deflate.Ensure(out2, ref outLen, n, maxOut);
+                if (out2 == null) { return null; }
+                for (int k = 0; k < n; k = k + 1) {
+                    out2[outLen + k] = src[pos + k];
+                }
+                outLen = outLen + n;
+                pos = pos + n;
+            } else if (btype == 1 || btype == 2) {
+                Deflate.FixedTables(litCount, litSymbol, distCount, distSymbol);
+                if (btype == 2) {
+                    int r = Deflate.DynamicTables(litCount, litSymbol, distCount,
+                        distSymbol, src, ref pos, ref bit, end);
+                    if (r != 0) { return null; }
+                }
+                while (true) {
+                    int sym = Deflate.DecodeSymbol(litCount, litSymbol, src,
+                        ref pos, ref bit, end);
+                    if (sym < 0) { return null; }
+                    if (sym == 256) { break; }
+                    if (sym < 256) {
+                        out2 = Deflate.Ensure(out2, ref outLen, 1, maxOut);
+                        if (out2 == null) { return null; }
+                        out2[outLen] = (byte)sym;
+                        outLen = outLen + 1;
+                    } else {
+                        int li = sym - 257;
+                        if (li < 0 || li >= 29) { return null; }
+                        int length = Deflate.LengthBase[li] +
+                            Deflate.ReadBits(src, ref pos, ref bit,
+                                Deflate.LengthExtra[li], end);
+                        int dsym = Deflate.DecodeSymbol(distCount, distSymbol,
+                            src, ref pos, ref bit, end);
+                        if (dsym < 0 || dsym >= 30) { return null; }
+                        int dist = Deflate.DistBase[dsym] +
+                            Deflate.ReadBits(src, ref pos, ref bit,
+                                Deflate.DistExtra[dsym], end);
+                        if (dist > outLen) { return null; }
+                        if (length > maxOut - outLen) { return null; }
+                        out2 = Deflate.Ensure(out2, ref outLen, length, maxOut);
+                        if (out2 == null) { return null; }
+                        for (int m = 0; m < length; m = m + 1) {
+                            out2[outLen + m] = out2[outLen - dist + m];
+                        }
+                        outLen = outLen + length;
+                    }
+                }
+            } else {
+                return null;    // 保留的块类型
+            }
+            if (bfinal != 0) { break; }
+        }
+        // 完全消耗的字节数；部分使用的字节也计为已读。
+        consumed = pos - offset;
+        if (bit > 0) { consumed = consumed + 1; }
+        if (outLen > maxOut) { return null; }
+        if (outLen == out2.Length) { return out2; }
+        byte[] trimmed = new byte[outLen];
+        for (int t = 0; t < outLen; t = t + 1) {
+            trimmed[t] = out2[t];
+        }
+        return trimmed;
+    }
+
+    /// 为当前块构建动态 Huffman 表。成功返回 0，码集无效返回 -1。
+    static int DynamicTables(int[] litCount, int[] litSymbol, int[] distCount,
+                             int[] distSymbol, byte[] src, ref int pos,
+                             ref int bit, int end) {
+        int hlit = Deflate.ReadBits(src, ref pos, ref bit, 5, end) + 257;
+        int hdist = Deflate.ReadBits(src, ref pos, ref bit, 5, end) + 1;
+        int hclen = Deflate.ReadBits(src, ref pos, ref bit, 4, end) + 4;
+        if (hlit > 286 || hdist > 30) { return -1; }
+        // 码长字母表顺序（RFC 1951 §3.2.7）。
+        int[] clOrder = new int[] { 16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15 };
+        int[] clLen = new int[19];
+        int i = 0;
+        for (; i < 19; i = i + 1) { clLen[i] = 0; }
+        i = 0;
+        while (i < hclen) {
+            clLen[clOrder[i]] = Deflate.ReadBits(src, ref pos, ref bit, 3, end);
+            i = i + 1;
+        }
+        int[] clCount = new int[16];
+        int[] clSymbol = new int[19];
+        if (Deflate.BuildHuffman(clCount, clSymbol, clLen, 19) != 0) {
+            return -1;
+        }
+        // 读取字面量/长度与距离的码长（通过码长字母表
+        // 进行游程编码）。
+        int[] lens = new int[hlit + hdist];
+        int n = 0;
+        while (n < hlit + hdist) {
+            int sym = Deflate.DecodeSymbol(clCount, clSymbol, src, ref pos,
+                ref bit, end);
+            if (sym < 0 || sym > 18) { return -1; }
+            if (sym < 16) {
+                lens[n] = sym;
+                n = n + 1;
+            } else if (sym == 16) {
+                if (n == 0) { return -1; }
+                int prev = lens[n - 1];
+                int rep = 3 + Deflate.ReadBits(src, ref pos, ref bit, 2, end);
+                while (rep > 0 && n < hlit + hdist) {
+                    lens[n] = prev;
+                    n = n + 1;
+                    rep = rep - 1;
+                }
+            } else if (sym == 17) {
+                int rep = 3 + Deflate.ReadBits(src, ref pos, ref bit, 3, end);
+                while (rep > 0 && n < hlit + hdist) {
+                    lens[n] = 0;
+                    n = n + 1;
+                    rep = rep - 1;
+                }
+            } else {
+                int rep = 11 + Deflate.ReadBits(src, ref pos, ref bit, 7, end);
+                while (rep > 0 && n < hlit + hdist) {
+                    lens[n] = 0;
+                    n = n + 1;
+                    rep = rep - 1;
+                }
+            }
+        }
+        int[] litLen = new int[hlit];
+        int[] distLen = new int[hdist];
+        int j = 0;
+        for (; j < hlit; j = j + 1) {
+            litLen[j] = lens[j];
+        }
+        j = 0;
+        while (j < hdist) {
+            distLen[j] = lens[hlit + j];
+            j = j + 1;
+        }
+        if (Deflate.BuildHuffman(litCount, litSymbol, litLen, hlit) != 0) {
+            return -1;
+        }
+        if (Deflate.BuildHuffman(distCount, distSymbol, distLen, hdist) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    /// 确保输出缓冲区能容纳 used+need 字节：超出 maxOut 返回 null，
+    /// 否则倍增扩容并拷贝旧内容。
+    static byte[] Ensure(byte[] buf, ref int used, int need, int maxOut) {
+        if (need < 0 || used + need > maxOut) { return null; }   // 超出上限
+        if (used + need <= buf.Length) { return buf; }
+        int cap = buf.Length * 2;
+        while (cap < used + need) { cap = cap * 2; }
+        if (cap > 268435456) { cap = 268435456; }
+        byte[] bigger = new byte[cap];
+        for (int i = 0; i < used; i = i + 1) {
+            bigger[i] = buf[i];
+        }
+        return bigger;
+    }
+
+    // ---- deflate (compression) ----------------------------------------------
+
+    /// <summary>
+    /// 将 `src` 压缩为 DEFLATE 流。`level` 0 原样存储数据
+    /// （最快）；1-9 使用带
+    /// 哈希链匹配器的 LZ77 固定 Huffman 压缩（级别越高链越长，压缩比越好，但越慢）。
+    /// </summary>
+    static byte[] Deflate(byte[] src, int level) {
+        if (level <= 0 || src.Length < 64) {
+            return Deflate.Store(src, 0, src.Length);
+        }
+        return Deflate.FixedCompress(src, level);
+    }
+
+    /// 单个 stored 块（BFINAL=1）——最简单合法的流。
+    static byte[] Store(byte[] src, int offset, int len) {
+        int blockHeader = 1;    // BFINAL=1, BTYPE=00 -> 字节 0x01
+        byte[] out2 = new byte[len + 8];
+        out2[0] = 1;
+        out2[1] = (byte)(len & 255);
+        out2[2] = (byte)((len >> 8) & 255);
+        out2[3] = (byte)((~len) & 255);
+        out2[4] = (byte)((~len >> 8) & 255);
+        for (int k = 0; k < len; k = k + 1) {
+            out2[5 + k] = src[offset + k];
+        }
+        return Deflate.Trim(out2, len + 5);
+    }
+
+    /// LZ77 + 固定 Huffman。输出一个最终块；字面量和长度/
+    /// 距离对用固定表编码。
+    static byte[] FixedCompress(byte[] src, int level) {
+        byte[] out2 = new byte[src.Length + src.Length / 2 + 64];
+        int bitPos = 0;
+        // 块头：BFINAL=1, BTYPE=01（固定）。
+        Deflate.WriteBits(out2, ref bitPos, 1, 1);
+        Deflate.WriteBits(out2, ref bitPos, 1, 2);
+        bitPos = Deflate.BlockInto(src, src.Length, Deflate.ChainLength(level),
+            out2, bitPos);
+        int bytes = (bitPos + 7) / 8;
+        return Deflate.Trim(out2, bytes);
+    }
+
+    /// 压缩级别对应的哈希链最大匹配长度（级别越高链越长）。
+    static int ChainLength(int level) {
+        if (level >= 9) { return 1024; }
+        if (level >= 7) { return 256; }
+        if (level >= 5) { return 64; }
+        if (level >= 3) { return 16; }
+        return 4;
+    }
+
+    /// 固定 Huffman 块体：LZ77 哈希链匹配 + 块结束符。从
+    /// `bitPos` 起按位续写（调用方已写好块头），返回结束时的
+    /// 位位置。head/prev 每次调用新建，因此匹配从不跨块——
+    /// 分块压缩（<see cref="DeflateChunker"/>）正依赖这一点。
+    static int BlockInto(byte[] src, int n, int maxChain, byte[] out2,
+                         int bitPos) {
+        // 哈希表：16 位哈希 -> 链头位置（从 1 开始，0 表示空）。
+        int hsize = 65536;
+        int[] head = new int[hsize];
+        int[] prev = new int[n];
+        for (int i = 0; i < n; i = i + 1) { prev[i] = 0; }
+
+        int pos = 0;
+        while (pos < n) {
+            int match = 0;
+            int matchLen = 0;
+            // 在 pos 处查找最长匹配（对 3 字节取哈希）。
+            if (pos + 2 < n) {
+                int h = ((src[pos] & 255) << 8 | (src[pos + 1] & 255)) ^
+                        (src[pos + 2] & 255);
+                int cand = head[h & 65535];     // 从 1 开始的位置
+                for (int chain = 0; cand > 0 && chain < maxChain; chain = chain + 1) {
+                    int c0 = cand - 1;
+                    int dist = pos - c0;
+                    if (dist <= 32768 && dist > 0) {
+                        int l = 0;
+                        for (; l < 258 && pos + l < n &&
+                               src[c0 + l] == src[pos + l]; l = l + 1) {
+                        }
+                        if (l > matchLen) {
+                            matchLen = l;
+                            match = dist;
+                            if (l >= 258) { break; }
+                        }
+                    }
+                    cand = prev[c0];
+                }
+            }
+            // 将当前位置插入哈希链。
+            if (pos + 2 < n) {
+                int h = ((src[pos] & 255) << 8 | (src[pos + 1] & 255)) ^
+                        (src[pos + 2] & 255);
+                prev[pos] = head[h & 65535];
+                head[h & 65535] = pos + 1;      // 从 1 开始
+            }
+            if (matchLen >= 3 && match > 0) {
+                Deflate.EmitLengthDistance(out2, ref bitPos, matchLen, match);
+                pos = pos + matchLen;
+            } else {
+                Deflate.EmitLitFixed(out2, ref bitPos, src[pos] & 255);
+                pos = pos + 1;
+            }
+        }
+        // 块结束符号 256（固定：7 位，码 0）。
+        Deflate.WriteBits(out2, ref bitPos, 0, 7);
+        return bitPos;
+    }
+
+    /// 按固定表编码一个字面量符号（MSB 优先）。
+    static void EmitLitFixed(byte[] out2, ref int bitPos, int sym) {
+        // 固定字面量码：0-143 -> 8 位（0x30+sym）；144-255 -> 9 位
+        // （0x190 + (sym-144)）。Huffman 码按 MSB 优先打包。
+        if (sym < 144) {
+            Deflate.WriteBitsMsb(out2, ref bitPos, 0x30 + sym, 8);
+        } else {
+            Deflate.WriteBitsMsb(out2, ref bitPos, 0x190 + (sym - 144), 9);
+        }
+    }
+
+    /// 按固定表编码一个长度/距离对（含附加位）。
+    static void EmitLengthDistance(byte[] out2, ref int bitPos, int length,
+                                   int dist) {
+        // 长度码。
+        int code = 0;
+        int extra = 0;
+        int baseLen = 0;
+        int li = 0;
+        for (; li < 29; li = li + 1) {
+            if (length < Deflate.LengthBase[li]) { break; }
+            code = 257 + li;
+            baseLen = Deflate.LengthBase[li];
+            extra = Deflate.LengthExtra[li];
+        }
+        if (li == 0) {
+            code = 257;
+            baseLen = 3;
+            extra = 0;
+        }
+        Deflate.EmitFixed(code, out2, ref bitPos);
+        Deflate.WriteBits(out2, ref bitPos, length - baseLen, extra);
+        // 距离码。
+        int dcode = 0;
+        int dextra = 0;
+        int dbase = 0;
+        for (int di = 0; di < 30; di = di + 1) {
+            if (dist < Deflate.DistBase[di]) { break; }
+            dcode = di;
+            dbase = Deflate.DistBase[di];
+            dextra = Deflate.DistExtra[di];
+        }
+        Deflate.WriteBitsMsb(out2, ref bitPos, dcode, 5);   // 固定：5 位
+        Deflate.WriteBits(out2, ref bitPos, dist - dbase, dextra);
+    }
+
+    /// 长度符号 `code`（257-285）的固定表编码，MSB 优先。
+    static void EmitFixed(int code, byte[] out2, ref int bitPos) {
+        if (code < 256) {
+            if (code < 144) { Deflate.WriteBitsMsb(out2, ref bitPos, 0x30 + code, 8); }
+            else { Deflate.WriteBitsMsb(out2, ref bitPos, 0x190 + (code - 144), 9); }
+        } else if (code < 280) {
+            // 256-279 -> 7 位（code-256）。
+            Deflate.WriteBitsMsb(out2, ref bitPos, code - 256, 7);
+        } else {
+            // 280-287 -> 8 位（0xC0 + code - 280）。
+            Deflate.WriteBitsMsb(out2, ref bitPos, 0xC0 + (code - 280), 8);
+        }
+    }
+
+    /// 从低位起写 n 位（LSB 优先；块头、附加位等非 Huffman 字段用）。
+    /// 按整字节打包：寄存器里一次对齐后按字节 OR 进缓冲，替代
+    /// 逐位读-改-写——每输出字节 8 次数组往返是本实现的主要 CPU
+    /// 去向。写入的位序列与逐位版本完全一致，压缩结果逐字节相同。
+    static void WriteBits(byte[] out2, ref int bitPos, int v, int n) {
+        if (n == 0) { return; }
+        int byteIdx = bitPos >> 3;
+        int bitIdx = bitPos & 7;
+        int w = (v & ((1 << n) - 1)) << bitIdx;
+        int nb = ((bitIdx + n) + 7) >> 3;
+        for (int k = 0; k < nb; k = k + 1) {
+            out2[byteIdx + k] = (byte)((out2[byteIdx + k] & 255)
+                | ((w >> (k << 3)) & 255));
+        }
+        bitPos = bitPos + n;
+    }
+
+    /// 写入 `v` 的低 `n` 位，最高有效位在前。RFC 1951 中
+    /// Huffman 码按 MSB 优先，而其他字段（块头、附加位、
+    /// LEN/NLEN）按 LSB 优先 —— 因此编码必须走这个函数。
+    /// 位序倒装先在寄存器里完成（首个写出的位 = v 的最高
+    /// 有效位），再走统一的整字节 LSB 打包。
+    static void WriteBitsMsb(byte[] out2, ref int bitPos, int v, int n) {
+        if (n == 0) { return; }
+        int r = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            r = (r << 1) | ((v >> i) & 1);
+        }
+        Deflate.WriteBits(out2, ref bitPos, r, n);
+    }
+
+    /// 返回 buf 前 len 字节的拷贝。
+    static byte[] Trim(byte[] buf, int len) {
+        byte[] out2 = new byte[len];
+        for (int i = 0; i < len; i = i + 1) {
+            out2[i] = buf[i];
+        }
+        return out2;
+    }
+
+    // ---- zlib wrapper (RFC 1950) ---------------------------------------------
+
+    /// <summary>
+    /// zlib 流（2 字节头 + adler32 尾部）包裹原始 DEFLATE
+    /// 流。大多数 .NET/Java/zip 工具可直接消费。
+    /// </summary>
+    static byte[] ZlibCompress(byte[] src, int level) {
+        byte[] deflated = Deflate.Deflate(src, level);
+        byte[] out2 = new byte[deflated.Length + 8];
+        out2[0] = 0x78;                     // CMF：32K 窗口，deflate
+        int flevel = 0;
+        if (level >= 7) { flevel = 3; }
+        else if (level >= 3) { flevel = 2; }
+        out2[1] = (byte)(flevel << 6);      // FLEVEL + FCHECK 位
+        out2[1] = (byte)(out2[1] | ((31 - ((out2[0] * 256 + out2[1]) % 31)) % 31));
+        for (int k = 0; k < deflated.Length; k = k + 1) {
+            out2[2 + k] = deflated[k];
+        }
+        long s1 = 1;
+        long s2 = 0;
+        for (int i = 0; i < src.Length; i = i + 1) {
+            s1 = (s1 + (src[i] & 255)) % 65521;
+            s2 = (s2 + s1) % 65521;
+        }
+        long ad = (s2 << 16) | s1;
+        out2[deflated.Length + 2] = (byte)((ad >> 24) & 255);
+        out2[deflated.Length + 3] = (byte)((ad >> 16) & 255);
+        out2[deflated.Length + 4] = (byte)((ad >> 8) & 255);
+        out2[deflated.Length + 5] = (byte)(ad & 255);
+        return out2;
+    }
+}
+
+/// <summary>
+/// DEFLATE 分块压缩器：大条目按块压成一条合法的流，内存占用
+/// 与数据总量无关。DEFLATE 的块在流里是位连续的，不能按字节
+/// 拼接，因此每块从上一块遗留的部分字节继续写；哈希链每块
+/// 重建、匹配从不跨块，对 1MB 量级的块压缩比损失可以忽略。
+/// <see cref="Push"/> 每次返回可直接落盘的完整字节（残位留在
+/// 内部状态里随下一块续写）；数据写完后调 <see cref="Finish"/>
+/// 发射收尾块并冲出最后的残位。与 Inflate 互通：Push+Finish
+/// 的输出整体是一次合法的 DEFLATE 流。
+/// </summary>
+class DeflateChunker {
+    // 上一块遗留的部分字节（低 pendingBits 位有效）。
+    int pending;
+    int pendingBits;
+
+    /// 构造从零残位开始的分块压缩器。
+    DeflateChunker() {
+        this.pending = 0;
+        this.pendingBits = 0;
+    }
+
+    /// <summary>压缩一块（非收尾块）。返回可落盘的完整字节。</summary>
+    byte[] Push(byte[] chunk, int level) {
+        if (chunk.Length == 0) { return new byte[0]; }
+        // 最坏情况：全字面量固定码 9 位/字节 + 头尾。
+        byte[] out2 = new byte[chunk.Length * 2 + 16];
+        out2[0] = (byte)this.pending;
+        int bitPos = this.pendingBits;
+        // 块头：BFINAL=0, BTYPE=01（固定）。
+        Deflate.WriteBits(out2, ref bitPos, 0, 1);
+        Deflate.WriteBits(out2, ref bitPos, 1, 2);
+        bitPos = Deflate.BlockInto(chunk, chunk.Length, Deflate.ChainLength(level),
+            out2, bitPos);
+        return DeflateChunker.TakeComplete(out2, bitPos, this);
+    }
+
+    /// <summary>收尾：发射 BFINAL=1 的空块并冲出最后的残位。</summary>
+    byte[] Finish() {
+        byte[] out2 = new byte[16];
+        out2[0] = (byte)this.pending;
+        int bitPos = this.pendingBits;
+        Deflate.WriteBits(out2, ref bitPos, 1, 1);
+        Deflate.WriteBits(out2, ref bitPos, 1, 2);
+        // 空块的块结束符号（7 位，码 0）。
+        Deflate.WriteBits(out2, ref bitPos, 0, 7);
+        this.pending = 0;
+        this.pendingBits = 0;
+        int bytes = (bitPos + 7) / 8;
+        return Deflate.Trim(out2, bytes);
+    }
+
+    /// 把位流切成完整字节返回；末尾残位存回 chunker 状态。
+    static byte[] TakeComplete(byte[] out2, int bitPos, DeflateChunker ch) {
+        int bytes = bitPos / 8;
+        int rem = bitPos - bytes * 8;
+        ch.pendingBits = rem;
+        ch.pending = 0;
+        if (rem > 0) { ch.pending = out2[bytes] & 255; }
+        return Deflate.Trim(out2, bytes);
+    }
+}
+
+

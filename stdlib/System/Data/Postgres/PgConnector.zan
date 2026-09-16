@@ -1,0 +1,64 @@
+using System;
+using System.Data;
+
+namespace System.Data.Postgres;
+
+/// <summary>
+/// <see cref="IDbConnector"/> 的原生 PostgreSQL 驱动实现。
+/// 使用非阻塞握手建立连接（<c>PQconnectStart</c> 由
+/// IO reactor 驱动），因此扩容连接池从不阻塞工作线程。
+///
+/// 用法：
+///   DbPool pool = PgConnector.Pool("127.0.0.1", 5432, "app", "postgres", "secret", 8);
+///   IDbConnection db = await pool.AcquireAsync();
+///   DbResult r = db.Query("SELECT 1");
+///   pool.Release(db);
+///
+/// <see cref="PgPool"/> 是对应的类型化连接池；当查询
+/// 本身需要以协程方式运行时使用（<c>QueryAsync</c>/<c>ExecuteAsync</c>）。
+/// </summary>
+class PgConnector : IDbConnector {
+    string conninfo;
+
+    PgConnector(string conninfo) {
+        this.conninfo = conninfo;
+    }
+
+    /// <summary>基于 host/port/database/user/password 的连接器。</summary>
+    static PgConnector CreateParams(string host, int port, string database,
+            string user, string password) {
+        return new PgConnector(PgConnector.BuildConninfo(host, port, database,
+                                                         user, password));
+    }
+
+    /// <summary>基于 libpq 连接字符串的连接池。</summary>
+    static DbPool Pool(string conninfo, int maxSize) {
+        return new DbPool(new PgConnector(conninfo), maxSize);
+    }
+
+    /// <summary>基于 host/port/database/user/password 的连接池。</summary>
+    static DbPool Pool(string host, int port, string database, string user,
+            string password, int maxSize) {
+        return new DbPool(
+            PgConnector.CreateParams(host, port, database, user, password),
+            maxSize);
+    }
+
+    /// 把 host/port/database/user/password 拼成 libpq conninfo 字符串。
+    static string BuildConninfo(string host, int port, string database,
+            string user, string password) {
+        return "host=" + host + " port=" + Convert.ToString(port)
+             + " dbname=" + database + " user=" + user
+             + " password=" + password;
+    }
+
+    /// 执行非阻塞握手打开一个新连接（由 IO reactor 驱动）。
+    async IDbConnection ConnectAsync() {
+        return await PgConnection.OpenAsync(this.conninfo);
+    }
+
+    /// 池的 provider id（恒为 <see cref="DbProvider.PostgreSQL"/>）。
+    int GetProvider() {
+        return DbProvider.PostgreSQL;
+    }
+}

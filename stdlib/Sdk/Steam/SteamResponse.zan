@@ -1,0 +1,112 @@
+using System;
+using System.Json;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Net.External;
+
+namespace Sdk.Steam;
+
+/// <summary>
+/// 一次成功调用的返回结果。
+///
+/// Steam Web API 的 JSON 信封各接口不一致（多数包在 <c>response</c> 里，
+/// AuthenticateUserTicket 包在 <c>response.params</c> 里），因此本类不预置
+/// 业务模型——成功时 <see cref="Value"/> 是已解析的完整 JSON 树，用
+/// <c>PathStr("response.personaname", "")</c> 等点分路径直接取值。
+///
+/// 失败不会走到这里：HTTP 非 2xx、JSON 解析失败或票据校验 result != 1
+/// 都直接抛 <see cref="SteamException"/>。
+/// </summary>
+class SteamResponse {
+    /// <summary>完整响应 JSON 文本。</summary>
+    public string Data;
+
+    /// <summary>HTTP 状态码（成功时为 200）。</summary>
+    public int StatusCode;
+
+    /// <summary>已解析的响应树，需要动态取值时用。</summary>
+    public JsonValue Value;
+
+    // Inspect 判定出的失败原因；Parse 读走后抛成 SteamException。
+    // 用 static 承载而不是实例字段，是为了让 throw 发生时本帧没有活跃对象
+    // （见 docs/bugs/throw-leaks-live-locals.md）。
+    static string lastErrCode = "";
+    static string lastErrMsg = "";
+
+    SteamResponse(string data, int statusCode, JsonValue v) {
+        this.Data = data;
+        this.StatusCode = statusCode;
+        this.Value = v;
+    }
+
+    /// <summary>
+    /// 解析 HTTP 200 的 Steam 响应。正文必须是合法 JSON 对象，否则抛
+    /// SteamException("client.badResponse")。
+    /// </summary>
+    static SteamResponse Parse(int statusCode, string body) {
+        SteamResponse.lastErrCode = "";
+        SteamResponse.lastErrMsg = "";
+        SteamResponse ok = SteamResponse.Inspect(statusCode, body);
+        if (ok != null) { return ok; }
+        throw new SteamException(SteamResponse.lastErrCode,
+                                 SteamResponse.lastErrMsg, body);
+    }
+
+    static SteamResponse Inspect(int statusCode, string body) {
+        if (statusCode < 200 || statusCode >= 300) {
+            return SteamResponse.Failure("http." + Convert.ToString(statusCode),
+                "Steam Web API 返回 HTTP " + Convert.ToString(statusCode));
+        }
+        JsonValue root = null;
+        string parseErr = "";
+        try {
+            root = JsonValue.Parse(body);
+        } catch (Exception e) {
+            parseErr = e.Message;
+        }
+        if (parseErr.Length > 0) {
+            return SteamResponse.Failure("client.badResponse", parseErr);
+        }
+        if (root == null || !root.IsObject()) {
+            return SteamResponse.Failure("client.badResponse",
+                "响应不是合法的 JSON 对象");
+        }
+        return new SteamResponse(root.ToJson(), statusCode, root);
+    }
+
+    static SteamResponse Failure(string code, string msg) {
+        SteamResponse.lastErrCode = code;
+        SteamResponse.lastErrMsg = msg;
+        return null;
+    }
+
+    /// <summary>从已解析结果中按点分路径读字符串（"response.personaname"）。</summary>
+    string Str(string path, string dflt) {
+        if (this.Value == null) { return dflt; }
+        return this.Value.PathStr(path, dflt);
+    }
+
+    /// <summary>从已解析结果中按点分路径读整数。</summary>
+    int Int(string path, int dflt) {
+        if (this.Value == null) { return dflt; }
+        return this.Value.PathInt(path, dflt);
+    }
+
+    /// <summary>从已解析结果中按点分路径读 64 位整数。</summary>
+    long Long(string path, long dflt) {
+        if (this.Value == null) { return dflt; }
+        JsonValue v = this.Value.PathGet(path);
+        if (v == null) { return dflt; }
+        // Steam 对 64 位整数一律以字符串返回；数字形态也兼容。
+        if (v.IsString()) { return JsonValue.LongOf(v.AsString("0")); }
+        return v.AsLong(dflt);
+    }
+
+    /// <summary>从已解析结果中按点分路径读布尔。</summary>
+    bool Bool(string path, bool dflt) {
+        if (this.Value == null) { return dflt; }
+        JsonValue v = this.Value.PathGet(path);
+        if (v == null) { return dflt; }
+        return v.AsBool(dflt);
+    }
+}

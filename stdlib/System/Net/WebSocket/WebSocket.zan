@@ -1,0 +1,866 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Tls;
+using System.Text;
+using System.Security.Cryptography;
+
+namespace System.Net.WebSocket;
+
+/// <summary>
+/// WebSocket 帧操作码（opcode）。
+/// </summary>
+class WsOpcode {
+    /// 分片消息的后续帧（RFC 6455 §5.4）。
+    static const int Continuation = 0;
+    /// UTF-8 文本消息。
+    static const int Text = 1;
+    /// 二进制消息。
+    static const int Binary = 2;
+    /// 连接关闭（含 2 字节状态码负载）。
+    static const int Close = 8;
+    /// 心跳探测（负载原样由 Pong 回）。
+    static const int Ping = 9;
+    /// 心跳应答。
+    static const int Pong = 10;
+}
+
+/// <summary>
+/// WebSocket 帧构建与解析器（RFC 6455）。
+/// </summary>
+class WsFrame {
+    int opcode;
+    string payload;
+    int payloadLen;
+    bool fin;
+    bool masked;
+
+    /// 内部构造：Text 帧、fin、不掩码；字段由各工厂方法填。
+    WsFrame() {
+        this.opcode = WsOpcode.Text;
+        this.payload = "";
+        this.payloadLen = 0;
+        this.fin = true;
+        this.masked = false;
+    }
+
+    /// 载荷为整串的 Text 帧。
+    static WsFrame TextFrame(string data) {
+        WsFrame f = new WsFrame();
+        f.opcode = WsOpcode.Text;
+        f.payload = data;
+        f.payloadLen = data.Length;
+        return f;
+    }
+
+    /// 二进制帧：data 可含 NUL，len 为精确字节数。
+    static WsFrame BinaryFrame(string data, int len) {
+        WsFrame f = new WsFrame();
+        f.opcode = WsOpcode.Binary;
+        f.payload = data;
+        f.payloadLen = len;
+        return f;
+    }
+
+    /// 不带状态码的空关闭帧。
+    static WsFrame CloseFrame() {
+        WsFrame f = new WsFrame();
+        f.opcode = WsOpcode.Close;
+        return f;
+    }
+
+    /// <summary>带状态码的关闭帧（RFC 6455 §7.1.5 的 2 字节
+    /// 负载）。协议错误 1002、消息过大 1009 等场景下应告知
+    /// 对端原因，而不是发空关闭帧。</summary>
+    static WsFrame CloseFrameWithCode(int code) {
+        WsFrame f = new WsFrame();
+        f.opcode = WsOpcode.Close;
+        byte[] p = new byte[3];
+        p[0] = (byte)((code >> 8) & 255);
+        p[1] = (byte)(code & 255);
+        f.payload = p.ToStr(0, 2);
+        f.payloadLen = 2;
+        return f;
+    }
+
+    /// 空 Ping 帧。
+    static WsFrame PingFrame() {
+        WsFrame f = new WsFrame();
+        f.opcode = WsOpcode.Ping;
+        return f;
+    }
+
+    /// 空 Pong 帧。
+    static WsFrame PongFrame() {
+        WsFrame f = new WsFrame();
+        f.opcode = WsOpcode.Pong;
+        return f;
+    }
+
+    /// <summary>任意 opcode 的出站帧（客户端统一发送入口用）。</summary>
+    static WsFrame RawFrame(int opcode, string payload, int payloadLen) {
+        WsFrame f = new WsFrame();
+        f.opcode = opcode;
+        f.payload = payload;
+        f.payloadLen = payloadLen;
+        return f;
+    }
+
+    /// <summary>帧头字节数（RFC 6455 长度编码）。发送方据它
+    /// 计算真实写出长度——此前发送方硬编码 2，载荷超过 125 字节时
+    /// 帧头被截断、帧流从此错位。</summary>
+    static int HeaderLen(int payloadLen) {
+        if (payloadLen > 65535) { return 10; }
+        if (payloadLen > 125) { return 4; }
+        return 2;
+    }
+
+    /// 服务端方向编码：FIN + opcode + RFC 6455 长度编码 + 载荷
+    /// （不掩码；客户端须用 EncodeMasked）。
+    byte[] Encode() {
+        int headerLen = WsFrame.HeaderLen(this.payloadLen);
+        byte[] buf = new byte[headerLen + this.payloadLen + 1];
+        int byte0 = 128 + this.opcode;
+        buf[0] = (byte)byte0;
+
+        if (this.payloadLen > 65535) {
+            buf[1] = 127;
+            buf[2] = 0;
+            buf[3] = 0;
+            buf[4] = 0;
+            buf[5] = 0;
+            buf[6] = (byte)((this.payloadLen >> 24) & 255);
+            buf[7] = (byte)((this.payloadLen >> 16) & 255);
+            buf[8] = (byte)((this.payloadLen >> 8) & 255);
+            buf[9] = (byte)(this.payloadLen & 255);
+        } else if (this.payloadLen > 125) {
+            buf[1] = 126;
+            buf[2] = (byte)((this.payloadLen >> 8) & 255);
+            buf[3] = (byte)(this.payloadLen & 255);
+        } else {
+            buf[1] = (byte)this.payloadLen;
+        }
+
+        for (int i = 0; i < this.payloadLen; i = i + 1) {
+            buf[headerLen + i] = (byte)this.payload[i];
+        }
+
+        return buf;
+    }
+
+    /// <summary>客户端方向的帧：RFC 6455 §5.1 要求浏览器之外的客户端
+    /// 也必须掩码，合规的服务器与代理会直接拒绝未掩码帧。每帧用
+    /// CSPRNG 掩码键（与 WssClient 相同的方案）。</summary>
+    byte[] EncodeMasked() {
+        int headerLen = WsFrame.HeaderLen(this.payloadLen) + 4;
+        byte[] buf = new byte[headerLen + this.payloadLen + 1];
+        int byte0 = 128 + this.opcode;
+        buf[0] = (byte)byte0;
+
+        int pos = 2;
+        if (this.payloadLen > 65535) {
+            buf[1] = (byte)(128 + 127);
+            buf[2] = 0;
+            buf[3] = 0;
+            buf[4] = 0;
+            buf[5] = 0;
+            buf[6] = (byte)((this.payloadLen >> 24) & 255);
+            buf[7] = (byte)((this.payloadLen >> 16) & 255);
+            buf[8] = (byte)((this.payloadLen >> 8) & 255);
+            buf[9] = (byte)(this.payloadLen & 255);
+            pos = 10;
+        } else if (this.payloadLen > 125) {
+            buf[1] = (byte)(128 + 126);
+            buf[2] = (byte)((this.payloadLen >> 8) & 255);
+            buf[3] = (byte)(this.payloadLen & 255);
+            pos = 4;
+        } else {
+            buf[1] = (byte)(128 + this.payloadLen);
+        }
+
+        byte[] mask = RandomNumberGenerator.GetBytes(4);
+        if (mask == null) { mask = new byte[] { 0, 0, 0, 0 }; }
+        for (int m = 0; m < 4; m = m + 1) { buf[pos + m] = mask[m]; }
+        pos = pos + 4;
+
+        for (int i = 0; i < this.payloadLen; i = i + 1) {
+            buf[pos + i] = (byte)((this.payload[i] & 255) ^ mask[i % 4]);
+        }
+
+        return buf;
+    }
+
+    /// <summary>解码从 `offset` 开始的帧；`frameLen` 为其
+    /// 总字节长度。原地读取让读取方能在同一缓冲区中持有多个管道帧，
+    /// 而不必在每帧之后搬移剩余数据。
+    ///
+    /// 所有扩展长度/掩码读取都先对照 `frameLen` 判界，64 位长度
+    /// 的高 32 位必须为零（RFC 6455 要求 MSB=0 且连接失败）——
+    /// 此前截断帧会读到越界字节、声明超长载荷会负向 Substring，
+    /// 都是 rt_crash 边界陷阱级的进程死亡。违规时返回 opcode=Close
+    /// 的空帧，调用方按关闭处理。
+    ///
+    /// 调用方必须保证底层缓冲覆盖 `offset0 + frameLen` 字节——
+    /// WsReader.FrameSize 返回正数时恰好给出这一保证。这里的
+    /// 缓冲实参是按 string 传入的 byte[]：其 `.Length` 退化为
+    /// strlen，而帧字节里随时可能出现 NUL（continuation 帧的
+    /// opcode 就是 0），因此绝不能拿 `data.Length` 当边界用——
+    /// 旧的按 strlen 钳制会提前截断 dataEnd，让解码器把完整帧
+    /// 误判为空帧并静默丢弃。</summary>
+    static WsFrame DecodeAt(string data, int offset0, int frameLen) {
+        WsFrame f = new WsFrame();
+        if (frameLen < 2) { return f; }
+        int dataEnd = offset0 + frameLen;
+        if (offset0 + 2 > dataEnd) { return f; }
+
+        int byte0 = data[offset0] & 255;
+        int byte1 = data[offset0 + 1] & 255;
+
+        f.fin = (byte0 & 128) != 0;
+        f.opcode = byte0 & 15;
+        f.masked = (byte1 & 128) != 0;
+
+        int payloadLen = byte1 & 127;
+        int offset = offset0 + 2;
+
+        if (payloadLen == 126) {
+            if (offset0 + 4 > dataEnd) { f.opcode = WsOpcode.Close; return f; }
+            payloadLen = ((data[offset0 + 2] & 255) << 8) + (data[offset0 + 3] & 255);
+            offset = offset0 + 4;
+        } else if (payloadLen == 127) {
+            if (offset0 + 10 > dataEnd) { f.opcode = WsOpcode.Close; return f; }
+            if ((data[offset0 + 2] & 255) != 0 || (data[offset0 + 3] & 255) != 0
+                || (data[offset0 + 4] & 255) != 0 || (data[offset0 + 5] & 255) != 0) {
+                // 64 位长度的有效位超出 32 位：按 RFC 视为协议错误。
+                f.opcode = WsOpcode.Close;
+                return f;
+            }
+            payloadLen = ((data[offset0 + 6] & 255) << 24) +
+                         ((data[offset0 + 7] & 255) << 16) +
+                         ((data[offset0 + 8] & 255) << 8) + (data[offset0 + 9] & 255);
+            offset = offset0 + 10;
+        }
+
+        if (f.masked) {
+            if (offset + 4 > dataEnd) { f.opcode = WsOpcode.Close; return f; }
+        }
+
+        f.payloadLen = payloadLen;
+
+        // 声明的载荷超过缓冲里实际拥有的字节：只解出可用的部分，
+        // 绝不越过缓冲边界（正常路径上 FrameSize 已保证完整帧）。
+        int avail = dataEnd - offset;
+        if (f.masked) { avail = avail - 4; }
+        int copyLen = payloadLen < avail ? payloadLen : avail;
+        if (copyLen < 0) { copyLen = 0; }
+
+        if (f.masked) {
+            int mask0 = data[offset] & 255;
+            int mask1 = data[offset + 1] & 255;
+            int mask2 = data[offset + 2] & 255;
+            int mask3 = data[offset + 3] & 255;
+            offset = offset + 4;
+
+            byte[] payload = new byte[copyLen + 1];
+            for (int i = 0; i < copyLen; i = i + 1) {
+                int maskByte = 0;
+                int mod = i % 4;
+                if (mod == 0) { maskByte = mask0; }
+                else if (mod == 1) { maskByte = mask1; }
+                else if (mod == 2) { maskByte = mask2; }
+                else { maskByte = mask3; }
+                payload[i] = (byte)((data[offset + i] & 255) ^ maskByte);
+            }
+            f.payload = payload.ToStr(0, copyLen);
+        } else {
+            f.payload = data.Substring(offset, copyLen);
+        }
+
+        return f;
+    }
+}
+
+/// <summary>
+/// 带缓冲、二进制安全的 WebSocket 帧读取器。
+///
+/// 修复了朴素的“一次 recv == 一整
+/// 帧”模型中的两个正确性/吞吐量缺陷：
+///   1. 大于单次 recv 的帧（或被 TCP 分段拆开的帧）会
+///      通过不断累积字节、直到声明的帧长度
+///      全部到达才完成重组。
+///   2. 一次 recv 收到多帧（管道化/合并发送）时，
+///      逐帧取出处理，而不是只解码第一帧。
+///
+/// 它还避免了基于字符串 recv 的 NUL 截断风险：字节由 <c>Socket.Recv</c>
+/// 接收（它返回真实字节数），
+/// 有效长度显式记录在 <c>len</c> 中，绝不用 <c>strlen</c>。
+/// </summary>
+class WsReader {
+    nint sock;
+    // 非空时字节源为 TLS 明文流（wss），否则直接从 sock 读取。
+    TlsStream tlsSrc;
+    byte[] buf;
+    int len;
+    int cap;
+    byte[] tmp;
+    // 下一个未读帧的游标。已消费的帧通过向前移动游标跳过；
+    // 仅当需要读取更多字节时才压缩缓冲区，
+    // 这样一批管道帧只需一次搬移，而不是每帧一次。
+    int start;
+    // 单条消息的缓冲上限：对端声明的帧总长超过它时按
+    // 协议错误拒绝（FrameSize 返回 -3），而不是把内存
+    // 无限翻倍——远端声明一个 2GB 的帧再慢慢滴字节，
+    // 即可把无上限的 Ensure 撑到 OOM。
+    int maxLen;
+
+    /// 内部构造：64KiB 缓冲、消息上限 16 MiB；经 new / WrapTls 使用。
+    WsReader(nint sock) {
+        this.sock = sock;
+        this.tlsSrc = null;
+        this.cap = 65536;
+        this.buf = new byte[this.cap + 1];
+        this.len = 0;
+        this.start = 0;
+        this.tmp = new byte[65537];
+        this.maxLen = 16777216;   // 16 MiB，与 MQTT broker 单包上限一致
+    }
+
+    /// <summary>以 TLS 明文流为字节源的读取器（wss 连接）。</summary>
+    static WsReader WrapTls(TlsStream stream) {
+        // 套接字句柄无用但字段必须一致：FillMore 走 tlsSrc 分支。
+        WsReader r = new WsReader((nint)0);
+        r.tlsSrc = stream;
+        return r;
+    }
+
+    /// <summary>调整单条消息的缓冲上限（字节）。</summary>
+    void SetMaxLen(int max) { this.maxLen = max; }
+
+    /// <summary>单条消息的缓冲上限（字节）。</summary>
+    int MaxLen() { return this.maxLen; }
+
+    /// <summary>缓冲中未读字节数。</summary>
+    int Buffered() { return this.len - this.start; }
+
+    /// <summary>把未读字节移到开头，使游标归零。</summary>
+    void Compact() {
+        if (this.start == 0) { return; }
+        int rem = this.len - this.start;
+        for (int i = 0; i < rem; i = i + 1) {
+            this.buf[i] = this.buf[this.start + i];
+        }
+        this.len = rem;
+        this.start = 0;
+    }
+
+    /// <summary>用已从套接字读到的字节初始化缓冲区。
+    /// 同时服务 HTTP 与 WebSocket 的端口会自行读取握手，可能连带读入
+    /// 首批帧，这些字节不能丢失。</summary>
+    void Prime(string data, int n) {
+        if (n <= 0) { return; }
+        this.Ensure(this.len + n);
+        for (int i = 0; i < n; i = i + 1) {
+            this.buf[this.len + i] = (byte)data[i];
+        }
+        this.len = this.len + n;
+    }
+
+    /// <summary>扩展累积缓冲区，使其至少容纳 `need` 个字节。</summary>
+    void Ensure(int need) {
+        if (need <= this.cap) { return; }
+        int nc = this.cap * 2;
+        while (nc < need) { nc = nc * 2; }
+        byte[] nb = new byte[nc + 1];
+        for (int i = 0; i < this.len; i = i + 1) {
+            nb[i] = this.buf[i];
+        }
+        this.buf = nb;
+        this.cap = nc;
+    }
+
+    /// <summary>挂起在 reactor 上直到可读，然后把收到的字节
+    /// 追加进缓冲区。返回读取的字节数；0 表示对端已关闭（EOF）。</summary>
+    async int FillMore() {
+        int got = 0;
+        this.Compact();
+        while (got == 0) {
+            if (this.tlsSrc != null) {
+                // TLS 字节源：解密后的明文落入 tmp 并按显式字节数
+                // 追加（帧负载可能含 NUL，绝不依赖 strlen）。
+                int tn = await this.tlsSrc.RecvIntoAsync(this.tmp, 65536);
+                if (tn <= 0) { return 0; }
+                this.Ensure(this.len + tn);
+                for (int i = 0; i < tn; i = i + 1) {
+                    this.buf[this.len + i] = this.tmp[i];
+                }
+                this.len = this.len + tn;
+                got = tn;
+                continue;
+            }
+            await Socket.ReadReady(this.sock);
+            int n = 0;
+            if (this.len == 0) {
+                // 快路径：缓冲区为空（常见的每 recv 一帧的情况）——
+                // 直接接收进缓冲区，无需中间拷贝。
+                n = Socket.Recv(this.sock, this.buf, this.cap);
+                if (n > 0) {
+                    this.len = n;
+                    got = n;
+                } else if (n == 0) {
+                    return 0;
+                }
+            } else {
+                // 缓冲区已有字节（部分帧/合并帧）：先收进
+                // 临时缓冲区再追加。
+                n = Socket.Recv(this.sock, this.tmp, 65536);
+                if (n > 0) {
+                    this.Ensure(this.len + n);
+                    for (int i = 0; i < n; i = i + 1) {
+                        this.buf[this.len + i] = this.tmp[i];
+                    }
+                    this.len = this.len + n;
+                    got = n;
+                } else if (n == 0) {
+                    return 0;
+                }
+            }
+            // n < 0：EWOULDBLOCK/虚假唤醒——再次等待可读。
+        }
+        return got;
+    }
+
+    /// <summary>缓冲区头部帧的总字节长度；若完整帧尚未全部缓冲
+    /// 则返回 -1。返回 -2 = 协议违规（64 位长度的高 32 位非零，
+    /// RFC 要求连接失败）；-3 = 帧总长超过 maxLen（消息过大）。
+    /// 调用方对 -2/-3 都必须关闭而非继续等待。</summary>
+    int FrameSize() {
+        int s = this.start;
+        int avail = this.len - s;
+        if (avail < 2) { return -1; }
+        int b1 = this.buf[s + 1] & 255;
+        bool masked = (b1 & 128) != 0;
+        int payloadLen = b1 & 127;
+        int offset = 2;
+        if (payloadLen == 126) {
+            if (avail < 4) { return -1; }
+            payloadLen = ((this.buf[s + 2] & 255) << 8) + (this.buf[s + 3] & 255);
+            offset = 4;
+        } else if (payloadLen == 127) {
+            if (avail < 10) { return -1; }
+            if ((this.buf[s + 2] & 255) != 0 || (this.buf[s + 3] & 255) != 0
+                || (this.buf[s + 4] & 255) != 0 || (this.buf[s + 5] & 255) != 0) {
+                return -2;
+            }
+            payloadLen = ((this.buf[s + 6] & 255) << 24) +
+                         ((this.buf[s + 7] & 255) << 16) +
+                         ((this.buf[s + 8] & 255) << 8) + (this.buf[s + 9] & 255);
+            offset = 10;
+        }
+        int maskLen = 0;
+        if (masked) { maskLen = 4; }
+        int total = offset + maskLen + payloadLen;
+        if (total < 0) { return -2; }
+        if (total > this.maxLen) { return -3; }
+        if (avail < total) { return -1; }
+        return total;
+    }
+
+    /// <summary>解码游标处的帧（长度由 FrameSize 给出），并
+    /// 越过该帧。</summary>
+    WsFrame TakeFrame(int total) {
+        WsFrame frame = WsFrame.DecodeAt(this.buf, this.start, total);
+        this.Consume(total);
+        return frame;
+    }
+
+    /// <summary>在缓冲的未读字节里扫描 HTTP 头部结束标记
+    /// （CRLFCRLF）。返回相对游标的偏移；未找到返回 -1。
+    /// 握手与首帧常在同一段到达，而帧字节可能含 NUL，
+    /// 因此扫描必须按字节下标进行，不能走字符串长度。</summary>
+    int FindHeaderEnd() {
+        int last = this.len - 4;
+        for (int i = this.start; i <= last; i = i + 1) {
+            if ((this.buf[i] & 255) == 13 && (this.buf[i + 1] & 255) == 10
+                && (this.buf[i + 2] & 255) == 13 && (this.buf[i + 3] & 255) == 10) {
+                return i - this.start;
+            }
+        }
+        return 0 - 1;
+    }
+
+    /// <summary>取出游标处 n 个字节，作为显式长度的字符串
+    /// （不推进游标）。头部是文本，但同一缓冲里可能已带有
+    /// 含 NUL 的帧字节——长度必须显式传递，不能用 strlen。</summary>
+    string Slice(int n) {
+        byte[] outp = new byte[n + 1];
+        for (int i = 0; i < n; i = i + 1) {
+            outp[i] = this.buf[this.start + i];
+        }
+        return outp.ToStr(0, n);
+    }
+
+    /// <summary>把外部收到的字节（例如 TLS 流解密出的明文）
+    /// 追加到累积缓冲区，绕过套接字。</summary>
+    void Append(string data, int n) {
+        this.Compact();
+        this.Ensure(this.len + n);
+        for (int i = 0; i < n; i = i + 1) {
+            this.buf[this.len + i] = (byte)data[i];
+        }
+        this.len = this.len + n;
+    }
+
+    /// <summary>跳过游标处的帧以丢弃它。</summary>
+    void Consume(int total) {
+        this.start = this.start + total;
+        if (this.start >= this.len) {
+            this.start = 0;
+            this.len = 0;
+        }
+    }
+}
+
+/// <summary>
+/// 供连续应答帧使用的二进制安全输出缓冲区。
+///
+/// 每帧一次 send() 比编码一帧更贵：每 recv 携带 64 个管道帧时，
+/// echo 路径把时间全花在系统调用上（满载内核约 13 万消息/秒，
+/// 而 tcp 路径一次写入回显整个 recv，达 680 万/秒）。
+/// 在更多完整帧已缓冲时累积响应，
+/// 待读取方无帧可读时再一次性刷出。
+/// </summary>
+class WsWriter {
+    byte[] buf;
+    int len;
+    int cap;
+
+    /// 内部构造：64KiB 输出缓冲。
+    WsWriter() {
+        this.cap = 65536;
+        this.buf = new byte[this.cap + 1];
+        this.len = 0;
+    }
+
+    /// 扩展输出缓冲到至少 need 字节。
+    void Ensure(int need) {
+        if (need <= this.cap) { return; }
+        int nc = this.cap * 2;
+        while (nc < need) { nc = nc * 2; }
+        byte[] nb = new byte[nc + 1];
+        for (int i = 0; i < this.len; i = i + 1) {
+            nb[i] = this.buf[i];
+        }
+        this.buf = nb;
+        this.cap = nc;
+    }
+
+    /// 追加编码后帧的 `n` 个字节。
+    void Append(string data, int n) {
+        this.Ensure(this.len + n);
+        for (int i = 0; i < n; i = i + 1) {
+            this.buf[this.len + i] = (byte)data[i];
+        }
+        this.len = this.len + n;
+    }
+
+    /// 缓冲中是否有待发字节。
+    bool Pending() {
+        return this.len > 0;
+    }
+
+    /// <summary>把缓冲内容作为一次 send 全部写出并重置。
+    /// 返回写出字节数；-1 表示连接已死。Socket.SendAsync 内部
+    /// 已循环补发，返回值小于请求长度只会是对端重置/中止等
+    /// 致命错误——旧实现无视这点直接清零缓冲，把没发出去的
+    /// 帧当已发，帧流从此错位且无任何上报。</summary>
+    async int Flush(TcpClient client) {
+        if (this.len == 0) { return 0; }
+        int want = this.len;
+        int n = await client.SendBytesAsync(this.buf, want);
+        this.len = 0;
+        if (n < want) { return 0 - 1; }
+        return n;
+    }
+}
+
+/// <summary>
+/// RFC 6455 §5.4 分片消息重组器：fin=0 的数据帧开始一条消息，
+/// opcode 0 的 continuation 帧追加负载，fin=1 交付。此前三条
+/// 服务器/客户端路径都把 continuation 帧静默丢弃——大消息被
+/// 发送方分片后内容直接丢失且无任何报错。
+///
+/// 负载按显式长度累积（帧字节可能含 NUL），累计超过 maxLen
+/// 时返回 -2，由调用方按 1009 关闭连接。
+/// </summary>
+class WsAssembler {
+    int opcode;      // -1 = 无分片进行中
+    string data;
+    int dataLen;
+    int maxLen;
+    // 双倍增量的累积缓冲（显式容量），避免每帧按全长重新分配。
+    byte[] dataBuf;
+    int bufCap;
+
+    /// 内部构造：状态复位，消息上限由调用方给定；经 WebSocketClient
+    /// / 服务器各路径使用。
+    WsAssembler(int maxLen) {
+        this.opcode = 0 - 1;
+        this.data = "";
+        this.dataLen = 0;
+        this.maxLen = maxLen;
+        this.dataBuf = null;
+        this.bufCap = 0;
+    }
+
+    /// <summary>喂入一个已解码的完整数据帧（控制帧不进这里）。
+    /// 返回：0 = 分片进行中；1 = 消息完整，用 Message/MessageLen/
+    /// MessageOpcode 取出；-1 = 协议违规（无起始帧的 continuation
+    /// 或分片中途插入新数据帧）；-2 = 累计超过 maxLen。</summary>
+    int Feed(WsFrame frame) {
+        if (frame.opcode == WsOpcode.Continuation) {
+            if (this.opcode < 0) { return 0 - 1; }
+        } else if (this.opcode >= 0) {
+            // 分片中途插入新数据帧：RFC 6455 §5.4 的协议错误。
+            return 0 - 1;
+        } else {
+            this.opcode = frame.opcode;
+        }
+        int newLen = this.dataLen + frame.payloadLen;
+        if (newLen > this.maxLen) { return 0 - 2; }
+        if (frame.payloadLen > 0) {
+            // 双倍增量的显式长度缓冲：整条消息只在交付时转换一次。
+            // 此前每帧都按 newLen 新分配并整体拷贝前缀，一条 16MiB
+            // 消息用 125 字节帧发送就是 ~13 万次 Feed、~1TB 的拷贝。
+            int cap = this.bufCap > 0 ? this.bufCap : 1024;
+            if (newLen > cap) {
+                while (cap < newLen) { cap = cap * 2; }
+            }
+            if (cap != this.bufCap) {
+                byte[] nb = new byte[cap + 1];
+                for (int i = 0; i < this.dataLen; i = i + 1) {
+                    nb[i] = (byte)this.data[i];
+                }
+                this.dataBuf = nb;
+                this.bufCap = cap;
+            }
+            for (int i = 0; i < frame.payloadLen; i = i + 1) {
+                this.dataBuf[this.dataLen + i] = (byte)frame.payload[i];
+            }
+            // 显式长度转换：`+` 按 strlen 定长，会在第一个 NUL 处截断
+            // 二进制负载；ToStr 按字节计数，NUL 原样保留。
+            this.data = this.dataBuf.ToStr(0, newLen);
+        }
+        this.dataLen = newLen;
+        if (frame.fin) { return 1; }
+        return 0;
+    }
+
+    /// <summary>取出重组完成的消息并复位状态。</summary>
+    string Complete() {
+        string m = this.data;
+        this.opcode = 0 - 1;
+        this.data = "";
+        this.dataLen = 0;
+        return m;
+    }
+
+    /// <summary>重组完成消息的 opcode（Text 或 Binary）。</summary>
+    int MessageOpcode() { return this.opcode; }
+
+    /// <summary>重组负载的字节数（Complete 复位后为 0）。</summary>
+    int MessageLen() { return this.dataLen; }
+}
+
+/// <summary>
+/// WebSocket 客户端。
+/// </summary>
+class WebSocketClient {
+    TcpClient conn;
+    bool connected;
+    string host;
+    int port;
+    string path;
+    // 握手与帧共用一个带显式长度的累积缓冲（WsReader）。
+    // 此前用字符串拼接攒帧：Zan 字符串按 NUL 结尾计长，
+    // 二进制帧负载里的 NUL 会让帧长判断、Substring 切片
+    // 全部错位；且无缓冲上限，对端可慢慢撑爆内存。
+    WsReader reader;
+    WsAssembler asm;
+
+    /// 内部构造：未连接；经 ConnectAsync 使用。
+    WebSocketClient() {
+        this.connected = false;
+        this.host = "";
+        this.port = 0;
+        this.path = "/";
+        this.reader = null;
+        this.asm = new WsAssembler(16777216);
+    }
+
+    /// 发起 ws://host:port/path 握手（随机 Sec-WebSocket-Key，校验
+    /// Sec-WebSocket-Accept）。绝不返回 null：连接/握手失败时返回
+    /// 一个 connected=false 的对象，用 IsConnected() 判断成败（失败
+    /// 路径已顺手关闭底层连接）。
+    static async WebSocketClient ConnectAsync(string host, int port, string path) {
+        WebSocketClient ws = new WebSocketClient();
+        ws.host = host;
+        ws.port = port;
+        ws.path = path;
+
+        ws.conn = await TcpClient.ConnectAsync(host, port);
+        // 连接失败/超时按文档返回 null：解引用是空对象虚调用，进程
+        // SIGSEGV。保持 connected=false 由 IsConnected() 检查。
+        if (ws.conn == null) { return ws; }
+
+        // RFC 6455 要求客户端握手的 key 是随机的；此前硬编码 RFC 样例
+        // nonce，可预测且部分服务器/代理会拒绝重复值。
+        byte[] keyBytes = RandomNumberGenerator.GetBytes(16);
+        if (keyBytes == null) { ws.conn.Close(); return ws; }
+        string key = Base64.Encode(keyBytes, 16);
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("GET ");
+        sb.Append(path);
+        sb.Append(" HTTP/1.1\r\n");
+        sb.Append("Host: ");
+        sb.Append(host);
+        sb.Append("\r\n");
+        sb.Append("Upgrade: websocket\r\n");
+        sb.Append("Connection: Upgrade\r\n");
+        sb.Append("Sec-WebSocket-Key: ");
+        sb.Append(key);
+        sb.Append("\r\n");
+        sb.Append("Sec-WebSocket-Version: 13\r\n\r\n");
+        await ws.conn.SendAsync(sb.ToString());
+
+        // 响应头可能被 TCP 分段；头之后的字节已是帧（可能含 NUL）。
+        // 全部落进 reader 的显式长度缓冲，按字节扫描头部结束标记。
+        // 握手接收受 30 秒空闲窗口约束：接受了连接却一个字节不发
+        // 的服务端不能再永久钉住本协程（数据阶段的空闲等待仍不设限）。
+        ws.reader = new WsReader(ws.conn.GetSocket());
+        HttpDeadlineToken watch = HttpDeadline.Arm(ws.conn.GetSocket(), 30000);
+        int headerEnd = -1;
+        while (headerEnd < 0) {
+            if (ws.reader.Buffered() > 65536) {
+                HttpDeadline.Disarm(watch);
+                ws.conn.Close();
+                return ws;
+            }
+            int n = await ws.reader.FillMore();
+            if (n == 0) {
+                HttpDeadline.Disarm(watch);
+                ws.conn.Close();
+                return ws;
+            }
+            if (HttpDeadline.Expired(watch)) {
+                HttpDeadline.Disarm(watch);
+                ws.conn.Close();
+                return ws;
+            }
+            headerEnd = ws.reader.FindHeaderEnd();
+        }
+        HttpDeadline.Disarm(watch);
+        string head = ws.reader.Slice(headerEnd);
+        if (head.Length < 12 || head.Substring(9, 3) != "101") {
+            ws.conn.Close();
+            return ws;
+        }
+        // 验证 Sec-WebSocket-Accept，防握手降级/伪造 101。
+        string acceptSource = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        string expectedAccept = Base64.Encode(
+            Sha1.Hash(acceptSource, acceptSource.Length), 20);
+        if (head.IndexOf(expectedAccept, 0) < 0) {
+            ws.conn.Close();
+            return ws;
+        }
+        ws.reader.Consume(headerEnd + 4);
+        ws.connected = true;
+
+        return ws;
+    }
+
+    /// <summary>客户端方向统一发送入口：掩码 + 正确的帧长。
+    /// 返回 false 表示连接已不可用。</summary>
+    async bool SendFrame(int opcode, string payload, int payloadLen) {
+        if (!this.connected || this.conn == null) { return false; }
+        WsFrame frame = WsFrame.RawFrame(opcode, payload, payloadLen);
+        byte[] encoded = frame.EncodeMasked();
+        int total = WsFrame.HeaderLen(payloadLen) + 4 + payloadLen;
+        int n = await this.conn.SendBytesAsync(encoded, total);
+        if (n <= 0) { this.connected = false; return false; }
+        return true;
+    }
+
+    /// 发送一条 Text 消息（fire-and-forget，失败仅置 disconnected）。
+    async void SendText(string text) {
+        await this.SendFrame(WsOpcode.Text, text, text.Length);
+    }
+
+    /// 发送一条二进制消息（data 可含 NUL，len 为精确字节数）。
+    async void SendBinary(string data, int len) {
+        await this.SendFrame(WsOpcode.Binary, data, len);
+    }
+
+    /// 发送空 Ping 帧（对端的 Pong 由 RecvText 静默消费）。
+    async void Ping() {
+        await this.SendFrame(WsOpcode.Ping, "", 0);
+    }
+
+    /// <summary>挂起直到下一个文本/二进制消息。Ping 以 Pong 应答后
+    /// 继续循环；分片消息重组到 fin 后整条交付；Close 或断开
+    /// 返回 ""。</summary>
+    async string RecvText() {
+        while (this.connected) {
+            int total = this.reader.FrameSize();
+            while (total < 0) {
+                if (total == -2 || total == -3) { this.CloseNow(); return ""; }
+                int n = await this.reader.FillMore();
+                if (n == 0) { this.CloseNow(); return ""; }
+                total = this.reader.FrameSize();
+            }
+            WsFrame frame = this.reader.TakeFrame(total);
+            if (frame.opcode >= 3 && frame.opcode <= 7
+                || frame.opcode >= 11 && frame.opcode <= 15) {
+                // RFC 6455 §5.2：保留 opcode 直接断开（服务器侧路径会
+                // 回 1002；客户端无回写通道，只关连接）。
+                this.CloseNow();
+                return "";
+            }
+            if (frame.opcode == WsOpcode.Close) {
+                this.CloseNow();
+                return "";
+            }
+            if (frame.opcode == WsOpcode.Ping) {
+                await this.SendFrame(WsOpcode.Pong, frame.payload, frame.payloadLen);
+                continue;
+            }
+            if (frame.opcode == WsOpcode.Pong) { continue; }
+            // 数据帧：分片消息在 fin 时整条交付——此前 continuation
+            // 帧被静默丢弃。
+            int feed = this.asm.Feed(frame);
+            if (feed < 0) { this.CloseNow(); return ""; }
+            if (feed == 0) { continue; }
+            return this.asm.Complete();
+        }
+        return "";
+    }
+
+    /// 立即断开（不发关闭帧）；RecvText 之后返回 ""。
+    void CloseNow() {
+        this.connected = false;
+        if (this.conn != null) { this.conn.Close(); }
+    }
+
+    /// 协礼关闭：先发空关闭帧再断开。
+    async void Close() {
+        if (this.connected) {
+            await this.SendFrame(WsOpcode.Close, "", 0);
+        }
+        this.CloseNow();
+    }
+
+    /// 握手是否成功且连接未断。
+    bool IsConnected() {
+        return this.connected;
+    }
+}

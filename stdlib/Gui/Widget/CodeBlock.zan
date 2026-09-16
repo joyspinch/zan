@@ -1,0 +1,393 @@
+using System;
+using Gui;
+using Gui.Component;
+using Gui.Component.CodeEditor;
+
+namespace Gui.Widget;
+
+/// 只读代码面板：带标题的头部含复制操作，下方是
+/// 可滚动、等宽外观的源码行。调用方拥有
+/// 内容行并决定“复制”做什么，因此本控件不关心
+/// 语言或所显示的文档。
+///
+///     CodeBlock cb = new CodeBlock("Zan", lines);
+///     cb.Copy += () => { Clipboard.Set(text); };
+///     cb.RenderInside(app, rect);
+class CodeBlock : Control {
+    List<string> lines;
+    /// 头部标题，通常是语言名。
+    Binding<string> Caption;
+    /// 复制操作上的标签。
+    Binding<string> CopyLabel;
+    SignalInt scroll;
+    bool copied;
+    int wid;
+    // 选中状态。代码只读但可选中（拖动、Ctrl+A、
+    // Ctrl+C），同一时刻只有一个代码块能持有选中，因此状态
+    // 共享，并标记所属代码块的焦点 id——这也使它
+    // 在每帧重建控件的宿主中依然有效。
+    static int selOwner;
+    static bool selActive;
+    static bool selDragging;
+    static int selAnchorLine;
+    static int selAnchorCol;
+    static int selLine;
+    static int selCol;
+    /// 复制操作被点击时触发。
+    UiEvent Copy;
+
+    /// 初始化：置标题/内容行/滚动信号并自管 Copy 事件。
+    void InitCodeBlock(string caption, List<string> src) {
+        this.InitControl("codeblock", 1);
+        lines = src;
+        Caption = caption;
+        CopyLabel = "Copy";
+        scroll = new SignalInt(0);
+        copied = false;
+        wid = WidgetId.Next();
+        wiresOwnEvents = true;
+        Copy = new UiEvent();
+    }
+
+    /// 空代码块（设计器用）。
+    CodeBlock() { InitCodeBlock("", new List<string>()); }
+    /// 标题 + 内容行；src 被直接引用，替换内容请走 SetLines。
+    CodeBlock(string caption, List<string> src) { InitCodeBlock(caption, src); }
+
+    /// 通过宿主持有的信号滚动，因此偏移量在
+    /// 面板重建后依然保留。
+    void UseScroll(SignalInt s) {
+        scroll = s;
+    }
+
+    /// 刚绘制的这一帧内复制操作被点击时返回 true，供
+    /// 倾向于轮询而非订阅 `Copy` 的宿主使用。
+    bool Copied() { return copied; }
+
+    /// 显示的行；赋值会替换行、重置滚动并清除
+    /// 任何选中状态。
+    void SetLines(List<string> src) {
+        lines = src;
+        scroll.Set(0);
+        CodeBlock.ClearSelection();
+    }
+
+    /// 清除共享选中状态，无论此前属于谁。
+    static void ClearSelection() {
+        CodeBlock.selActive = false;
+        CodeBlock.selDragging = false;
+        CodeBlock.selOwner = 0 - 1;
+    }
+
+    /// 将整个代码片段拼成一个字符串。
+    string AllText() { return string.Join("\n", lines); }
+
+    /// 选中的文本；本块无选中时返回 ""。
+    string SelectedText(int owner) {
+        if (!CodeBlock.selActive || CodeBlock.selOwner != owner) { return ""; }
+        int sL = CodeBlock.selAnchorLine;
+        int sC = CodeBlock.selAnchorCol;
+        int eL = CodeBlock.selLine;
+        int eC = CodeBlock.selCol;
+        if (sL > eL || (sL == eL && sC > eC)) {
+            int tL = sL; sL = eL; eL = tL;
+            int tC = sC; sC = eC; eC = tC;
+        }
+        if (sL < 0) { sL = 0; }
+        if (eL >= lines.Count) { eL = lines.Count - 1; }
+        string acc = "";
+        int i = sL;
+        while (i <= eL) {
+            string ln = lines[i];
+            int a = 0;
+            int b = ln.Length;
+            if (i == sL) { a = sC; }
+            if (i == eL) { b = eC; }
+            if (a < 0) { a = 0; }
+            if (b > ln.Length) { b = ln.Length; }
+            if (b > a) { acc = acc + ln.Substring(a, b - a); }
+            if (i < eL) { acc = acc + "\n"; }
+            i = i + 1;
+        }
+        return acc;
+    }
+
+    /// 选中整个代码片段（Ctrl+A）。
+    void SelectAll(int owner) {
+        if (lines.Count == 0) { return; }
+        CodeBlock.selOwner = owner;
+        CodeBlock.selAnchorLine = 0;
+        CodeBlock.selAnchorCol = 0;
+        CodeBlock.selLine = lines.Count - 1;
+        CodeBlock.selCol = lines[lines.Count - 1].Length;
+        CodeBlock.selActive = true;
+    }
+
+    /// 把指针位置映射为代码区内的（行, 列）光标位置。
+    void CaretFromMouse(App app, int codeX, int topY, int lineH, int off,
+                        int font, bool moveAnchor) {
+        int l = off + (app.mouseY - topY) / lineH;
+        if (l < 0) { l = 0; }
+        if (l >= lines.Count) { l = lines.Count - 1; }
+        if (l < 0) { return; }
+        int col = CodeEditor.ColFromX(lines[l], app.mouseX - codeX, font);
+        if (moveAnchor) {
+            CodeBlock.selAnchorLine = l;
+            CodeBlock.selAnchorCol = col;
+        }
+        CodeBlock.selLine = l;
+        CodeBlock.selCol = col;
+    }
+
+
+    /// 行高：`codeblock::line` 字号加呼吸空间。
+    static int LineHeight(App app) {
+        StyleBox line = Style.Part(app, "codeblock", "line", "", "", "",
+                                   Style.SNormal());
+        return Canvas.FontHeight(line.FontOr(Style.FontFallback(app, "small")))
+            + app.Scale(4);
+    }
+
+    /// 标题栏高度：一个标准小按钮加上下
+    /// 留白，使标题和复制操作在合适的栏内
+    /// 居中，而非被压缩进过矮的栏。
+    static int HeaderHeight(App app) {
+        int h = app.theme.heightSmall + app.Scale(8);
+        if (h < app.Scale(32)) { h = app.Scale(32); }
+        return h;
+    }
+
+    /// `lineCount` 行时行号槽的宽度。
+    static int GutterWidth(App app, int lineCount) {
+        StyleBox line = Style.Part(app, "codeblock", "line", "", "", "",
+                                   Style.SNormal());
+        int fs = line.FontOr(Style.FontFallback(app, "small"));
+        int digits = Canvas.MeasureText(Convert.ToString(lineCount), fs);
+        return digits + app.Scale(18);
+    }
+
+    /// 默认表面：皮肤自带的面板材质，使代码块看起来
+    /// 像周围卡片的一员，而非编辑器配色的一块
+    /// 色斑——编辑器调色板跟随*代码主题*，与
+    /// 页面其余部分的皮肤无关。
+    /// 但样式表在 `codeblock` 上的 `background` 仍然优先。
+    static int SurfaceColor(App app, EditorPalette pal) {
+        StyleBox ps = Style.Of(app, "panel", "", Style.SNormal());
+        return ps.BgOr(0);
+    }
+
+    /// `lineCount` 行的自然高度（限制在可用空间内）。
+    static int Height(App app, int lineCount) {
+        return CodeBlock.HeaderHeight(app)
+            + lineCount * CodeBlock.LineHeight(app) + app.Scale(16);
+    }
+
+    /// 覆写：自然高度（标题栏 + 行数 × 行高 + 留白），宽取最宽行
+    /// 加行号槽。
+    override void OnMeasure(App app) {
+        prefH = CodeBlock.Height(app, lines.Count);
+        StyleBox line = Style.Part(app, "codeblock", "line", "", Class, "",
+                                   Style.SNormal());
+        int fs = line.FontOr(Style.FontFallback(app, "small"));
+        int widest = 0;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            int lw = Canvas.MeasureText(lines[i], fs);
+            if (lw > widest) { widest = lw; }
+        }
+        prefW = widest + app.Scale(34);
+    }
+
+    /// 覆写：画表面、标题栏（标题 + 复制按钮）、行号与代码文本，
+    /// 并处理滚轮滚动、文本选择与复制交互。
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        EditorPalette pal = EditorPalette.For(t);
+        StyleBox s = this.ResolveStyleAs(app, "codeblock", Class,
+                                         Style.SNormal());
+
+        int hdrH = CodeBlock.HeaderHeight(app);
+        int lineH = CodeBlock.LineHeight(app);
+        c.FillRoundRect(bx, by, bw, bh, s.RadiusOr(t.borderRadiusMedium),
+                        s.BgOr(CodeBlock.SurfaceColor(app, pal)));
+        c.DrawRect(bx, by, bw, bh, s.BorderOr(0),
+                   s.BorderWOr(1));
+        c.FillRect(bx, by + hdrH, bw, 1, pal.panelBg);
+        StyleBox cs = this.ResolvePartAs(app, "codeblock", "caption", "", Class,
+                                         Style.SNormal());
+        int capFont = cs.FontOr(Style.FontFallback(app, "medium"));
+        c.DrawText(bx + app.Scale(12),
+                   Canvas.CenterTextY(by, hdrH, capFont), Caption.Get(),
+                   cs.FgOr(0), capFont);
+
+        // 复制操作是标准小按钮，用自身高度和
+        // 自然宽度（图标 + 标签 + 内边距，翻译后的标签
+        // 不会被省略），在标题栏内居中。
+        Button cp = new Button { Text = CopyLabel.Get(), Icon = "copy",
+                                 Class = "small" };
+        int cpH = t.heightSmall;
+        int cpW = cp.AutoWidth(app);
+        int cpId = cp.RenderIn(app, bx + bw - cpW - app.Scale(8),
+                               by + (hdrH - cpH) / 2, cpW, cpH);
+
+        int textY = by + hdrH + app.Scale(8);
+        int bottom = by + bh - app.Scale(6);
+        int visRows = (bottom - textY) / lineH;
+        if (visRows < 1) { visRows = 1; }
+        int maxScroll = lines.Count - visRows;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (app.CaptureWheel(bx, by, bw, bh)) {
+            int delta = app.window.EventKeyCode();
+            int step = delta / 120;
+            if (step == 0) {
+                if (delta > 0) { step = 1; }
+                else if (delta < 0) { step = 0 - 1; }
+            }
+            scroll.Set(scroll.Get() - step * 3);
+            app.RequestRedraw();
+        }
+        int off = scroll.Get();
+        if (off > maxScroll) { off = maxScroll; }
+        if (off < 0) { off = 0; }
+        scroll.Set(off);
+
+        StyleBox ls = this.ResolvePartAs(app, "codeblock", "line", "", Class,
+                                         Style.SNormal());
+        int lineFont = ls.FontOr(Style.FontFallback(app, "small"));
+        int lineColor = ls.FgOr(pal.plain);
+        int gutW = CodeBlock.GutterWidth(app, lines.Count);
+        // 行号槽：右对齐行号背后的一列淡色背景，用细线
+        // 与代码区隔开——保留编辑器在
+        // 只读块中的阅读节奏。
+        c.FillRect(bx + 1, by + hdrH + 1, gutW, bh - hdrH - 2,
+                   34 * 16777216 + (pal.panelBg % 16777216));
+        c.FillRect(bx + gutW, by + hdrH + 1, 1, bh - hdrH - 2,
+                   60 * 16777216 + (pal.border % 16777216));
+        int codeX = bx + gutW + app.Scale(10);
+        // ---- 可选中只读文本：拖动选中，Ctrl+A，Ctrl+C ----
+        int fid = app.focus.AllocId();
+        bool focused = app.focus.IsFocused(fid);
+        bool overCode = app.mouseX >= bx + gutW && app.mouseX < bx + bw
+            && app.mouseY >= textY && app.mouseY < bottom;
+        if (app.EventKind() == 2 && app.window.EventButton() == 0 && overCode) {
+            app.focus.SetFocused(fid);
+            focused = true;
+            bool shift = Modifiers.HasShift(app.window.EventMods());
+            bool keep = shift && CodeBlock.selOwner == fid;
+            CodeBlock.selOwner = fid;
+            this.CaretFromMouse(app, codeX, textY, lineH, off, lineFont, !keep);
+            CodeBlock.selActive = keep;
+            CodeBlock.selDragging = true;
+            app.RequestRedraw();
+        }
+        if (app.EventKind() == 1 && CodeBlock.selDragging
+            && CodeBlock.selOwner == fid) {
+            this.CaretFromMouse(app, codeX, textY, lineH, off, lineFont, false);
+            CodeBlock.selActive = CodeBlock.selLine != CodeBlock.selAnchorLine
+                || CodeBlock.selCol != CodeBlock.selAnchorCol;
+            app.RequestRedraw();
+        }
+        if (app.EventKind() == 3 && app.window.EventButton() == 0) {
+            CodeBlock.selDragging = false;
+        }
+        if (focused && app.EventKind() == 6) {
+            int key = app.window.EventKeyCode();
+            if (key == 1) {                                  // Ctrl+A
+                this.SelectAll(fid);
+                app.RequestRedraw();
+            } else if (key == 3) {                           // Ctrl+C
+                string sel = this.SelectedText(fid);
+                if (sel == "") { sel = this.AllText(); }
+                Clipboard.SetText(sel);
+                app.RequestRedraw();
+            }
+        }
+        bool showSel = CodeBlock.selActive && CodeBlock.selOwner == fid;
+
+        c.PushClip(bx, by + hdrH, bw, bh - hdrH);
+        // 块注释跨行，因此词法分析器状态从
+        // 第一行延续——而不是第一行*可见*的行。
+        bool inBlock = false;
+        for (int pre = 0; pre < off && pre < lines.Count; pre = pre + 1) {
+            List<CodeSpan> preSpans = new List<CodeSpan>();
+            inBlock = CodeEditor.HighlightSpans(lines[pre], pal.keyword,
+                pal.type, pal.str, pal.comment, pal.number, lineColor,
+                inBlock, preSpans);
+        }
+        int i = off;
+        while (i < lines.Count && textY + lineH <= bottom) {
+            string no = Convert.ToString(i + 1);
+            int noW = Canvas.MeasureText(no, lineFont);
+            c.DrawText(bx + gutW - app.Scale(8) - noW, textY, no,
+                       pal.lineNo, lineFont);
+            if (showSel) {
+                CodeEditor.DrawSelHighlight(c, app, CodeBlock.selAnchorLine,
+                    CodeBlock.selAnchorCol, CodeBlock.selLine, CodeBlock.selCol,
+                    i, lines[i], codeX, textY, lineH, lineFont,
+                    new Rect(bx, by, bw, bh));
+            }
+            List<CodeSpan> spans = new List<CodeSpan>();
+            inBlock = CodeEditor.HighlightSpans(lines[i], pal.keyword,
+                pal.type, pal.str, pal.comment, pal.number, lineColor,
+                inBlock, spans);
+            int tx = codeX;
+            for (int g = 0; g < spans.Count; g = g + 1) {
+                CodeSpan span = spans[g];
+                c.DrawText(tx, textY, span.text, span.color, lineFont);
+                tx = tx + Canvas.MeasureText(span.text, lineFont);
+            }
+            textY = textY + lineH;
+            i = i + 1;
+        }
+        c.PopClip();
+
+        if (maxScroll > 0) {
+            int viewH = bh - hdrH - app.Scale(8);
+            SignalInt px = new SignalInt(off * lineH);
+            Scrollbar.RenderVerticalScrollIn(app, bx + bw - app.Scale(10),
+                by + hdrH + app.Scale(4), viewH, viewH,
+                lines.Count * lineH, px, bx, by + hdrH, bw, bh - hdrH);
+            int moved = px.Get() / lineH;
+            if (moved != off) {
+                scroll.Set(moved);
+                app.RequestRedraw();
+            }
+        }
+        copied = Ui.Clicked(app, cpId);
+        if (copied) {
+            Copy.Raise();
+            app.RequestRedraw();
+        }
+        On.Fire(app, wid);
+    }
+
+    // ---- 设计器 / 序列化模型 ----
+
+    /// 控件类型标识（序列化/设计器用）。
+    override string Kind() { return "CodeBlock"; }
+
+    /// 覆写：返回设计器属性清单（caption/copyLabel）。
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec cap = PropSpec.Text("caption", "Caption");
+        cap.str = Caption;
+        ps.Add(cap);
+        PropSpec cp = PropSpec.Text("copyLabel", "Copy label");
+        cp.str = CopyLabel;
+        ps.Add(cp);
+        return ps;
+    }
+
+    /// 覆写：公共事件之外提供 "Copy"。
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Copy");
+        return e;
+    }
+
+    /// 覆写："Copy" 挂 Copy 事件，其余按名称走通用路由。
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Copy") { Copy.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+}

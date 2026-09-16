@@ -1,0 +1,2732 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.WebSocket;
+using System.Net.Sse;
+using System.Net.Mqtt;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading;
+
+namespace System.Net;
+
+/// <summary>Invoked when a client connection is established. Async so the
+/// handler can await I/O (Db/Redis/etc.) without blocking the event loop.</summary>
+async delegate void ConnectionHandler(Connection conn);
+
+/// <summary>Invoked for every complete inbound message on a TCP or WebSocket
+/// connection. The returned string (when non-empty) is sent back to the peer
+/// as the reply; return "" to send nothing. Async: may await I/O.</summary>
+async delegate string MessageHandler(Connection conn, string data);
+
+/// <summary>Invoked after a connection is closed (peer disconnect or
+/// conn.Close()). Async: may await I/O.</summary>
+async delegate void ConnectionCloseHandler(Connection conn);
+
+/// <summary>Invoked per UDP datagram. The returned string (when non-empty) is
+/// sent back to the datagram's sender; return "" to send nothing. Async.</summary>
+async delegate string DatagramHandler(string data);
+
+/// <summary>Invoked when an SSE subscriber completes its handshake. The
+/// application keeps the SseConnection and pushes events through it. Async.</summary>
+async delegate void SseSubscriberHandler(SseConnection conn);
+
+/// <summary>Invoked with a freshly accepted (and, on Windows, handed-off)
+/// client socket. When set it overrides the built-in per-protocol handling:
+/// the callback owns the socket and drives the whole connection itself. Lets
+/// an application server (e.g. an MVC framework) reuse the master/worker
+/// accept + WSADuplicateSocket handoff + supervision while keeping its own
+/// request pipeline. Async so it can await I/O.</summary>
+async delegate void RawConnHandler(nint sock);
+
+/// <summary>
+/// Workerman-style multi-protocol server: one Worker per listen address,
+/// per-event callbacks, and a master + N worker-processes runtime that
+/// load-balances accepted connections across CPU cores.
+///
+///   Worker w = new Worker("http", "0.0.0.0", 8080);
+///   w.count = 4;                        // 4 worker processes
+///   w.onHttpRequest = App.Handle;       // HttpRequest -> HttpResponse
+///   Worker.RunAll();                    // never returns
+///
+/// Protocols: "tcp", "udp", "http", "websocket" (or "ws"), "sse", "mqtt".
+/// Callbacks (assign what the protocol needs); the second name is an alias
+/// reading the way that protocol usually does:
+///   onConnect / onOpen                  -- tcp, websocket: connection up
+///   onMessage / onReceive               -- tcp, websocket: data in, reply out
+///   onClose                             -- tcp, websocket: connection gone
+///   onHttpRequest / onRequest           -- http
+///   onUdpMessage / onPacket             -- udp
+///   onSseSubscriber                     -- sse
+///   (none)                              -- mqtt: connections are served by
+///                                          the built-in MqttBroker.Global()
+///
+/// An "http" worker with onOpen/onMessage set also serves WebSocket on that
+/// same port: a request asking to upgrade becomes a frame loop, everything else
+/// is answered by onRequest.
+///
+/// MULTI-PROCESS MODEL (count > 1). The initially launched process becomes the
+/// MASTER: it spawns `count` worker copies of this executable and supervises
+/// them (a crashed worker is respawned). Accepted connections are spread
+/// across workers, fully event-driven (no polling anywhere):
+///   - Windows: the master binds and accepts every TCP listener on its own
+///     IOCP, then hands each ACCEPTED socket to a worker round-robin via
+///     WSADuplicateSocket over a dedicated per-listener channel connection.
+///     (AcceptEx on a listener shared across processes loses completions --
+///     a documented WSADuplicateSocket/IOCP limitation -- so workers never
+///     accept themselves.) UDP has no accept; UDP Workers are served in the
+///     master process on Windows.
+///   - Linux/macOS: each worker binds its own listener with SO_REUSEPORT and
+///     the kernel hashes new connections across the sockets.
+/// Workers watch the control connection to the master and exit when it dies,
+/// so no orphan processes outlive the master.
+///
+/// SINGLE-PROCESS MODEL (count == 1, default): RunAll runs every Worker's
+/// event loop on this process's coroutine scheduler -- no child processes.
+/// </summary>
+class Worker {
+    string protocol;
+    string host;
+    int port;
+    string name;
+    bool running;
+    // Live connections on this Worker. Incremented by the accept loop and
+    // decremented by each connection coroutine, which with --async-workers
+    // runs on a different thread than the accept loop: a plain int loses
+    // decrements and the count drifts up until maxConnections rejects
+    // everything.
+    AtomicInt connectionCount;
+    int maxConnections;
+
+    // ---- http limits (see HttpServer.ServeConnection) ----
+    int maxHeaderBytes;
+    int maxRequestBytes;
+    int requestTimeout;
+
+    /// <summary>Number of worker processes serving this Worker's port. The
+    /// largest count of any registered Worker decides how many worker
+    /// processes RunAll launches; 1 (default) = serve in-process.</summary>
+    int count;
+
+    // ---- event callbacks (assign before RunAll) ----
+    /// TCP 连接建立后调用（tcp 协议；可 await I/O）。
+    ConnectionHandler onConnect;
+    /// 收到一条完整入站消息后调用；返回串作为应答回发，返回 "" 不回发。
+    MessageHandler onMessage;
+    /// 连接关闭（对端断开或 conn.Close() 生效）后调用。
+    ConnectionCloseHandler onClose;
+    /// 每个解析完成的 HTTP 请求调用，返回响应对象。
+    HttpRequestHandler onHttpRequest;
+    /// 每个完整 UDP 数据报调用；返回串回发给发送方，返回 "" 不回发。
+    DatagramHandler onUdpMessage;
+    /// SSE 订阅者握手完成后调用；应用持有 SseConnection 主动推事件。
+    SseSubscriberHandler onSseSubscriber;
+    /// 设置后接管该 Worker 的整条连接：socket 交给回调自主驱动，
+    /// 绕过内建协议处理与连接数闸门。
+    RawConnHandler onRawConnection;
+
+    // Protocol-flavoured names for the same events, so each protocol reads the
+    // way it does elsewhere: a WebSocket server talks about open/message/close,
+    // a TCP server about connect/receive/close. Whichever is set wins; setting
+    // both is pointless, not harmful.
+    /// onConnect 的 WebSocket 叫法（连接已建立）。
+    ConnectionHandler onOpen;        // websocket: connection established
+    /// onMessage 的 TCP 叫法（收到字节）。
+    MessageHandler onReceive;        // tcp: bytes arrived
+    /// onUdpMessage 的 UDP 叫法（收到数据报）。
+    DatagramHandler onPacket;        // udp: datagram arrived
+    /// onHttpRequest 的 HTTP 叫法（请求已解析）。
+    HttpRequestHandler onRequest;    // http: request parsed
+
+    // WebSocket 连接注册表（对标 workerman $server->connections）：Upgrade
+    // 成功时登记，连接结束/回调关闭后移除。list 上的协程切换只发生在
+    // await 点，Add/Remove/快照拷贝都是同步段，无需加锁。多 worker 进程
+    // 时注册表是进程内的——跨进程广播属 SharedTable/事件总线范畴。
+    List<Connection> wsConns;
+    // 同步段进出 WS 连接协程用的互斥（--async-workers 下连接协程跑在
+    // 不同线程，List 本身不是线程安全）。
+    static nint wsRegLock = 0;
+
+    static List<Worker> workers = new List<Worker>();
+    static bool daemonize = false;
+    // Set by RunCommand: the process was started through the CLI, so it also
+    // answers stop/reload/status on the control port.
+    static bool cliMode = false;
+    // Set by a STOP command: workers that exit are not respawned.
+    static bool stopping = false;
+    // Live worker control connections, used to ask a worker to quit.
+    static List<TcpClient> ctlConn = new List<TcpClient>();
+    static List<int> ctlWid = new List<int>();
+    #if WINDOWS
+    // Worker side: the handoff channels this process reads accepted sockets
+    // from, closed when it is asked to quit so no new work arrives.
+    static List<TcpClient> wkChannels = new List<TcpClient>();
+    #endif
+    static int controlPort = 0;
+    // Set when the control port was named (--ctl-port, SetControlPort, or the
+    // ZAN_CTL_PORT a worker inherits): the master then uses it as given instead
+    // of moving to a free one, and the command line does not consult the
+    // record left by a running instance.
+    static bool ctlPortFixed = false;
+    static int nextConnId = 1;
+    // Worker output is captured by default: a worker runs detached (no console
+    // on Windows, no controlling terminal after daemonize), so anything it
+    // prints -- including the runtime's crash record for a fatal signal -- is
+    // gone unless it lands in a file. Pass "" to SetLogDir to opt out.
+    //
+    // master and every worker append to the same file, one per day: a request is
+    // served by whichever process the kernel picked, so splitting per worker
+    // only means the line explaining a failure sits in a file nobody opens.
+    // Nothing holds the file open (Log writes are open-append-close, a worker's
+    // redirected stdout is just an appending descriptor), so sharing it is safe.
+    static string logDir = "logs";
+    static string logPattern = "{yyyy}{MM}/{dd}.log";
+
+    // ---- status/statistics (workerman-style `status`) ----
+    // Requests/messages served by this process, across all Workers.
+    /// 本进程累计服务的请求/消息数（workerman 风格 `status` 统计）。
+    static AtomicInt statRequests = new AtomicInt(0);
+
+    // Static-context increment. Do NOT inline `statRequests = statRequests+1`
+    // into the instance async handlers: the async lowering captures statics
+    // referenced from instance async methods by value, so increments there
+    // write to a per-coroutine copy and are lost.
+    /// 静态上下文里的计数自增；实例 async 方法中直接自增会被按值捕获而丢失。
+    static void BumpStat() {
+        long _r = statRequests.Increment();
+    }
+
+    // Messages/frames/datagrams written back to peers by this process.
+    /// 本进程累计发回对端的消息/帧/数据报数。
+    static AtomicInt statSent = new AtomicInt(0);
+
+    /// 发送计数自增（同 BumpStat 的静态上下文约束）。
+    static void BumpSent() {
+        long _s = statSent.Increment();
+    }
+
+    // Live connections across every Worker in this process.
+    /// 本进程所有 Worker 的在线连接总数。
+    static int LiveConnections() {
+        int n = 0;
+        for (int i = 0; i < workers.Count; i = i + 1) {
+            n = n + (int)workers[i].connectionCount.Load();
+        }
+        return n;
+    }
+    // Status print interval in seconds for the foreground master (or the
+    // single-process server). 0 disables. Workers report to the master over
+    // the control connection every 2s regardless.
+    static int statusInterval = 10;
+
+    // Cross-process counters live in shared memory, the same mechanism the
+    // router's per-route stats use: every process publishes its own row every
+    // two seconds and `status` reads the rows, so no worker has to be asked
+    // and a report cannot be lost with a control connection.
+    // Columns: pid, recv (requests/messages in), sent (messages out), conns,
+    // cpu (ms), rss (bytes). Key: "w<id>", or "self" in a single process.
+    static SharedTable statTable = null;
+
+    // Previous sample per worker id, for the periodic rate line.
+    static List<long> stPrevReq = new List<long>();
+    static List<long> stPrevCpuMs = new List<long>();
+
+    [DllImport("crt")]
+    static extern void exit(int code);
+    [DllImport("crt")]
+    static extern long strlen(string str);
+    static bool debugLog = false;
+    /// 调试跟踪输出：SetDebug(true) 时打印 master/worker 交接与握手轨迹。
+    static void Dbg(string msg) {
+        if (!debugLog) { return; }
+        Console.WriteLine("[dbg] " + msg);
+        #if WINDOWS
+        int _f = _flushall();
+        #endif
+    }
+    #if WINDOWS
+    [DllImport("crt")]
+    static extern int _flushall();
+    #endif
+    /// <summary>Enables verbose master/worker handoff tracing.</summary>
+    static void SetDebug(bool on) {
+        debugLog = on;
+    }
+
+    #if !WINDOWS
+    // A291②：收紧记录文件权限用（见 RecordControlPort）。
+    [DllImport("crt")]
+    static extern int chmod(string path, int mode);
+    #endif
+
+    #if WINDOWS
+    [DllImport("ws2_32", EntryPoint = "WSADuplicateSocketA")]
+    static extern int WSADuplicateSocketA(nint s, int pid, string info);
+    [DllImport("ws2_32", EntryPoint = "WSASocketA")]
+    static extern nint WSASocketA(int af, int type, int protocol, string info, int g, int flags);
+    [DllImport("kernel32", EntryPoint = "SetEnvironmentVariableW")]
+    static extern int SetEnvironmentVariableW(nint name, nint val);
+    #endif
+
+    /// 按协议、监听地址与端口构造 Worker 并注册进全局 Worker 列表；
+    /// 经 Listen() 使用。
+    Worker(string protocol, string host, int port) {
+        this.protocol = protocol;
+        this.host = host;
+        this.port = port;
+        this.name = protocol + "-worker";
+        this.running = false;
+        this.connectionCount = new AtomicInt(0);
+        this.maxConnections = 10000;
+        this.maxHeaderBytes = 16384;
+        this.maxRequestBytes = 1048576;
+        this.requestTimeout = 30000;
+        this.count = 1;
+        this.onConnect = null;
+        this.onMessage = null;
+        this.onClose = null;
+        this.onHttpRequest = null;
+        this.onUdpMessage = null;
+        this.onSseSubscriber = null;
+        this.onRawConnection = null;
+        this.onOpen = null;
+        this.onReceive = null;
+        this.onPacket = null;
+        this.onRequest = null;
+        this.wsConns = new List<Connection>();
+        workers.Add(this);
+    }
+
+    /// onOpen 与 onConnect 中已设置的那个（别名归一）。
+    ConnectionHandler OpenHandler() {
+        if (this.onOpen != null) { return this.onOpen; }
+        return this.onConnect;
+    }
+
+    /// onMessage 与 onReceive 中已设置的那个。
+    MessageHandler MessageHandlerOf() {
+        if (this.onMessage != null) { return this.onMessage; }
+        return this.onReceive;
+    }
+
+    /// onPacket 与 onUdpMessage 中已设置的那个。
+    DatagramHandler PacketHandler() {
+        if (this.onPacket != null) { return this.onPacket; }
+        return this.onUdpMessage;
+    }
+
+    /// onRequest 与 onHttpRequest 中已设置的那个。
+    HttpRequestHandler RequestHandler() {
+        if (this.onRequest != null) { return this.onRequest; }
+        return this.onHttpRequest;
+    }
+
+    // ---- WebSocket 连接注册表（对标 workerman connections + push）----
+
+    /// 惰性创建 WebSocket 注册表用的互斥锁。
+    static void WsRegInit() {
+        if (Worker.wsRegLock == 0) { Worker.wsRegLock = Mutex.Create(); }
+    }
+
+    /// Upgrade 成功后由 HandleWebSocket 调用（单线程 accept 路径）。
+    void WsConnAdd(Connection conn) {
+        Worker.WsRegInit();
+        Mutex.Lock(Worker.wsRegLock);
+        this.wsConns.Add(conn);
+        Mutex.Unlock(Worker.wsRegLock);
+    }
+
+    /// 连接结束后由 HandleWebSocket 调用。
+    void WsConnRemove(Connection conn) {
+        Worker.WsRegInit();
+        Mutex.Lock(Worker.wsRegLock);
+        int id = conn.GetId();
+        int i = 0;
+        while (i < this.wsConns.Count) {
+            if (this.wsConns[i].GetId() == id) {
+                this.wsConns.RemoveAt(i);
+                break;
+            }
+            i = i + 1;
+        }
+        Mutex.Unlock(Worker.wsRegLock);
+    }
+
+    /// <summary>本 Worker 当前在线 WebSocket 连接数（进程内）。</summary>
+    int WsConnCount() {
+        Worker.WsRegInit();
+        Mutex.Lock(Worker.wsRegLock);
+        int n = this.wsConns.Count;
+        Mutex.Unlock(Worker.wsRegLock);
+        return n;
+    }
+
+    /// <summary>按连接 id 取在线连接；不存在（已断开）返回 null。
+    /// 用于定时器等无引用上下文里找回连接后 conn.Push(...)。</summary>
+    Connection WsConnById(int id) {
+        Worker.WsRegInit();
+        Mutex.Lock(Worker.wsRegLock);
+        Connection found = null;
+        int i = 0;
+        while (i < this.wsConns.Count) {
+            if (this.wsConns[i].GetId() == id) {
+                found = this.wsConns[i];
+                break;
+            }
+            i = i + 1;
+        }
+        Mutex.Unlock(Worker.wsRegLock);
+        return found;
+    }
+
+    /// <summary>向所有在线 WebSocket 连接广播一条 Text 帧，返回成功
+    /// 投递数。快照在锁内拷出、Push 在锁外执行——Push 是 await 点，
+    /// 决不能持锁挂起。断开的连接由其帧循环稍后自行移除。</summary>
+    async int WsBroadcast(string data) {
+        Worker.WsRegInit();
+        Mutex.Lock(Worker.wsRegLock);
+        List<Connection> snap = new List<Connection>();
+        int i = 0;
+        while (i < this.wsConns.Count) {
+            snap.Add(this.wsConns[i]);
+            i = i + 1;
+        }
+        Mutex.Unlock(Worker.wsRegLock);
+        int sent = 0;
+        int j = 0;
+        while (j < snap.Count) {
+            Connection c = snap[j];
+            bool ok = await c.Push(data);
+            if (ok) { sent = sent + 1; }
+            j = j + 1;
+        }
+        return sent;
+    }
+
+    /// Whether this worker can serve WebSocket connections, i.e. whether an HTTP
+    /// port should honour an Upgrade request instead of answering it as HTTP.
+    bool HasWsHandlers() {
+        if (this.onOpen != null) { return true; }
+        if (this.onMessage != null) { return true; }
+        return false;
+    }
+
+    /// <summary>Creates a Worker from an address like "http://0.0.0.0:8080".</summary>
+    static Worker Listen(string address) {
+        string proto = "tcp";
+        string rest = address;
+        int n = address.Length;
+        for (int i = 0; i + 2 < n; i = i + 1) {
+            if ((address[i] & 255) == 58 && (address[i + 1] & 255) == 47 && (address[i + 2] & 255) == 47) {
+                proto = address.Substring(0, i);
+                rest = address.Substring(i + 3, n - i - 3);
+                break;
+            }
+        }
+        string host = rest;
+        int port = 0;
+        int colon = -1;
+        int j = rest.Length - 1;
+        while (j >= 0) {
+            if ((rest[j] & 255) == 58) { colon = j; break; }
+            j = j - 1;
+        }
+        if (colon >= 0) {
+            host = rest.Substring(0, colon);
+            port = Convert.ToInt32(rest.Substring(colon + 1, rest.Length - colon - 1));
+        }
+        return new Worker(proto, host, port);
+    }
+
+    /// <summary>Sets the worker name (used in log lines).</summary>
+    Worker SetName(string name) {
+        this.name = name;
+        return this;
+    }
+
+    /// <summary>Sets max concurrent connections for this Worker (per process).
+    /// Connections over the limit are accepted and immediately closed.</summary>
+    Worker SetMaxConnections(int max) {
+        this.maxConnections = max;
+        return this;
+    }
+
+    /// <summary>Sets the HTTP limits enforced per connection: header block
+    /// size (431 past it), whole-request size (413), and the time a single
+    /// request may take before the connection is hung up (0 disables).</summary>
+    Worker SetHttpLimits(int maxHeaderBytes, int maxRequestBytes, int timeoutMs) {
+        // 与 HttpServer.SetMaxRequestBytes 同一钳制：超出 1 GiB 会让
+        // 帧解析的 `headerEnd + bodyLen` int 回绕，判限失效。
+        if (maxRequestBytes < 1024) { maxRequestBytes = 1024; }
+        if (maxRequestBytes > 1073741824) { maxRequestBytes = 1073741824; }
+        this.maxHeaderBytes = maxHeaderBytes;
+        this.maxRequestBytes = maxRequestBytes;
+        this.requestTimeout = timeoutMs;
+        return this;
+    }
+
+    /// <summary>Sets the number of worker processes (like Workerman's
+    /// $worker->count). The process-wide worker count is the max over all
+    /// registered Workers.</summary>
+    Worker SetCount(int count) {
+        this.count = count;
+        return this;
+    }
+
+    /// <summary>Requests daemon mode: on Linux the master detaches from the
+    /// terminal (setsid) before serving. No-op elsewhere.</summary>
+    static void SetDaemonize(bool on) {
+        daemonize = on;
+    }
+
+    /// <summary>Overrides the loopback control port used by the master/worker
+    /// handshake (default: first Worker's port + 10000, and the master moves
+    /// off that default if something else holds it). A port named here is
+    /// used as given: the master fails instead of moving.</summary>
+    static void SetControlPort(int port) {
+        controlPort = port;
+        ctlPortFixed = true;
+    }
+
+    /// <summary>Seconds between status lines printed by the foreground
+    /// master/single-process server (like watching workerman's status).
+    /// 0 disables printing; stats are still collected.</summary>
+    static void SetStatusInterval(int seconds) {
+        statusInterval = seconds;
+    }
+
+    /// <summary>Directory the master and every worker log into -- their
+    /// stdout/stderr (like Workerman's stdout_file) plus the supervision
+    /// records -- all in one file per day; defaults to `logs`, created on
+    /// demand. The file name comes from <see cref="SetLogPattern"/>. Pass "" to
+    /// discard worker output instead -- then a worker that dies of a fatal
+    /// signal leaves no record anywhere, so only do that when the application
+    /// already routes its own logging elsewhere.</summary>
+    static void SetLogDir(string dir) {
+        logDir = dir;
+    }
+
+    /// <summary>The configured worker output directory ("" when disabled).</summary>
+    static string LogDir() {
+        return logDir;
+    }
+
+    /// <summary>File-name pattern for that shared file, expanded by
+    /// <see cref="Log.Expand"/>: {yyyy} {MM} {dd} {HH} {pid} {wid}, and it may
+    /// contain directories (missing ones are created). The default
+    /// `{yyyy}{MM}/{dd}.log` gives `logs/202608/13.log`: a new file each day,
+    /// grouped by month, so a long-running service neither ends up with one
+    /// unbounded log nor with a directory of thousands of entries.</summary>
+    static void SetLogPattern(string pattern) {
+        if (pattern != "") { logPattern = pattern; }
+    }
+
+    /// <summary>The file master and workers write to right now, or "" when
+    /// logging to a file is disabled.</summary>
+    static string LogPath() {
+        if (logDir == "") { return ""; }
+        return logDir + Path.Separator()
+            + Log.ExpandFor(logPattern, DateTime.Now(), ProcessHost.WorkerId());
+    }
+
+    // Master side, before anything else happens: make sure supervision events
+    // reach a file. An application that called Log.Configure itself keeps its
+    // own destination.
+    /// master 启动初期：应用未自配 Log 时按 logDir/logPattern 配置日志，确保监督事件落盘。
+    static void EnsureMasterLog() {
+        if (logDir == "") { return; }
+        EnsureLogDir();
+        if (Log.IsEnabled()) { return; }
+        Log.Configure(logDir, logPattern, Log.INFO);
+    }
+
+    // Creates the directory the current log file lives in; called before every
+    // spawn because the release directory of a fresh deployment does not have
+    // it yet, and because a dated pattern needs a new one every month.
+    /// 确保当前日志文件所在目录存在（每次 spawn 前调用）。
+    static void EnsureLogDir() {
+        if (logDir == "") { return; }
+        Log.EnsureDirFor(LogPath());
+    }
+
+    /// 所有注册 Worker 中最大的 worker 进程数。
+    static int MaxCount() {
+        int m = 1;
+        for (int i = 0; i < workers.Count; i = i + 1) {
+            if (workers[i].count > m) { m = workers[i].count; }
+        }
+        return m;
+    }
+
+    /// 控制端口取值顺序：显式指定 > 环境变量 ZAN_CTL_PORT > 首 Worker 端口+10000（无 Worker 时 19999）。
+    static int ControlPort() {
+        if (controlPort > 0) { return controlPort; }
+        string env = ProcessHost.Env("ZAN_CTL_PORT");
+        if (env != "") {
+            // A worker inherits the port its master claimed and must not go
+            // looking for another one.
+            controlPort = Convert.ToInt32(env);
+            ctlPortFixed = true;
+            return controlPort;
+        }
+        if (workers.Count > 0) { return workers[0].port + 10000; }
+        return 19999;
+    }
+
+    /// What identifies this server among everything else on the machine: its
+    /// own executable, the way workerman keys a server by its entry script. Two
+    /// copies in two directories are two servers and share nothing; the same
+    /// copy started again is the same server, so it finds what its previous run
+    /// left behind. NOT the port -- a port is configuration, it changes, and
+    /// the control port even moves at startup when something else holds it.
+    static string appId = "";
+
+    /// 服务器实例标识：自身可执行文件路径的哈希（同副本重启即同实例，与端口无关）。
+    static string AppId() {
+        if (appId == "") {
+            long h = SharedTable.Hash(ProcessHost.SelfExe());
+            if (h < 0) { h = 0 - h; }
+            appId = Convert.ToString(h);
+        }
+        return appId;
+    }
+
+    /// The default control port is derived from the service port, so an
+    /// unrelated program holding it used to be fatal even though nothing
+    /// outside the process group ever talks to it. The master may move to
+    /// another port and records the one it claimed here, so stop/status/reload
+    /// still find it.
+    static string CtlPortFile() {
+        return Path.Combine(Path.GetTempPath(),
+            "zan-worker-" + AppId() + ".ctl");
+    }
+
+    /// master 把实际认领的控制端口与实例令牌写入记录文件，供 stop/status/reload 寻址。
+    static void RecordControlPort() {
+        File.WriteAllText(CtlPortFile(), Convert.ToString(ControlPort())
+            + " " + CtlToken());
+        #if !WINDOWS
+        // A291②：POSIX 上 temp 里的新文件默认 0644，任何本机用户可读走令牌、
+        // 进而伪造 PONG 冒充本实例 master。收到 0600（仅属主可读写）。
+        // Windows 无需处理：%TEMP% 在用户 profile 下，ACL 天然仅本用户。
+        chmod(CtlPortFile(), 384);
+        #endif
+    }
+
+    /// 停机时删除控制端口记录文件。
+    static void ForgetControlPort() {
+        File.Delete(CtlPortFile());
+    }
+
+    /// The port a running instance recorded, or 0 when there is no usable
+    /// record. Only for the CLI side: the master writes the file.
+    static int RecordedControlPort() {
+        string f = CtlPortFile();
+        if (!File.Exists(f)) { return 0; }
+        string body = File.ReadAllText(f);
+        int port = 0;
+        for (int i = 0; i < body.Length; i = i + 1) {
+            int c = body[i] & 255;
+            if (c < 48 || c > 57) { break; }
+            port = port * 10 + (c - 48);
+        }
+        if (port < 1 || port > 65535) { return 0; }
+        return port;
+    }
+
+    // ---- instance identity on the control port ----
+    // A master is identified by a token, not just by answering the port:
+    // "something answers PONG on 18099" also happens when an unrelated
+    // instance is reachable there -- a server inside WSL, say, whose port WSL
+    // mirrors onto Windows' loopback. That instance is not this app's master
+    // and must not make this one refuse to start.
+    //
+    // The token is minted by whoever claims the port and written next to the
+    // port in the record file, which lives in this system's temp directory: an
+    // instance from another OS or another user cannot have written it, so its
+    // PONG carries a token that does not match the record and is recognised as
+    // foreign. A worker of THIS master reads the same file its master wrote,
+    // so the fork-bomb guard still sees its own master.
+    static string ctlToken = "";
+
+    /// 本实例令牌：CSPRNG 16 字节的 32 位 hex（A291②）。原先的
+    /// "<pid>-<unix秒>" 可被本机任何进程按进程表+时间预算出来，从而在
+    /// 控制端口上伪造 PONG 冒充本实例 master（影响 start 的占用判定与
+    /// stop/status 的寻址结论）。令牌只做身份甄别，不是控制命令的鉴权
+    /// 凭据——CSPRNG 不可用时退回旧形态，甄别仍然工作。
+    static string CtlToken() {
+        if (ctlToken == "") {
+            byte[] rnd = RandomNumberGenerator.GetBytes(16);
+            if (rnd != null) {
+                ctlToken = ByteHex(rnd, 16);
+            } else {
+                ctlToken = Convert.ToString(ProcessHost.Pid()) + "-"
+                    + Convert.ToString(DateTime.UtcNow().ToUnixSeconds());
+            }
+        }
+        return ctlToken;
+    }
+
+    /// 字节数组的低位在前 hex 编码（每字节两位）。
+    static string ByteHex(byte[] b, int n) {
+        string symbols = "0123456789abcdef";
+        string s = "";
+        for (int i = 0; i < n; i = i + 1) {
+            int v = b[i] & 255;
+            s = s + symbols.Substring(v >> 4, 1) + symbols.Substring(v & 15, 1);
+        }
+        return s;
+    }
+
+    /// The token of the instance that recorded the control port, or "" when
+    /// there is no record.
+    static string RecordedCtlToken() {
+        string f = CtlPortFile();
+        if (!File.Exists(f)) { return ""; }
+        string body = File.ReadAllText(f);
+        int sp = 0 - 1;
+        for (int i = 0; i < body.Length; i = i + 1) {
+            if ((body[i] & 255) == 32) { sp = i; break; }
+        }
+        if (sp < 0) { return ""; }
+        return Worker.TrimEol(body.Substring(sp + 1));
+    }
+
+    /// 去除字符串尾部的换行、空格与制表符。
+    static string TrimEol(string s) {
+        int n = s.Length;
+        while (n > 0) {
+            int c = s[n - 1] & 255;
+            if (c != 10 && c != 13 && c != 32 && c != 9) { break; }
+            n = n - 1;
+        }
+        return s.Substring(0, n);
+    }
+
+    // How long the control port is given to answer: connect and reply budgets
+    // for the liveness probe, and how long the CLI waits for stop/status/
+    // reload. Loopback and a master that is not wedged answer in microseconds;
+    // the budget only bounds the pathological cases (ghost listener, wedged
+    // master), which used to hang the caller for good.
+    static int ctlProbeMs = 1500;
+    static int ctlCmdMs = 10000;
+
+    // Why the last BindCtl failed. Kept here because closing the socket in the
+    // failure path overwrites the platform error before the caller sees it.
+    static string lastCtlErr = "";
+
+    /// Binds the control socket on one port. Returns the socket, or -1 with the
+    /// reason in lastCtlErr.
+    static nint BindCtl(int port, bool reuse) {
+        nint s = Socket.CreateTcp();
+        if (s < 0) {
+            lastCtlErr = SocketErr();
+            return -1;
+        }
+        if (reuse) { Socket.SetReuseAddr(s); }
+        if (Socket.Bind(s, "127.0.0.1", port) != 0) {
+            lastCtlErr = SocketErr();
+            Socket.Close(s);
+            return -1;
+        }
+        return s;
+    }
+
+    /// Claims a control port for this instance: the wanted one if it is free, a
+    /// reclaimed leftover from a previous run, or -- unless the port was named
+    /// explicitly -- the next free port after it. Returns the bound socket and
+    /// leaves ControlPort() reporting the port actually claimed, or -1.
+    static async nint ClaimControlPort() {
+        int want = ControlPort();
+        #if WINDOWS
+        // No SO_REUSEADDR on the first try: on Windows it would let this
+        // process steal a live master's port instead of failing, which is what
+        // keeps a child that mistook itself for a master from spawning
+        // children of its own.
+        nint s = BindCtl(want, false);
+        #else
+        // Lets a restart rebind while the previous master's control
+        // connections are still in TIME_WAIT. On POSIX this does not allow a
+        // second listener on the port, so the check below still catches a
+        // master that is actually running.
+        nint s = BindCtl(want, true);
+        #endif
+        if (s >= 0) { return s; }
+        string wantErr = lastCtlErr;
+
+        // Only something that ANSWERS is a running master; a lingering socket
+        // (TIME_WAIT, or a listener left behind by a dead master whose handle
+        // an exiting child still held) either refuses the connection or
+        // accepts it and never replies -- both are reclaimable below.
+        int probed = await ProbeControlPort();
+        if (probed == Worker.CTL_OURS) {
+            Console.WriteLine("[Worker] FATAL: control port "
+                + Convert.ToString(want)
+                + " is served by a running master; stop it first"
+                + " (<app> stop), or start this one with --ctl-port N");
+            exit(1);
+        }
+
+        // Someone else is alive on the port -- or something that cannot show it
+        // is this instance. Reclaiming it would be stealing a live listener, so
+        // the derived default gives way instead: nothing outside this process
+        // group ever talks to it. If that live listener really is another copy
+        // of this server, its SERVICE port is the one that fails to bind, and
+        // that error names the actual conflict.
+        if (probed == Worker.CTL_FOREIGN || probed == Worker.CTL_UNKNOWN) {
+            if (ctlPortFixed) {
+                Console.WriteLine("[Worker] FATAL: control port "
+                    + Convert.ToString(want) + " is held by another program"
+                    + " that is not this app's master (" + wantErr
+                    + "); name a free one with --ctl-port N");
+                exit(1);
+            }
+            return MoveOffControlPort(want, wantErr);
+        }
+
+        s = BindCtl(want, true);
+        if (s >= 0) {
+            Console.WriteLine("[Worker] control port " + Convert.ToString(want)
+                + " was left behind by a previous run; reclaimed it");
+            return s;
+        }
+
+        if (ctlPortFixed) {
+            Console.WriteLine("[Worker] FATAL: cannot bind control port "
+                + Convert.ToString(want) + " (" + wantErr + ", retry: "
+                + lastCtlErr + "); nothing answers on it, so it is not a"
+                + " running master -- name a free one with --ctl-port N");
+            exit(1);
+        }
+
+        return MoveOffControlPort(want, wantErr);
+    }
+
+    /// The control port is internal: only this master and its own workers ever
+    /// connect to it, and they are told which port to use. So an unrelated
+    /// program sitting on the derived default is no reason to refuse to start --
+    /// move to the next free port and record it for stop/status/reload.
+    static nint MoveOffControlPort(int want, string wantErr) {
+        int probe = want + 1;
+        while (probe <= want + 64) {
+            nint s = BindCtl(probe, false);
+            if (s >= 0) {
+                controlPort = probe;
+                Console.WriteLine("[Worker] control port "
+                    + Convert.ToString(want) + " is taken (" + wantErr
+                    + "); using " + Convert.ToString(probe) + " instead");
+                return s;
+            }
+            probe = probe + 1;
+        }
+        Console.WriteLine("[Worker] FATAL: no free control port in "
+            + Convert.ToString(want) + "-" + Convert.ToString(want + 64)
+            + " (" + lastCtlErr + "); name one with --ctl-port N");
+        exit(1);
+        return -1;
+    }
+
+    /// <summary>Runs the process-management command line, workerman-style:
+    ///
+    ///   app                 -- start in the foreground (debug)
+    ///   app start           -- same
+    ///   app start -d        -- start as a daemon
+    ///   app stop            -- stop the running master and its workers
+    ///   app restart [-d]    -- stop, then start
+    ///   app reload          -- replace the workers one at a time, letting the
+    ///                          old ones finish what they are serving
+    ///   app status          -- print the running server's worker table
+    ///
+    /// The running instance is addressed through its control port, so no pid
+    /// file has to be kept in sync, and the same commands work on Windows,
+    /// where signals are not available.
+    ///
+    /// Start commands never return; the others exit when the master answers.
+    /// </summary>
+    static async void RunCommand() {
+        cliMode = true;
+        string cmd = "start";
+        bool detach = false;
+        for (int i = 0; i < Environment.ArgCount(); i = i + 1) {
+            string a = Environment.ArgAt(i);
+            if (a == "-d" || a == "--daemon") {
+                detach = true;
+            } else if (a == "--ctl-port" && i + 1 < Environment.ArgCount()) {
+                // The control port is derived (first Worker's port + 10000),
+                // so two servers on nearby ports collide with no way out but
+                // an environment variable. Name it on the command line, and
+                // stop/status/reload address the same instance -- and the
+                // master uses it as given instead of moving off it.
+                SetControlPort(Convert.ToInt32(Environment.ArgAt(i + 1)));
+            } else if (i == 0) {
+                cmd = a;
+            }
+        }
+
+        if (cmd == "stop") {
+            await SendCommand("STOP");
+            return;
+        }
+        if (cmd == "reload") {
+            await SendCommand("RELOAD");
+            return;
+        }
+        if (cmd == "status") {
+            await SendCommand("STATUS");
+            return;
+        }
+        if (cmd == "restart") {
+            await SendCommand("STOP");
+            // Give the old master time to drop the control port before the new
+            // one claims it exclusively.
+            await Task.Delay(1500);
+            // STOP addressed the old instance's port, which may have been a
+            // fallback. The new one starts from the default again.
+            if (!ctlPortFixed) { controlPort = 0; }
+            cmd = "start";
+        }
+        if (cmd != "start") {
+            Console.WriteLine("usage: " + Worker.Usage());
+            return;
+        }
+        if (detach) { daemonize = true; }
+        await RunAll();
+    }
+
+    /// Sends one command line to the running master and prints its answer. The
+    /// running instance may have moved off the derived port, so its record wins
+    /// over the default -- unless the port was named on the command line.
+    static async void SendCommand(string cmd) {
+        Socket.Initialize();
+        if (!ctlPortFixed) {
+            int recorded = RecordedControlPort();
+            if (recorded > 0) { controlPort = recorded; }
+        }
+        // stop/reload/status must not be delivered to whatever else happens to
+        // answer on the port: a foreign server there would be stopped in this
+        // app's place. Only an instance whose token matches the record is it.
+        if (await ProbeControlPort() == Worker.CTL_FOREIGN) {
+            Console.WriteLine("[Worker] control port "
+                + Convert.ToString(ControlPort()) + " is answered by another"
+                + " program, not by this app -- ignoring " + cmd);
+            return;
+        }
+        TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", ControlPort(),
+            ctlProbeMs);
+        if (c == null || !c.IsConnected()) {
+            Console.WriteLine("[Worker] no server on control port "
+                + Convert.ToString(ControlPort()));
+            return;
+        }
+        int _s = await c.SendAsync(cmd + "\n");
+        // Bounded read: a socket left listening by a dead master accepts and
+        // then says nothing, and an unbounded read left `stop`/`status`
+        // hanging on it forever (the reactor wakeup can never be cancelled).
+        string reply = "";
+        bool timedOut = false;
+        while (true) {
+            string chunk = await c.RecvAsync(4096, ctlCmdMs);
+            if (chunk.Length == 0) {
+                timedOut = Socket.LastRecvTimedOut();
+                break;
+            }
+            reply = reply + chunk;
+        }
+        c.Close();
+        if (reply.Length > 0) { Console.Write(reply); }
+        if (timedOut) {
+            Console.WriteLine("[Worker] control port "
+                + Convert.ToString(ControlPort()) + " accepted the connection"
+                + " but did not answer " + cmd + " within "
+                + Convert.ToString(ctlCmdMs / 1000) + "s; it is not a live"
+                + " master (leftover listening socket?)");
+        }
+    }
+
+    /// <summary>Runs every registered Worker. Never returns. Command-mode
+    /// servers always use a supervising master, including a single worker;
+    /// direct RunAll callers keep the lightweight single-process path when
+    /// count is 1.</summary>
+    static async void RunAll() {
+        Socket.Initialize();
+
+        if (ProcessHost.IsWorker()) {
+            await RunAsWorkerProcess();
+            return;
+        }
+
+        EnsureMasterLog();
+        if (daemonize) {
+            // Detaching must not throw the master's own output away: without a
+            // file the supervision lines (worker N exited signal=...) go to
+            // /dev/null with the terminal, which is exactly why a restart loop
+            // on a server leaves nothing behind to read.
+            if (ProcessHost.DaemonizeTo(LogPath(), logDir)) {
+                exit(0);
+            }
+        }
+
+        int procs = MaxCount();
+        if (procs <= 1 && !cliMode) {
+            // Bind BEFORE the banner, like the master does: a port that is
+            // already taken used to be announced as "Start success." and only
+            // then reported as a fatal bind failure two lines below.
+            List<nint> socks = new List<nint>();
+            for (int i = 0; i < workers.Count; i = i + 1) {
+                nint s = workers[i].BindSocket(false);
+                if (s < 0) {
+                    Console.WriteLine(BindFailure(workers[i]));
+                    exit(1);
+                }
+                socks.Add(s);
+            }
+            StatsCreate(1);
+            Task.Spawn(StatsPublishLoop());
+            PrintBanner(1);
+            PrintSharedTables();
+            // stop/status/reload have to reach a single-process server too, so
+            // it listens on the control port just like a master does. Only
+            // under RunCommand: a program that just calls RunAll gets exactly
+            // the behaviour it had before, with no extra port bound.
+            if (cliMode) { Task.Spawn(SingleProcessControlLoop()); }
+            await RunAllLoopsOnSockets(socks);
+            return;
+        }
+
+        // The banner is printed inside RunAsMaster, once the control port is
+        // actually claimed: a second instance used to announce "Start
+        // success." and only then die on the port conflict.
+        await RunAsMaster(procs);
+    }
+
+    // Table formatting for the start-up and status screens (ServerBanner owns
+    // the column/rule geometry so both screens line up the same way).
+    /// 状态屏文本按宽度左对齐补空格（委托 ServerBanner.Pad）。
+    static string Pad(string s, int width) {
+        return ServerBanner.Pad(s, width);
+    }
+
+    /// 状态屏分隔线（委托 ServerBanner.Rule）。
+    static string Rule(string title) {
+        return ServerBanner.Rule(title);
+    }
+
+    /// <summary>Prints the workerman-style start-up screen: version line, then
+    /// one row per listener with protocol, address, process count and
+    /// state.</summary>
+    static void PrintBanner(int procs) {
+        string mode = "single process";
+        if (procs > 1 || cliMode) {
+            mode = "master + " + Convert.ToString(procs) + " worker";
+            if (procs != 1) { mode = mode + "s"; }
+        }
+        ServerBanner b = new ServerBanner("ZAN", "WORKERS").Mode(mode);
+        for (int i = 0; i < workers.Count; i = i + 1) {
+            Worker w = workers[i];
+            int c = w.count;
+            if (c < 1) { c = 1; }
+            b.Service(w.name,
+                w.protocol + "://" + w.host + ":" + Convert.ToString(w.port),
+                Convert.ToString(c), "[OK]");
+        }
+        if (cliMode) { b.Commands(Worker.Usage()); }
+        b.Footer("Press Ctrl+C to stop. Start success.");
+        b.Print();
+    }
+
+    // ---- shared stats table ----
+
+    // The table is ANONYMOUS: it has no name, so nothing else on the machine
+    // can open it -- a server's process table is not something an unrelated
+    // program should be able to read, let alone write -- and nothing is left
+    // behind when the server goes, however it goes. The master creates it before
+    // spawning anyone and each worker inherits the handle through the
+    // environment, which is what fork gives Swoole for free and what we have to
+    // hand over explicitly because a worker here is a freshly exec'd process.
+    //
+    // The handle the children attach to. Only meaningful in the master.
+    static long statOsHandle = 0;
+
+    /// 统计表行键：wid>0 为 "w<id>"，否则 "self"。
+    static string StatsKey(int wid) {
+        if (wid <= 0) { return "self"; }
+        return "w" + Convert.ToString(wid);
+    }
+
+    /// 构造跨进程统计共享表的列布局（pid/recv/sent/conns/cpu/rss）。
+    static SharedTable StatsTable(int procs) {
+        SharedTable t = new SharedTable("", procs + 8);
+        t.Label("worker stats");
+        t.KeySize(16);
+        t.ColumnInt("pid");
+        t.ColumnInt("recv");
+        t.ColumnInt("sent");
+        t.ColumnInt("conns");
+        t.ColumnInt("cpu");
+        t.ColumnInt("rss");
+        return t;
+    }
+
+    /// Seeds the rows so a worker's first publish writes into an existing row
+    /// instead of racing to create one.
+    static void StatsSeed(SharedTable t, int procs) {
+        for (int wid = 0; wid <= procs; wid = wid + 1) {
+            t.SetInt(StatsKey(wid), "pid", 0);
+            t.SetInt(StatsKey(wid), "recv", 0);
+            t.SetInt(StatsKey(wid), "sent", 0);
+            t.SetInt(StatsKey(wid), "conns", 0);
+            t.SetInt(StatsKey(wid), "cpu", 0);
+            t.SetInt(StatsKey(wid), "rss", 0);
+        }
+    }
+
+    /// Master (or single process): create the stats table, one row per process.
+    /// Must run before the first worker is spawned -- a worker can only be given
+    /// a handle that already exists.
+    static void StatsCreate(int procs) {
+        SharedTable t = StatsTable(procs);
+        if (!t.CreateAnonymous()) {
+            Console.WriteLine("[Worker] cannot create the shared stats table;"
+                + " per-process counters will read as zero");
+            return;
+        }
+        StatsSeed(t, procs);
+        statTable = t;
+        statOsHandle = t.OsHandle();
+    }
+
+    /// Master only, on the way out. The kernel would reclaim the memory anyway
+    /// once the last worker holding it is gone -- there is no name and no file to
+    /// clean up -- but dropping it here means a master that keeps running after
+    /// its workers (a failed start) is not sitting on a mapping.
+    static void StatsDestroy() {
+        SharedTable t = statTable;
+        statOsHandle = 0;
+        if (t == null) { return; }
+        statTable = null;
+        if (t.IsOpen()) { bool _d = t.Destroy(); }
+    }
+
+    /// Worker side: map the table the master created and handed down. Nothing to
+    /// attach to (a stats table that failed to be created, or an executable run
+    /// as a worker by something other than our master) leaves the worker without
+    /// one, which only costs it its row in `status`.
+    static void StatsAttach() {
+        string env = ProcessHost.Env("ZAN_STATS_HANDLE");
+        if (env == "") { return; }
+        SharedTable t = SharedTable.Attach(Convert.ToInt64(env));
+        if (t.IsOpen()) {
+            t.Label("worker stats");
+            statTable = t;
+        }
+    }
+
+    // ---- anonymous shared tables handed down to the workers ----
+    // A table the master created before spawning: the child inherits the OS
+    // handle and maps the same memory, so the table needs no machine-global
+    // name to be found by -- and nothing outside this server's own processes
+    // can reach it. The Web framework's rate/lock/route tables travel here,
+    // as do any shared tables an application builds for itself.
+    static List<string> shareNames = new List<string>();
+    static List<long> shareHandles = new List<long>();
+
+    // The handle travels in the environment, like ZAN_STATS_HANDLE does.
+    /// 共享表句柄经环境变量传递时的变量名（ZAN_SHARE_<name>）。
+    static string ShareEnv(string name) { return "ZAN_SHARE_" + name; }
+
+    /// <summary>Hands an anonymous shared table down to every worker this
+    /// master spawns, under <paramref name="name"/>. Must be called before the
+    /// first worker starts: a child only inherits handles that already existed.
+    /// A handle of 0 -- one that could not be created -- shares nothing.</summary>
+    static void ShareHandle(string name, long osHandle) {
+        if (name == "" || osHandle == 0) { return; }
+        for (int i = 0; i < shareNames.Count; i = i + 1) {
+            if (shareNames[i] == name) {
+                shareHandles[i] = osHandle;
+                return;
+            }
+        }
+        shareNames.Add(name);
+        shareHandles.Add(osHandle);
+    }
+
+    /// <summary>Worker side: the handle the master shared under this name, or 0
+    /// in a process that was not spawned as a worker of such a master.</summary>
+    static long InheritedHandle(string name) {
+        string env = ProcessHost.Env(ShareEnv(name));
+        if (env == "") { return 0; }
+        return Convert.ToInt64(env);
+    }
+
+    /// Publishes this process's counters into its row.
+    static void StatsPublish() {
+        SharedTable t = statTable;
+        if (t == null) { return; }
+        if (!t.IsOpen()) { return; }
+        string key = StatsKey(ProcessHost.WorkerId());
+        t.SetInt(key, "pid", ProcessHost.Pid());
+        t.SetInt(key, "recv", statRequests.Load());
+        t.SetInt(key, "sent", statSent.Load());
+        t.SetInt(key, "conns", LiveConnections());
+        t.SetInt(key, "cpu", ServerMetrics.CpuMillis());
+        t.SetInt(key, "rss", ServerMetrics.MemoryRssBytes());
+    }
+
+    /// 后台循环：每 2 秒把本进程计数器发布进统计表。
+    static async void StatsPublishLoop() {
+        while (true) {
+            await Task.Delay(2000);
+            StatsPublish();
+        }
+    }
+
+    /// 读取指定 worker 行的统计列；统计表不可用时返回 0。
+    static long StatsRead(int wid, string column) {
+        SharedTable t = statTable;
+        if (t == null) { return 0; }
+        if (!t.IsOpen()) { return 0; }
+        return t.GetInt(StatsKey(wid), column);
+    }
+
+    /// <summary>The command line a CLI-driven server answers.</summary>
+    static string Usage() {
+        return "<app> [start [-d] | stop | restart [-d] | reload | status]"
+            + " [--ctl-port N]";
+    }
+
+    /// <summary>Stops all workers in this process (single-process mode);
+    /// worker processes are managed by the master instead.</summary>
+    static void StopAll() {
+        for (int i = 0; i < workers.Count; i = i + 1) {
+            workers[i].Stop();
+        }
+    }
+
+    /// <summary>Requests this worker's event loop to exit after the current
+    /// iteration; the running coroutine is not interrupted.</summary>
+    void Stop() {
+        this.running = false;
+    }
+
+    // One connection arrived / left. Wrapped so the atomic's return value is
+    // discarded in one place instead of a throwaway local at every call site.
+    /// 连接计数 +1（包装一层以便集中丢弃原子自增的返回值）。
+    void AddConn() { long _n = this.connectionCount.Increment(); }
+    /// 连接计数 -1。
+    void DropConn() { long _n = this.connectionCount.Decrement(); }
+
+    /// <summary>当前活连接数（本进程视角；多进程时其他 worker 的
+    /// 连接不计入）。</summary>
+    int GetConnectionCount() {
+        return (int)this.connectionCount.Load();
+    }
+
+    // ======================================================================
+    /// <summary>Sets inherited worker settings without narrowing UTF-8 paths through the Windows ANSI code page.</summary>
+    #if WINDOWS
+    /// 以宽字符 API 设置环境变量，避免 UTF-8 值经 Windows ANSI 代码页窄化。
+    static void SetWorkerEnv(string name, string val) {
+        nint wname = Wide.Of(name);
+        nint wval = Wide.Of(val);
+        int _ok = SetEnvironmentVariableW(wname, wval);
+        Wide.Free(wname);
+        Wide.Free(wval);
+    }
+    #endif
+
+    // master: spawn + share listeners + supervise
+    // ======================================================================
+
+    // Total children ever spawned by this master. Hard safety cap: a bug that
+    // respawns workers in a tight loop must never take the machine down again.
+    static int totalSpawned = 0;
+    static int maxTotalSpawns = 512;
+
+    /// Master 派生一个 worker 子进程（wid 从 1 起）：经环境变量（Windows）或
+    /// 命令行前缀（POSIX）传递 worker id、控制端口、统计表句柄、日志目录与
+    /// 共享表句柄；总派生数受 maxTotalSpawns 硬上限保护。
+    static void SpawnChild(int wid) {
+        if (totalSpawned >= maxTotalSpawns) {
+            Console.WriteLine("[Worker] spawn cap (" + Convert.ToString(maxTotalSpawns)
+                + ") reached; refusing to spawn more workers");
+            return;
+        }
+        totalSpawned = totalSpawned + 1;
+        string exe = ProcessHost.SelfExe();
+        int ctl = ControlPort();
+        EnsureLogDir();
+        string logPath = Worker.LogPath();
+        #if WINDOWS
+        // Set the variables in our own environment so the child inherits them
+        // via CreateProcess, then clear them so the master itself never looks
+        // like a worker.
+        SetWorkerEnv("ZAN_WORKER_ID", Convert.ToString(wid));
+        SetWorkerEnv("ZAN_CTL_PORT", Convert.ToString(ctl));
+        // The stats table is anonymous; this handle is the only way in, and the
+        // child gets it because StartProgram creates the process with handle
+        // inheritance on.
+        SetWorkerEnv("ZAN_STATS_HANDLE", Convert.ToString(statOsHandle));
+        // The runtime crash handler puts its record next to the worker output.
+        SetWorkerEnv("ZAN_LOG_DIR", logDir);
+        for (int s = 0; s < shareNames.Count; s = s + 1) {
+            SetWorkerEnv(ShareEnv(shareNames[s]),
+                Convert.ToString(shareHandles[s]));
+        }
+        // Started directly, NOT through `cmd.exe /c`: a shell hop would leave
+        // one cmd.exe plus one conhost.exe alive alongside every worker for as
+        // long as it runs, so N workers (and every respawn) pile up as a crowd
+        // of "Windows command processor" / console host entries.
+        int rc = Process.StartProgram(exe, logPath);
+        SetWorkerEnv("ZAN_WORKER_ID", "");
+        SetWorkerEnv("ZAN_CTL_PORT", "");
+        SetWorkerEnv("ZAN_STATS_HANDLE", "");
+        for (int c = 0; c < shareNames.Count; c = c + 1) {
+            SetWorkerEnv(ShareEnv(shareNames[c]), "");
+        }
+        if (rc != 0) {
+            Log.Error("[Worker] worker " + Convert.ToString(wid)
+                + " failed to start: CreateProcess(" + exe + ") failed");
+        }
+        #else
+        // The descriptor is not close-on-exec, so it survives the shell hop and
+        // arrives in the worker under the same number.
+        string shared = "";
+        for (int s = 0; s < shareNames.Count; s = s + 1) {
+            shared = shared + ShareEnv(shareNames[s]) + "="
+                + Convert.ToString(shareHandles[s]) + " ";
+        }
+        string cmd = "ZAN_WORKER_ID=" + Convert.ToString(wid)
+            + " ZAN_CTL_PORT=" + Convert.ToString(ctl)
+            + " ZAN_STATS_HANDLE=" + Convert.ToString(statOsHandle)
+            + " ZAN_LOG_DIR=\"" + logDir + "\" "
+            + shared
+            + "\"" + exe + "\"";
+        if (logPath != "") {
+            // Append only, and nothing after the command: the spawning shell
+            // execs the worker instead of waiting for it, so a worker costs one
+            // process, not a shell parked next to it for its whole life.
+            cmd = cmd + " >> \"" + logPath + "\" 2>&1";
+        }
+        Process.RunDetached(cmd);
+        #endif
+        Log.Info("[Worker] worker " + Convert.ToString(wid) + " spawned");
+    }
+
+    // ---- master-side handoff channel registry (Windows) ----
+    // One entry per (worker process, TCP listener) channel connection, filled
+    // in by HandleWorkerControl when a worker sends its CHAN handshake.
+    static List<int> chIdx = new List<int>();      // listener index served
+    static List<int> chPid = new List<int>();      // worker process pid
+    static List<TcpClient> chConn = new List<TcpClient>();
+    static int rrCounter = 0;
+
+    /// The platform error text for the socket call that just failed. Read it
+    /// immediately: any later socket call -- even a successful close --
+    /// overwrites the platform error.
+    static string SocketErr() {
+        #if WINDOWS
+        return "WSA error " + Convert.ToString(Socket.LastSocketError());
+        #else
+        return "errno " + Convert.ToString(Socket.LastSocketError());
+        #endif
+    }
+
+    // Error from the last failed BindSocket, captured there because the
+    // failure path closes the socket before the caller can read it.
+    static string lastBindErr;
+
+    // The listen address is the one thing a user can act on, and the platform
+    // error number alone ((errno 48) on macOS, 98 on Linux, WSA 10048) says
+    // nothing about what to do, so name the condition and the two fixes.
+    /// 监听绑定失败的完整错误信息；端口被占用时给出可操作的两种处理建议。
+    static string BindFailure(Worker w) {
+        string at = w.protocol + "://" + w.host + ":" + Convert.ToString(w.port);
+        string s = "[Worker] FATAL: cannot bind " + at + " ("
+            + Worker.lastBindErr + ")";
+        if (Worker.lastBindErrInUse) {
+            s = s + "; the address is already in use -- another program (or a"
+                + " previous run of this one that is still alive) is listening"
+                + " on it. Stop it, or give this server a free port.";
+        }
+        return s;
+    }
+
+    // Whether that failure was "address already in use": EADDRINUSE is 48 on
+    // macOS/BSD, 98 on Linux and WSAEADDRINUSE 10048 on Windows.
+    static bool lastBindErrInUse;
+
+    /// 平台错误号是否表示"地址已被占用"（WSA 10048 / macOS 48 / Linux 98）。
+    static bool IsAddrInUse(int err) {
+        #if WINDOWS
+        return err == 10048;
+        #elif MACOS
+        return err == 48;
+        #else
+        return err == 98;
+        #endif
+    }
+
+    /// True when a live Zan master answers PING on the control port.
+    ///
+    /// Accepting the connection is not enough: a listening socket outlives the
+    /// process that created it whenever a handle to it was inherited or
+    /// duplicated (Windows worker handoff), and the kernel completes the
+    /// handshake from the backlog with nobody left to accept it. Treating that
+    /// ghost as a running master made every later start fail with "served by a
+    /// running master" until the leftover handle was found and killed -- a
+    /// reboot being the usual cure. So talk to it: only something that answers
+    /// PONG owns the port as a master.
+    ///
+    /// And only a master of THIS instance is one this process must stand down
+    /// for: the answer carries the token from the record file (see CtlToken),
+    /// so an unrelated server reachable on the same loopback port -- one inside
+    /// WSL, whose ports Windows mirrors -- is reported as foreign instead of
+    /// stopping this app from starting.
+    ///
+    /// Returns CTL_FREE (nothing answers, the port is reclaimable), CTL_OURS
+    /// (this app's master is running -- it proved it by echoing the token from
+    /// the record file), CTL_FOREIGN (a master of some other instance) or
+    /// CTL_UNKNOWN (something answered PONG but named no token, which is how a
+    /// build from before the token answers).
+    static const int CTL_FREE = 0;
+    static const int CTL_OURS = 1;
+    static const int CTL_FOREIGN = 2;
+    static const int CTL_UNKNOWN = 3;
+
+    /// 向控制端口发 PING 并按应答（含令牌核对）返回 CTL_FREE/CTL_OURS/CTL_FOREIGN/CTL_UNKNOWN。
+    static async int ProbeControlPort() {
+        TcpClient probe = await TcpClient.ConnectAsync("127.0.0.1",
+            ControlPort(), ctlProbeMs);
+        if (probe == null || !probe.IsConnected()) { return Worker.CTL_FREE; }
+        int _s = await probe.SendAsync("PING\n");
+        string reply = await probe.RecvAsync(64, ctlProbeMs);
+        probe.Close();
+        if (reply.Length < 4 || reply.Substring(0, 4) != "PONG") {
+            return Worker.CTL_FREE;
+        }
+        // "PONG <pid> <token>", and only a matching token proves the answer
+        // comes from this instance: an unproven claim of ownership is what made
+        // a stranger on the port fatal in the first place.
+        List<string> f = SplitWords(reply);
+        if (f.Count < 3) { return Worker.CTL_UNKNOWN; }
+        string mine = RecordedCtlToken();
+        if (mine != "" && f[2] == mine) { return Worker.CTL_OURS; }
+        if (ctlToken != "" && f[2] == ctlToken) { return Worker.CTL_OURS; }
+        return Worker.CTL_FOREIGN;
+    }
+
+    /// master 主流程：先认领控制端口（fork 炸弹防护），再绑定监听、建统计表、派生并监督 procs 个 worker。
+    static async void RunAsMaster(int procs) {
+        // Fork-bomb guard: claim the control port BEFORE spawning anything. If
+        // a child ever mistakes itself for a master (e.g. env vars failed to
+        // propagate), the claim fails here and it exits instead of spawning
+        // children of its own.
+        nint ctlSock = await ClaimControlPort();
+        RecordControlPort();
+        PrintBanner(procs);
+        Socket.Listen(ctlSock, 64);
+        Socket.SetNonBlocking(ctlSock);
+
+        // On Windows the master owns every listen socket, accepts on its own
+        // IOCP, and hands each accepted connection to a worker; on POSIX
+        // workers bind their own SO_REUSEPORT sockets.
+        #if WINDOWS
+        for (int i = 0; i < workers.Count; i = i + 1) {
+            Worker w = workers[i];
+            nint s = w.BindSocket(false);
+            if (s < 0) {
+                Console.WriteLine(BindFailure(w));
+                exit(1);
+            }
+            if (w.protocol == "udp") {
+                // No accept to distribute: serve UDP in the master itself.
+                Task.Spawn(w.RunOnSocket(s));
+            } else {
+                Task.Spawn(MasterAcceptLoop(i, s));
+            }
+        }
+        #endif
+
+        // The stats table must exist before the first worker starts, so a
+        // worker's Open always finds it.
+        StatsCreate(procs);
+        // The master serves no request but is a process like any other: it has
+        // a pid, burns CPU supervising and holds memory, so it publishes its
+        // own row (worker id 0) instead of being missing from the table.
+        StatsPublish();
+        Task.Spawn(StatsPublishLoop());
+        PrintSharedTables();
+
+        int wid = 1;
+        while (wid <= procs) {
+            SpawnChild(wid);
+            wid = wid + 1;
+        }
+
+
+        // Accept control connections forever: first HELLO from each worker gets
+        // the listener handoff, then the connection doubles as a liveness watch
+        // (worker died => respawn it).
+        while (true) {
+            nint sock = await Socket.AcceptAsync(ctlSock);
+            if (sock < 0) { continue; }
+            Socket.SetNonBlocking(sock);
+            Task.Spawn(HandleWorkerControl(sock));
+        }
+    }
+
+    #if WINDOWS
+    // Master accept loop for listener `idx`: event-driven accept on the
+    // master's IOCP, then hand the accepted socket to the next worker.
+    /// Windows：listener idx 的 master 接受循环，事件驱动 accept 后把连接轮流移交 worker。
+    static async void MasterAcceptLoop(int idx, nint sock) {
+        Dbg("accept loop up idx=" + Convert.ToString(idx));
+        while (true) {
+            nint c = await Socket.AcceptAsync(sock);
+            Dbg("accepted idx=" + Convert.ToString(idx) + " c=" + Convert.ToString(c));
+            if (c < 0) { continue; }
+            await HandoffClient(idx, c);
+        }
+    }
+
+    /// Round-robin pick of a live channel serving listener `idx`; -1 if none.
+    static int PickChannel(int idx) {
+        int n = chIdx.Count;
+        if (n == 0) { return -1; }
+        rrCounter = rrCounter + 1;
+        int start = rrCounter;
+        for (int k = 0; k < n; k = k + 1) {
+            int slot = (start + k) % n;
+            if (chIdx[slot] == idx) { return slot; }
+        }
+        return -1;
+    }
+
+    /// 关闭并移除一个失效的 handoff 通道（worker 已死/ACK 失败）。
+    static void DropChannel(int slot) {
+        chConn[slot].Close();
+        chIdx.RemoveAt(slot);
+        chPid.RemoveAt(slot);
+        chConn.RemoveAt(slot);
+    }
+
+    /// Duplicates accepted socket `c` into a worker process and closes the
+    /// master's copy once the worker ACKs that it rebuilt the socket.
+    static async void HandoffClient(int idx, nint c) {
+        while (true) {
+            int slot = PickChannel(idx);
+            if (slot < 0) {
+                // No worker online (all crashed / still starting): drop.
+                Socket.Close(c);
+                return;
+            }
+            TcpClient ch = chConn[slot];
+            byte[] info = new byte[373];
+            int r = WSADuplicateSocketA(c, chPid[slot], info);
+            Dbg("dup c=" + Convert.ToString(c) + " -> pid=" + Convert.ToString(chPid[slot]) + " r=" + Convert.ToString(r));
+            if (r != 0) {
+                Socket.Close(c);
+                return;
+            }
+            int n = await Socket.SendAsync(ch.GetSocket(), info, 372);
+            if (n <= 0) { DropChannel(slot); continue; }
+            string ack = await ch.RecvAsync(1);
+            Dbg("ack len=" + Convert.ToString(ack.Length));
+            if (ack.Length == 0) { DropChannel(slot); continue; }
+            Socket.Close(c);
+            return;
+        }
+    }
+    #endif
+
+    /// 处理一条控制端口连接。首行是握手："HELLO <pid> <wid>"（控制/存活
+    /// 连接）、"CHAN <pid> <listenerIdx>"（Windows 交接通道），CLI 的单词
+    /// 命令 PING/STOP/RELOAD/STATUS 也在此分流。HELLO 连接随后作为存活
+    /// 监视长驻：对端关闭即视为 worker 退出，延迟 1s 后重启（stopping
+    /// 置位时不重启，避免停机后复活）。
+    static async void HandleWorkerControl(nint sock) {
+        TcpClient conn = TcpClient.FromSocket(sock);
+
+        // First line is the handshake:
+        //   "HELLO <pid> <wid>\n"        -- control/liveness/STAT connection
+        //   "CHAN <pid> <listenerIdx>\n" -- Windows per-listener handoff channel
+        string line = "";
+        bool ok = true;
+        while (true) {
+            int nl = IndexOfByte(line, 10);
+            if (nl >= 0) { line = line.Substring(0, nl); break; }
+            string chunk = await conn.RecvAsync(256);
+            if (chunk.Length == 0) { ok = false; break; }
+            line = line + chunk;
+        }
+        if (!ok) { conn.Close(); return; }
+
+        List<string> f = SplitWords(line);
+        if (f.Count == 0) { conn.Close(); return; }
+
+        // Commands from the CLI (`app stop|reload|status`) share the control
+        // port with the worker handshake: they are single words.
+        if (f[0] == "PING" || f[0] == "STOP" || f[0] == "RELOAD"
+                || f[0] == "STATUS") {
+            await HandleCliCommand(conn, f[0]);
+            return;
+        }
+        if (f.Count < 3) { conn.Close(); return; }
+
+        #if WINDOWS
+        if (f[0] == "CHAN") {
+            // Register the handoff channel; it is written to by HandoffClient
+            // from now on and dropped when a send/ACK fails (worker died).
+            chPid.Add(Convert.ToInt32(f[1]));
+            chIdx.Add(Convert.ToInt32(f[2]));
+            chConn.Add(conn);
+            Dbg("chan registered pid=" + f[1] + " idx=" + f[2] + " total=" + Convert.ToString(chConn.Count));
+            return;
+        }
+        #endif
+        if (f[0] != "HELLO") { conn.Close(); return; }
+        int childPid = Convert.ToInt32(f[1]);
+        int childWid = Convert.ToInt32(f[2]);
+
+        #if !WINDOWS
+        int _n = await Socket.SendStringAsync(sock, "GO\n");
+        #endif
+
+        Log.Info("[Worker] worker " + Convert.ToString(childWid)
+            + " (pid " + Convert.ToString(childPid) + ") online");
+        ctlConn.Add(conn);
+        ctlWid.Add(childWid);
+
+        // Supervise: the control connection stays open for the worker's whole
+        // life (counters travel through the shared stats table, not this
+        // socket); it closing means the worker exited.
+        while (true) {
+            string beat = await conn.RecvAsync(256);
+            if (beat.Length == 0) { break; }
+        }
+        conn.Close();
+        DropCtl(conn);
+        if (stopping) {
+            Log.Info("[Worker] worker " + Convert.ToString(childWid)
+                + " (pid " + Convert.ToString(childPid) + ") stopped");
+            return;
+        }
+        // Pace respawns so a worker that dies instantly on startup cannot
+        // drive a rapid spawn loop.
+        await Task.Delay(1000);
+        // The master is not the worker's parent (it is spawned detached), so
+        // there is no wait status to report here. What the worker died of is in
+        // this same file: the runtime's crash record for a fatal signal and
+        // anything it printed are redirected into it.
+        Log.Error("[Worker] worker " + Convert.ToString(childWid) + " pid="
+            + Convert.ToString(childPid)
+            + " exited; see the records above for its last output; respawning");
+        SpawnChild(childWid);
+    }
+
+    /// worker 退出后将其控制连接从存活表中移除。
+    static void DropCtl(TcpClient conn) {
+        for (int i = 0; i < ctlConn.Count; i = i + 1) {
+            if (ctlConn[i] == conn) {
+                ctlConn.RemoveAt(i);
+                ctlWid.RemoveAt(i);
+                return;
+            }
+        }
+    }
+
+    /// Master side of `app stop|reload|status`.
+    ///
+    /// stop:   ask every worker to quit (each finishes what it is serving),
+    ///         wait for their control connections to close, then exit.
+    /// reload: ask them to quit one at a time; the supervisor respawns each one,
+    ///         so the port is served throughout.
+    /// status: send back the same table the foreground master prints.
+    static async void HandleCliCommand(TcpClient conn, string cmd) {
+        if (cmd == "PING") {
+            // Liveness probe (ClaimControlPort): proves a master is accepting
+            // AND serving, not just a socket left listening by a dead one. The
+            // token says WHICH instance answered, so a server that merely
+            // shares the loopback port is not mistaken for this app's master.
+            int _p = await conn.SendAsync("PONG "
+                + Convert.ToString(ProcessHost.Pid()) + " " + CtlToken()
+                + "\n");
+            conn.Close();
+            return;
+        }
+        if (cmd == "STATUS") {
+            int _s = await conn.SendAsync(StatusText());
+            conn.Close();
+            return;
+        }
+        if (cmd == "STOP") {
+            stopping = true;
+            int _r = await conn.SendAsync("stopping "
+                + Convert.ToString(ctlConn.Count) + " worker(s)\n");
+            conn.Close();
+            await StopWorkersAndExit();
+            return;
+        }
+        // RELOAD: answer right away and cycle the workers in the background,
+        // so the caller is not held for the whole rolling restart.
+        int _l = await conn.SendAsync("reloading "
+            + Convert.ToString(ctlConn.Count) + " worker(s)\n");
+        conn.Close();
+        Task.Spawn(ReloadWorkers());
+    }
+
+    /// 依次向所有 worker 发 QUIT，等待它们的控制连接关闭（上限 30s）后
+    /// 清理端口记录与统计表并 exit(0)。
+    static async void StopWorkersAndExit() {
+        for (int i = 0; i < ctlConn.Count; i = i + 1) {
+            int _q = await ctlConn[i].SendAsync("QUIT\n");
+        }
+        int waited = 0;
+        while (ctlConn.Count > 0 && waited < 30000) {
+            await Task.Delay(200);
+            waited = waited + 200;
+        }
+        ForgetControlPort();
+        StatsDestroy();
+        Console.WriteLine("[Worker] master stopped");
+        exit(0);
+    }
+
+    /// Replaces the workers one at a time: each is asked to quit, finishes what
+    /// it is serving and exits, the supervisor respawns it, and only then is the
+    /// next one touched -- so the listener is served throughout.
+    static async void ReloadWorkers() {
+        int total = ctlConn.Count;
+        int done = 0;
+        while (done < total && ctlConn.Count > 0) {
+            TcpClient victim = ctlConn[0];
+            int wid = ctlWid[0];
+            int before = ctlConn.Count;
+            int _q = await victim.SendAsync("QUIT\n");
+            int waited = 0;
+            while (waited < 30000 && ctlConn.Count >= before) {
+                await Task.Delay(100);
+                waited = waited + 100;
+            }
+            Console.WriteLine("[Worker] reloaded worker " + Convert.ToString(wid));
+            done = done + 1;
+            // Let the replacement report in before cycling the next one.
+            await Task.Delay(1500);
+        }
+        Console.WriteLine("[Worker] reload complete");
+    }
+
+    /// The status table `app status` prints, built from the workers' last
+    /// reports (master) or this process's own counters (single process).
+    static string StatusText() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(Rule("ZAN STATUS"));
+        sb.Append("\n");
+        sb.Append(Pad("master pid: " + Convert.ToString(ProcessHost.Pid()), 30));
+        sb.Append("control port: " + Convert.ToString(ControlPort()));
+        sb.Append("\n");
+        sb.Append(Pad("service", 22) + Pad("listen", 32)
+            + Pad("processes", 12) + "status\n");
+        for (int i = 0; i < workers.Count; i = i + 1) {
+            Worker w = workers[i];
+            int wc = w.count;
+            if (wc < 1) { wc = 1; }
+            sb.Append(Pad(w.name, 22)
+                + Pad(w.protocol + "://" + w.host + ":" + Convert.ToString(w.port), 32)
+                + Pad(Convert.ToString(wc), 12) + "[OK]\n");
+        }
+        sb.Append(Rule(""));
+        sb.Append("\n");
+        sb.Append(Pad("worker", 8) + Pad("pid", 9) + Pad("received", 12)
+            + Pad("sent", 12) + Pad("clients", 10) + Pad("cpu ms", 10)
+            + "memory\n");
+        int procs = MaxCount();
+        if (procs <= 1 && !cliMode) {
+            // Single process: publish first so the row is this second's truth.
+            StatsPublish();
+            sb.Append(StatusRow("self", 0));
+            sb.Append(SharedTablesText());
+            return sb.ToString();
+        }
+        // Row 0 is the master's own: it answers this query, so publishing here
+        // makes its counters as current as the workers' last report.
+        StatsPublish();
+        sb.Append(StatusRow("master", 0));
+        long totRecv = 0;
+        long totSent = 0;
+        long totConns = 0;
+        int wid = 1;
+        while (wid <= procs) {
+            if (StatsRead(wid, "pid") != 0) {
+                totRecv = totRecv + StatsRead(wid, "recv");
+                totSent = totSent + StatsRead(wid, "sent");
+                totConns = totConns + StatsRead(wid, "conns");
+                sb.Append(StatusRow("w" + Convert.ToString(wid), wid));
+            }
+            wid = wid + 1;
+        }
+        sb.Append("total   received: " + Convert.ToString(totRecv)
+            + "   sent: " + Convert.ToString(totSent)
+            + "   clients: " + Convert.ToString(totConns) + "\n");
+        sb.Append(SharedTablesText());
+        return sb.ToString();
+    }
+
+    /// What this process is holding in shared memory. Reserved is the whole
+    /// mapping a table sets aside for its capacity; "in memory" is the part of
+    /// it that is actually resident -- the number that belongs in a memory
+    /// report, and usually a small fraction of the first.
+    static string SharedTablesText() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(Rule("SHARED TABLES"));
+        sb.Append("\n");
+        sb.Append(SharedTable.StatusText());
+        return sb.ToString();
+    }
+
+    /// 启动屏打印本进程共享内存表占用情况。
+    static void PrintSharedTables() {
+        Console.Write(SharedTablesText());
+    }
+
+    /// One process row of the status table, read from the shared stats table.
+    static string StatusRow(string label, int wid) {
+        return Pad(label, 8)
+            + Pad(Convert.ToString(StatsRead(wid, "pid")), 9)
+            + Pad(Convert.ToString(StatsRead(wid, "recv")), 12)
+            + Pad(Convert.ToString(StatsRead(wid, "sent")), 12)
+            + Pad(Convert.ToString(StatsRead(wid, "conns")), 10)
+            + Pad(Convert.ToString(StatsRead(wid, "cpu")), 10)
+            + Convert.ToString(StatsRead(wid, "rss") / 1048576) + "MB\n";
+    }
+
+    /// Control listener for a single-process server started through RunCommand:
+    /// the same stop/reload/status commands, answered without a master.
+    static async void SingleProcessControlLoop() {
+        #if WINDOWS
+        nint ctlSock = BindCtl(ControlPort(), false);
+        #else
+        nint ctlSock = BindCtl(ControlPort(), true);
+        #endif
+        if (ctlSock < 0) {
+            // Same as the master: a refused port is a leftover socket from the
+            // previous run, so stop/status/reload still reach this server
+            // instead of silently going unanswered for two minutes.
+            // A43-A15 catch: this used to call ControlPortHasMaster(), which
+            // never existed -- the silent-empty lowering made the guard always
+            // false, so a live owner's port was stolen via reuse-bind below.
+            if (await ProbeControlPort() != Worker.CTL_FREE) { return; }
+            ctlSock = BindCtl(ControlPort(), true);
+        }
+        if (ctlSock < 0 && !ctlPortFixed) {
+            int want = ControlPort();
+            int probe = want + 1;
+            while (probe <= want + 64 && ctlSock < 0) {
+                ctlSock = BindCtl(probe, false);
+                if (ctlSock >= 0) { controlPort = probe; }
+                probe = probe + 1;
+            }
+        }
+        // Losing the control port only costs this server its command line, not
+        // its ability to serve, so it gives up quietly.
+        if (ctlSock < 0) { return; }
+        RecordControlPort();
+        Socket.Listen(ctlSock, 16);
+        Socket.SetNonBlocking(ctlSock);
+        while (true) {
+            nint s = await Socket.AcceptAsync(ctlSock);
+            if (s < 0) { continue; }
+            Socket.SetNonBlocking(s);
+            Task.Spawn(HandleSelfCommand(s));
+        }
+    }
+
+    /// 单进程服务器的控制命令处理：与 master 相同的 PING/STATUS/STOP/
+    /// RELOAD；RELOAD 回复提示改用 restart（没有可替换的 worker 进程）。
+    static async void HandleSelfCommand(nint sock) {
+        TcpClient conn = TcpClient.FromSocket(sock);
+        string line = "";
+        while (true) {
+            int nl = IndexOfByte(line, 10);
+            if (nl >= 0) { line = line.Substring(0, nl); break; }
+            string chunk = await conn.RecvAsync(64);
+            if (chunk.Length == 0) { conn.Close(); return; }
+            line = line + chunk;
+        }
+        List<string> f = SplitWords(line);
+        if (f.Count == 0) { conn.Close(); return; }
+        if (f[0] == "PING") {
+            int _p = await conn.SendAsync("PONG "
+                + Convert.ToString(ProcessHost.Pid()) + " " + CtlToken()
+                + "\n");
+            conn.Close();
+            return;
+        }
+        if (f[0] == "STATUS") {
+            int _s = await conn.SendAsync(StatusText());
+            conn.Close();
+            return;
+        }
+        if (f[0] == "STOP") {
+            StopAll();
+            int _r = await conn.SendAsync("stopped\n");
+            conn.Close();
+            await DrainThenExit();
+            return;
+        }
+        if (f[0] == "RELOAD") {
+            // Nothing to replace without worker processes; a single-process
+            // server is reloaded by restarting it.
+            int _l = await conn.SendAsync("single-process server: use restart\n");
+            conn.Close();
+            return;
+        }
+        conn.Close();
+    }
+
+    /// Stops accepting and leaves once the connections in flight are done (or
+    /// the grace period is over), so a stop/reload does not cut off a response
+    /// that is halfway out.
+    static async void DrainThenExit() {
+        StopAll();
+        #if WINDOWS
+        // Drop the handoff channels so the master stops giving this worker new
+        // connections while it finishes the ones it already has.
+        for (int c = 0; c < wkChannels.Count; c = c + 1) {
+            wkChannels[c].Close();
+        }
+        #endif
+        int waited = 0;
+        while (waited < 30000) {
+            int conns = 0;
+            for (int i = 0; i < workers.Count; i = i + 1) {
+                conns = conns + (int)workers[i].connectionCount.Load();
+            }
+            if (conns <= 0) { break; }
+            await Task.Delay(100);
+            waited = waited + 100;
+        }
+        // A worker never wrote the record and does not own the stats table;
+        // only the process that claimed the control port drops them.
+        if (!ProcessHost.IsWorker()) {
+            ForgetControlPort();
+            StatsDestroy();
+        }
+        exit(0);
+    }
+
+    // ======================================================================
+    // worker process: obtain listeners, serve, exit with master
+    // ======================================================================
+
+    /// worker 进程入口：向 master 的控制端口发 HELLO 注册。Windows 上为每个
+    /// TCP listener 开一条 CHAN 交接通道并服务 master 递来的 socket；POSIX 上
+    /// 等 GO 后自行以 SO_REUSEPORT 绑定各 listener。随后挂载统计上报，并长驻
+    /// 监视控制连接：master 关闭即退出，收到 QUIT 则排空在途请求后退出。
+    static async void RunAsWorkerProcess() {
+        TcpClient ctl = await TcpClient.ConnectAsync("127.0.0.1", ControlPort());
+        if (ctl == null || !ctl.IsConnected()) {
+            Console.WriteLine("[Worker] worker cannot reach master; exiting");
+            exit(1);
+        }
+        int _h = await ctl.SendAsync("HELLO " + Convert.ToString(ProcessHost.Pid())
+            + " " + Convert.ToString(ProcessHost.WorkerId()) + "\n");
+
+        #if WINDOWS
+        // The master owns and accepts every TCP listener; open one handoff
+        // channel per listener and serve the accepted sockets it delivers.
+        // (UDP Workers run in the master on Windows.)
+        int i = 0;
+        for (; i < workers.Count; i = i + 1) {
+            if (workers[i].protocol != "udp") {
+                TcpClient ch = await TcpClient.ConnectAsync("127.0.0.1", ControlPort());
+                if (ch == null || !ch.IsConnected()) {
+                    Console.WriteLine("[Worker] channel connect failed; exiting");
+                    exit(1);
+                }
+                int _c = await ch.SendAsync("CHAN " + Convert.ToString(ProcessHost.Pid())
+                    + " " + Convert.ToString(i) + "\n");
+                wkChannels.Add(ch);
+                Task.Spawn(ChannelLoop(ch, workers[i]));
+            }
+        }
+        #else
+        // Wait for GO, then bind our own SO_REUSEPORT sockets.
+        string go = await ctl.RecvAsync(16);
+        if (go.Length == 0) { exit(1); }
+        for (int i = 0; i < workers.Count; i = i + 1) {
+            Worker w = workers[i];
+            nint s = w.BindSocket(true);
+            if (s < 0) {
+                Console.WriteLine("[Worker] worker cannot bind "
+                    + Convert.ToString(w.port) + "; exiting");
+                exit(1);
+            }
+            Task.Spawn(w.RunOnSocket(s));
+        }
+        #endif
+
+        // Publish this worker's counters into the shared stats table.
+        StatsAttach();
+        Task.Spawn(StatsPublishLoop());
+
+        // Liveness watch: the master holds this connection open for our whole
+        // life; when it closes (master exited), leave too. It also sends QUIT
+        // for a stop or a reload, which means "stop accepting and leave once
+        // the requests in flight are answered".
+        while (true) {
+            string beat = await ctl.RecvAsync(64);
+            if (beat.Length == 0) { break; }
+            if (IndexOfByte(beat, 81) >= 0) {   // 'Q'
+                ctl.Close();
+                await DrainThenExit();
+                return;
+            }
+        }
+        exit(0);
+    }
+
+    #if WINDOWS
+    /// Worker side of a handoff channel: each inbound 372-byte
+    /// WSAPROTOCOL_INFOA block is one accepted client connection. Rebuild the
+    /// socket, ACK so the master can close its copy, and serve it.
+    static async void ChannelLoop(TcpClient ch, Worker w) {
+        Dbg("worker chan loop up " + w.protocol);
+        while (true) {
+            byte[] info = new byte[373];
+            bool ok = await RecvExact(ch, info, 372);
+            if (!ok) {
+                exit(0);   // master gone
+            }
+            nint s = WSASocketA(-1, -1, -1, info, 0, 1);
+            Dbg("worker rebuilt s=" + Convert.ToString(s));
+            int _a = await ch.SendAsync("K");
+            if (_a <= 0) { exit(0); }
+            if (s >= 0) {
+                Socket.SetNonBlocking(s);
+                w.Dispatch(s);
+            }
+        }
+    }
+    #endif
+
+    /// 按空白字符（空格/制表/回车/换行）切分为单词列表。
+    static List<string> SplitWords(string s) {
+        List<string> parts = new List<string>();
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 32 || c == 9 || c == 13 || c == 10) {
+                if (sb.Length > 0) { parts.Add(sb.ToString()); sb = new StringBuilder(); }
+            } else {
+                sb.Append(s.Substring(i, 1));
+            }
+        }
+        if (sb.Length > 0) { parts.Add(sb.ToString()); }
+        return parts;
+    }
+
+    /// Foreground master: print one status block per interval, computing each
+    /// worker's qps and cpu%% from the deltas between its last two reports.
+    static async void MasterStatusLoop() {
+        long prevWall = ServerMetrics.MonoMillis();
+        while (true) {
+            await Task.Delay(statusInterval * 1000);
+            long now = ServerMetrics.MonoMillis();
+            long dWall = now - prevWall;
+            prevWall = now;
+            if (dWall <= 0) { continue; }
+            StringBuilder sb = new StringBuilder();
+            sb.Append("[status]");
+            sb.Append(" master pid=" + Convert.ToString(ProcessHost.Pid())
+                + " mem=" + Convert.ToString(StatsRead(0, "rss") / 1048576)
+                + "MB");
+            long totQps = 0;
+            int procs = MaxCount();
+            while (stPrevReq.Count <= procs) {
+                stPrevReq.Add(0);
+                stPrevCpuMs.Add(0);
+            }
+            int wid = 1;
+            while (wid <= procs) {
+                long pid = StatsRead(wid, "pid");
+                if (pid == 0) { wid = wid + 1; continue; }
+                long recv = StatsRead(wid, "recv");
+                long cpu = StatsRead(wid, "cpu");
+                long dReq = recv - stPrevReq[wid];
+                long dCpu = cpu - stPrevCpuMs[wid];
+                stPrevReq[wid] = recv;
+                stPrevCpuMs[wid] = cpu;
+                long qps = (dReq * 1000) / dWall;
+                totQps = totQps + qps;
+                long cpuPct = -1;
+                if (cpu >= 0 && dCpu >= 0) { cpuPct = (dCpu * 100) / dWall; }
+                sb.Append(" | w" + Convert.ToString(wid)
+                    + " pid=" + Convert.ToString(pid)
+                    + " reqs=" + Convert.ToString(recv)
+                    + " qps=" + Convert.ToString(qps)
+                    + " sent=" + Convert.ToString(StatsRead(wid, "sent"))
+                    + " conns=" + Convert.ToString(StatsRead(wid, "conns"))
+                    + " cpu=" + Convert.ToString(cpuPct) + "%"
+                    + " mem=" + Convert.ToString(StatsRead(wid, "rss") / 1048576) + "MB");
+                wid = wid + 1;
+            }
+            sb.Append(" | total qps=" + Convert.ToString(totQps));
+            Console.WriteLine(sb.ToString());
+        }
+    }
+
+    /// Single-process server: same status line from in-process counters.
+    static async void SelfStatusLoop() {
+        long prevWall = ServerMetrics.MonoMillis();
+        long prevReq = 0;
+        long prevCpu = 0;
+        while (true) {
+            await Task.Delay(statusInterval * 1000);
+            long now = ServerMetrics.MonoMillis();
+            long dWall = now - prevWall;
+            prevWall = now;
+            if (dWall <= 0) { continue; }
+            long cpu = ServerMetrics.CpuMillis();
+            long rss = ServerMetrics.MemoryRssBytes();
+            long nowReq = statRequests.Load();
+            long qps = ((nowReq - prevReq) * 1000) / dWall;
+            long cpuPct = -1;
+            if (cpu >= 0) { cpuPct = ((cpu - prevCpu) * 100) / dWall; }
+            prevReq = nowReq;
+            prevCpu = cpu;
+            Console.WriteLine("[status] pid=" + Convert.ToString(ProcessHost.Pid())
+                + " reqs=" + Convert.ToString(nowReq)
+                + " qps=" + Convert.ToString(qps)
+                + " sent=" + Convert.ToString(statSent.Load())
+                + " conns=" + Convert.ToString(LiveConnections())
+                + " cpu=" + Convert.ToString(cpuPct) + "%"
+                + " mem=" + Convert.ToString(rss / 1048576) + "MB");
+        }
+    }
+
+    /// <summary>Receives exactly `need` bytes into `dest` (binary-safe).</summary>
+    static async bool RecvExact(TcpClient conn, byte[] dest, int need) {
+        byte[] tmp = new byte[need + 1];
+        int got = 0;
+        while (got < need) {
+            int n = await Socket.RecvIntoAsync(conn.GetSocket(), tmp, need - got);
+            if (n <= 0) { return false; }
+            for (int k = 0; k < n; k = k + 1) {
+                dest[got + k] = tmp[k];
+            }
+            got = got + n;
+        }
+        return true;
+    }
+
+    /// 返回字节 b 在字符串中首次出现的下标，未找到返回 -1。
+    static int IndexOfByte(string s, int b) {
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if ((s[i] & 255) == b) { return i; }
+        }
+        return -1;
+    }
+
+    // ======================================================================
+    // in-process serving
+    // ======================================================================
+
+    /// <summary>Runs all registered workers concurrently on this process's
+    /// scheduler, on sockets the caller has already bound (one per registered
+    /// worker, in order) -- binding first is what lets a bind failure be
+    /// reported before anything is printed about the server having started.
+    /// Every worker but the last is spawned as its own coroutine; the last is
+    /// awaited so this call drives the scheduler forever.</summary>
+    static async void RunAllLoopsOnSockets(List<nint> socks) {
+        int n = socks.Count;
+        for (int j = 0; j < n - 1; j = j + 1) {
+            Task.Spawn(workers[j].RunOnSocket(socks[j]));
+        }
+        if (n > 0) {
+            await workers[n - 1].RunOnSocket(socks[n - 1]);
+        }
+    }
+
+    /// <summary>Binds this worker's socket. For "udp" that is a bound datagram
+    /// socket; otherwise a listening TCP socket. reusePort=true additionally
+    /// sets SO_REUSEPORT before bind (POSIX multi-worker). Returns the socket
+    /// or -1.</summary>
+    nint BindSocket(bool reusePort) {
+        if (this.protocol == "udp") {
+            nint u = Socket.CreateUdp();
+            Socket.SetReuseAddr(u);
+            if (reusePort) { Socket.SetReusePort(u); }
+            int r = Socket.Bind(u, this.host, this.port);
+            if (r != 0) {
+                Worker.lastBindErrInUse = IsAddrInUse(Socket.LastSocketError());
+                Worker.lastBindErr = SocketErr();
+                Socket.Close(u);
+                return -1;
+            }
+            Socket.SetNonBlocking(u);
+            return u;
+        }
+        nint s = Socket.CreateTcp();
+        Socket.SetReuseAddr(s);
+        if (reusePort) { Socket.SetReusePort(s); }
+        int r2 = Socket.Bind(s, this.host, this.port);
+        if (r2 != 0) {
+            Worker.lastBindErrInUse = IsAddrInUse(Socket.LastSocketError());
+            Worker.lastBindErr = SocketErr();
+            Socket.Close(s);
+            return -1;
+        }
+        Socket.Listen(s, 511);
+        Socket.SetNonBlocking(s);
+        return s;
+    }
+
+    /// <summary>Serves this worker's protocol on an already-bound socket.</summary>
+    async void RunOnSocket(nint sock) {
+        this.running = true;
+
+        if (this.protocol == "udp") {
+            await RunUdp(sock);
+            return;
+        }
+
+        while (this.running) {
+            nint clientSock = await Socket.AcceptAsync(sock);
+            if (clientSock >= 0) {
+                Socket.SetNonBlocking(clientSock);
+                this.Dispatch(clientSock);
+            }
+        }
+    }
+
+    // Starts serving one accepted client on its own coroutine, so the caller
+    // (accept loop or handoff channel) immediately moves to the next one.
+    /// 分发一个已接受的客户端 socket：先设 NoDelay；onRawConnection 在场时
+    /// 整条连接交给它（回调自主计数，不计入连接数闸门）；否则超过
+    /// maxConnections 的连接直接关闭，余者按协议路由到 HTTP/WebSocket/
+    /// SSE/MQTT/TCP 处理协程。
+    void Dispatch(nint clientSock) {
+        Socket.SetNoDelay(clientSock);
+        // Application-owned socket: the raw handler drives the whole
+        // connection (its own request loop and connection accounting), so it
+        // bypasses the built-in per-protocol handlers and connectionCount gate.
+        if (this.onRawConnection != null) {
+            Task.Spawn(this.RunRaw(clientSock));
+            return;
+        }
+        if (this.connectionCount.Load() >= (long)this.maxConnections) {
+            Socket.Close(clientSock);
+            return;
+        }
+        this.AddConn();
+        if (this.protocol == "http") {
+            // An HTTP port with WebSocket callbacks answers both, the way
+            // swoole's WebSocket\Server does: the request head decides.
+            if (this.HasWsHandlers()) {
+                Task.Spawn(HandleWebSocket(clientSock));
+            } else {
+                Task.Spawn(HandleHttp(clientSock));
+            }
+        } else if (this.protocol == "websocket" || this.protocol == "ws") {
+            Task.Spawn(HandleWebSocket(clientSock));
+        } else if (this.protocol == "sse") {
+            Task.Spawn(HandleSse(clientSock));
+        } else if (this.protocol == "mqtt") {
+            Task.Spawn(HandleMqtt(clientSock));
+        } else {
+            Task.Spawn(HandleTcp(clientSock));
+        }
+    }
+
+    /// Spawnable async wrapper around the raw-connection delegate. Task.Spawn
+    /// needs a concrete async method frame; awaiting the delegate here uses the
+    /// proven indirect async-call path (spawning the delegate call directly does
+    /// not build a task frame).
+    async void RunRaw(nint clientSock) {
+        // The delegate owns the protocol, so it counts its own messages.
+        await this.onRawConnection(clientSock);
+    }
+
+    /// 分配自增连接 id 并构造 Connection。
+    Connection NewConnection(nint sock) {
+        int id = nextConnId;
+        nextConnId = nextConnId + 1;
+        return new Connection(id, sock, this.protocol);
+    }
+
+    // ---- tcp ----
+
+    /// TCP 连接生命周期：先触发 onConnect，再循环收取数据交给 onMessage
+    /// （未设回调时默认回显），非空返回串回发；对端断开后触发 onClose 并
+    /// 归还连接计数。回调抛出的异常会跳过顺序清理（Close/DropConn），
+    /// 计数漂移会让服务器在 maxConnections 处永久拒绝新连接，因此
+    /// 清理在 finally 中执行。
+    async void HandleTcp(nint clientSock) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
+        Connection conn = NewConnection(clientSock);
+        try {
+            ConnectionHandler onUp = this.OpenHandler();
+            if (onUp != null) { await onUp(conn); }
+
+            MessageHandler onData = this.MessageHandlerOf();
+            bool active = true;
+            while (active && !conn.closed) {
+                string data = await client.RecvReuseAsync();
+                if (data.Length == 0) {
+                    active = false;
+                } else {
+                    BumpStat();
+                    string response = "";
+                    if (onData != null) {
+                        // 用户回调不受框架信任：抛出只结束本连接，
+                        // 不允许撕断 accept 循环之外的任何东西。
+                        try {
+                            response = await onData(conn, data);
+                            if (response == null) { response = ""; }
+                        } catch (Exception e) {
+                            Console.WriteLine("[tcp] onMessage exception: "
+                                + e.Message);
+                            response = "";
+                        }
+                    } else {
+                        response = data;   // default: echo
+                    }
+                    if (response.Length > 0) {
+                        int _n = await client.SendAsync(response);
+                        BumpSent();
+                    }
+                }
+            }
+        } finally {
+            client.Close();
+            conn.closed = true;
+            this.DropConn();
+            ConnectionCloseHandler onDown = this.onClose;
+            if (onDown != null) { await onDown(conn); }
+        }
+    }
+
+    // ---- http ----
+
+    /// HTTP framing, limits and dispatch live in exactly one place --
+    /// HttpServer.ServeConnection -- which this protocol runs as-is, so the
+    /// Worker path and a bare HttpServer cannot drift apart. DropConn 在
+    /// finally 中：ServeConnection 抛出时计数同样必须归还。
+    async void HandleHttp(nint clientSock) {
+        try {
+            await HttpServer.ServeConnection(clientSock, this.RequestHandler(),
+                this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
+        } finally {
+            this.DropConn();
+        }
+    }
+
+    // ---- websocket ----
+
+    /// A WebSocket port is an HTTP port until the client asks to upgrade, so the
+    /// request head is read and parsed first: an Upgrade request becomes a frame
+    /// loop, anything else is served as HTTP (swoole's WebSocket\Server does the
+    /// same). The bytes consumed here are handed to whichever path takes over.
+    async void HandleWebSocket(nint clientSock) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
+
+        // The head is read with the shared HTTP framer, so the bytes that
+        // arrive with it (an HTTP body, pipelined WebSocket frames) keep their
+        // exact count instead of being length-counted with strlen.
+        // 握手读取与明文 HTTP 一样受 requestTimeout 约束（慢速客户端
+        // 每秒滴一个字节就能永久钉住协程与 64KB 复用缓冲）；WS 循环
+        // 的空闲不设限，与 HTTP keep-alive 的请求间空闲一致。
+        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeout);
+        HttpFramer framer = HttpFramer.Create(clientSock);
+        int headerEnd = 0;
+        try {
+            headerEnd = await framer.ReadHead(this.maxHeaderBytes);
+            HttpDeadline.Disarm(watch);
+            watch = null;
+        } finally {
+            // ReadHead 半途抛出时 deadline 槽位必须释放（幂等）。
+            HttpDeadline.Disarm(watch);
+        }
+        if (headerEnd <= 0) {
+            framer.Dispose();
+            client.Close();
+            this.DropConn();
+            return;
+        }
+        HttpRequest req = HttpRequest.Parse(framer.Head(headerEnd), headerEnd);
+        string wsKey = req.GetHeader("Sec-WebSocket-Key");
+
+        if (wsKey.Length == 0) {
+            // Plain HTTP on the same port. The framer already holds the head
+            // (and whatever followed it), so it is handed to the HTTP loop
+            // as-is rather than re-read or converted back to a string.
+            await HttpServer.ServeFramed(clientSock, this.RequestHandler(), framer,
+                this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
+            this.DropConn();
+            return;
+        }
+        // 之后的路径全部收口到帧循环末尾的统一清理；本函数内不再
+        // 有提前 return。
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
+        sb.Append("Upgrade: websocket\r\n");
+        sb.Append("Connection: Upgrade\r\n");
+        sb.Append("Sec-WebSocket-Accept: ");
+        sb.Append(Encoding.WebSocketAccept(wsKey));
+        sb.Append("\r\n\r\n");
+        int _hs = await client.SendAsync(sb.ToString());
+
+        Connection conn = NewConnection(clientSock);
+
+        // Reassemble whole frames via WsReader (handles partial and coalesced
+        // frames), rather than assuming one recv == one frame.
+        WsReader reader = new WsReader(clientSock);
+        int afterHead = framer.Pending() - headerEnd;
+        if (afterHead > 0) {
+            // The client pipelined frames behind the handshake. Frame bytes are
+            // binary, so they are sliced out of the framer by exact count.
+            reader.Prime(framer.Slice(headerEnd, afterHead), afterHead);
+        }
+        framer.Dispose();
+        WsWriter writer = new WsWriter();
+        // 连接级出站能力：conn.Push/PushBinary 与帧循环共用这个 writer，
+        // 回调里（onOpen 欢迎、定时器广播）无需入站消息先行即可推帧。
+        conn.wsWriter = writer;
+        conn.wsClient = client;
+        this.WsConnAdd(conn);
+        // onOpen 必须在 wsWriter/wsClient 挂载并登记之后触发：回调里的
+        // conn.Push/PushBinary 依赖 wsWriter 非 null（否则静默返回 false，
+        // 欢迎帧丢失且无任何错误迹象）。
+        // WS 帧循环的收尾清理在 finally 中：onOpen/onFrameData 抛出时
+        // Close/WsConnRemove/DropConn 一个都不能少——连接留在广播表里
+        // 会对死 socket 持续推送，计数漂移则自我拒绝服务。
+        ConnectionHandler onUp = this.OpenHandler();
+        try {
+        if (onUp != null) { await onUp(conn); }
+        WsAssembler asm = new WsAssembler(reader.MaxLen());
+        MessageHandler onFrameData = this.MessageHandlerOf();
+        bool active = true;
+        while (active && !conn.closed) {
+            int total = reader.FrameSize();
+            while (total < 0) {
+                if (total == -2 || total == -3) {
+                    // -2 = 帧长编码违规（1002）；-3 = 消息过大（1009）。
+                    // 无上限时对端声明一个 2GB 的帧就能把缓冲撑到 OOM。
+                    byte[] enc = WsFrame.CloseFrameWithCode(total == -3 ? 1009 : 1002).Encode();
+                    writer.Append(enc, 4);
+                    int _v = await writer.Flush(client);
+                    active = false;
+                    break;
+                }
+                // Nothing more to answer from this batch: put the replies on the
+                // wire before parking on the reactor.
+                if (writer.Pending()) { int _f = await writer.Flush(client); }
+                int got = await reader.FillMore();
+                if (got == 0) {
+                    active = false;
+                    break;
+                }
+                total = reader.FrameSize();
+            }
+            if (!active) { break; }
+
+            WsFrame frame = reader.TakeFrame(total);
+
+            // RFC 6455 入站帧门禁：§5.2 保留 opcode（3-7 数据、11-15
+            // 控制）、§5.5 控制帧载荷 ≤125、§5.1 客户端帧必须掩码。
+            // 此前非法 opcode 落进数据帧路径被原样回显给对端。
+            bool protoErr = frame.opcode >= 3 && frame.opcode <= 7
+                || frame.opcode >= 11 && frame.opcode <= 15
+                || frame.opcode >= 8 && frame.payloadLen > 125
+                || !frame.masked;
+            if (protoErr) {
+                byte[] enc = WsFrame.CloseFrameWithCode(1002).Encode();
+                writer.Append(enc, 4);
+                int _b = await writer.Flush(client);
+                active = false;
+                break;
+            }
+            if (frame.opcode == WsOpcode.Ping) {
+                // §5.5.3：Pong 必须原样带回 Ping 的应用数据——空 Pong
+                // 会让按载荷配对的心跳客户端断连。
+                WsFrame pong = WsFrame.RawFrame(WsOpcode.Pong, frame.payload, frame.payloadLen);
+                byte[] encoded = pong.Encode();
+                writer.Append(encoded, WsFrame.HeaderLen(frame.payloadLen) + frame.payloadLen);
+                continue;
+            }
+            if (frame.opcode == WsOpcode.Pong) { continue; }
+            if (frame.opcode == WsOpcode.Close) {
+                WsFrame closeResp = WsFrame.CloseFrame();
+                byte[] enc2 = closeResp.Encode();
+                writer.Append(enc2, 2);
+                int _c = await writer.Flush(client);
+                active = false;
+                break;
+            }
+            // 数据帧（Text/Binary/Continuation）：分片消息在 fin 时
+            // 整条交付——此前 continuation 帧被静默丢弃。
+            int feed = asm.Feed(frame);
+            if (feed < 0) {
+                byte[] enc = WsFrame.CloseFrameWithCode(feed == -2 ? 1009 : 1002).Encode();
+                writer.Append(enc, 4);
+                int _r = await writer.Flush(client);
+                active = false;
+                break;
+            }
+            if (feed == 0) { continue; }
+
+            int msgOpcode = asm.MessageOpcode();
+            string message = asm.Complete();
+
+            BumpStat();
+            string response = "";
+            if (onFrameData != null) {
+                // 同 HandleTcp：用户帧回调抛出只丢弃本条消息，
+                // 连接与循环存活。
+                try {
+                    response = await onFrameData(conn, message);
+                    if (response == null) { response = ""; }
+                } catch (Exception e) {
+                    Console.WriteLine("[ws] onMessage exception: " + e.Message);
+                    response = "";
+                }
+            } else {
+                response = message;   // default: echo
+            }
+            // One length drives both the frame header and the Append count.
+            // Reading .Length twice around the handler call is not safe: a
+            // cross-unit call can invalidate the cached length of a writable
+            // string (compiler stamps strlen back into the header), so the
+            // two reads can disagree for payloads containing NUL bytes and
+            // the frame goes out with a header larger than its body. strlen
+            // is stable across calls and matches the truncation contract the
+            // old server had (a NUL-payload echo re-delivers up to the NUL).
+            int respLen = (int)strlen(response);
+            if (respLen > 0) {
+                WsFrame respFrame = WsFrame.RawFrame(msgOpcode, response, respLen);
+                byte[] encoded = respFrame.Encode();
+                writer.Append(encoded, WsFrame.HeaderLen(respLen) + respLen);
+                BumpSent();
+            }
+        }   // while (active && !conn.closed)
+        } finally {
+            client.Close();
+            conn.closed = true;
+            conn.wsWriter = null;    // Push 之后拒绝写已关闭的 socket
+            this.WsConnRemove(conn);
+            this.DropConn();
+            ConnectionCloseHandler onDown = this.onClose;
+            if (onDown != null) { await onDown(conn); }
+        }
+    }
+
+    // ---- sse ----
+
+    /// SSE 订阅：读取 GET 请求头后回 200 text/event-stream（带 no-cache 与
+    /// CORS 通配头），把连接包成 SseConnection 交给 onSseSubscriber（未设
+    /// 回调时立即关闭）；此后连接由应用持有。请求头读取与 HTTP 路径
+    /// 一样武装 requestTimeout（慢速滴字客户端不能永久钉住连接），
+    /// 清理在 finally 中执行——onSseSubscriber 抛出时 DropConn 不能丢。
+    async void HandleSse(nint clientSock) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
+        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeout);
+
+        // Read the subscriber's GET request head.
+        string req = "";
+        try {
+            while (HttpServer.FindHeaderEnd(req) < 0 && req.Length < 65536) {
+                string chunk = await client.RecvAsync(4096);
+                if (chunk.Length == 0) {
+                    client.Close();
+                    return;
+                }
+                req = req + chunk;
+            }
+        } finally {
+            HttpDeadline.Disarm(watch);
+        }
+        string path = "/";
+        HttpRequest head = HttpRequest.Parse(req);
+        if (head.path.Length > 0) { path = head.path; }
+
+        try {
+            int _n = await client.SendAsync("HTTP/1.1 200 OK\r\n"
+                + "Content-Type: text/event-stream\r\n"
+                + "Cache-Control: no-cache\r\n"
+                + "Connection: keep-alive\r\n"
+                + "Access-Control-Allow-Origin: *\r\n"
+                + "\r\n");
+
+            BumpStat();
+            SseConnection sse = SseConnection.Of(client, path);
+            if (this.onSseSubscriber != null) {
+                await this.onSseSubscriber(sse);
+            } else {
+                sse.Close();
+            }
+        } finally {
+            // The application owns the SseConnection from here.
+            this.DropConn();
+        }
+    }
+
+    // ---- mqtt ----
+
+    /// 把连接交给内置的 MqttBroker.Global() 处理；mqtt 协议没有应用回调。
+    async void HandleMqtt(nint clientSock) {
+        BumpStat();
+        try {
+            await MqttBroker.Global().HandleConnection(clientSock);
+        } finally {
+            this.DropConn();
+        }
+    }
+
+    // ---- udp ----
+
+    /// UDP 事件循环：每收到一个数据报调用 onPacket（未设回调时默认回显），
+    /// 非空返回串回发给发送方；Stop 置位退出循环后关闭 socket。
+    async void RunUdp(nint sock) {
+        DatagramHandler onDatagram = this.PacketHandler();
+        while (this.running) {
+            string data = await Socket.RecvFromPeerAsync(sock, 65536);
+            if (data.Length > 0) {
+                BumpStat();
+                string peerIp = Socket.PeerIp();
+                int peerPort = Socket.PeerPort();
+                string response = "";
+                if (onDatagram != null) {
+                    response = await onDatagram(data);
+                    if (response == null) { response = ""; }
+                } else {
+                    response = data;   // default: echo
+                }
+                if (response.Length > 0 && peerPort > 0) {
+                    int _n = await Socket.SendToAsync(sock, response, response.Length, peerIp, peerPort);
+                    BumpSent();
+                }
+            }
+        }
+        Socket.Close(sock);
+    }
+}
+
+/// <summary>
+/// One accepted client connection, passed to Worker callbacks. Send pushes
+/// data to the peer from any (including non-async) context; Close marks the
+/// connection for shutdown after the current callback returns.
+/// </summary>
+class Connection {
+    [DllImport("crt")]
+    static extern long strlen(string str);
+
+    int id;
+    nint sock;
+    string protocol;
+    string userData;
+    bool closed;
+    // WebSocket 连接的出站缓冲（服务端帧不掩码）。帧循环与 Push 共用
+    // 同一 writer：Append 到 Flush 之间没有 await，协程切换只发生在
+    // await 点，因此帧序天然一致，无需加锁。null = 非 WS 连接。
+    WsWriter wsWriter;
+    TcpClient wsClient;
+
+    Connection(int id, nint sock, string protocol) {
+        this.id = id;
+        this.sock = sock;
+        this.protocol = protocol;
+        this.userData = "";
+        this.closed = false;
+        this.wsWriter = null;
+        this.wsClient = null;
+    }
+
+    /// <summary>Arbitrary per-connection state for the application.</summary>
+    void SetData(string data) {
+        this.userData = data;
+    }
+
+    /// 取该连接的自定义应用数据（SetData 设置的值）。
+    string GetData() {
+        return this.userData;
+    }
+
+    /// 连接 id（进程内自增，唯一）。
+    int GetId() {
+        return this.id;
+    }
+
+    /// 底层 socket 句柄。
+    nint GetSocket() {
+        return this.sock;
+    }
+
+    /// 连接所属协议名（如 "http"、"websocket"、"tcp"）。
+    string GetProtocol() {
+        return this.protocol;
+    }
+
+    /// <summary>Queues raw bytes to the peer (fire-and-forget; usable from
+    /// synchronous callbacks). For "websocket" workers, prefer Push (framed)
+    /// or returning the reply from onMessage; Send writes raw bytes.</summary>
+    void Send(string data) {
+        Task.Spawn(Socket.SendStringAsync(this.sock, data));
+        Worker.BumpSent();
+    }
+
+    /// <summary>Sends data and suspends until it is written.</summary>
+    async int SendAsync(string data) {
+        int n = await Socket.SendStringAsync(this.sock, data);
+        Worker.BumpSent();
+        return n;
+    }
+
+    /// <summary>WebSocket push：把一条 Text 帧排进该连接的出站缓冲并立即
+    /// 写出（服务端帧不掩码）。可从任何回调上下文调用——包括 onOpen 里
+    /// 主动欢迎、定时器里广播等没有入站消息先行的场景，这正是与"从
+    /// onMessage 返回应答"的区别。连接已关或非 WS 连接返回 false。
+    /// 帧序与帧循环共用同一缓冲，Append 到 Flush 之间不让出，天然一致。</summary>
+    async bool Push(string data) {
+        if (this.closed || this.wsWriter == null) { return false; }
+        int len = (int)strlen(data);
+        WsFrame frame = WsFrame.RawFrame(WsOpcode.Text, data, len);
+        byte[] encoded = frame.Encode();
+        this.wsWriter.Append(encoded, WsFrame.HeaderLen(len) + len);
+        int n = await this.wsWriter.Flush(this.wsClient);
+        if (n < 0) {
+            this.closed = true;
+            return false;
+        }
+        Worker.BumpSent();
+        return true;
+    }
+
+    /// <summary>WebSocket 二进制 push：`data` 可含 NUL，`len` 为精确
+    /// 字节数（绝不 strlen）。语义同 Push。</summary>
+    async bool PushBinary(string data, int len) {
+        if (this.closed || this.wsWriter == null) { return false; }
+        WsFrame frame = WsFrame.RawFrame(WsOpcode.Binary, data, len);
+        byte[] encoded = frame.Encode();
+        this.wsWriter.Append(encoded, WsFrame.HeaderLen(len) + len);
+        int n = await this.wsWriter.Flush(this.wsClient);
+        if (n < 0) {
+            this.closed = true;
+            return false;
+        }
+        Worker.BumpSent();
+        return true;
+    }
+
+    /// <summary>Marks the connection to be closed by its worker loop.</summary>
+    void Close() {
+        this.closed = true;
+    }
+
+    /// 连接是否已被标记关闭（实际关闭由 worker 循环执行）。
+    bool IsClosed() {
+        return this.closed;
+    }
+}

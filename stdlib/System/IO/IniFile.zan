@@ -1,0 +1,255 @@
+using System;
+using System.IO;
+
+namespace System.IO;
+
+/// <summary>一个 INI 节：名称加有序的键/值条目。</summary>
+class IniSection {
+    /// 节名（无节头的条目归入空串节）。
+    public string name;
+    /// 节内条目（按文件顺序）。
+    public List<IniEntry> entries = new List<IniEntry>();
+}
+
+/// <summary>一对 INI 键/值。</summary>
+class IniEntry {
+    /// 键（去除首尾空白）。
+    public string key;
+    /// 值（去除首尾空白，可含 "="）。
+    public string text;
+}
+
+/// <summary>
+/// INI 文件读写器。节为 <c>[Name]</c>，条目为
+/// <c>key=value</c>，<c>;</c> 和 <c>#</c> 开头为注释，空行
+/// 被忽略。键和值会去除首尾空白；值中可包含 <c>=</c>。
+/// 可从文本（内存中）或文件解析，也可保存回两者。
+///
+///   IniFile ini = IniFile.Load("app.ini");
+///   int port = ini.GetInt("server", "port", 8080);
+///   ini.SetString("server", "name", "dev");
+///   ini.Save("app.ini");
+/// </summary>
+class IniFile {
+    List<IniSection> sections = new List<IniSection>();
+
+    /// <summary>将给定文本解析为内存中的 INI。</summary>
+    static IniFile Parse(string text) {
+        IniFile ini = new IniFile();
+        IniSection cur = null;
+        List<string> lines = IniFile.SplitLines(text);
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i].Trim();
+            if (line.Length > 0) {
+                string head = line.Substring(0, 1);
+                if (head == ";" || head == "#") {
+                    // 注释
+                } else if (head == "[") {
+                    int close = IniFile.IndexOf(line, "]", 1);
+                    if (close > 1) {
+                        cur = new IniSection();
+                        cur.name = line.Substring(1, close - 1).Trim();
+                        ini.sections.Add(cur);
+                    }
+                } else {
+                    int eq = IniFile.IndexOf(line, "=", 0);
+                    if (eq > 0) {
+                        IniEntry e = new IniEntry();
+                        e.key = line.Substring(0, eq).Trim();
+                        e.text = line.Substring(eq + 1, line.Length - eq - 1).Trim();
+                        if (cur == null) {
+                            cur = new IniSection();
+                            cur.name = "";
+                            ini.sections.Add(cur);
+                        }
+                        cur.entries.Add(e);
+                    }
+                }
+            }
+        }
+        return ini;
+    }
+
+    /// <summary>读取并解析 `path` 处的文件。文件不存在时返回
+    /// 空的 INI。</summary>
+    static IniFile Load(string path) {
+        if (!File.Exists(path)) { return new IniFile(); }
+        return IniFile.Parse(File.ReadAllText(path));
+    }
+
+    /// <summary>在节中查找键。节或键不存在时返回
+    /// `fallback`。</summary>
+    string GetString(string section, string key, string fallback) {
+        IniEntry e = IniFile.Find(this, section, key);
+        if (e == null) { return fallback; }
+        return e.text;
+    }
+
+    /// <summary>数值查找；缺失或非数值时返回 `fallback`。</summary>
+    int GetInt(string section, string key, int fallback) {
+        IniEntry e = IniFile.Find(this, section, key);
+        if (e == null) { return fallback; }
+        int v = IniFile.ParseInt(e.text);
+        if (v < 0) { return fallback; }
+        return v;
+    }
+
+    /// <summary>设置字符串值，必要时创建节/键。
+    /// 新节追加在末尾；新键追加在所属
+    /// 节内。已有键保持原有位置。</summary>
+    void SetString(string section, string key, string val) {
+        IniSection sec = IniFile.Section(this, section);
+        for (int i = 0; i < sec.entries.Count; i = i + 1) {
+            if (sec.entries[i].key == key) {
+                sec.entries[i].text = val;
+                return;
+            }
+        }
+        IniEntry e = new IniEntry();
+        e.key = key;
+        e.text = val;
+        sec.entries.Add(e);
+    }
+
+    /// <summary>设置整数值（以十进制文本存储）。</summary>
+    void SetInt(string section, string key, int val) {
+        SetString(section, key, Convert.ToString(val));
+    }
+
+    /// <summary>删除键。键存在时返回 true。</summary>
+    bool RemoveKey(string section, string key) {
+        IniSection sec = IniFile.FindSection(this, section);
+        if (sec == null) { return false; }
+        for (int i = 0; i < sec.entries.Count; i = i + 1) {
+            if (sec.entries[i].key == key) {
+                sec.entries.RemoveAt(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>删除整个节（含其所有键）。节存在时返回 true。</summary>
+    bool RemoveSection(string section) {
+        for (int i = 0; i < sections.Count; i = i + 1) {
+            if (sections[i].name == section) {
+                sections.RemoveAt(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>所有节的名称（按文件顺序）。</summary>
+    List<string> EnumSections() {
+        List<string> names = new List<string>();
+        for (int i = 0; i < sections.Count; i = i + 1) {
+            names.Add(sections[i].name);
+        }
+        return names;
+    }
+
+    /// <summary>节的键列表（按文件顺序）；节不存在时为空。</summary>
+    List<string> EnumKeys(string section) {
+        List<string> keys = new List<string>();
+        IniSection sec = IniFile.FindSection(this, section);
+        if (sec == null) { return keys; }
+        for (int i = 0; i < sec.entries.Count; i = i + 1) {
+            keys.Add(sec.entries[i].key);
+        }
+        return keys;
+    }
+
+    /// <summary>将 INI 序列化为文本。</summary>
+    string ToText() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < sections.Count; i = i + 1) {
+            IniSection sec = sections[i];
+            if (sec.name != "") {
+                sb.Append("[" + sec.name + "]\n");
+            }
+            for (int k = 0; k < sec.entries.Count; k = k + 1) {
+                sb.Append(sec.entries[k].key + "=" + sec.entries[k].text + "\n");
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>将 INI 写回 `path`。</summary>
+    void Save(string path) {
+        File.WriteAllText(path, ToText());
+    }
+
+    /// 查找节中的键；节或键不存在时返回 null。
+    static IniEntry Find(IniFile ini, string section, string key) {
+        IniSection sec = IniFile.FindSection(ini, section);
+        if (sec == null) { return null; }
+        for (int i = 0; i < sec.entries.Count; i = i + 1) {
+            if (sec.entries[i].key == key) { return sec.entries[i]; }
+        }
+        return null;
+    }
+
+    /// 只查找不创建：节不存在时返回 null。
+    static IniSection FindSection(IniFile ini, string name) {
+        for (int i = 0; i < ini.sections.Count; i = i + 1) {
+            if (ini.sections[i].name == name) { return ini.sections[i]; }
+        }
+        return null;
+    }
+
+    /// 返回节，不存在时创建（追加到末尾）。
+    static IniSection Section(IniFile ini, string name) {
+        IniSection existing = IniFile.FindSection(ini, name);
+        if (existing != null) { return existing; }
+        IniSection sec = new IniSection();
+        sec.name = name;
+        ini.sections.Add(sec);
+        return sec;
+    }
+
+    /// 按 \n 拆行并去掉行尾 \r；末尾无换行符的行也计入。
+    static List<string> SplitLines(string text) {
+        List<string> lines = new List<string>();
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < text.Length; i = i + 1) {
+            string ch = text.Substring(i, 1);
+            if (ch == "\n") {
+                lines.Add(sb.ToString());
+                sb = new StringBuilder();
+            } else if (ch != "\r") {
+                sb.Append(ch);
+            }
+        }
+        string last = sb.ToString();
+        if (last.Length > 0) { lines.Add(last); }
+        return lines;
+    }
+
+    /// 从 from 起查找子串；没有时返回 -1。
+    static int IndexOf(string hay, string needle, int from) {
+        int n = needle.Length;
+        int h = hay.Length;
+        int i = from;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// 解析非负十进制整数；空串或含非数字字符返回 -1。
+    static int ParseInt(string s) {
+        if (s.Length == 0) { return -1; }
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            int c = ch[0] & 255;
+            if (c < 0x30 || c > 0x39) { return -1; }
+            v = v * 10 + (c - 0x30);
+        }
+        return v;
+    }
+}
+
+

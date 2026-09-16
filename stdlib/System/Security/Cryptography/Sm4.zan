@@ -1,0 +1,163 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>GB/T 32907-2016 SM4（中国国家分组密码）：128 位分组，
+/// 128 位密钥。实现走 OpenSSL libcrypto 的 EVP_sm4_cbc（OpenSSL
+/// 3.0+ 内置 SM4）。静态发布未捆绑 libcrypto 时导入被 zanc 桩化，
+/// 各方法返回 null。纯 Zan 参考实现见 examples/crypto_reference/。
+///
+/// 注意：OpenSSL 的 EVP 不直接暴露 SM4 的 ECB/CTR，本类保留的
+/// ECB/CBC 语义里单分组用无填充 CBC（零 IV）承载。</summary>
+class Sm4 {
+    [DllImport("crypto")]
+    static extern string EVP_CIPHER_CTX_new();
+    [DllImport("crypto")]
+    static extern void EVP_CIPHER_CTX_free(string ctx);
+    [DllImport("crypto")]
+    static extern int EVP_EncryptInit_ex(string ctx, string cipher, string impl, string key, string iv);
+    [DllImport("crypto")]
+    static extern int EVP_EncryptUpdate(string ctx, byte[] outb, nint outl, byte[] inb, int inl);
+    [DllImport("crypto", EntryPoint = "EVP_EncryptUpdate")]
+    static extern int EVP_EncryptUpdateS(string ctx, byte[] outb, nint outl, string inb, int inl);
+    [DllImport("crypto")]
+    static extern int EVP_EncryptFinal_ex(string ctx, byte[] outb, nint outl);
+    [DllImport("crypto")]
+    static extern int EVP_DecryptInit_ex(string ctx, string cipher, string impl, string key, string iv);
+    [DllImport("crypto")]
+    static extern int EVP_DecryptUpdate(string ctx, byte[] outb, nint outl, byte[] inb, int inl);
+    [DllImport("crypto", EntryPoint = "EVP_DecryptUpdate")]
+    static extern int EVP_DecryptUpdateS(string ctx, byte[] outb, nint outl, string inb, int inl);
+    [DllImport("crypto")]
+    static extern int EVP_DecryptFinal_ex(string ctx, byte[] outb, nint outl);
+    [DllImport("crypto")]
+    static extern int EVP_CIPHER_CTX_set_padding(string ctx, int pad);
+    [DllImport("crypto")]
+    static extern string EVP_sm4_cbc();
+    /* 收缩拷贝（解密剥填充后明文短于密文）用 native memcpy，理由同
+       Aes.zan：逐字节 Zan 循环只有 ~130 MiB/s。 */
+    [DllImport("crt", EntryPoint = "memcpy")]
+    static extern void BufCopy(byte[] dst, byte[] src, int n);
+
+    static int CellRead(nint cell) {
+        return new Span<int>(cell, 1)[0];
+    }
+
+    /// 无填充 SM4-CBC（微信语义）：inLen 必须是 16 的整数倍。
+    static byte[] CryptCbcNoPad(string key, string iv, string data, int len, int enc) {
+        if (key == null || iv == null) { return null; }
+        if (len < 0 || (len % 16) != 0) { return null; }
+        if (len > 0 && data == null) { return null; }
+        string cipher = EVP_sm4_cbc();
+        if (cipher == null) { return null; }
+        string ctx = EVP_CIPHER_CTX_new();
+        if (ctx == null) { return null; }
+        /* 无填充：密文与明文严格等长，缓冲精确分配、原样返回 */
+        byte[] outb = new byte[len];
+        nint cell = NativeMemory.Alloc(4);
+        int ok;
+        if (enc == 1) {
+            ok = EVP_EncryptInit_ex(ctx, cipher, null, key, iv);
+            if (ok == 1) { ok = EVP_CIPHER_CTX_set_padding(ctx, 0); }
+        } else {
+            ok = EVP_DecryptInit_ex(ctx, cipher, null, key, iv);
+            if (ok == 1) { ok = EVP_CIPHER_CTX_set_padding(ctx, 0); }
+        }
+        int total = -1;
+        if (ok == 1) {
+            ok = (enc == 1) ? EVP_EncryptUpdateS(ctx, outb, cell, data, len)
+                            : EVP_DecryptUpdateS(ctx, outb, cell, data, len);
+            total = Sm4.CellRead(cell);
+        }
+        if (ok == 1) {
+            byte[] fin = new byte[16];
+            ok = (enc == 1) ? EVP_EncryptFinal_ex(ctx, fin, cell)
+                            : EVP_DecryptFinal_ex(ctx, fin, cell);
+        }
+        NativeMemory.Free(cell);
+        EVP_CIPHER_CTX_free(ctx);
+        if (ok != 1 || total != len) { return null; }
+        return outb;
+    }
+
+    /// <summary>加密单个 16 字节分组。返回新的 16 字节缓冲区。</summary>
+    static byte[] EncryptBlock(string key, string in16) {
+        return Sm4.CryptCbcNoPad(key,
+            "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", in16, 16, 1);
+    }
+
+    /// <summary>解密单个 16 字节分组。返回新的 16 字节缓冲区。</summary>
+    static byte[] DecryptBlock(string key, string in16) {
+        return Sm4.CryptCbcNoPad(key,
+            "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", in16, 16, 0);
+    }
+
+    /// <summary>带 PKCS#7 填充的 SM4-CBC 加密。</summary>
+    static byte[] EncryptCbc(string key, string iv, string data, int len, List<int> outLen) {
+        if (key == null || iv == null) { outLen[0] = -1; return null; }
+        if (len < 0 || (len > 0 && data == null)) { outLen[0] = -1; return null; }
+        string cipher = EVP_sm4_cbc();
+        if (cipher == null) { outLen[0] = -1; return null; }
+        string ctx = EVP_CIPHER_CTX_new();
+        if (ctx == null) { outLen[0] = -1; return null; }
+        /* PKCS#7 密文长度加密前即确定：(len/16+1)*16。缓冲精确分配、
+           EVP 直接写入、原样返回——契约与 Aes.EncryptCbc 一致
+           （返回 byte[].Length == outLen[0]，不再带 len+32 尾巴）。 */
+        byte[] outb = new byte[(len / 16 + 1) * 16];
+        nint cell = NativeMemory.Alloc(4);
+        int ok = EVP_EncryptInit_ex(ctx, cipher, null, key, iv);
+        int total = -1;
+        if (ok == 1) {
+            ok = EVP_EncryptUpdateS(ctx, outb, cell, data, len);
+            total = Sm4.CellRead(cell);
+        }
+        if (ok == 1) {
+            byte[] fin = new byte[32];
+            ok = EVP_EncryptFinal_ex(ctx, fin, cell);
+            int tail = Sm4.CellRead(cell);
+            for (int i = 0; i < tail; i = i + 1) { outb[total + i] = fin[i] & 255; }
+            total = total + tail;
+        }
+        NativeMemory.Free(cell);
+        EVP_CIPHER_CTX_free(ctx);
+        if (ok != 1 || total != outb.Length) { outLen[0] = -1; return null; }
+        outLen[0] = total;
+        return outb;
+    }
+
+    /// <summary>SM4-CBC 解密，去除 PKCS#7 填充。</summary>
+    static byte[] DecryptCbc(string key, string iv, string data, int len, List<int> outLen) {
+        if (key == null || iv == null) { outLen[0] = -1; return null; }
+        if (len <= 0 || (len % 16) != 0 || data == null) { outLen[0] = -1; return null; }
+        string cipher = EVP_sm4_cbc();
+        if (cipher == null) { outLen[0] = -1; return null; }
+        string ctx = EVP_CIPHER_CTX_new();
+        if (ctx == null) { outLen[0] = -1; return null; }
+        byte[] outb = new byte[len];
+        nint cell = NativeMemory.Alloc(4);
+        int ok = EVP_DecryptInit_ex(ctx, cipher, null, key, iv);
+        int total = -1;
+        if (ok == 1) {
+            ok = EVP_DecryptUpdateS(ctx, outb, cell, data, len);
+            total = Sm4.CellRead(cell);
+        }
+        if (ok == 1) {
+            byte[] fin = new byte[32];
+            ok = EVP_DecryptFinal_ex(ctx, fin, cell);
+            int tail = Sm4.CellRead(cell);
+            for (int i = 0; i < tail; i = i + 1) { outb[total + i] = fin[i] & 255; }
+            total = total + tail;
+        }
+        NativeMemory.Free(cell);
+        EVP_CIPHER_CTX_free(ctx);
+        if (ok != 1) { outLen[0] = -1; return null; }
+        outLen[0] = total;
+        if (total != outb.Length) {
+            /* 填充剥离后明文短于密文：收缩拷贝走 native memcpy */
+            byte[] exact = new byte[total];
+            Sm4.BufCopy(exact, outb, total);
+            return exact;
+        }
+        return outb;
+    }
+}
