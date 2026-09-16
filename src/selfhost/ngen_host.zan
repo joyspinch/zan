@@ -120,14 +120,111 @@ partial class Ngen {
             if ((e.a.sval == "Append" && e.kids.Count == 1)
                     || (e.a.sval == "AppendLine" && e.kids.Count <= 1)) { return "StringBuilder"; }
         }
+        // ---- threading / process / environment statics ----
+        if (HostStatic(e, "Thread", "Sleep", 1)) { return "void"; }
+        if (HostStatic(e, "ProcessList", "SelfPid", 0)) { return "int"; }
+        if (HostStatic(e, "Interop", "getenv", 1)) { return "string"; }
+        if (HostStatic(e, "KnownFolders", "Home", 0)
+                || HostStatic(e, "KnownFolders", "Temp", 0)
+                || HostStatic(e, "KnownFolders", "AppData", 0)
+                || HostStatic(e, "KnownFolders", "GetEnv", 1)
+                || HostStatic(e, "KnownFolders", "Expand", 1)) { return "string"; }
+        if (HostStatic(e, "KnownFolders", "SetEnv", 2)) { return "void"; }
+        // ---- file system statics ----
+        if (HostStatic(e, "Directory", "Exists", 1)) { return "bool"; }
+        if (HostStatic(e, "Directory", "CreateDirectory", 1)
+                || HostStatic(e, "Directory", "Delete", 1)
+                || HostStatic(e, "File", "Delete", 1)) { return "void"; }
+        if (HostStatic(e, "Directory", "GetFiles", 1)
+                || HostStatic(e, "Directory", "GetDirectories", 1)) { return "List<string>"; }
+        if (HostStatic(e, "Stopwatch", "Frequency", 0)
+                || HostStatic(e, "Stopwatch", "GetMilliseconds", 0)) { return "long"; }
+        if (HostStatic(e, "Semaphore", "Create", 2)) { return "string"; }
+        if (HostStatic(e, "Semaphore", "Wait", 1)
+                || HostStatic(e, "Semaphore", "Release", 1)
+                || HostStatic(e, "Semaphore", "Destroy", 1)) { return "void"; }
+        // ---- Stopwatch / Timer / FileInfo instance members (stdlib classes
+        // absent from the compile) ----
+        if (e.kind == AK.Call() && e.a != null && e.a.kind == AK.MemberAccess()
+                && e.a.a != null) {
+            string mn3 = e.a.sval;
+            int n3 = e.kids.Count;
+            if (FindClass("Stopwatch") == null && StaticTyOf(e.a.a) == "Stopwatch"
+                    && !UserDefinesClsMember("Stopwatch", mn3)) {
+                if ((mn3 == "Start" || mn3 == "Stop" || mn3 == "Reset")
+                        && n3 == 0) { return "void"; }
+                if (mn3 == "ElapsedMilliseconds" && n3 == 0) { return "double"; }
+            }
+            if (FindClass("Timer") == null && StaticTyOf(e.a.a) == "Timer"
+                    && !UserDefinesClsMember("Timer", mn3)) {
+                if (mn3 == "Start" && n3 == 0) { return "bool"; }
+                if (mn3 == "Stop" && n3 == 0) { return "void"; }
+            }
+            if (FindClass("FileInfo") == null && StaticTyOf(e.a.a) == "FileInfo"
+                    && !UserDefinesClsMember("FileInfo", mn3)) {
+                if ((mn3 == "Exists" || mn3 == "IsDirectory" || mn3 == "IsReadOnly"
+                        || mn3 == "NewerThan" || mn3 == "SetReadOnly") && n3 <= 1) { return "bool"; }
+                if ((mn3 == "Length" || mn3 == "LastWriteTime" || mn3 == "CreationTime")
+                        && n3 == 0) { return "long"; }
+                if (mn3 == "FullName" && n3 == 0) { return "string"; }
+            }
+        }
+        // FileInfo static shortcuts
+        if (HostStatic(e, "FileInfo", "GetLength", 1)) { return "long"; }
+        if (HostStatic(e, "FileInfo", "GetLastWriteTime", 1)) { return "long"; }
         string et = HostExtRetTy(e);
         if (et != null) { return et; }
         return null;
     }
 
     bool TryGenHostNew(Node e) {
-        if (e.type == null || e.type.sval != "StringBuilder" || e.ival != 0
-                || FindClass("StringBuilder") != null) { return false; }
+        if (e.type == null || e.ival != 0) { return false; }
+        string hcls = e.type.sval;
+        // Stopwatch: {start@0, accumulated@8, running@16}, zero-filled.
+        if (hcls == "Stopwatch" && FindClass("Stopwatch") == null) {
+            if (e.kids.Count != 0) {
+                diags.Error("ngen host: Stopwatch constructor requires zero arguments", e.line, e.col);
+                return true;
+            }
+            LoadImm(0, 32); LoadImm(1, 0);
+            BLInternal("_zan_rt_alloc");
+            return true;
+        }
+        // Timer: {intervalMs@0, closure@8, running@16, pthread@24}. The
+        // callback argument is a method group; GenExpr lowers it to the
+        // delegate {thunk, env} pair via the standard untargeted conversion.
+        if (hcls == "Timer" && FindClass("Timer") == null) {
+            if (e.kids.Count != 2) {
+                diags.Error("ngen host: Timer constructor requires (intervalMs, callback)", e.line, e.col);
+                return true;
+            }
+            GenExpr(e.kids[0]);
+            ExtPush(0);
+            GenExpr(e.kids[1]);
+            ExtPush(0);
+            LoadImm(0, 40); LoadImm(1, 0);
+            BLInternal("_zan_rt_alloc");
+            ExtPop(1);                           // closure
+            StrU(1, 0, 8);
+            ExtPop(1);                           // interval
+            StrU(1, 0, 0);
+            return true;
+        }
+        // FileInfo: {path@0} — methods re-stat on every call.
+        if (hcls == "FileInfo" && FindClass("FileInfo") == null) {
+            if (e.kids.Count != 1) {
+                diags.Error("ngen host: FileInfo constructor requires one path argument", e.line, e.col);
+                return true;
+            }
+            GenExpr(e.kids[0]);
+            ExtPush(0);
+            LoadImm(0, 24); LoadImm(1, 0);
+            BLInternal("_zan_rt_alloc");
+            ExtPop(1);
+            StrU(1, 0, 0);
+            return true;
+        }
+        if (hcls != "StringBuilder" || FindClass("StringBuilder") != null) { return false; }
         if (e.kids.Count != 0) {
             diags.Error("ngen host: StringBuilder constructor requires zero arguments", e.line, e.col);
         } else { BLInternal("_zan_host_sb_new"); }
@@ -230,6 +327,18 @@ partial class Ngen {
         }
     }
 
+    // instance-call recognition on a stdlib class absent from the compile:
+    // the receiver must statically type as `cls`, the class must not exist,
+    // and no user method may shadow the member
+    bool HostInst(Node e, string cls, string name, int count) {
+        if (e == null || e.kind != AK.Call() || e.a == null) { return false; }
+        Node m = e.a;
+        if (m.kind != AK.MemberAccess() || m.sval != name
+                || e.kids.Count != count) { return false; }
+        if (m.a == null || FindClass(cls) != null) { return false; }
+        return StaticTyOf(m.a) == cls && !UserDefinesClsMember(cls, name);
+    }
+
     bool TryGenHostCall(Node e) {
         if (HostStatic(e, "File", "ReadAllText", 1)) { HostCallArgs(e, "_zan_host_read"); return true; }
         if (HostStatic(e, "File", "WriteAllText", 2)) { HostCallArgs(e, "_zan_host_write"); return true; }
@@ -309,6 +418,281 @@ partial class Ngen {
                     return true;
                 }
             }
+        }
+        // ---- threading / process / environment statics ----
+        if (HostStatic(e, "Thread", "Sleep", 1)) {
+            GenExpr(e.kids[0]);                  // ms
+            LoadImm(1, 1000);
+            E4(0x9AC10C02);                      // sdiv x2, x0, x1   tv_sec
+            E4(0x9B018043);                      // msub x3, x2, x1, x0  ms%1000
+            LoadImm(1, 1000000);
+            E4(0x9B017C63);                      // mul x3, x3, x1    tv_nsec
+            E4(0xA9BF0FE2);                      // stp x2, x3, [sp, #-0x10]! (contiguous timespec)
+            AddImm(0, 31, 0);                    // x0 = sp
+            LoadImm(1, 0);                       // rem = NULL
+            BLExtern("_nanosleep");
+            AddSPImm(16, true);
+            return true;
+        }
+        if (HostStatic(e, "ProcessList", "SelfPid", 0)) { BLExtern("_getpid"); return true; }
+        if (HostStatic(e, "Interop", "getenv", 1)) {
+            GenExpr(e.kids[0]);
+            // raw libc result: null when unset (the null test is the API)
+            BLExtern("_getenv");
+            return true;
+        }
+        if (HostStatic(e, "KnownFolders", "Home", 0)) {
+            LoadStr(ioHome, 0);
+            BLInternal("_zan_ext_getenv");
+            return true;
+        }
+        if (HostStatic(e, "KnownFolders", "Temp", 0)) {
+            // oracle order: TEMP -> TMP -> TMPDIR -> /tmp (POSIX)
+            LoadStr(ioTemp, 0); BLInternal("_zan_ext_getenv");
+            ExtLenOf(0, 9);
+            int tDone = NL(); CbnzReg(9, tDone);
+            LoadStr(ioTmp, 0); BLInternal("_zan_ext_getenv");
+            ExtLenOf(0, 9);
+            CbnzReg(9, tDone);
+            LoadStr(ioTmpdir, 0); BLInternal("_zan_ext_getenv");
+            ExtLenOf(0, 9);
+            CbnzReg(9, tDone);
+            LoadStr(ioSlashTmp, 0);
+            int tFin = NL(); EmitB(tFin);
+            Mark(tDone);
+            return true;
+        }
+        if (HostStatic(e, "KnownFolders", "AppData", 0)) {
+            // XDG_CONFIG_HOME, else $HOME + "/.config"
+            LoadStr(ioXdgCfg, 0); BLInternal("_zan_ext_getenv");
+            ExtLenOf(0, 9);
+            int aFin = NL(); int aEmpty = NL();
+            CbnzReg(9, aFin);
+            LoadStr(ioHome, 0); BLInternal("_zan_ext_getenv");
+            ExtLenOf(0, 9);
+            CbzReg(9, aEmpty);
+            ExtPush(0);
+            LoadStr(ioDotConfig, 0);
+            ExtMov(1, 0);
+            ExtPop(0);
+            BLInternal("_zan_ext_path_combine");
+            EmitB(aFin);
+            Mark(aEmpty);
+            LoadStr(extEmpty, 0);
+            Mark(aFin);
+            return true;
+        }
+        if (HostStatic(e, "KnownFolders", "GetEnv", 1)) {
+            GenExpr(e.kids[0]);
+            BLInternal("_zan_ext_getenv");
+            return true;
+        }
+        if (HostStatic(e, "KnownFolders", "SetEnv", 2)) {
+            GenExpr(e.kids[0]); ExtPush(0);
+            GenExpr(e.kids[1]); ExtPush(0);
+            ExtPop(1);                           // value
+            ExtPop(0);                           // name
+            ExtLenOf(1, 9);
+            int sUnset = NL(); CbzReg(9, sUnset);
+            int sFin = NL();
+            LoadImm(2, 1);                       // overwrite = 1
+            BLExtern("_setenv");
+            EmitB(sFin);
+            Mark(sUnset);
+            BLExtern("_unsetenv");
+            Mark(sFin);
+            LoadImm(0, 0);
+            return true;
+        }
+        if (HostStatic(e, "KnownFolders", "Expand", 1)) {
+            GenExpr(e.kids[0]);
+            BLInternal("_zan_ext_expand");
+            return true;
+        }
+        // ---- file system statics ----
+        if (HostStatic(e, "Directory", "Exists", 1)) {
+            GenExpr(e.kids[0]);
+            BLInternal("_zan_host_direxists");
+            return true;
+        }
+        if (HostStatic(e, "Directory", "CreateDirectory", 1)) {
+            GenExpr(e.kids[0]);
+            LoadImm(1, 511);                     // 0o777, umask applies
+            BLExtern("_mkdir");
+            LoadImm(0, 0);
+            return true;
+        }
+        if (HostStatic(e, "Directory", "Delete", 1)) {
+            GenExpr(e.kids[0]);
+            BLExtern("_rmdir");
+            LoadImm(0, 0);
+            return true;
+        }
+        if (HostStatic(e, "File", "Delete", 1)) {
+            GenExpr(e.kids[0]);
+            BLExtern("_unlink");
+            LoadImm(0, 0);
+            return true;
+        }
+        if (HostStatic(e, "Directory", "GetFiles", 1)) {
+            GenExpr(e.kids[0]);
+            BLInternal("_zan_host_getfiles");
+            return true;
+        }
+        if (HostStatic(e, "Directory", "GetDirectories", 1)) {
+            GenExpr(e.kids[0]);
+            BLInternal("_zan_host_getdirs");
+            return true;
+        }
+        // ---- Stopwatch statics ----
+        if (HostStatic(e, "Stopwatch", "Frequency", 0)) {
+            LoadImm(0, 1000000000);              // clock_gettime nanoseconds
+            return true;
+        }
+        if (HostStatic(e, "Stopwatch", "GetMilliseconds", 0)) {
+            BLInternal("_zan_host_mono_ms");
+            return true;
+        }
+        // ---- Semaphore (GCD dispatch on macOS, per the stdlib) ----
+        if (HostStatic(e, "Semaphore", "Create", 2)) {
+            GenExpr(e.kids[0]);                  // initial count
+            LoadImm(1, 0);
+            BLExtern("_dispatch_semaphore_create");
+            return true;
+        }
+        if (HostStatic(e, "Semaphore", "Wait", 1)) {
+            GenExpr(e.kids[0]);
+            LoadImm(1, -1);                      // DISPATCH_TIME_FOREVER
+            BLExtern("_dispatch_semaphore_wait");
+            return true;
+        }
+        if (HostStatic(e, "Semaphore", "Release", 1)) {
+            GenExpr(e.kids[0]);
+            BLExtern("_dispatch_semaphore_signal");
+            return true;
+        }
+        if (HostStatic(e, "Semaphore", "Destroy", 1)) {
+            GenExpr(e.kids[0]);
+            BLExtern("_dispatch_release");
+            return true;
+        }
+        // ---- Stopwatch / Timer / FileInfo instance members ----
+        if (HostInst(e, "Stopwatch", "Start", 0)) {
+            GenExpr(e.a.a); BLInternal("_zan_host_sw_start"); return true;
+        }
+        if (HostInst(e, "Stopwatch", "Stop", 0)) {
+            GenExpr(e.a.a); BLInternal("_zan_host_sw_stop"); return true;
+        }
+        if (HostInst(e, "Stopwatch", "Reset", 0)) {
+            GenExpr(e.a.a); BLInternal("_zan_host_sw_reset"); return true;
+        }
+        if (HostInst(e, "Stopwatch", "ElapsedMilliseconds", 0)) {
+            GenExpr(e.a.a); BLInternal("_zan_host_sw_elapsed"); return true;
+        }
+        if (HostInst(e, "Timer", "Start", 0)) {
+            GenExpr(e.a.a);                      // x0 = timer
+            E4(0xB9800009);                      // ldrsw x9, [x0]  interval
+            ExtCmpImm(9, 1);
+            int tmBad = NL(); EmitBcond(11, tmBad);   // interval < 1 -> false
+            LdrU(9, 0, 16);
+            int tmOk = NL(); CbnzReg(9, tmOk);        // already running -> true
+            LoadImm(9, 1);
+            StrU(9, 0, 16);                      // running = 1
+            ExtPush(0);                          // timer for the arg slot
+            AddImm(0, 0, 24);                    // x0 = &timer->pthread
+            LoadImm(1, 0);                       // attr
+            LoadSymRef("_zan_host_timer_thread", 2);
+            ExtPop(3);                           // x3 = timer
+            BLExtern("_pthread_create");
+            LoadImm(0, 1);
+            int tmFin = NL(); EmitB(tmFin);
+            Mark(tmBad);
+            LoadImm(0, 0);
+            EmitB(tmFin);
+            Mark(tmOk);
+            LoadImm(0, 1);
+            Mark(tmFin);
+            return true;
+        }
+        if (HostInst(e, "Timer", "Stop", 0)) {
+            GenExpr(e.a.a);
+            LoadImm(9, 0);
+            StrU(9, 0, 16);                      // running = 0
+            return true;
+        }
+        if (HostInst(e, "FileInfo", "Exists", 0)) {
+            GenExpr(e.a.a); LdrU(0, 0, 0);
+            BLInternal("_zan_host_fattr");
+            LoadImm(1, 0);
+            HostCmp(0, 1);
+            int feT = NL(); int feFin = NL();
+            EmitBcond(10, feT);                  // b.ge attr >= 0
+            LoadImm(0, 0); EmitB(feFin);
+            Mark(feT); LoadImm(0, 1);
+            Mark(feFin);
+            return true;
+        }
+        if (HostInst(e, "FileInfo", "Length", 0)) {
+            GenExpr(e.a.a); LdrU(0, 0, 0);
+            BLInternal("_zan_host_flength");
+            return true;
+        }
+        if (HostInst(e, "FileInfo", "IsDirectory", 0)) {
+            GenExpr(e.a.a); LdrU(0, 0, 0);
+            BLInternal("_zan_host_fattr");
+            ExtUbfmR(0, 0, 2, 2);                // attribute bit 2
+            return true;
+        }
+        if (HostInst(e, "FileInfo", "IsReadOnly", 0)) {
+            GenExpr(e.a.a); LdrU(0, 0, 0);
+            BLInternal("_zan_host_fattr");
+            ExtUbfmR(0, 0, 0, 0);                // attribute bit 0
+            return true;
+        }
+        if (HostInst(e, "FileInfo", "LastWriteTime", 0)) {
+            GenExpr(e.a.a); LdrU(0, 0, 0);
+            LoadImm(1, 0);
+            BLInternal("_zan_host_ftime");
+            return true;
+        }
+        if (HostInst(e, "FileInfo", "CreationTime", 0)) {
+            GenExpr(e.a.a); LdrU(0, 0, 0);
+            LoadImm(1, 1);
+            BLInternal("_zan_host_ftime");
+            return true;
+        }
+        if (HostInst(e, "FileInfo", "FullName", 0)) {
+            GenExpr(e.a.a); LdrU(0, 0, 0);
+            return true;
+        }
+        if (HostInst(e, "FileInfo", "NewerThan", 1)) {
+            GenExpr(e.a.a); LdrU(0, 0, 0);       // obj.path
+            ExtPush(0);
+            GenExpr(e.kids[0]);
+            MovRR(1, 0);
+            ExtPop(0);
+            BLInternal("_zan_host_fnewer");
+            return true;
+        }
+        if (HostInst(e, "FileInfo", "SetReadOnly", 1)) {
+            GenExpr(e.a.a); LdrU(0, 0, 0);       // obj.path
+            ExtPush(0);
+            GenExpr(e.kids[0]);
+            MovRR(1, 0);
+            ExtPop(0);
+            BLInternal("_zan_host_setreadonly");
+            return true;
+        }
+        if (HostStatic(e, "FileInfo", "GetLength", 1)) {
+            GenExpr(e.kids[0]);
+            BLInternal("_zan_host_flength");
+            return true;
+        }
+        if (HostStatic(e, "FileInfo", "GetLastWriteTime", 1)) {
+            GenExpr(e.kids[0]);
+            LoadImm(1, 0);
+            BLInternal("_zan_host_ftime");
+            return true;
         }
         if (TryGenHostExtCall(e)) { return true; }
         if (e.a == null || e.a.kind != AK.MemberAccess() || !HostIsBuilder(e.a.a)) { return false; }
@@ -604,6 +988,14 @@ partial class Ngen {
     int extEmpty;
     int extTrue;
     int extFalse;
+    int ioHome;
+    int ioTemp;
+    int ioTmp;
+    int ioTmpdir;
+    int ioXdgCfg;
+    int ioDotConfig;
+    int ioSlashTmp;
+    int extDollar;
 
     // ---- codegen shorthands ----
     void ExtLsl(int rd, int rn, int n) { E4(0xD3400000 | (((64 - n) & 63) << 16) | ((63 - n) << 10) | (rn << 5) | rd); }
@@ -1114,7 +1506,20 @@ partial class Ngen {
         HostEmitStrJoin();
         HostEmitPath();
         HostEmitDt();
+        HostEmitIo();
     }
+
+    // host frame with room for a 160-byte struct stat buffer above the
+    // 16 slot words (buffer base = sp + 128)
+    void HostBeginN(string sym, int extra) {
+        syms.Add(new Sym(sym, txt.Count));
+        RtPrologue(); AddSPImm(128 + extra, false);
+    }
+    void HostEndN(int extra) { AddSPImm(128 + extra, true); RtEpilogue(); }
+
+    // 32-bit status register tests (C int results do not sign-extend x0)
+    void HostCbzW(int lbl) { E4(0x7100001F); EmitBcond(0, lbl); }
+    void HostCbnzW(int lbl) { E4(0x7100001F); EmitBcond(1, lbl); }
 
     // ---- System.IO.Path: pure string surgery over '/' and '\\' ----
 
@@ -1768,6 +2173,605 @@ partial class Ngen {
         HostEmitDtDateStr();
         HostEmitDtTimeStr();
         HostEmitDtToStr();
+    }
+
+    // ===================== threads / env / filesystem =====================
+    // KnownFolders, Stopwatch/Timer, File/Directory listings, FileInfo.
+    // Darwin arm64 struct stat is 144 bytes: st_mode u16 @ +4, st_size @
+    // +96, st_mtimespec.tv_sec @ +48, st_ctimespec.tv_sec @ +64 (verified
+    // against the macOS SDK); with the 176-byte HostBeginN extension the
+    // buffer base is sp + 128. struct dirent: d_type @ +20, d_name @ +21.
+
+    // x0 = name (NUL-terminated) -> stamped copy of the value, or "".
+    void HostEmitGetenv() {
+        HostBegin("_zan_ext_getenv");
+        HostSave(0, 0);
+        BLExtern("_getenv");
+        int isNull = NL(); CbzReg(0, isNull);    // unset -> ""
+        HostSave(0, 1);
+        BLExtern("_strlen");
+        MovRR(1, 0);
+        HostLoad(0, 1);
+        BLInternal("_zan_host_copy");
+        int fin = NL(); EmitB(fin);
+        Mark(isNull);
+        LoadStr(extEmpty, 0);
+        Mark(fin);
+        HostEnd();
+    }
+
+    // x0 = text -> $NAME (POSIX letter/digit/underscore run) substituted
+    // from the process environment; missing or empty values keep the
+    // literal token, matching KnownFolders.Expand in the stdlib.
+    void HostEmitExpand() {
+        HostBegin("_zan_ext_expand");
+        HostSave(0, 0);                          // text
+        LoadStr(extEmpty, 0);
+        HostSave(0, 3);                          // result
+        HostLoad(9, 0);
+        ExtLenOf(9, 10);
+        HostSave(10, 2);                         // len
+        LoadImm(9, 0);
+        HostSave(9, 1);                          // i
+        int fin = NL(); int loop = NL(); int next = NL();
+        int plain = NL(); int dollarBody = NL(); int dollarLit = NL();
+        int nameScan = NL(); int nameDone = NL(); int nameOk = NL();
+        int notLetter = NL(); int noVal = NL(); int vEmpty = NL();
+        EmitB(loop);
+        Mark(loop);
+        HostLoad(9, 1); HostLoad(10, 2);
+        HostCmp(9, 10);
+        EmitBcond(2, fin);                       // i >= len
+        HostLoad(0, 0);
+        ExtLdrbReg(0, 0, 9);                     // c = text[i]
+        ExtCmpImm(0, 36);                        // '$'
+        EmitBcond(0, dollarBody);
+        EmitB(plain);
+        Mark(dollarBody);
+        // scan the name run: end starts at i + 1 and extends over
+        // [A-Za-z0-9_]
+        HostLoad(9, 1); AddImm(9, 9, 1);
+        HostSave(9, 4);                          // end
+        EmitB(nameScan);
+        Mark(nameScan);
+        HostLoad(9, 4); HostLoad(10, 2);
+        HostCmp(9, 10);
+        EmitBcond(2, nameDone);
+        HostLoad(0, 0);
+        HostLoad(12, 4);
+        ExtLdrbReg(0, 0, 12);                    // c = text[end]
+        ExtCmpImm(0, 95);
+        EmitBcond(0, nameOk);                    // '_'
+        LoadImm(1, 32);
+        E4(0xAA000020);                          // orr x0, x1, x0 -> c|32
+        ExtCmpImm(0, 97);
+        EmitBcond(11, notLetter);                // b.lt (unsigned)
+        ExtCmpImm(0, 122);
+        EmitBcond(12, nameOk);                   // b.gt
+        EmitB(nameOk);
+        Mark(notLetter);
+        AddImm(0, 0, -48);
+        ExtCmpImm(0, 9);
+        EmitBcond(9, nameOk);                    // digit (unsigned ls)
+        EmitB(nameDone);
+        Mark(nameOk);
+        HostLoad(9, 4); AddImm(9, 9, 1); HostSave(9, 4);
+        EmitB(nameScan);
+        Mark(nameDone);
+        HostLoad(9, 4); HostLoad(10, 1); AddImm(10, 10, 1);
+        HostCmp(9, 10);
+        EmitBcond(9, dollarLit);                 // end <= i+1 -> bare '$'
+        // name = text[i+1 .. end)
+        HostLoad(0, 0);
+        HostLoad(1, 1); AddImm(1, 1, 1);
+        HostLoad(2, 4); HostLoad(9, 1);
+        ExtSubRR(2, 2, 9); AddImm(2, 2, -1);
+        BLInternal("_zan_ext_path_slice");
+        HostSave(0, 5);                          // name (stamped)
+        HostLoad(0, 5);
+        BLExtern("_getenv");
+        int haveV = NL(); CbzReg(0, noVal);
+        HostSave(0, 6);                          // raw value
+        HostLoad(0, 6);
+        BLExtern("_strlen");
+        MovRR(1, 0);
+        CbzReg(1, vEmpty);                       // empty value = unset
+        HostLoad(0, 6);
+        BLInternal("_zan_host_copy");
+        ExtMov(1, 0);
+        HostLoad(0, 3);
+        BLInternal("_zan_rt_strcat2");
+        HostSave(0, 3);
+        HostLoad(9, 4); HostSave(9, 1);          // i = end
+        EmitB(next);
+        Mark(vEmpty);
+        Mark(noVal);
+        // unknown token stays literal: result + "$" + name
+        HostLoad(0, 3); LoadStr(extDollar, 1);
+        BLInternal("_zan_rt_strcat2");
+        HostSave(0, 3);
+        HostLoad(0, 3); HostLoad(1, 5);
+        BLInternal("_zan_rt_strcat2");
+        HostSave(0, 3);
+        HostLoad(9, 4); HostSave(9, 1);
+        EmitB(next);
+        Mark(dollarLit);
+        HostLoad(0, 3); LoadStr(extDollar, 1);
+        BLInternal("_zan_rt_strcat2");
+        HostSave(0, 3);
+        HostLoad(9, 1); AddImm(9, 9, 1); HostSave(9, 1);
+        EmitB(next);
+        // plain byte: a one-byte stamped string appended to the result
+        Mark(plain);
+        ExtPush(0);                              // [sp] = c (low byte)
+        AddImm(0, 31, 0);
+        LoadImm(1, 1);
+        BLInternal("_zan_host_copy");
+        ExtPop(1);
+        MovRR(1, 0);
+        HostLoad(0, 3);
+        BLInternal("_zan_rt_strcat2");
+        HostSave(0, 3);
+        HostLoad(9, 1); AddImm(9, 9, 1); HostSave(9, 1);
+        Mark(next);
+        EmitB(loop);
+        Mark(fin);
+        HostLoad(0, 3);
+        HostEnd();
+    }
+
+    // -> monotonic nanoseconds (CLOCK_MONOTONIC = 6 on Darwin).
+    void HostEmitMono() {
+        HostBegin("_zan_host_mono_ns");
+        AddSPImm(16, false);                     // timespec
+        LoadImm(0, 6);
+        AddImm(1, 31, 0);
+        BLExtern("_clock_gettime");
+        LdrU(9, 31, 0);                          // tv_sec
+        LoadImm(10, 1000000000);
+        E4(0x9B097D49);                          // mul x9, x10, x9
+        LdrU(10, 31, 8);                         // tv_nsec
+        AddRR(0, 9, 10);
+        AddSPImm(16, true);
+        HostEnd();
+
+        // MonoScaled(1000): (t/f)*unit + (t%f)*unit/f, divide-first like
+        // the stdlib so the multiply cannot overflow i64
+        HostBegin("_zan_host_mono_ms");
+        BLInternal("_zan_host_mono_ns");
+        HostSave(0, 0);                          // t
+        LoadImm(1, 1000000000);
+        E4(0x9AC10C02);                          // sdiv x2, x0, x1
+        LoadImm(3, 1000);
+        E4(0x9B037C40);                          // mul x0, x2, x3
+        HostLoad(4, 0);
+        E4(0x9B019044);                          // msub x4 = x4 - x2*x1 (rem)
+        E4(0x9B037C84);                          // mul x4, x4, x3
+        E4(0x9AC10C84);                          // sdiv x4, x4, x1
+        AddRR(0, 0, 4);
+        HostEnd();
+    }
+
+    // Stopwatch: {start@0, accumulated@8, running@16}; x0 = object.
+    void HostEmitStopwatch() {
+        HostBegin("_zan_host_sw_start");
+        HostSave(0, 0);
+        LdrU(9, 0, 16);
+        int done = NL(); CbnzReg(9, done);
+        LoadImm(9, 1);
+        HostLoad(0, 0);
+        StrU(9, 0, 16);
+        BLInternal("_zan_host_mono_ns");
+        HostLoad(9, 0);
+        StrU(0, 9, 0);
+        Mark(done);
+        HostEnd();
+
+        HostBegin("_zan_host_sw_stop");
+        HostSave(0, 0);
+        LdrU(9, 0, 16);
+        int sDone = NL(); CbzReg(9, sDone);
+        LoadImm(9, 0);
+        HostLoad(0, 0);
+        StrU(9, 0, 16);
+        BLInternal("_zan_host_mono_ns");         // now
+        HostLoad(9, 0);
+        LdrU(10, 9, 0);                          // start
+        LdrU(11, 9, 8);                          // accumulated
+        ExtSubRR(10, 0, 10);                     // now - start
+        AddRR(10, 11, 10);
+        StrU(10, 9, 8);
+        Mark(sDone);
+        HostEnd();
+
+        HostBegin("_zan_host_sw_reset");
+        HostSave(0, 0);
+        LoadImm(9, 0);
+        HostLoad(0, 0);
+        StrU(9, 0, 8);
+        StrU(9, 0, 16);
+        HostEnd();
+
+        HostBegin("_zan_host_sw_elapsed");
+        HostSave(0, 0);
+        LdrU(9, 0, 8);                           // accumulated
+        LdrU(10, 0, 16);                         // running
+        int have = NL(); CbzReg(10, have);
+        BLInternal("_zan_host_mono_ns");
+        MovRR(10, 0);                            // now
+        HostLoad(9, 0);
+        LdrU(11, 9, 0);                          // start
+        ExtSubRR(10, 10, 11);
+        LdrU(9, 9, 8);                           // reload accumulated
+        AddRR(9, 9, 10);
+        Mark(have);
+        ExtMov(0, 9);                            // ticks
+        E4(0x9E620000);                          // scvtf d0, x0
+        LoadImm(1, 1000000);
+        E4(0x9E620021);                          // scvtf d1, x1
+        E4(0x1E611800);                          // fdiv d0, d0, d1
+        E4(0x9E660000);                          // fmov x0, d0
+        HostEnd();
+    }
+
+    // pthread body: sleep the interval, fire the delegate, repeat until
+    // Stop clears `running`. The timer pointer rides in x20 (callee-saved:
+    // usleep/libSystem preserve it; compiled Zan code never touches x19+),
+    // so the loop keeps zero stack dependence. The entry LR rides in x21:
+    // every `bl` below would otherwise clobber it, and the exit `ret` must
+    // still land in the pthread trampoline. Frameless: no HostBegin.
+    void HostEmitTimerThread() {
+        syms.Add(new Sym("_zan_host_timer_thread", txt.Count));
+        E4(0xAA0003F4);                          // mov x20, x0 (timer)
+        E4(0xAA1E03F5);                          // mov x21, x30 (thread exit)
+        int tLoop = NL(); int tDone = NL();
+        EmitB(tLoop);
+        Mark(tLoop);
+        E4(0xB9400281);                          // ldr w1, [x20] (interval)
+        E4(0x52807D02);                          // mov w2, #1000
+        E4(0x1B027C20);                          // mul w0, w1, w2 (usec)
+        BLExtern("_usleep");
+        LdrU(1, 20, 16);                         // running
+        CbzReg(1, tDone);
+        LdrU(1, 20, 8);                          // closure
+        LdrU(0, 1, 8);                           // env
+        LdrU(9, 1, 0);                           // thunk
+        E4(0xD63F0120);                          // blr x9
+        EmitB(tLoop);
+        Mark(tDone);
+        LoadImm(0, 0);                           // pthread return value
+        E4(0xD65F02A0);                          // ret x21
+    }
+
+    // x0 = path -> -1 or attribute bits (bit0 readable? no: W_OK fails,
+    // bit1 basename starts '.', bit2 directory) — matches
+    // zan_file_attributes_at in the reference runtime.
+    void HostEmitFattr() {
+        HostBeginN("_zan_host_fattr", 176);
+        HostSave(0, 0);
+        HostLoad(0, 0);
+        AddImm(1, 31, 128);
+        BLExtern("_stat");
+        int miss = NL(); HostCbnzW(miss);
+        LoadImm(9, 0);
+        HostSave(9, 1);                          // bits
+        HostLoad(0, 0);
+        LoadImm(1, 2);                           // W_OK
+        BLExtern("_access");
+        int yesW = NL(); HostCbzW(yesW);         // writable -> no bit
+        LoadImm(9, 1);
+        HostSave(9, 1);
+        Mark(yesW);
+        HostLoad(0, 0);
+        BLInternal("_zan_ext_path_filename");
+        ExtLdrbImm(9, 0, 0);
+        ExtCmpImm(9, 46);                        // '.'
+        int noDot = NL(); EmitBcond(1, noDot);   // not hidden -> no bit
+        HostLoad(9, 1); LoadImm(10, 2); AddRR(9, 9, 10);
+        HostSave(9, 1);
+        Mark(noDot);
+        E4(0x79400000 | (66 << 10) | (31 << 5) | 9);   // ldrh w9, [sp, #132]
+        E4(0x530C3D29);                                // ubfm w9, w9, #12, #15
+        ExtCmpImm(9, 4);                               // S_IFDIR
+        int noDirB = NL(); EmitBcond(1, noDirB);       // not a dir -> no bit
+        HostLoad(9, 1); AddImm(9, 9, 4);
+        HostSave(9, 1);
+        Mark(noDirB);
+        HostLoad(0, 1);
+        int fin = NL(); EmitB(fin);
+        Mark(miss);
+        LoadImm(0, -1);
+        Mark(fin);
+        HostEndN(176);
+    }
+
+    // x0 = path -> size in bytes, or -1 when missing.
+    void HostEmitFlength() {
+        HostBeginN("_zan_host_flength", 176);
+        HostSave(0, 0);
+        HostLoad(0, 0);
+        AddImm(1, 31, 128);
+        BLExtern("_stat");
+        int miss = NL(); HostCbnzW(miss);
+        LdrU(0, 31, 128 + 96);                   // st_size
+        int fin = NL(); EmitB(fin);
+        Mark(miss);
+        LoadImm(0, -1);
+        Mark(fin);
+        HostEndN(176);
+    }
+
+    // x0 = path, x1 = which (0 mtime, 1 ctime) -> Unix seconds, 0 when
+    // missing (zan_file_time semantics).
+    void HostEmitFtime() {
+        HostBeginN("_zan_host_ftime", 176);
+        HostSave(0, 0); HostSave(1, 1);
+        HostLoad(0, 0);
+        AddImm(1, 31, 128);
+        BLExtern("_stat");
+        int miss = NL(); HostCbnzW(miss);
+        HostLoad(9, 1);
+        ExtCmpImm(9, 1);
+        int isC = NL(); EmitBcond(0, isC);
+        LdrU(0, 31, 128 + 48);                   // st_mtimespec.tv_sec
+        int got = NL(); EmitB(got);
+        Mark(isC);
+        LdrU(0, 31, 128 + 64);                   // st_ctimespec.tv_sec
+        Mark(got);
+        int fin = NL(); EmitB(fin);
+        Mark(miss);
+        LoadImm(0, 0);
+        Mark(fin);
+        HostEndN(176);
+    }
+
+    // x0 = path, x1 = on -> 1 when the mode change succeeded. Setreadonly
+    // clears the 0o222 write bits; making writable restores S_IWUSR, the
+    // minimum the reference shim grants back.
+    void HostEmitSetReadonly() {
+        HostBeginN("_zan_host_setreadonly", 176);
+        HostSave(0, 0); HostSave(1, 1);
+        HostLoad(0, 0);
+        AddImm(1, 31, 128);
+        BLExtern("_stat");
+        int miss = NL(); int fail = NL(); int fin = NL(); int chmodL = NL();
+        HostCbnzW(miss);
+        E4(0x79400000 | (66 << 10) | (31 << 5) | 9);   // ldrh w9, [sp, #132]
+        HostLoad(10, 1);
+        ExtCmpImm(10, 0);
+        int wOn0 = NL(); EmitBcond(0, wOn0);
+        LoadImm(10, 146);                        // 0o222
+        E4(0x0A2A0129);                          // bic w9, w9, w10
+        EmitB(chmodL);
+        Mark(wOn0);
+        LoadImm(10, 128);                        // S_IWUSR
+        E4(0x2A0A0129);                          // orr w9, w9, w10
+        Mark(chmodL);
+        HostLoad(0, 0);
+        ExtMov(1, 9);
+        BLExtern("_chmod");
+        HostCbnzW(fail);
+        LoadImm(0, 1);
+        EmitB(fin);
+        Mark(fail);
+        LoadImm(0, 0);
+        EmitB(fin);
+        Mark(miss);
+        LoadImm(0, 0);
+        Mark(fin);
+        HostEndN(176);
+    }
+
+    // x0 = mine, x1 = other -> other is missing (mtime 0) or mine is newer.
+    void HostEmitFnewer() {
+        HostBegin("_zan_host_fnewer");
+        HostSave(0, 0); HostSave(1, 1);
+        HostLoad(0, 1); LoadImm(1, 0);
+        BLInternal("_zan_host_ftime");
+        HostSave(0, 2);                          // theirs
+        HostLoad(0, 0); LoadImm(1, 0);
+        BLInternal("_zan_host_ftime");
+        MovRR(10, 0);                            // mine
+        HostLoad(9, 2);
+        int fin = NL(); int cmpP = NL(); int bigger = NL();
+        CbnzReg(9, cmpP);                        // theirs != 0 -> compare
+        LoadImm(0, 1);                           // missing target: stale
+        EmitB(fin);
+        Mark(cmpP);
+        HostCmp(10, 9);
+        EmitBcond(12, bigger);                   // b.gt mine > theirs
+        LoadImm(0, 0);
+        EmitB(fin);
+        Mark(bigger);
+        LoadImm(0, 1);
+        Mark(fin);
+        HostEnd();
+    }
+
+    // x0 = path -> 1 when a directory exists there (stat + S_ISDIR).
+    void HostEmitDirExists() {
+        HostBeginN("_zan_host_direxists", 176);
+        HostSave(0, 0);
+        HostLoad(0, 0);
+        AddImm(1, 31, 128);
+        BLExtern("_stat");
+        int miss = NL(); int fin = NL(); int isD = NL();
+        HostCbnzW(miss);
+        E4(0x79400000 | (66 << 10) | (31 << 5) | 9);
+        E4(0x530C3D29);
+        ExtCmpImm(9, 4);
+        EmitBcond(0, isD);
+        LoadImm(0, 0);
+        EmitB(fin);
+        Mark(isD);
+        LoadImm(0, 1);
+        EmitB(fin);
+        Mark(miss);
+        LoadImm(0, 0);
+        Mark(fin);
+        HostEndN(176);
+    }
+
+    // Host List<string>: {count@0, cap@8, data@16}, identical layout to
+    // GenListNew/ListAppendRaw so user code can Add/index the result.
+    void HostEmitList() {
+        HostBegin("_zan_host_list_new");
+        HostSave(0, 0);                          // cap
+        LoadImm(0, 24); LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");
+        HostSave(0, 1);                          // list
+        HostLoad(0, 0);
+        LoadImm(1, 8);
+        BLExtern("_calloc");
+        MovRR(9, 0);                             // data
+        HostLoad(1, 1);
+        StrU(9, 1, 16);
+        HostLoad(0, 0);
+        StrU(0, 1, 8);                           // cap
+        LoadImm(9, 0);
+        StrU(9, 1, 0);                           // count
+        HostLoad(0, 1);
+        HostEnd();
+
+        HostBegin("_zan_host_list_push");
+        HostSave(0, 0); HostSave(1, 1);
+        LdrU(2, 0, 0);                           // count
+        LdrU(3, 0, 8);                           // cap
+        HostCmp(2, 3);
+        int skip = NL(); EmitBcond(1, skip);
+        AddRR(3, 3, 3);                          // ncap = cap * 2
+        HostLoad(9, 0);
+        StrU(3, 9, 8);
+        LdrU(0, 9, 16);                          // old data
+        LoadImm(4, 8);
+        E4(0x9B047C61);                          // mul x1, x3, x4
+        BLExtern("_realloc");
+        HostLoad(9, 0);
+        StrU(0, 9, 16);
+        Mark(skip);
+        HostLoad(0, 0);
+        LdrU(2, 0, 0);
+        LdrU(3, 0, 16);
+        HostLoad(1, 1);
+        E4(0xF8207800 | (2 << 16) | (3 << 5) | 1);   // str x1, [x3, x2, lsl 3]
+        AddImm(2, 2, 1);
+        StrU(2, 0, 0);
+        HostEnd();
+    }
+
+    // x0 = path, wantDirs selects files (0) or directories (1). Bare
+    // names, hidden entries included, non-recursive — the stdlib
+    // GetFiles/GetDirectories contract.
+    void HostEmitDirList(string sym, int wantDirs) {
+        HostBeginN(sym, 176);
+        HostSave(0, 0);                          // path
+        LoadImm(0, 8);
+        BLInternal("_zan_host_list_new");
+        HostSave(0, 1);                          // list
+        HostLoad(0, 0);
+        BLExtern("_opendir");
+        int noDir = NL(); CbzReg(0, noDir);
+        HostSave(0, 2);                          // DIR*
+        int rLoop = NL(); int rNext = NL(); int rDone = NL();
+        int keep = NL(); int pushIt = NL(); int badStat = NL(); int cls = NL();
+        int d0 = NL(); int d1 = NL();
+        EmitB(rLoop);
+        Mark(rLoop);
+        HostLoad(0, 2);
+        BLExtern("_readdir");
+        CbzReg(0, rDone);
+        HostSave(0, 3);                          // dirent*
+        // skip "." and ".." only (hidden entries are listed)
+        AddImm(9, 0, 21);                        // d_name
+        ExtLdrbImm(10, 9, 0);
+        ExtCmpImm(10, 46);
+        EmitBcond(0, d0);
+        EmitB(keep);
+        Mark(d0);
+        ExtLdrbImm(10, 9, 1);
+        ExtCmpImm(10, 0);
+        EmitBcond(0, rNext);                     // "."
+        ExtCmpImm(10, 46);
+        EmitBcond(0, d1);
+        EmitB(keep);
+        Mark(d1);
+        ExtLdrbImm(10, 9, 2);
+        ExtCmpImm(10, 0);
+        EmitBcond(0, rNext);                     // ".."
+        Mark(keep);
+        // classify via stat on the combined path (d_type is unreliable on
+        // some filesystems)
+        HostLoad(0, 0);
+        HostLoad(9, 3);
+        AddImm(1, 9, 21);                        // d_name
+        BLInternal("_zan_ext_path_combine");
+        HostSave(0, 5);                          // full path
+        HostLoad(0, 5);
+        AddImm(1, 31, 128);
+        BLExtern("_stat");
+        HostCbnzW(badStat);
+        E4(0x79400000 | (66 << 10) | (31 << 5) | 9);
+        E4(0x530C3D29);
+        LoadImm(10, 4);
+        HostCmp(9, 10);
+        int isD = NL(); EmitBcond(0, isD);
+        LoadImm(9, 0);
+        EmitB(cls);
+        Mark(isD);
+        LoadImm(9, 1);
+        Mark(cls);
+        HostSave(9, 6);                          // is_dir
+        HostLoad(9, 6);
+        ExtCmpImm(9, wantDirs);
+        EmitBcond(0, pushIt);
+        EmitB(rNext);
+        Mark(pushIt);
+        HostLoad(9, 3);
+        AddImm(0, 9, 21);                        // d_name
+        BLExtern("_strlen");
+        MovRR(1, 0);
+        HostLoad(9, 3);
+        AddImm(0, 9, 21);
+        BLInternal("_zan_host_copy");
+        MovRR(1, 0);
+        HostLoad(0, 1);
+        BLInternal("_zan_host_list_push");
+        EmitB(rNext);
+        Mark(badStat);
+        EmitB(rLoop);
+        Mark(rNext);
+        EmitB(rLoop);
+        Mark(rDone);
+        HostLoad(0, 2);
+        BLExtern("_closedir");
+        Mark(noDir);
+        HostLoad(0, 1);
+        HostEndN(176);
+    }
+
+    void HostEmitIo() {
+        ioHome = InternStr("HOME");
+        ioTemp = InternStr("TEMP");
+        ioTmp = InternStr("TMP");
+        ioTmpdir = InternStr("TMPDIR");
+        ioXdgCfg = InternStr("XDG_CONFIG_HOME");
+        ioDotConfig = InternStr(".config");
+        ioSlashTmp = InternStr("/tmp");
+        extDollar = InternStr("$");
+        HostEmitGetenv();
+        HostEmitExpand();
+        HostEmitMono();
+        HostEmitStopwatch();
+        HostEmitTimerThread();
+        HostEmitFattr();
+        HostEmitFlength();
+        HostEmitFtime();
+        HostEmitSetReadonly();
+        HostEmitFnewer();
+        HostEmitDirExists();
+        HostEmitList();
+        HostEmitDirList("_zan_host_getfiles", 0);
+        HostEmitDirList("_zan_host_getdirs", 1);
     }
 
     // x0 = fmt, x1 = argc, x2..x4 = pre-rendered argument strings. Scans
