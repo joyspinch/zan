@@ -122,8 +122,38 @@ partial class Ngen {
         }
         // ---- threading / process / environment statics ----
         if (HostStatic(e, "Thread", "Sleep", 1)) { return "void"; }
+        if (HostStatic(e, "Thread", "Start", 1)) { return "bool"; }
+        if (HostStatic(e, "Thread", "CurrentId", 0)) { return "long"; }
         if (HostStatic(e, "ProcessList", "SelfPid", 0)) { return "int"; }
         if (HostStatic(e, "Interop", "getenv", 1)) { return "string"; }
+        // ---- dynamic library loading (System.Interop) ----
+        if (HostStatic(e, "Interop", "Load", 1)
+                || HostStatic(e, "Interop", "Symbol", 2)) { return "long"; }
+        if (HostStatic(e, "Interop", "LastError", 0)) { return "string"; }
+        if (HostStatic(e, "Interop", "Unload", 1)) { return "void"; }
+        // ---- raw memory intrinsics (System.Runtime.InteropServices) ----
+        if (HostStatic(e, "NativeMemory", "Alloc", 1)
+                || HostStatic(e, "NativeMemory", "Sha256", 2)) { return "long"; }
+        if (HostStatic(e, "NativeMemory", "GetString", 3)) { return "string"; }
+        if (HostStatic(e, "NativeMemory", "Free", 1)
+                || HostStatic(e, "NativeMemory", "PutString", 4)) { return "void"; }
+        // ---- current working directory ----
+        if (HostStatic(e, "Directory", "GetCurrentDirectory", 0)) { return "string"; }
+        // ---- numeric TryParse with an out slot ----
+        if ((HostStatic(e, "int", "TryParse", 2)
+                || HostStatic(e, "long", "TryParse", 2))) { return "bool"; }
+        // ---- AtomicInt instance members (stdlib class absent) ----
+        if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.a != null
+                && HostAtomicRecvTy(e.a.a) != null
+                && !UserDefinesClsMember("AtomicInt", e.a.sval)) {
+            string an = e.a.sval;
+            if ((an == "Load" || an == "Add" || an == "Increment"
+                    || an == "Decrement" || an == "Exchange"
+                    || an == "CompareExchange") && (e.kids.Count == 0
+                    || e.kids.Count == 1 || (an == "CompareExchange"
+                        && e.kids.Count == 2))) { return "long"; }
+            if (an == "Store" && e.kids.Count == 1) { return "void"; }
+        }
         if (HostStatic(e, "KnownFolders", "Home", 0)
                 || HostStatic(e, "KnownFolders", "Temp", 0)
                 || HostStatic(e, "KnownFolders", "AppData", 0)
@@ -136,7 +166,11 @@ partial class Ngen {
                 || HostStatic(e, "Directory", "Delete", 1)
                 || HostStatic(e, "File", "Delete", 1)) { return "void"; }
         if (HostStatic(e, "Directory", "GetFiles", 1)
-                || HostStatic(e, "Directory", "GetDirectories", 1)) { return "List<string>"; }
+                || HostStatic(e, "Directory", "GetDirectories", 1)
+                || HostStatic(e, "Directory", "GetPaths", 1)
+                || HostStatic(e, "Directory", "GetDirectoryPaths", 1)) { return "List<string>"; }
+        if (HostStatic(e, "Directory", "CreateDirectoryRecursive", 1)) { return "void"; }
+        if (HostStatic(e, "Directory", "DeleteRecursive", 1)) { return "bool"; }
         if (HostStatic(e, "Stopwatch", "Frequency", 0)
                 || HostStatic(e, "Stopwatch", "GetMilliseconds", 0)) { return "long"; }
         if (HostStatic(e, "Semaphore", "Create", 2)) { return "string"; }
@@ -207,6 +241,20 @@ partial class Ngen {
             ExtPop(1);                           // closure
             StrU(1, 0, 8);
             ExtPop(1);                           // interval
+            StrU(1, 0, 0);
+            return true;
+        }
+        // AtomicInt: {long value@0}, seeded with the constructor argument.
+        if (hcls == "AtomicInt" && FindClass("AtomicInt") == null) {
+            if (e.kids.Count != 1) {
+                diags.Error("ngen host: AtomicInt constructor requires one initial value", e.line, e.col);
+                return true;
+            }
+            GenExpr(e.kids[0]);
+            ExtPush(0);
+            LoadImm(0, 8); LoadImm(1, 0);
+            BLInternal("_zan_rt_alloc");
+            ExtPop(1);
             StrU(1, 0, 0);
             return true;
         }
@@ -337,6 +385,87 @@ partial class Ngen {
                 || e.kids.Count != count) { return false; }
         if (m.a == null || FindClass(cls) != null) { return false; }
         return StaticTyOf(m.a) == cls && !UserDefinesClsMember(cls, name);
+    }
+
+    // does this expression denote an AtomicInt object? Locals, fields,
+    // class-qualified statics and calls; null when it does not. The stdlib
+    // class is absent from the compile, so ordinary field typing misses the
+    // class-qualified static shape (`Prog.counter`) that the Threading
+    // tests use.
+    string HostAtomicRecvTy(Node e) {
+        if (e == null || FindClass("AtomicInt") != null) { return null; }
+        if (e.kind == AK.Ident()) {
+            return NamedSlotTy(e.sval) == "AtomicInt" ? "AtomicInt" : null;
+        }
+        if (e.kind == AK.MemberAccess() && e.a != null) {
+            string t = StaticTyOf(e);
+            if (t == "AtomicInt") { return t; }
+            if (e.a.kind == AK.Ident() && FindClass(e.a.sval) != null) {
+                string st = FindStaticTy(QualifiedCls(e.a.sval, e.a.sval2), e.sval);
+                if (st == "AtomicInt") { return st; }
+            }
+            return null;
+        }
+        if (e.kind == AK.Call()) {
+            return CallRetTy(e) == "AtomicInt" ? "AtomicInt" : null;
+        }
+        return null;
+    }
+
+    // declared return type of the desugared `get_<name>` property accessor
+    // on the receiver's class (no base-chain walk; properties used with
+    // ToString() sit on the receiver's own class), or null
+    string HostPropGetterTy(Node mem) {
+        if (mem == null || mem.kind != AK.MemberAccess() || mem.a == null) { return null; }
+        string gc = ExprCls(mem.a);
+        if (gc == null) { return null; }
+        string want = "get_" + mem.sval;
+        int i = 0;
+        while (i < methNodes.Count) {
+            if (methCls[i] == gc && methNodes[i].sval == want
+                    && methNodes[i].type != null) {
+                return TypeFullName(methNodes[i].type);
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // how would ToString() render this receiver? "int" (value already in
+    // x0 after GenExpr(r)), "strlen" (receiver in r.a is a string pointer
+    // whose stamp must be read), "bool" / "char" / "double" / "ulong", or
+    // null when the receiver is not a host-rendered scalar. Covers
+    // built-in property chains (string/array Length, List/Dictionary
+    // Count, StringBuilder.Length) whose member access has no field
+    // symbol and therefore no static type for the generic path.
+    string HostToStrArgKind(Node r) {
+        if (r == null) { return null; }
+        if (HostIsLength(r)) { return "int"; }
+        if (r.kind == AK.MemberAccess() && r.a != null) {
+            if (r.sval == "Length") {
+                if (ArrContainerTy(r.a) != null) { return "int"; }
+                if (IsStrExpr(r.a)) { return "int"; }
+                if (HostPropGetterTy(r.a) == "string") { return "strlen"; }
+            }
+            else if (r.sval == "Count") {
+                if (IsStrExpr(r.a)) { return "int"; }
+                string ct = StaticTyOf(r.a);
+                if (ct != null && (ct.IndexOf("List") == 0
+                        || ct.IndexOf("Dict") == 0)) { return "int"; }
+            }
+            else {
+                string pt = HostPropGetterTy(r);
+                if (pt == "int" || pt == "long") { return "int"; }
+            }
+        }
+        if (ExtIsIntExpr(r)) { return "int"; }
+        if (IsBoolExpr(r)) { return "bool"; }
+        if (IsCharExpr(r)) { return "char"; }
+        if (IsDblExpr(r)) { return "double"; }
+        if (IsUlongExpr(r)) { return "ulong"; }
+        string pg = HostPropGetterTy(r);
+        if (pg == "int" || pg == "long") { return "int"; }
+        return null;
     }
 
     bool TryGenHostCall(Node e) {
@@ -544,6 +673,27 @@ partial class Ngen {
             BLInternal("_zan_host_getdirs");
             return true;
         }
+        // full-path variants and the recursive create/delete pair
+        if (HostStatic(e, "Directory", "GetPaths", 1)) {
+            GenExpr(e.kids[0]);
+            BLInternal("_zan_dir_getpaths");
+            return true;
+        }
+        if (HostStatic(e, "Directory", "GetDirectoryPaths", 1)) {
+            GenExpr(e.kids[0]);
+            BLInternal("_zan_dir_getdirpaths");
+            return true;
+        }
+        if (HostStatic(e, "Directory", "CreateDirectoryRecursive", 1)) {
+            GenExpr(e.kids[0]);
+            BLInternal("_zan_dir_mkdirs");
+            return true;
+        }
+        if (HostStatic(e, "Directory", "DeleteRecursive", 1)) {
+            GenExpr(e.kids[0]);
+            BLInternal("_zan_dir_delrec");
+            return true;
+        }
         // ---- Stopwatch statics ----
         if (HostStatic(e, "Stopwatch", "Frequency", 0)) {
             LoadImm(0, 1000000000);              // clock_gettime nanoseconds
@@ -694,6 +844,186 @@ partial class Ngen {
             BLInternal("_zan_host_ftime");
             return true;
         }
+        // ---- dynamic library loading (System.Interop) ----
+        if (HostStatic(e, "Interop", "Load", 1)) {
+            GenExpr(e.kids[0]);
+            LoadImm(1, 1);                         // RTLD_LAZY
+            BLExtern("_dlopen");                   // 0 handle when missing
+            return true;
+        }
+        if (HostStatic(e, "Interop", "Symbol", 2)) {
+            GenExpr(e.kids[0]); ExtPush(0);
+            GenExpr(e.kids[1]); ExtPush(0);
+            ExtPop(1);                             // x1 = symbol name
+            ExtPop(0);                             // x0 = module handle
+            int symFin = NL(); int symNull = NL();
+            CbzReg(0, symNull);                    // null handle resolves to 0
+            BLExtern("_dlsym");
+            EmitB(symFin);
+            Mark(symNull);
+            LoadImm(0, 0);
+            Mark(symFin);
+            return true;
+        }
+        if (HostStatic(e, "Interop", "LastError", 0)) {
+            BLInternal("_zan_host_dlerror_str");   // owned "" when no error
+            return true;
+        }
+        if (HostStatic(e, "Interop", "Unload", 1)) {
+            GenExpr(e.kids[0]);
+            int unlFin = NL();
+            CbzReg(0, unlFin);                     // null handle is a no-op
+            BLExtern("_dlclose");
+            Mark(unlFin);
+            LoadImm(0, 0);
+            return true;
+        }
+        // ---- raw memory intrinsics ----
+        if (HostStatic(e, "NativeMemory", "Alloc", 1)) {
+            HostGenI64Arg(e.kids[0]);
+            BLExtern("_malloc");
+            return true;
+        }
+        if (HostStatic(e, "NativeMemory", "Free", 1)) {
+            GenExpr(e.kids[0]);
+            BLExtern("_free");
+            LoadImm(0, 0);
+            return true;
+        }
+        if (HostStatic(e, "NativeMemory", "PutString", 4)) {
+            GenExpr(e.kids[0]); ExtPush(0);        // dst
+            GenExpr(e.kids[1]); ExtPush(0);        // offset
+            GenExpr(e.kids[2]); ExtPush(0);        // source string
+            GenExpr(e.kids[3]); ExtPush(0);        // count
+            ExtPop(3); ExtPop(2); ExtPop(1); ExtPop(0);
+            AddRR(0, 0, 1);                        // dst + offset
+            MovRR(1, 2);
+            MovRR(2, 3);
+            BLExtern("_memcpy");
+            LoadImm(0, 0);
+            return true;
+        }
+        if (HostStatic(e, "NativeMemory", "GetString", 3)) {
+            GenExpr(e.kids[0]); ExtPush(0);
+            GenExpr(e.kids[1]); ExtPush(0);
+            GenExpr(e.kids[2]); ExtPush(0);
+            ExtPop(2); ExtPop(1); ExtPop(0);
+            BLInternal("_zan_nm_getstring");
+            return true;
+        }
+        if (HostStatic(e, "NativeMemory", "Sha256", 2)) {
+            GenExpr(e.kids[0]); ExtPush(0);
+            GenExpr(e.kids[1]); ExtPush(0);
+            ExtPop(1); ExtPop(0);
+            BLInternal("_zan_nm_sha256");
+            return true;
+        }
+        // ---- current working directory ----
+        if (HostStatic(e, "Directory", "GetCurrentDirectory", 0)) {
+            BLInternal("_zan_host_getcwd");
+            return true;
+        }
+        // ---- string statics: IsNullOrEmpty. The stamp word at ptr-8 is
+        // magic|len, so only the low 32 bits are the length; a null string
+        // counts as empty. ExtLenOf already handles both. ----
+        if (HostStatic(e, "string", "IsNullOrEmpty", 1)
+                || HostStatic(e, "String", "IsNullOrEmpty", 1)) {
+            GenExpr(e.kids[0]);
+            ExtLenOf(0, 0);                        // x0 = len (0 for null)
+            ExtCmpImm(0, 0);
+            int sneFin = NL();
+            LoadImm(0, 1);
+            EmitBcond(0, sneFin);                  // len == 0 -> true
+            LoadImm(0, 0);
+            Mark(sneFin);
+            return true;
+        }
+        // ---- numeric TryParse: full-string decimal parse (strtoll
+        // semantics); on failure the out slot receives 0 ----
+        if (HostStatic(e, "int", "TryParse", 2)
+                || HostStatic(e, "long", "TryParse", 2)) {
+            GenRefArg(e.kids[1]);                  // x0 = out address
+            ExtPush(0);
+            GenExpr(e.kids[0]);                    // x0 = text
+            ExtMov(1, 0);                          // x1 = text
+            ExtPop(0);                             // x0 = out address
+            BLInternal("_zan_host_int_tryparse");
+            return true;
+        }
+        // ---- background threads over the delegate closure ABI ----
+        if (HostStatic(e, "Thread", "Start", 1)) {
+            GenExpr(e.kids[0]);                    // closure {thunk, env}
+            ExtPush(0);
+            LoadImm(0, 24); BLExtern("_malloc");   // {tid@0, thunk@8, env@16}
+            ExtMov(9, 0);                          // block
+            ExtPop(1);
+            LdrU(2, 1, 0); StrU(2, 9, 8);          // thunk
+            LdrU(2, 1, 8); StrU(2, 9, 16);         // env
+            ExtMov(0, 9);                          // x0 = &tid
+            LoadImm(1, 0);                         // attr
+            LoadSymRef("_zan_host_thread_trampoline", 2);
+            ExtMov(3, 9);                          // x3 = block
+            BLExtern("_pthread_create");
+            LoadImm(0, 1);                         // started
+            return true;
+        }
+        if (HostStatic(e, "Thread", "CurrentId", 0)) {
+            BLInternal("_zan_host_thread_id");
+            return true;
+        }
+        // ---- AtomicInt instance members ----
+        if (FindClass("AtomicInt") == null && e.a != null
+                && e.a.kind == AK.MemberAccess() && e.a.a != null
+                && HostAtomicRecvTy(e.a.a) != null
+                && !UserDefinesClsMember("AtomicInt", e.a.sval)) {
+            string an2 = e.a.sval;
+            int an = e.kids.Count;
+            if (an2 == "Load" && an == 0) {
+                GenExpr(e.a.a);
+                E4(0xC8DFFC00);                    // ldar x0, [x0]
+                return true;
+            }
+            if (an2 == "Store" && an == 1) {
+                GenExpr(e.a.a); ExtPush(0);
+                GenExpr(e.kids[0]);
+                MovRR(1, 0);
+                ExtPop(0);
+                E4(0xC89FFC01);                    // stlr x1, [x0]
+                LoadImm(0, 0);
+                return true;
+            }
+            if ((an2 == "Add" && an == 1) || ((an2 == "Increment"
+                    || an2 == "Decrement") && an == 0)) {
+                GenExpr(e.a.a); ExtPush(0);
+                if (an2 == "Add") { HostGenI64Arg(e.kids[0]); }
+                else { LoadImm(1, an2 == "Increment" ? 1 : 0 - 1); }
+                MovRR(1, 0);
+                ExtPop(0);
+                E4(0xF8E10009);                    // ldaddal x1, x9, [x0]
+                AddRR(0, 9, 1);                    // Add/Increment return NEW
+                return true;
+            }
+            if (an2 == "Exchange" && an == 1) {
+                GenExpr(e.a.a); ExtPush(0);
+                GenExpr(e.kids[0]);
+                MovRR(1, 0);
+                ExtPop(0);
+                E4(0xF8E18009);                    // swpal x1, x9, [x0]
+                ExtMov(0, 9);                      // old value
+                return true;
+            }
+            if (an2 == "CompareExchange" && an == 2) {
+                GenExpr(e.a.a); ExtPush(0);
+                GenExpr(e.kids[0]); ExtPush(0);
+                GenExpr(e.kids[1]); ExtPush(0);
+                ExtPop(2);                         // x2 = desired
+                ExtPop(1);                         // x1 = expected
+                ExtPop(0);                         // x0 = object
+                E4(0xC8E1FC02);                    // casal x1, x2, [x0]
+                ExtMov(0, 1);                      // old value
+                return true;
+            }
+        }
         if (TryGenHostExtCall(e)) { return true; }
         if (e.a == null || e.a.kind != AK.MemberAccess() || !HostIsBuilder(e.a.a)) { return false; }
         string name = e.a.sval;
@@ -784,6 +1114,7 @@ partial class Ngen {
         HostEnd();
         HostEmitCopy(); HostEmitArgs(); HostEmitFiles(); HostEmitPaths(); HostEmitSb();
         HostEmitExt();
+        HostEmitHost2();
     }
 
     // x0 = C string, x1 = byte count; copy to an owning native string.
@@ -1137,6 +1468,8 @@ partial class Ngen {
             if (name == "ToBytes" && n == 0 && !UserDefinesClsMember(null, "ToBytes")) { return "byte[]"; }
             if (!UserDefinesClsMember(null, name)) {
                 if (name == "LastIndexOf" && n == 1) { return "int"; }
+                if (name == "Contains" && n == 1) { return "bool"; }
+                if (name == "Split" && n == 1) { return "List<string>"; }
                 if (name == "Trim" && n == 0) { return "string"; }
                 if ((name == "ToUpper" || name == "ToLower") && n == 0) { return "string"; }
                 if ((name == "StartsWith" || name == "EndsWith") && n == 1) { return "bool"; }
@@ -1147,11 +1480,12 @@ partial class Ngen {
         // instance family on array receivers
         if (name == "ToStr" && (n == 0 || n == 2) && ExtIsBytes(r)
                 && !UserDefinesClsMember(null, "ToStr")) { return "string"; }
-        // array/string Length.ToString(): receiver is a MemberAccess, so it
-        // must be claimed before the Ident-only gate below
-        if (name == "ToString" && n == 0 && r != null && r.kind == AK.MemberAccess()
-                && r.sval == "Length" && r.a != null
-                && !UserDefinesClsMember(null, "ToString")) { return "string"; }
+        // scalar.ToString(): built-in property chains (Length/Count), plain
+        // scalars and int property getters — the receiver carries no field
+        // symbol, so the generic member path cannot type the call
+        if (name == "ToString" && n == 0 && r != null
+                && !UserDefinesClsMember(null, "ToString")
+                && HostToStrArgKind(r) != null) { return "string"; }
         // dotted static families (Encoding.UTF8.*): the receiver is a
         // MemberAccess, so these must be claimed before the Ident-only gate
         if (ExtStaticQ(e, "Encoding.UTF8", "GetBytes", 1)) { return "byte[]"; }
@@ -1227,6 +1561,35 @@ partial class Ngen {
                         : name == "ToUpper" ? "_zan_ext_str_upper" : "_zan_ext_str_trim");
                     return true;
                 }
+                if (n == 1 && name == "Contains") {
+                    GenExpr(r);
+                    ExtPush(0);
+                    GenExpr(e.kids[0]);
+                    if (IsCharExpr(e.kids[0])) { BLInternal("_zan_rt_chrstr"); }
+                    ExtPush(0);
+                    ExtPop(1);                     // x1 = the needle
+                    ExtPop(0);                     // x0 = the receiver
+                    BLInternal("_zan_ext_str_contains");
+                    return true;
+                }
+                if (n == 1 && name == "Split") {
+                    // str.Split(sep) -> fresh List<string> of every segment
+                    // (empty separator yields the whole string; empty
+                    // segments are kept, including the tail)
+                    GenExpr(r);
+                    ExtPush(0);
+                    GenExpr(e.kids[0]);
+                    if (IsCharExpr(e.kids[0])) { BLInternal("_zan_rt_chrstr"); }
+                    ExtPush(0);
+                    LoadImm(0, 4);
+                    BLInternal("_zan_host_list_new");
+                    ExtPush(0);                    // list (top of stack)
+                    ExtPop(2);                     // x2 = list
+                    ExtPop(1);                     // x1 = sep
+                    ExtPop(0);                     // x0 = receiver
+                    BLInternal("_zan_str_split");  // returns the list in x0
+                    return true;
+                }
                 if (n == 1 && (name == "StartsWith" || name == "EndsWith"
                         || name == "Equals" || name == "CompareTo" || name == "LastIndexOf")) {
                     GenExpr(r);
@@ -1244,20 +1607,36 @@ partial class Ngen {
                 }
             }
         }
-        // ---- array/string Length.ToString(): the scalar renderer cannot
-        // type a Length member access, so host it here ----
-        if (n == 0 && name == "ToString" && r != null && r.kind == AK.MemberAccess()
-                && r.sval == "Length" && r.a != null && !UserDefinesClsMember(null, "ToString")) {
-            GenExpr(r.a);                          // receiver -> x0
-            if (ArrContainerTy(r.a) != null) {
-                E4(0xF85F0000);                    // ldur x0, [x0, #-16] (count)
-            } else {
-                E4(0xD1002009);                    // sub x9, x0, #8
-                E4(0xF9400120);                    // ldr x0, [x9]
-                E4(0xD3407C00);                    // ubfm x0, x0, #0, #31
+        // ---- scalar.ToString(): built-in property chains (xs.Count,
+        // sb.Length, arr.Length, s.Length), plain int/bool/char/double/ulong
+        // values and int property getters ----
+        if (n == 0 && name == "ToString" && r != null
+                && !UserDefinesClsMember(null, "ToString")) {
+            string k = HostToStrArgKind(r);
+            if (k != null) {
+                if (k == "strlen") {
+                    GenExpr(r.a);                  // string pointer
+                    E4(0xD1002009);                // sub x9, x0, #8
+                    E4(0xF9400120);                // ldr x0, [x9]
+                    E4(0xD3407C00);                // ubfm x0, x0, #0, #31
+                } else {
+                    GenExpr(r);
+                }
+                if (k == "bool") {
+                    int bf = NL(); int bd = NL();
+                    CbzReg(0, bf);
+                    LoadStr(extTrue, 0);
+                    EmitB(bd);
+                    Mark(bf);
+                    LoadStr(extFalse, 0);
+                    Mark(bd);
+                }
+                else if (k == "char") { BLInternal("_zan_rt_chrstr"); }
+                else if (k == "double") { BLInternal("_zan_rt_dbl2str"); }
+                else if (k == "ulong") { BLInternal("_zan_rt_uint2str"); }
+                else { BLInternal("_zan_rt_int2str"); }
+                return true;
             }
-            BLInternal("_zan_rt_int2str");
-            return true;
         }
         // ---- String.Format / string.Join (both class spellings) ----
         if (r != null && r.kind == AK.Ident()
@@ -2661,8 +3040,10 @@ partial class Ngen {
 
     // x0 = path, wantDirs selects files (0) or directories (1). Bare
     // names, hidden entries included, non-recursive — the stdlib
-    // GetFiles/GetDirectories contract.
-    void HostEmitDirList(string sym, int wantDirs) {
+    // GetFiles/GetDirectories contract. full=true instead pushes the
+    // combined path + "/" + name (the GetPaths/GetDirectoryPaths
+    // contract); a missing directory yields an empty list either way.
+    void HostEmitDirList(string sym, int wantDirs, bool full) {
         HostBeginN(sym, 176);
         HostSave(0, 0);                          // path
         LoadImm(0, 8);
@@ -2726,14 +3107,30 @@ partial class Ngen {
         EmitBcond(0, pushIt);
         EmitB(rNext);
         Mark(pushIt);
-        HostLoad(9, 3);
-        AddImm(0, 9, 21);                        // d_name
-        BLExtern("_strlen");
-        MovRR(1, 0);
-        HostLoad(9, 3);
-        AddImm(0, 9, 21);
-        BLInternal("_zan_host_copy");
-        MovRR(1, 0);
+        if (full) {
+            // stamped copy of d_name, then dir + "/" + name (strcat2
+            // requires stamped strings)
+            HostLoad(9, 3);
+            AddImm(0, 9, 21);
+            BLExtern("_strlen");
+            MovRR(1, 0);
+            HostLoad(9, 3);
+            AddImm(0, 9, 21);
+            BLInternal("_zan_host_copy");
+            MovRR(1, 0);
+            HostLoad(0, 0);
+            BLInternal("_zan_ext_path_combine");
+            MovRR(1, 0);
+        } else {
+            HostLoad(9, 3);
+            AddImm(0, 9, 21);                    // d_name
+            BLExtern("_strlen");
+            MovRR(1, 0);
+            HostLoad(9, 3);
+            AddImm(0, 9, 21);
+            BLInternal("_zan_host_copy");
+            MovRR(1, 0);
+        }
         HostLoad(0, 1);
         BLInternal("_zan_host_list_push");
         EmitB(rNext);
@@ -2770,8 +3167,10 @@ partial class Ngen {
         HostEmitFnewer();
         HostEmitDirExists();
         HostEmitList();
-        HostEmitDirList("_zan_host_getfiles", 0);
-        HostEmitDirList("_zan_host_getdirs", 1);
+        HostEmitDirList("_zan_host_getfiles", 0, false);
+        HostEmitDirList("_zan_host_getdirs", 1, false);
+        HostEmitDirList("_zan_dir_getpaths", 0, true);
+        HostEmitDirList("_zan_dir_getdirpaths", 1, true);
     }
 
     // x0 = fmt, x1 = argc, x2..x4 = pre-rendered argument strings. Scans
@@ -4319,6 +4718,400 @@ partial class Ngen {
         HostLoad(0, 6); AddImm(1, 31, 64); LoadImm(2, 32);
         BLInternal("_zan_ext_slot_copy");
         HostLoad(0, 6);
+        HostEnd();
+    }
+
+    // ===================== interop / threading emitters =====================
+    // Everything here is emitted AFTER HostEmitExt, so the list/string
+    // helpers it builds on (_zan_host_list_new/_push, _zan_host_copy,
+    // _zan_rt_str_alloc) already exist.
+
+    void HostEmitHost2() {
+        HostEmitStrSplit();
+        HostEmitStrContains();
+        HostEmitDlErrorStr();
+        HostEmitGetCwd();
+        HostEmitNmGetStr();
+        HostEmitNmSha();
+        HostEmitThreadHelpers();
+        HostEmitIntTryParse();
+        HostEmitMkdirs();
+        HostEmitDelRec();
+    }
+
+    // x0 = path -> void. mkdir every "/"- or "\\"-delimited prefix
+    // (mkdir -p); existing prefixes are ignored (mkdir EEXIST).
+    void HostEmitMkdirs() {
+        HostBeginN("_zan_dir_mkdirs", 2048);
+        HostSave(0, 0);                          // path (buffer at sp+128)
+        HostLoad(0, 0);
+        BLExtern("_strlen");
+        HostSave(0, 1);                          // len
+        LoadImm(0, 1);
+        HostSave(0, 2);                          // i = 1
+        int mLoop = NL(); int mNext = NL(); int mDone = NL();
+        int mSlash = NL(); int mEqLen = NL();
+        EmitB(mLoop);
+        Mark(mLoop);
+        HostLoad(9, 2);
+        HostLoad(10, 1);
+        HostCmp(9, 10);
+        EmitBcond(12, mDone);                    // i > len
+        AddImm(9, 9, -1);
+        HostLoad(10, 0);                         // path
+        AddRR(10, 10, 9);                        // path + i - 1
+        ExtLdrbImm(11, 10, 0);
+        ExtCmpImm(11, 47);
+        EmitBcond(0, mSlash);                    // '/'
+        ExtCmpImm(11, 92);
+        EmitBcond(0, mSlash);                    // '\\'
+        HostLoad(9, 2);
+        HostLoad(10, 1);
+        HostCmp(9, 10);
+        EmitBcond(0, mEqLen);                    // i == len: full path
+        EmitB(mNext);
+        Mark(mEqLen);
+        Mark(mSlash);
+        AddImm(0, 31, 128);                      // dst = buffer
+        HostLoad(1, 0);                          // src = path
+        HostLoad(2, 2);                          // n = i
+        BLExtern("_memcpy");
+        AddImm(9, 31, 128);
+        HostLoad(10, 2);
+        AddRR(9, 9, 10);                         // buffer + i
+        E4(0x3900013F);                          // strb wzr, [x9]
+        AddImm(0, 31, 128);
+        LoadImm(1, 511);                         // 0o777, umask applies
+        BLExtern("_mkdir");
+        Mark(mNext);
+        HostLoad(9, 2);
+        AddImm(9, 9, 1);
+        HostSave(9, 2);
+        EmitB(mLoop);
+        Mark(mDone);
+        HostEndN(2048);
+    }
+
+    // x0 = path -> bool. Recursively removes the tree: files unlinked,
+    // subdirectories recursed, then rmdir; a missing path is success,
+    // anything that survives the attempt fails. Mirrors the reference
+    // Directory.DeleteRecursive contract.
+    void HostEmitDelRec() {
+        HostBeginN("_zan_dir_delrec", 176);      // stat buffer at sp+128
+        HostSave(0, 0);                          // path
+        int Lmiss = NL(); int Lfile = NL(); int Lrm = NL(); int Lret = NL();
+        int Lloop = NL(); int Lnext = NL(); int Ldone = NL();
+        int Ldot = NL(); int Lkeep = NL(); int Ld1 = NL(); int Ldir2 = NL();
+        int Lmerge = NL(); int Lunlok = NL(); int Lgone = NL();
+        HostLoad(0, 0);
+        AddImm(1, 31, 128);
+        BLExtern("_stat");
+        HostCbnzW(Lmiss);                        // stat failed: missing
+        E4(0x79400000 | (66 << 10) | (31 << 5) | 9);   // ldrh w9,[sp,#132]
+        E4(0x530C3D29);                          // ubfm w9, w9, #12, #15
+        LoadImm(10, 4);
+        HostCmp(9, 10);
+        int Lisdir = NL();
+        EmitBcond(0, Lisdir);
+        EmitB(Lfile);
+        Mark(Lisdir);
+        HostLoad(0, 0);
+        BLExtern("_opendir");
+        CbzReg(0, Lrm);                          // unreadable: go rmdir
+        HostSave(0, 1);                          // DIR*
+        LoadImm(0, 1);
+        HostSave(0, 2);                          // ok = 1
+        EmitB(Lloop);
+        Mark(Lloop);
+        HostLoad(0, 1);
+        BLExtern("_readdir");
+        CbzReg(0, Ldone);
+        HostSave(0, 3);                          // dirent*
+        AddImm(9, 0, 21);                        // d_name
+        ExtLdrbImm(10, 9, 0);
+        ExtCmpImm(10, 46);
+        EmitBcond(0, Ldot);
+        EmitB(Lkeep);
+        Mark(Ldot);
+        ExtLdrbImm(10, 9, 1);
+        ExtCmpImm(10, 0);
+        EmitBcond(0, Lnext);                     // "."
+        ExtCmpImm(10, 46);
+        EmitBcond(0, Ld1);
+        EmitB(Lkeep);
+        Mark(Ld1);
+        ExtLdrbImm(10, 9, 2);
+        ExtCmpImm(10, 0);
+        EmitBcond(0, Lnext);                     // ".."
+        Mark(Lkeep);
+        // full = path + "/" + name, over a stamped copy of d_name
+        // (strcat2 requires stamped strings)
+        HostLoad(9, 3);
+        AddImm(0, 9, 21);
+        BLExtern("_strlen");
+        MovRR(1, 0);
+        HostLoad(9, 3);
+        AddImm(0, 9, 21);
+        BLInternal("_zan_host_copy");
+        MovRR(1, 0);
+        HostLoad(0, 0);
+        BLInternal("_zan_ext_path_combine");
+        HostSave(0, 4);                          // full path (owning string)
+        HostLoad(0, 4);
+        AddImm(1, 31, 128);
+        BLExtern("_stat");
+        HostCbnzW(Lnext);                        // unstatable: skip entry
+        E4(0x79400000 | (66 << 10) | (31 << 5) | 9);
+        E4(0x530C3D29);
+        LoadImm(10, 4);
+        HostCmp(9, 10);
+        EmitBcond(0, Ldir2);
+        HostLoad(0, 4);
+        BLExtern("_unlink");
+        ExtCmpImm(0, 0);
+        LoadImm(9, 1);
+        EmitBcond(0, Lunlok);
+        LoadImm(9, 0);
+        EmitB(Lmerge);
+        Mark(Lunlok);
+        EmitB(Lmerge);
+        Mark(Ldir2);
+        HostLoad(0, 4);
+        BLInternal("_zan_dir_delrec");           // recurse
+        MovRR(9, 0);
+        Mark(Lmerge);
+        HostLoad(10, 2);
+        E4(0x8A09014A);                          // and x10, x10, x9
+        HostSave(10, 2);                         // ok &= sub-result
+        Mark(Lnext);
+        EmitB(Lloop);
+        Mark(Ldone);
+        HostLoad(0, 1);
+        BLExtern("_closedir");
+        EmitB(Lrm);
+        Mark(Lrm);
+        HostLoad(0, 0);
+        BLExtern("_rmdir");
+        HostLoad(0, 0);
+        AddImm(1, 31, 128);
+        BLExtern("_stat");
+        HostCbnzW(Lgone);                        // stat failed: gone
+        LoadImm(0, 0);                           // still present: fail
+        EmitB(Lret);
+        Mark(Lgone);
+        HostLoad(0, 2);                          // gone: return ok
+        Mark(Lret);
+        Mark(Lfile);
+        HostLoad(0, 0);
+        BLExtern("_unlink");
+        LoadImm(0, 1);
+        EmitB(Lret);
+        Mark(Lmiss);
+        LoadImm(0, 1);
+        Mark(Lret);
+        HostEndN(176);
+    }
+
+    // x0 = text, x1 = out address -> bool. strtoll(base 10); ok = the whole
+    // text was consumed (endp moved past the start AND stopped at NUL);
+    // *out = ok ? value : 0.
+    void HostEmitIntTryParse() {
+        // entry: x0 = out address, x1 = text. Slots: 0=out, 1=text,
+        // 2=endp, 3=parsed value. ok = endp != text && *endp == 0.
+        HostBegin("_zan_host_int_tryparse");
+        HostSave(0, 0); HostSave(1, 1);
+        LoadImm(0, 0); HostSave(0, 2);         // endp = NULL
+        HostLoad(0, 1);                        // x0 = nptr (text)
+        AddImm(1, 31, 16);                     // x1 = &endp (char**)
+        LoadImm(2, 10);                        // base 10
+        BLExtern("_strtoll");
+        HostSave(0, 3);                        // parsed value
+        HostLoad(0, 2);                        // endp
+        HostLoad(1, 1);                        // text
+        HostCmp(0, 1);
+        int tpFail = NL(); int tpOk = NL(); int tpFin = NL();
+        EmitBcond(0, tpFail);                  // endp == text: no digits
+        ExtLdrbImm(9, 0, 0);                   // w9 = *endp
+        ExtCmpImm(9, 0);
+        EmitBcond(0, tpOk);                    // NUL: whole text consumed
+        EmitB(tpFail);
+        Mark(tpOk);
+        LoadImm(0, 1); EmitB(tpFin);
+        Mark(tpFail);
+        LoadImm(0, 0);
+        Mark(tpFin);
+        int tpZero = NL(); int tpStore = NL();
+        CbzReg(0, tpZero);                     // failure stores 0
+        HostLoad(0, 3); EmitB(tpStore);
+        Mark(tpZero); LoadImm(0, 0);
+        Mark(tpStore);
+        HostLoad(1, 0); StrU(0, 1, 0);         // *out = value
+        HostEnd();
+    }
+
+    // x0 = string, x1 = separator, x2 = list. Pushes every occurrence-free
+    // segment as a fresh owning string; an empty separator yields the whole
+    // string once; empty segments (including the tail) are kept. Mirrors the
+    // reference __zan_str_split exactly.
+    void HostEmitStrSplit() {
+        HostBegin("_zan_str_split");
+        HostSave(0, 0); HostSave(1, 1); HostSave(2, 2);
+        HostLoad(0, 1); BLExtern("_strlen"); HostSave(0, 3);
+        HostLoad(9, 3); ExtCmpImm(9, 0);
+        int spEmpty = NL(); int spDone = NL();
+        int spLoop = NL(); int spTail = NL();
+        EmitBcond(0, spEmpty);                 // seplen == 0 -> one element
+        HostLoad(0, 0); HostSave(0, 4);        // cur = s
+        EmitB(spLoop);
+        Mark(spEmpty);
+        HostLoad(0, 0); BLExtern("_strlen"); MovRR(1, 0);
+        HostLoad(0, 0); BLInternal("_zan_host_copy");
+        MovRR(1, 0); HostLoad(0, 2); BLInternal("_zan_host_list_push");
+        EmitB(spDone);
+        Mark(spLoop);
+        HostLoad(0, 4); HostLoad(1, 1); BLExtern("_strstr");
+        CbzReg(0, spTail);                     // no more separators
+        HostSave(0, 5);                        // hit
+        HostLoad(0, 5); HostLoad(1, 4); ExtSubRR(0, 0, 1);   // seglen
+        MovRR(1, 0); HostLoad(0, 4); BLInternal("_zan_host_copy");
+        MovRR(1, 0); HostLoad(0, 2); BLInternal("_zan_host_list_push");
+        HostLoad(0, 5); HostLoad(1, 3); AddRR(0, 0, 1);      // cur = hit + seplen
+        HostSave(0, 4);
+        EmitB(spLoop);
+        Mark(spTail);
+        HostLoad(0, 4); BLExtern("_strlen"); MovRR(1, 0);
+        HostLoad(0, 4); BLInternal("_zan_host_copy");
+        MovRR(1, 0); HostLoad(0, 2); BLInternal("_zan_host_list_push");
+        Mark(spDone);
+        HostLoad(0, 2);
+        HostEnd();
+    }
+
+    // x0 = string, x1 = needle -> bool via strstr (null-safe for the empty
+    // needle: strstr(s, "") == s, so "" is contained everywhere).
+    void HostEmitStrContains() {
+        HostBegin("_zan_ext_str_contains");
+        BLExtern("_strstr");
+        int ctNo = NL(); int ctFin = NL();
+        ExtCmpImm(0, 0);
+        EmitBcond(0, ctNo);
+        LoadImm(0, 1); EmitB(ctFin);
+        Mark(ctNo); LoadImm(0, 0);
+        Mark(ctFin);
+        HostEnd();
+    }
+
+    // x0 = char* from dlerror -> owning stamped string ("" when null). The
+    // error state is consumed by the call, matching libc.
+    void HostEmitDlErrorStr() {
+        HostBegin("_zan_host_dlerror_str");
+        BLExtern("_dlerror");
+        int dlNull = NL(); int dlFin = NL();
+        CbzReg(0, dlNull);
+        HostSave(0, 0);
+        BLExtern("_strlen"); MovRR(1, 0);
+        HostLoad(0, 0); BLInternal("_zan_host_copy");
+        EmitB(dlFin);
+        Mark(dlNull);
+        LoadStr(extEmpty, 0);
+        Mark(dlFin);
+        HostEnd();
+    }
+
+    // getcwd -> owning stamped string (2048-byte buffer above the frame;
+    // the whole frame must stay under the imm12 SP-adjust limit of 4096).
+    void HostEmitGetCwd() {
+        HostBeginN("_zan_host_getcwd", 2048);
+        AddImm(0, 31, 128); LoadImm(1, 2048);
+        BLExtern("_getcwd");
+        int cwFail = NL(); int cwFin = NL();
+        CbzReg(0, cwFail);                     // null result -> fail closed
+        HostSave(0, 0);
+        BLExtern("_strlen"); MovRR(1, 0);
+        HostLoad(0, 0); BLInternal("_zan_host_copy");
+        EmitB(cwFin);
+        Mark(cwFail);
+        HostFailAt("dir.getcwd");
+        Mark(cwFin);
+        HostEndN(2048);
+    }
+
+    // x0 = byte[] object, x1 = offset, x2 = count -> owning string of the
+    // byte elements [offset, offset+count). Elements live one per 8-byte
+    // slot; off/count are clamped to the array (null array -> "").
+    void HostEmitNmGetStr() {
+        HostBegin("_zan_nm_getstring");
+        HostSave(0, 0); HostSave(1, 1); HostSave(2, 2);
+        HostLoad(0, 2); ExtCmpImm(0, 0);
+        int gsCPos = NL(); EmitBcond(10, gsCPos); LoadImm(0, 0);
+        Mark(gsCPos); HostSave(0, 2);
+        HostLoad(0, 1); ExtCmpImm(0, 0);
+        int gsOPos = NL(); EmitBcond(10, gsOPos); LoadImm(0, 0);
+        Mark(gsOPos); HostSave(0, 1);
+        HostLoad(0, 0); ExtCountOf(0, 9);
+        HostLoad(1, 1); ExtSubRR(9, 9, 1);     // avail = count - off
+        ExtCmpImm(9, 0);
+        int gsAPos = NL(); EmitBcond(10, gsAPos); LoadImm(9, 0);
+        Mark(gsAPos);
+        HostLoad(0, 2); HostCmp(0, 9);         // n = min(count, avail)
+        int gsKeep = NL(); EmitBcond(9, gsKeep); ExtMov(0, 9);
+        Mark(gsKeep); HostSave(0, 2);
+        HostLoad(0, 2); AddImm(0, 0, 1);
+        BLInternal("_zan_rt_str_alloc"); HostSave(0, 3);
+        LoadImm(4, 0);
+        int gsLoop = NL(); int gsDone = NL();
+        Mark(gsLoop);
+        HostLoad(5, 2); HostCmp(4, 5);
+        EmitBcond(2, gsDone);                  // i >= n -> done
+        HostLoad(5, 1); AddRR(5, 5, 4); ExtLsl(5, 5, 3);      // (off+i)*8
+        HostLoad(6, 0); AddRR(5, 5, 6);
+        ExtLdrbImm(5, 5, 0);
+        HostLoad(6, 3); AddRR(6, 6, 4);
+        ExtStrbReg(5, 6, 4);                   // strb w5, [dst, i]
+        AddImm(4, 4, 1);
+        EmitB(gsLoop);
+        Mark(gsDone);
+        HostLoad(0, 3); HostLoad(1, 2); AddRR(2, 0, 1); Strb0(2);
+        HostStamp();
+        HostLoad(0, 3);
+        HostEnd();
+    }
+
+    // x0 = raw pointer, x1 = length -> owning 32-byte SHA-256 digest string
+    // (a negative length hashes zero bytes, never wraps).
+    void HostEmitNmSha() {
+        HostBeginN("_zan_nm_sha256", 64);
+        HostSave(0, 0); HostSave(1, 1);
+        HostLoad(0, 1); ExtCmpImm(0, 0);
+        int nmPos = NL(); EmitBcond(10, nmPos); LoadImm(0, 0);
+        Mark(nmPos); HostSave(0, 1);
+        HostLoad(0, 0); HostLoad(1, 1); AddImm(2, 31, 128);
+        BLExtern("_CC_SHA256");
+        LoadImm(0, 33); BLInternal("_zan_rt_str_alloc"); HostSave(0, 2);
+        HostLoad(0, 2); AddImm(1, 31, 128); LoadImm(2, 32);
+        BLExtern("_memcpy");
+        HostLoad(0, 2); HostLoad(1, 1); AddRR(2, 0, 1); Strb0(2);
+        HostStamp();
+        HostLoad(0, 2);
+        HostEndN(64);
+    }
+
+    // pthread entry: x0 = {tid@0, thunk@8, env@16} block built by
+    // Thread.Start; invoke the delegate, then return 0 to pthreads.
+    void HostEmitThreadHelpers() {
+        syms.Add(new Sym("_zan_host_thread_trampoline", txt.Count));
+        LdrU(9, 0, 8);                         // thunk
+        LdrU(0, 0, 16);                        // env
+        E4(0xD63F0120);                        // blr x9
+        LoadImm(0, 0);
+        E4(0xD65F03C0);                        // ret (pthread start routine)
+
+        // per-thread id: pthread_threadid_np(pthread_self(), &id)
+        HostBegin("_zan_host_thread_id");
+        BLExtern("_pthread_self");
+        AddImm(1, 31, 0);                      // &slot
+        BLExtern("_pthread_threadid_np");
+        LdrU(0, 31, 0);
         HostEnd();
     }
 }
