@@ -64,14 +64,22 @@ namespace Zan;
 // no-op, and Task.Delay/Task.* intrinsics are compile errors.
 //
 // Supported subset: static async int/long/string/class-returning and
-// `async void` methods (also spelled Task / Task<T>); statement-head awaits
-// (`int v = await F();`, `await F();`, `x = await F();`,
+// `async void` methods (also spelled Task / Task<T>), plus instance async
+// methods (direct, virtual and interface dispatch -- the vtable slot holds
+// the ramp, so a dispatched call yields the frame handle); statement-head
+// awaits (`int v = await F();`, `await F();`, `x = await F();`,
 // `return await F();`); sequential and chained awaits; awaits inside if and
-// while bodies; throw before and after suspension; root drive from any
-// non-async method. Everything else -- try/foreach/for/switch inside an async
-// body, awaits in nested expression positions, async Main, ref/out params,
-// generics, instance-method awaits, Task.*/Gate.*/Socket.* intrinsics -- is a
-// compile diagnostic, never a silent miscompile.
+// while bodies and in hoisted expression positions; for / foreach / switch
+// inside an async body (loop bookkeeping mirrors the sync lane; the foreach
+// collection and switch discriminant live in frame slots so they survive
+// suspensions); try/catch and try/finally (the finally body is emitted once
+// per exit path -- normal, after-handled-catch, unmatched-rethrow, and each
+// early transfer -- with the frame's #afinret scratch carrying a `return`
+// result across finally suspensions); Task.Spawn/Task.Run of an async call
+// as a discarded statement; async Main; root drive from any non-async
+// method. Everything else -- ref/out params, generics, Task.* APIs beyond
+// Spawn/Run (WhenAll/Cancel/IsDone/...), delegate and Socket intrinsics --
+// is a compile diagnostic, never a silent miscompile.
 partial class Ngen {
     bool inAsyncNg;          // emitting inside an async $resume body
     string asyncResumeSym;   // "$resume" symbol of the method being emitted
@@ -85,6 +93,16 @@ partial class Ngen {
     List<Node> hoistNodes;   // ANF: awaits hoisted out of the current statement
     List<int> hoistSlots;    // ANF: frame slot parking each hoisted result
     List<int> asyncTryCatchLs; // catch label per try open in this async body
+    List<int> asyncTryFinLs;   // fin index (or -1) per open async try, parallel
+                               // to asyncTryCatchLs (survives the catch dispatch)
+    List<int> asyncBrkTryBase; // open-async-try count at loop/switch entry (break)
+    List<int> asyncCntTryBase; // same, for continue
+    List<Node> asyncFeNodes; // foreach statements, pre-order (collection slots)
+    List<Node> asyncSwNodes; // switch statements, pre-order (discriminant slots)
+    int asyncFeBase;         // stack slot of the first foreach collection slot
+    int asyncSwBase;         // stack slot of the first switch discriminant slot
+    int asyncFinRetLocal;    // #afinret: return-value scratch across finallys
+    string asyncWhyNg;       // why the last resolver lookup failed (diagnostics)
     bool asyncRtDone;        // scheduler runtime emitted once
 
     // ---- element type of an await: Task<T> -> T, Task/void -> null ----
@@ -149,43 +167,83 @@ partial class Ngen {
         if (k == AK.WhileStmt()) {
             return CountAwaitExprsNg(s.a) + CountAsyncSuspendsNg(s.b);
         }
+        if (k == AK.DoWhileStmt()) {
+            return CountAwaitExprsNg(s.a) + CountAsyncSuspendsNg(s.b);
+        }
+        if (k == AK.ForStmt()) {
+            return CountAsyncSuspendsNg(s.a) + CountAwaitExprsNg(s.b)
+                    + CountAsyncSuspendsNg(s.d) + CountAwaitExprsNg(s.c);
+        }
+        if (k == AK.ForeachStmt()) {
+            return CountAwaitExprsNg(s.b) + CountAsyncSuspendsNg(s.c);
+        }
+        if (k == AK.SwitchStmt()) {
+            int n = CountAwaitExprsNg(s.a);
+            int i = 0;
+            while (i < s.kids.Count) {
+                n = n + CountAwaitExprsNg(s.kids[i].a) + CountAsyncSuspendsNg(s.kids[i].b);
+                i = i + 1;
+            }
+            return n;
+        }
         if (k == AK.TryStmt()) {
             int n = CountAsyncSuspendsNg(s.a);       // try body
+            int ct = 0;
             Node cc = s.b;
-            while (cc != null) { n = n + CountAsyncSuspendsNg(cc.a); cc = cc.b; }
+            while (cc != null) { n = n + CountAsyncSuspendsNg(cc.a); ct = ct + CountTransfersNg(cc.a); cc = cc.b; }
+            if (s.c != null) {
+                // a finally body is emitted once per exit path: the normal
+                // path, the unmatched-rethrow path, the after-handled-catch
+                // path (when clauses exist), and once per early transfer in
+                // the guarded bodies. Over-counting is safe: a resume state
+                // no await ever armed gets an unreachable stub. The whole
+                // subtree multiplies, so nested try/finally compounds like
+                // the per-copy emission does.
+                int copies = 3 + (s.b != null ? 1 : 0) + CountTransfersNg(s.a) + ct;
+                n = n + CountAsyncSuspendsNg(s.c) * copies;
+            }
             return n;
         }
         return 0;
     }
 
-    // compile-time rejection of everything outside the slice, before any code
-    // is emitted (the per-construct checks during emission remain as a net)
-    void DiagnoseAsyncBodyNg(Node s) {
+    // every early transfer (return/break/continue) in a subtree: each one
+    // emits one extra copy of every finally it leaves
+    int CountTransfersNg(Node n) {
+        if (n == null) { return 0; }
+        int k = n.kind;
+        int total = (k == AK.ReturnStmt() || k == AK.BreakStmt() || k == AK.ContinueStmt()) ? 1 : 0;
+        total = total + CountTransfersNg(n.a);
+        total = total + CountTransfersNg(n.b);
+        total = total + CountTransfersNg(n.c);
+        total = total + CountTransfersNg(n.d);
+        int i = 0;
+        while (i < n.kids.Count) { total = total + CountTransfersNg(n.kids[i]); i = i + 1; }
+        return total;
+    }
+
+    // foreach and switch statements in pre-order: each needs one frame-resident
+    // scratch slot (collection / discriminant) that must survive suspensions
+    void AsyncScanCtrlNodesNg(Node s, List<Node> fes, List<Node> sws) {
         if (s == null) { return; }
         int k = s.kind;
-        if (k == AK.TryStmt() && s.c != null) {
-            diags.Error("ngen: finally inside an async method is not supported by the native backend; await at the root instead", s.line, s.col);
-        }
-        if (k == AK.ForeachStmt()) {
-            diags.Error("ngen: foreach inside an async method is not supported by the native backend", s.line, s.col);
-        }
-        if (k == AK.ForStmt()) {
-            diags.Error("ngen: for inside an async method is not supported by the native backend", s.line, s.col);
-        }
-        if (k == AK.SwitchStmt()) {
-            diags.Error("ngen: switch inside an async method is not supported by the native backend", s.line, s.col);
-        }
-        DiagnoseAsyncBodyNg(s.a);
-        DiagnoseAsyncBodyNg(s.b);
-        DiagnoseAsyncBodyNg(s.c);
-        DiagnoseAsyncBodyNg(s.d);
+        if (k == AK.ForeachStmt() && fes != null) { fes.Add(s); }
+        if (k == AK.SwitchStmt() && sws != null) { sws.Add(s); }
+        AsyncScanCtrlNodesNg(s.a, fes, sws);
+        AsyncScanCtrlNodesNg(s.b, fes, sws);
+        AsyncScanCtrlNodesNg(s.c, fes, sws);
+        AsyncScanCtrlNodesNg(s.d, fes, sws);
         int i = 0;
-        while (i < s.kids.Count) { DiagnoseAsyncBodyNg(s.kids[i]); i = i + 1; }
+        while (i < s.kids.Count) { AsyncScanCtrlNodesNg(s.kids[i], fes, sws); i = i + 1; }
     }
 
     // declare the resume frame's local slots (this, params, body locals, then
-    // the two system slots); called twice (ramp count + resume emission) and
-    // must stay in the same order
+    // the system slots); called twice (ramp count + resume emission) and
+    // must stay in the same order. Everything after the user locals is
+    // system-owned: per-foreach collection and per-switch discriminant
+    // slots (frame-resident: both live across suspensions inside the loop /
+    // case bodies), the return-value scratch that carries a result across
+    // finally bodies on `return` paths, and the two EH/system slots.
     void AsyncDeclareSlotsNg(string cls, Node m, bool inst) {
         InitLocalsNg();
         if (inst) { AddLoc("this", m.sval2 != null && m.sval2 != "" ? m.sval2 : cls, false); }
@@ -201,6 +259,11 @@ partial class Ngen {
             pi = pi + 1;
         }
         ReserveLocals(m.d);
+        int fi = 0;
+        while (fi < asyncFeNodes.Count) { AddLoc("#afc" + Convert.ToString(fi), "long", false); fi = fi + 1; }
+        int wi = 0;
+        while (wi < asyncSwNodes.Count) { AddLoc("#asw" + Convert.ToString(wi), "long", false); wi = wi + 1; }
+        AddLoc("#afinret", "long", false);
         AddLoc("#aframe", "long", false);
         AddLoc("#aehtop0", "long", false);
     }
@@ -262,17 +325,24 @@ partial class Ngen {
         if (HasTypeParams(m)) {
             diags.Error("ngen: generic async methods are not supported by the native backend", m.line, m.col);
         }
-        if (HasMod(m, MOD.Abstract()) || IsVirtualMod(m)) {
-            diags.Error("ngen: virtual/abstract async methods are not supported by the native backend", m.line, m.col);
-        }
-        DiagnoseAsyncBodyNg(m.d);
+        // virtual/abstract async methods emit like any other: the ramp keeps
+        // the original signature, so a vtable/interface slot holds it and a
+        // dispatched call yields the frame handle the awaiter drives
         int nAwaits = CountAsyncSuspendsNg(m.d);
         int nArgs = inst ? ParamCount(m) + 1 : ParamCount(m);
         string rampSym = MethSymNg(cls, m);
         asyncResumeSym = rampSym + "$resume";
+        asyncFeNodes = new List<Node>();
+        asyncSwNodes = new List<Node>();
+        AsyncScanCtrlNodesNg(m.d, asyncFeNodes, asyncSwNodes);
 
         AsyncDeclareSlotsNg(cls, m, inst);
-        int nSlots = nloc - 2;   // this + params + locals (the saved set)
+        // saved-set size: user locals + ctrl scratches + #afinret (heap mirror
+        // count and ramp size); #aframe/#aehtop0 live above it, unsaved
+        int nSlots = nloc - 2;
+        asyncFeBase = nSlots - asyncFeNodes.Count - asyncSwNodes.Count - 1;
+        asyncSwBase = asyncFeBase + asyncFeNodes.Count;
+        asyncFinRetLocal = asyncSwBase + asyncSwNodes.Count;
 
         // ---- ramp: <Cls>_<name>(args...) -> frame ----
         syms.Add(new Sym(rampSym, txt.Count));
@@ -310,6 +380,10 @@ partial class Ngen {
         hoistNodes = new List<Node>();
         hoistSlots = new List<int>();
         asyncTryCatchLs = new List<int>();
+        asyncTryFinLs = new List<int>();
+        asyncBrkTryBase = new List<int>();
+        asyncCntTryBase = new List<int>();
+        finCur = -1;
         int lw = 0;
         while (lw < nAwaits) { asyncResumeLbls.Add(NL()); lw = lw + 1; }
         curHasTry = false;
@@ -388,7 +462,12 @@ partial class Ngen {
         int mk = 0;
         while (mk < asyncResumeLbls.Count) {
             if (lblPos[asyncResumeLbls[mk]] < 0) {
-                diags.Error("ngen: internal async error: resume state never emitted", m.line, m.col);
+                // a reserved state no await ever armed (the finally copy count
+                // over-approximates exit paths): an unreachable stub keeps the
+                // image well-formed. State k is only ever stored by the await
+                // emission that marks its label, so nothing lands here.
+                Mark(asyncResumeLbls[mk]);
+                Epilogue();
             }
             mk = mk + 1;
         }
@@ -509,6 +588,55 @@ partial class Ngen {
                 && inner.a.sval == "Delay" && inner.kids.Count == 1;
     }
 
+    // classify an awaited/detached call: -1 = not an async call, >= 0 = the
+    // static method index (CallStaticNg emits the ramp call), -2 = an
+    // instance/interface/virtual dispatch (GenExpr emits it -- the vtable
+    // slot holds the ramp, so the call still yields the frame handle)
+    int AsyncResolveCallNg(Node call) {
+        asyncWhyNg = "not-a-call";
+        if (call == null || call.kind != AK.Call() || call.a == null) { return -1; }
+        int mi = ResolveStaticNg(call);
+        if (mi >= 0) {
+            if (IsAsync(methNodes[mi]) && !HasMod(methNodes[mi], MOD.Extern())
+                    && !HasTypeParams(methNodes[mi])) { return mi; }
+            asyncWhyNg = "static-not-async";
+            return -1;
+        }
+        Node callee = call.a;
+        string name = callee.sval;
+        string rc = null;
+        if (callee.kind == AK.MemberAccess() && callee.a != null) {
+            rc = ExprCls(callee.a);
+        } else if (callee.kind == AK.Ident() && LocalIdx("this") >= 0) {
+            rc = curCls;                                 // implicit `this` receiver
+        }
+        if (rc == null) {
+            asyncWhyNg = "rc-null kind=" + Convert.ToString(callee.kind);
+            return -1;
+        }
+        List<int> icands = new List<int>();
+        InstanceCands(rc, name, icands);
+        int im = icands.Count > 0 ? FitPickIdx(icands, call) : -1;
+        if (im < 0) { im = FindInstanceIdx(name); }
+        if (im < 0) {
+            asyncWhyNg = "no-inst rc=" + rc + " ncands=" + Convert.ToString(icands.Count);
+            return -1;
+        }
+        Node m = methNodes[im];
+        if (!IsAsync(m) || HasMod(m, MOD.Extern()) || HasTypeParams(m)) {
+            asyncWhyNg = "inst-not-async im=" + Convert.ToString(im);
+            return -1;
+        }
+        return -2;
+    }
+
+    // emit an async call whose frame lands in x0 (the ramp returns it)
+    void EmitAsyncCallNg(int kind, int mi, Node call) {
+        if (kind >= 0) { CallStaticNg(mi, call); }
+        else if (kind == -2) { GenExpr(call); }
+        else { LoadImm(0, 0); }
+    }
+
     // the CPS core: lower `await <call>` at a statement head inside an async
     // body (irgen_expr.c:8498-8554). Always consumes exactly one pre-reserved
     // resume state, whether or not the target is resolvable, so the dispatch
@@ -564,19 +692,12 @@ partial class Ngen {
             LoadImm(0, 0);                           // Delay yields 0
             return;
         }
-        int mi = -1;
-        if (inner == null || inner.kind != AK.Call()) {
-            diags.Error("ngen: 'await' target must be a call to an async method", aw.line, aw.col);
-        } else {
-            mi = ResolveStaticNg(inner);
-            if (mi < 0 || !IsAsync(methNodes[mi]) || HasMod(methNodes[mi], MOD.Extern())) {
-                string nm = inner.a != null ? inner.a.sval : "?";
-                diags.Error("ngen: 'await' of '" + nm + "' is not supported by the native backend (only calls to non-generic static async methods)", aw.line, aw.col);
-                mi = -1;
-            }
+        int mi = AsyncResolveCallNg(inner);
+        if (mi == -1) {
+            string nm = inner != null && inner.a != null ? inner.a.sval : "?";
+            diags.Error("ngen: 'await' of '" + nm + "' is not supported by the native backend (only calls to non-generic async methods) [" + asyncWhyNg + "]", aw.line, aw.col);
         }
-        if (mi >= 0) { CallStaticNg(mi, inner); }    // x0 = sub frame (ramp)
-        else { LoadImm(0, 0); }
+        EmitAsyncCallNg(mi, mi, inner);              // x0 = sub frame (ramp)
         MovRR(9, 0);                                 // x9 = sub
         // heap slot for this await's sub handle
         LoadLocal(asyncFrameLocal, 2);               // x2 = frame (x9 survives)
@@ -696,16 +817,113 @@ partial class Ngen {
         StrU(3, 1, 0);                               // state->top = saved
     }
 
+    // ---- async pending-finally machinery ----
+    // The sync lane's finBodies/finInHandler lists are shared: an async try
+    // pushes its finally body exactly where GenTry would, so the loop
+    // bookkeeping (brkFinBase/cntFinBase) lines up. The bodies are emitted
+    // with GenAsyncStmtNg (a finally may suspend), and the freeze/stop rules
+    // mirror EmitPendingFinsFrom. asyncTryCatchLs/asyncTryFinLs track the
+    // ARMED async try buffers: the runtime top is always the method
+    // trampoline (one above the pre-arm top) plus that many buffers.
+
+    // restore the runtime top to the currently armed set's level
+    void AsyncTopSetNg() {
+        BLInternal("_zan_rt_eh_state");
+        MovRR(1, 0);
+        LoadLocal(asyncEhtopLocal, 0);
+        LoadImm(2, 1 + asyncTryCatchLs.Count);
+        AddRR(0, 0, 2);
+        StrU(0, 1, 0);                               // state->top = armed level
+    }
+
+    // run the pending finally bodies from index `from` down (innermost
+    // first), mirroring EmitPendingFinsFrom but emitting with GenAsyncStmtNg
+    void AsyncRunFinsNg(int from, bool stopAtBody) {
+        int i = finBodies.Count - 1;
+        while (i >= from) {
+            if (i <= finCur) { break; }
+            if (stopAtBody && finInHandler[i] == 0) { break; }
+            if (finBodies[i] != null) {
+                int saved = finCur;
+                finCur = i;                          // a finally never re-runs itself
+                ExcSave();                           // keep the in-flight exception
+                GenAsyncStmtNg(finBodies[i]);
+                ExcRestore();
+                finCur = saved;
+            }
+            i = i - 1;
+        }
+    }
+
+    // a break/continue leaving a loop/switch: abandon every try opened inside
+    // it (records above tryBase), disarm their buffers, run the finally
+    // bodies the exit skips, then restore the compile-time records so the
+    // enclosing emission stays balanced (control jumps away; the restore
+    // only keeps the bookkeeping properly nested)
+    void AsyncTransferNg(int finFrom, int tryBase) {
+        if (finBodies.Count <= finFrom && asyncTryFinLs.Count <= tryBase) { return; }
+        List<int> savedC = new List<int>();
+        List<int> savedF = new List<int>();
+        int i = 0;
+        while (i < asyncTryCatchLs.Count) { savedC.Add(asyncTryCatchLs[i]); i = i + 1; }
+        i = 0;
+        while (i < asyncTryFinLs.Count) { savedF.Add(asyncTryFinLs[i]); i = i + 1; }
+        while (asyncTryFinLs.Count > tryBase) {
+            asyncTryFinLs.RemoveAt(asyncTryFinLs.Count - 1);
+            // the armed-set list is popped when the try BODY ends, the fin
+            // list when the whole try closes: inside a catch/finally region
+            // the fin list runs deeper, so each pop is guarded
+            if (asyncTryCatchLs.Count > 0) {
+                asyncTryCatchLs.RemoveAt(asyncTryCatchLs.Count - 1);
+            }
+        }
+        AsyncTopSetNg();                             // disarm the left buffers
+        AsyncRunFinsNg(finFrom, false);
+        asyncTryCatchLs = savedC;
+        asyncTryFinLs = savedF;
+    }
+
+    // foreach/switch scratch slot of a statement (pre-order assigned)
+    int AsyncCtrlSlotNg(Node s, List<Node> nodes, int baseSlot, string what) {
+        int i = 0;
+        while (i < nodes.Count) {
+            if (nodes[i] == s) { return baseSlot + i; }
+            i = i + 1;
+        }
+        diags.Error("ngen: internal async error: unregistered " + what, s.line, s.col);
+        return baseSlot;
+    }
+
+    int AsyncFeSlotNg(Node s) {
+        return AsyncCtrlSlotNg(s, asyncFeNodes, asyncFeBase, "foreach");
+    }
+
+    int AsyncSwSlotNg(Node s) {
+        return AsyncCtrlSlotNg(s, asyncSwNodes, asyncSwBase, "switch");
+    }
+
     void EmitAsyncTryNg(Node s) {
         int catchL = NL();
         int endL = NL();
         ArmAsyncTryBufNg(catchL);
         asyncTryCatchLs.Add(catchL);                 // resumes inside re-arm it
+        int finIdx = -1;
+        if (s.c != null) {
+            finBodies.Add(s.c);                      // pending-fins bookkeeping,
+            finInHandler.Add(0);                     // shared with the sync lane
+            finIdx = finBodies.Count - 1;
+        }
+        asyncTryFinLs.Add(finIdx);
         GenAsyncStmtNg(s.a);
         asyncTryCatchLs.RemoveAt(asyncTryCatchLs.Count - 1);
         EhAsyncTryRestoreNg();                       // disarm: normal path
         AddSPImm(32, true);                          // release the arm area --
                                                      // only this path pushed it
+        if (finIdx >= 0) {
+            finCur = finIdx;                         // a throw in the finally propagates
+            GenAsyncStmtNg(s.c);
+            finCur = -1;
+        }
         EmitB(endL);
         Mark(catchL);
         EhAsyncTryRestoreNg();                       // disarm: thrown path
@@ -714,6 +932,7 @@ partial class Ngen {
                                                      // the longjmp restored the
                                                      // armed sp; a resumed join
                                                      // has sp = fp-0x50 as well
+        if (finIdx >= 0) { finInHandler[finIdx] = 1; }
         LdrU(0, 1, 8);                               // exc
         LoadImm(2, 0);
         int hasObj = NL();
@@ -760,10 +979,30 @@ partial class Ngen {
             cc = cc.b;
         }
         Mark(doneL);
+        if (finIdx >= 0) {
+            finCur = finIdx;                         // finally after a handled catch
+            GenAsyncStmtNg(s.c);
+            finCur = -1;
+        }
         EmitB(endL);
         Mark(noMatch);
+        if (finIdx >= 0) {
+            // the exception leaves this try unmatched (or there was never a
+            // clause): the finally runs while it keeps unwinding. The
+            // in-flight exception stays parked in state->exc across any
+            // suspension the finally introduces; the rethrow below sends it
+            // to the enclosing handler.
+            finCur = finIdx;
+            GenAsyncStmtNg(s.c);
+            finCur = -1;
+        }
         EhRethrowNg();                               // unmatched: keep unwinding
         Mark(endL);
+        if (finIdx >= 0) {
+            finBodies.RemoveAt(finBodies.Count - 1);
+            finInHandler.RemoveAt(finInHandler.Count - 1);
+        }
+        asyncTryFinLs.RemoveAt(asyncTryFinLs.Count - 1);
         // sp already restored: both armed paths released their own arm area,
         // and a resumed join never pushed it (the try is disarmed by then)
     }
@@ -773,6 +1012,11 @@ partial class Ngen {
     void GenAsyncStmtNg(Node s) {
         if (s == null) { return; }
         if (s.line > 0) { curLine = s.line; curCol = s.col; }
+        // mirror GenStmt's env discipline: ReserveLocals restored locHead to
+        // the pre-body chain, so without this the type helpers below (and
+        // anything running before the first GenExpr of the statement) cannot
+        // see the method's user locals
+        int savedEnv = EnterEnvNg(s);
         int k = s.kind;
         if (k == AK.Block()) {
             int i = 0;
@@ -800,6 +1044,20 @@ partial class Ngen {
                 GenConversionValueNg(s.a, el);
             } else {
                 LoadImm(0, 0);
+            }
+            if (finBodies.Count > 0 || asyncTryCatchLs.Count > 0) {
+                // the result survives every finally this return runs (they may
+                // suspend, so the scratch lives in the frame's saved set)
+                StoreLocal(asyncFinRetLocal, 0);
+                while (asyncTryFinLs.Count > 0) {
+                    asyncTryFinLs.RemoveAt(asyncTryFinLs.Count - 1);
+                    if (asyncTryCatchLs.Count > 0) { // see AsyncTransferNg: the
+                        asyncTryCatchLs.RemoveAt(asyncTryCatchLs.Count - 1); // lists desync in handlers
+                    }
+                }
+                AsyncTopSetNg();                     // only the trampoline stays armed
+                AsyncRunFinsNg(0, false);            // C# runs every finally
+                LoadLocal(asyncFinRetLocal, 0);
             }
             EmitAsyncCompleteNg();
         } else if (k == AK.ExprStmt()) {
@@ -842,6 +1100,8 @@ partial class Ngen {
             brkL.Add(outL); cntL.Add(cnt);
             brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
             cntFinBase.Add(finBodies.Count);
+            asyncBrkTryBase.Add(asyncTryFinLs.Count);
+            asyncCntTryBase.Add(asyncTryFinLs.Count);
             Mark(top);
             HoistAllAwaitsNg(s.a);                   // re-suspends on every iteration
             GenExpr(s.a);
@@ -855,11 +1115,198 @@ partial class Ngen {
             brkLoop.RemoveAt(brkLoop.Count - 1);
             brkFinBase.RemoveAt(brkFinBase.Count - 1);
             cntFinBase.RemoveAt(cntFinBase.Count - 1);
+            asyncBrkTryBase.RemoveAt(asyncBrkTryBase.Count - 1);
+            asyncCntTryBase.RemoveAt(asyncCntTryBase.Count - 1);
+        } else if (k == AK.ForStmt()) {
+            // for (init; cond; step) body: init runs once, the condition
+            // guards the top (its awaits re-suspend every iteration), the
+            // step runs at the continue point before looping back
+            if (s.a != null) { GenAsyncStmtNg(s.a); }
+            int top = NL(); int outL = NL(); int cnt = NL();
+            brkL.Add(outL); cntL.Add(cnt);
+            brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
+            cntFinBase.Add(finBodies.Count);
+            asyncBrkTryBase.Add(asyncTryFinLs.Count);
+            asyncCntTryBase.Add(asyncTryFinLs.Count);
+            Mark(top);
+            if (s.b != null) {
+                HoistAllAwaitsNg(s.b);
+                GenExpr(s.b);
+                EmitCBZ(0, outL);
+            }
+            GenAsyncStmtNg(s.d);
+            Mark(cnt);
+            if (s.c != null) {
+                HoistAllAwaitsNg(s.c);
+                GenExpr(s.c);
+            }
+            EmitB(top);
+            Mark(outL);
+            brkL.RemoveAt(brkL.Count - 1);
+            cntL.RemoveAt(cntL.Count - 1);
+            brkLoop.RemoveAt(brkLoop.Count - 1);
+            brkFinBase.RemoveAt(brkFinBase.Count - 1);
+            cntFinBase.RemoveAt(cntFinBase.Count - 1);
+            asyncBrkTryBase.RemoveAt(asyncBrkTryBase.Count - 1);
+            asyncCntTryBase.RemoveAt(asyncCntTryBase.Count - 1);
+        } else if (k == AK.ForeachStmt()) {
+            // foreach (T x in coll) body with the collection in a frame slot:
+            // the sync lane keeps it on the machine stack across the body,
+            // which a suspension would discard
+            Node coll = s.b;
+            bool isArr = IsArrExpr(coll);
+            bool isStr = !isArr && IsStrExpr(coll);
+            int esz = isArr ? ArrElemSize(ArrTyOf(coll)) : 8;
+            int elemVar = DeclSlotNg(s);
+            int idxVar = elemVar + 1;                // this foreach's hidden index
+            int collSlot = AsyncFeSlotNg(s);
+            int top = NL(); int outL = NL(); int cnt = NL();
+            brkL.Add(outL); cntL.Add(cnt);
+            brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
+            cntFinBase.Add(finBodies.Count);
+            asyncBrkTryBase.Add(asyncTryFinLs.Count);
+            asyncCntTryBase.Add(asyncTryFinLs.Count);
+            LoadImm(0, 0);
+            StoreLocal(idxVar, 0);
+            Mark(top);
+            HoistAllAwaitsNg(coll);                  // collection awaits re-suspend
+            GenExpr(coll);
+            StoreLocal(collSlot, 0);
+            LoadLocal(collSlot, 0);
+            if (isArr) {
+                E4(0xF85F0002);                      // ldur x2, [x0, #-16] (len)
+            } else if (isStr) {
+                E4(0xD1002002);                      // sub x2, x0, #8
+                E4(0xF9400042);                      // ldr x2, [x2]
+                E4(0xD3407C42);                      // ubfm x2, x2, #0, #31
+            } else {
+                LdrU(2, 0, 0);                       // x2 = count
+            }
+            LoadLocal(idxVar, 0);                    // x0 = i
+            E4(0xEB02001F);                          // cmp x0, x2
+            int outGe = NL();
+            EmitBcond(10, outGe);                    // b.ge out
+            LoadLocal(collSlot, 2);                  // x2 = coll
+            if (isArr && esz == 4) {
+                E4(0xB8A07840);                      // ldrsw x0, [x2, x0, lsl #2]
+            } else if (isArr) {
+                E4(0xF8607840);                      // ldr x0, [x2, x0, lsl #3]
+            } else if (isStr) {
+                E4(0x38606840);                      // ldrb w0, [x2, x0]
+            } else {
+                LdrU(3, 2, 16);                      // x3 = data
+                E4(0xF8607860);                      // ldr x0, [x3, x0, lsl #3]
+            }
+            StoreLocal(elemVar, 0);
+            GenAsyncStmtNg(s.c);
+            Mark(cnt);
+            LoadLocal(idxVar, 0);
+            AddImm(0, 0, 1);
+            StoreLocal(idxVar, 0);
+            EmitB(top);
+            Mark(outGe);
+            EmitB(outL);
+            Mark(outL);
+            brkL.RemoveAt(brkL.Count - 1);
+            cntL.RemoveAt(cntL.Count - 1);
+            brkLoop.RemoveAt(brkLoop.Count - 1);
+            brkFinBase.RemoveAt(brkFinBase.Count - 1);
+            cntFinBase.RemoveAt(cntFinBase.Count - 1);
+            asyncBrkTryBase.RemoveAt(asyncBrkTryBase.Count - 1);
+            asyncCntTryBase.RemoveAt(asyncCntTryBase.Count - 1);
+        } else if (k == AK.SwitchStmt()) {
+            // switch with the discriminant in a frame slot: a case body may
+            // suspend, and the sync lane's machine-stack slot would not
+            // survive the round trip
+            int swSlot = AsyncSwSlotNg(s);
+            int endL = NL();
+            int defL = NL();
+            HoistAllAwaitsNg(s.a);
+            GenExpr(s.a);
+            StoreLocal(swSlot, 0);
+            int nc = s.kids.Count;
+            int[] bodies = new int[nc];
+            int defIdx = -1;
+            int i = 0;
+            while (i < nc) {
+                Node c = s.kids[i];
+                if (c.a == null) { defIdx = i; i = i + 1; continue; }
+                bodies[i] = NL();
+                HoistAllAwaitsNg(c.a);
+                GenExpr(c.a);                        // x0 = case label
+                if (IsStrExpr(s.a)) {
+                    LoadLocal(swSlot, 1);            // x1 = discriminant
+                    BLExtern("_strcmp");
+                    E4(0xEB1F001F);                  // cmp x0, xzr
+                } else {
+                    LoadLocal(swSlot, 1);            // x1 = discriminant
+                    E4(0xEB01001F);                  // cmp x0, x1
+                }
+                EmitBcond(0, bodies[i]);             // b.eq body
+                i = i + 1;
+            }
+            EmitB(defIdx >= 0 ? defL : endL);
+            brkL.Add(endL);
+            brkLoop.Add(false); brkFinBase.Add(finBodies.Count);
+            asyncBrkTryBase.Add(asyncTryFinLs.Count);
+            i = 0;
+            while (i < nc) {
+                Node c = s.kids[i];
+                if (c.a == null) { i = i + 1; continue; }
+                Mark(bodies[i]);
+                GenAsyncStmtNg(c.b);
+                // an empty case body falls through to the next case (C# rule);
+                // only a body that emitted code needs the jump to the exit
+                if (c.b == null || c.b.kids.Count > 0) { EmitB(endL); }
+                i = i + 1;
+            }
+            if (defIdx >= 0) {
+                Mark(defL);
+                GenAsyncStmtNg(s.kids[defIdx].b);
+                EmitB(endL);
+            }
+            brkL.RemoveAt(brkL.Count - 1);
+            brkLoop.RemoveAt(brkLoop.Count - 1);
+            brkFinBase.RemoveAt(brkFinBase.Count - 1);
+            asyncBrkTryBase.RemoveAt(asyncBrkTryBase.Count - 1);
+            Mark(endL);
+        } else if (k == AK.BreakStmt()) {
+            if (brkL.Count == 0) {
+                diags.Error("ngen: break outside loop", s.line, s.col);
+            } else {
+                AsyncTransferNg(brkFinBase[brkFinBase.Count - 1],
+                        asyncBrkTryBase[asyncBrkTryBase.Count - 1]);
+                EmitB(brkL[brkL.Count - 1]);
+            }
+        } else if (k == AK.ContinueStmt()) {
+            if (cntL.Count == 0) {
+                diags.Error("ngen: continue outside loop", s.line, s.col);
+            } else {
+                AsyncTransferNg(cntFinBase[cntFinBase.Count - 1],
+                        asyncCntTryBase[asyncCntTryBase.Count - 1]);
+                EmitB(cntL[cntL.Count - 1]);
+            }
+        } else if (k == AK.ThrowStmt()) {
+            if (s.a != null) {
+                GenExpr(s.a);
+            } else {
+                // bare rethrow: the in-flight exception stays in the state block
+                BLInternal("_zan_rt_eh_state");
+                LdrU(0, 0, 8);
+            }
+            E4(0xF81F0FE0);                          // hold the exception value
+            AsyncRunFinsNg(0, true);                 // finallys of abandoned catches
+            BLInternal("_zan_rt_eh_state");
+            MovRR(1, 0);
+            E4(0xF84107E2);                          // exception value
+            StrU(2, 1, 8);                           // state->exc = value
+            EhRethrowNg();
         } else if (k == AK.TryStmt()) {
             EmitAsyncTryNg(s);
         } else {
             GenStmt(s);                              // break/continue/plain decl
         }
+        locHead = savedEnv;
     }
 
     // park the exception a completed sub carries in frame[6] into the runtime
@@ -906,18 +1353,21 @@ partial class Ngen {
             LoadImm(0, 0);
             return true;
         }
-        int mi = ResolveStaticNg(inner);
-        if (mi < 0 || !IsAsync(methNodes[mi]) || HasMod(methNodes[mi], MOD.Extern())
-                || HasTypeParams(methNodes[mi])) {
-            diags.Error("ngen: 'await' of this expression is not supported by the native backend (only calls to non-generic static async methods)", e.line, e.col);
+        int mi = AsyncResolveCallNg(inner);
+        if (mi == -1) {
+            diags.Error("ngen: 'await' of this expression is not supported by the native backend (only calls to non-generic async methods) [" + asyncWhyNg + "]", e.line, e.col);
             LoadImm(0, 0);
             return true;
         }
         EnsureAsyncRuntimeNg();
-        CallStaticNg(mi, inner);                     // x0 = sub frame
+        EmitAsyncCallNg(mi, mi, inner);              // x0 = sub frame
         MovRR(9, 0);
         E4(0xF81F0FE9);                              // hold sub: the driver
-        LoadSymRef(AsyncResumeSymNg(mi), 1);         // calls clobber x9
+        if (mi >= 0) {
+            LoadSymRef(AsyncResumeSymNg(mi), 1);     // calls clobber x9
+        } else {
+            LdrU(1, 9, 40);                          // dispatched: the ramp's own resume
+        }
         MovRR(0, 9);
         BLInternal("_zan_co_ready");                 // ready(sub, sub_resume)
         E4(0xF84107E9);                              // x9 = sub
@@ -935,17 +1385,27 @@ partial class Ngen {
     // (irgen_call.c:22-68): awaiter = the frame itself (a non-null marker),
     // awaiter_step = the reaper, then ready. The queue is NOT pumped here:
     // the reference only readies, so a detached body runs at the next pump.
+    // `Task.Spawn(<async call>)` / `Task.Run(<async call>)` detach the same
+    // way (the handle they return is the frame; only statement-level spawns
+    // that discard it are recognized here).
     bool PrepareAsyncStmtNg(Node s) {
         if (s == null || s.kind != AK.ExprStmt() || s.a == null
                 || s.a.kind != AK.Call()) { return false; }
-        int mi = ResolveStaticNg(s.a);
-        if (mi < 0 || !IsAsync(methNodes[mi])) { return false; }
-        if (HasMod(methNodes[mi], MOD.Extern()) || HasTypeParams(methNodes[mi])) {
-            diags.Error("ngen: a discarded extern/generic async call is not supported by the native backend", s.line, s.col);
+        Node call = s.a;
+        bool spawn = call.a != null && call.a.kind == AK.MemberAccess()
+                && call.a.a != null && call.a.a.kind == AK.Ident()
+                && call.a.a.sval == "Task"
+                && (call.a.sval == "Spawn" || call.a.sval == "Run")
+                && call.kids.Count == 1;
+        Node target = spawn ? (call.kids.Count > 0 ? call.kids[0] : null) : call;
+        int mi = AsyncResolveCallNg(target);
+        if (mi == -1) { return false; }              // not an async call (or a non-async Task.Spawn argument)
+        if (mi >= 0 && HasTypeParams(methNodes[mi])) {
+            diags.Error("ngen: a discarded generic async call is not supported by the native backend", s.line, s.col);
             return true;
         }
         EnsureAsyncRuntimeNg();
-        CallStaticNg(mi, s.a);                       // x0 = sub frame
+        EmitAsyncCallNg(mi, mi, target);             // x0 = sub frame
         MovRR(9, 0);
         StrU(9, 9, 16);                              // sub.awaiter = sub (marker)
         LoadSymRef("_zan_co_reap", 1);
