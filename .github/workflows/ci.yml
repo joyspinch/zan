@@ -14,6 +14,23 @@ jobs:
         run: SEED=$PWD/seed/stage2 RT_OBJS='' bash scripts/native_bootstrap.sh
       - name: Conformance regression
         run: python3 scripts/native_regression.py --seed $(ls -dt build/native-bootstrap/run.*/stage2 | head -1)
+      - name: Emit ELF64 + PE-COFF objects for cross-platform jobs
+        run: |
+          SEED=$(ls -dt build/native-bootstrap/run.*/stage2 | head -1)
+          mkdir -p xelf xobj
+          for f in tests/selfhost/kernel*.zan; do
+            n=$(basename "$f" .zan)
+            ZAN_TARGET=aarch64-linux "$SEED" "xelf/$n.o" "$f"
+            "$SEED" "xobj/$n.obj" "$f"
+          done
+          for o in xelf/*.o; do python3 scripts/elfcheck.py "$o"; done
+          for o in xobj/*.obj; do python3 scripts/coffcheck.py "$o"; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cross-objects
+          path: |
+            xelf/
+            xobj/
       - name: Upload bootstrap artifacts (debugging)
         if: always()
         uses: actions/upload-artifact@v4
@@ -23,3 +40,59 @@ jobs:
             build/native-bootstrap/*/stage1.o
             build/native-bootstrap/*/stage2.o
           if-no-files-found: ignore
+
+  elf-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    needs: bootstrap-macos
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: cross-objects
+      - name: Link and run ELF objects against goldens
+        run: |
+          set -x
+          pass=0; fail=0
+          for o in xelf/*.o; do
+            n=$(basename "$o" .o)
+            cc "$o" -o "/tmp/$n" 2> "/tmp/$n.link" || { echo "LINK FAIL $n"; cat "/tmp/$n.link"; fail=$((fail+1)); continue; }
+            "/tmp/$n" > "/tmp/$n.out"; rc=$?
+            if diff -q "tests/selfhost/$n.out" "/tmp/$n.out" >/dev/null 2>&1; then
+              echo "PASS $n"; pass=$((pass+1))
+            else
+              echo "DIFF $n (rc=$rc)"; diff "tests/selfhost/$n.out" "/tmp/$n.out" | head -5; fail=$((fail+1))
+            fi
+          done
+          echo "elf-linux: $pass pass, $fail fail"
+
+  coff-windows-arm64:
+    runs-on: windows-11-arm
+    needs: bootstrap-macos
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: cross-objects
+      - name: Install LLVM (lld-link)
+        run: choco install llvm -y --no-progress
+      - name: Link COFF objects
+        shell: cmd
+        run: |
+          setlocal enabledelayedexpansion
+          set /a pass=0
+          set /a fail=0
+          for %%o in (xobj\*.obj) do (
+            set n=%%~no
+            lld-link "%%o" /OUT:"%%~no.exe" /SUBSYSTEM:CONSOLE kernel32.lib ucrt.lib legacy_stdio_definitions.lib > "%%~no.link" 2>&1
+            if errorlevel 1 (
+              echo LINK FAIL %%~no
+              type "%%~no.link"
+              set /a fail+=1
+            ) else (
+              echo LINKED %%~no
+              set /a pass+=1
+            )
+          )
+          echo coff-windows: !pass! linked, !fail! failed
