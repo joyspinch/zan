@@ -69,6 +69,9 @@ partial class Ngen {
     List<string> locTy;     // declared type name per local ("" for this/params of unknown)
     List<int> locOff;       // frame offset (bytes from sp)
     List<bool> locRef;      // by-ref slots (out/ref params): the slot holds an address
+    List<int> locOpaq;      // string slot holding an extern-call result: no
+                            // length header, no trusted NUL bound (the stdlib
+                            // slices readdir's struct dirent* byte by byte)
     // A persistent lexical environment is a chain of declaration slots.
     // Every AST node records its visible chain before emission, so sibling
     // scopes and re-emitted finally bodies never borrow one another's types.
@@ -1212,6 +1215,7 @@ partial class Ngen {
             Node p = m.kids[pi];
             if (p.kind == AK.Param()) {
                 AddLoc(p.sval, TypeFullName(p.type), p.ival == 1);
+                if (locTy[nloc - 1] == "string") { locOpaq[nloc - 1] = 1; }
             }
             pi = pi + 1;
         }
@@ -1341,6 +1345,7 @@ partial class Ngen {
         locName = new List<string>(); locTy = new List<string>();
         locOff = new List<int>(); locRef = new List<bool>();
         locDecl = new List<Node>(); locPrev = new List<int>();
+        locOpaq = new List<int>();
         envNodes = new List<Node>(); envHeads = new List<int>();
         locHead = -1; nloc = 0;
     }
@@ -1350,7 +1355,62 @@ partial class Ngen {
     void AddLoc(string name, string ty, bool isRef) {
         locName.Add(name); locTy.Add(ty); locOff.Add(16 * nloc);
         locRef.Add(isRef); locDecl.Add(null); locPrev.Add(locHead);
+        locOpaq.Add(0);
         locHead = nloc; nloc = nloc + 1;
+    }
+
+    // A string slot declared with an extern-call initializer carries a raw
+    // host buffer: no stamped length header and bytes possibly past the
+    // first NUL. Marked at the declaration only, like the C host's
+    // call_targets_extern + local->opaque_string pair; reassignment never
+    // clears the flag.
+    void MarkOpaqIfExtern(string name, Node init) {
+        if (init == null) { return; }
+        int li = LocalIdx(name);
+        if (li >= 0 && locTy[li] == "string" && CallTargetsExtern(init)) {
+            locOpaq[li] = 1;
+        }
+    }
+
+    // does this call expression directly invoke an extern-declared method?
+    bool CallTargetsExtern(Node e) {
+        if (e == null || e.kind != AK.Call()) { return false; }
+        Node callee = e.a;
+        if (callee == null) { return false; }
+        string cls = null;
+        string name = callee.sval;
+        bool bare = callee.kind == AK.Ident();
+        if (bare) {
+            cls = curCls;
+        } else if (callee.kind == AK.MemberAccess() && callee.a != null
+                && callee.a.kind == AK.Ident() && FindClass(callee.a.sval) != null) {
+            cls = callee.a.sval;
+        } else {
+            return false;
+        }
+        int found = 0;
+        while (cls != null && found == 0) {
+            int i = 0;
+            while (i < methNodes.Count) {
+                if (methStat[i] == 1 && methCls[i] == cls && methNodes[i].sval == name
+                        && HasMod(methNodes[i], MOD.Extern())) { found = 1; break; }
+                i = i + 1;
+            }
+            if (found == 0) {
+                Cls c = FindClass(cls);
+                cls = c != null ? c.baseName : null;
+            }
+        }
+        if (found == 0 && bare) {
+            // legacy global-static fallback for bare names
+            int i = 0;
+            while (i < methNodes.Count) {
+                if (methStat[i] == 1 && methNodes[i].sval == name
+                        && HasMod(methNodes[i], MOD.Extern())) { found = 1; break; }
+                i = i + 1;
+            }
+        }
+        return found == 1;
     }
 
     void AddDeclNg(Node n, string name, string ty) {
@@ -1496,11 +1556,13 @@ partial class Ngen {
         } else if (k == AK.VarDecl()) {
             ReserveOutDecls(s.b);
             AddDeclNg(s, s.sval, InferDeclTyNg(s));
+            MarkOpaqIfExtern(s.sval, s.b);
             int di = 0;
             while (di < s.kids.Count) {
                 Node d = s.kids[di];
                 ReserveOutDecls(d.b);
                 AddDeclNg(d, d.sval, InferDeclTyNg(d));
+                MarkOpaqIfExtern(d.sval, d.b);
                 di = di + 1;
             }
         } else if (k == AK.IfStmt()) {
@@ -3992,6 +4054,7 @@ partial class Ngen {
                 while (pi < m.kids.Count) {
                     if (m.kids[pi].kind == AK.Param()) {
                         AddLoc(m.kids[pi].sval, TypeFullName(m.kids[pi].type), m.kids[pi].ival == 1);
+                        if (locTy[nloc - 1] == "string") { locOpaq[nloc - 1] = 1; }
                     }
                     pi = pi + 1;
                 }
@@ -4554,6 +4617,25 @@ partial class Ngen {
             i = i + 1;
         }
         return result;
+    }
+
+    // Whether a string-typed expression's NUL terminator is a reliable bound
+    // for the substring window check (mirrors the C host's
+    // expr_has_reliable_string_bounds): only string literals and plain local
+    // identifiers of string type qualify. Everything else -- string
+    // parameters, extern call results and raw FFI buffers kept in `string`
+    // slots (the stdlib slices `struct dirent*` byte by byte) -- may carry
+    // bytes past the first NUL or lack a length header entirely, so a
+    // header-backed window check would reject in-range reads; those slice
+    // raw.
+    bool IsBoundedStrExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.StringLit()) { return true; }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            return li >= 0 && locTy[li] == "string" && locOpaq[li] == 0;
+        }
+        return false;
     }
 
     // does this expression evaluate to a string? (local type / field type /
@@ -5922,19 +6004,37 @@ partial class Ngen {
             // string instance methods (gen0: Substring checks start <= len
             // and folds to 0; IndexOf is strstr with a -1 miss)
             if (e.kids.Count == 2 && IsStrExpr(recv) && callee.sval == "Substring") {
-                // two-argument form: substr3 clamps the window against the
-                // string's own length (an out-of-range window answers empty,
-                // not a crash -- gen0's soft-continue behavior)
+                // two-argument form. A receiver with reliable bounds (string
+                // literal or string local) clamps the window against the
+                // string's own length -- an out-of-range window answers
+                // empty, gen0's soft-continue behavior. An unbounded
+                // receiver (raw FFI buffer typed as `string`, e.g. the
+                // stdlib's struct dirent* sliced byte by byte) has no
+                // length header to trust: slice raw, mirroring the C host's
+                // expr_has_reliable_string_bounds policy.
+                if (IsBoundedStrExpr(recv)) {
+                    GenExpr(recv);
+                    E4(0xF81F0FE0);                  // push s
+                    GenExpr(e.kids[0]);
+                    E4(0xF81F0FE0);                  // push start
+                    GenExpr(e.kids[1]);
+                    E4(0xF81F0FE0);                  // push len
+                    E4(0xF84107E2);                  // pop len -> x2
+                    E4(0xF84107E1);                  // pop start -> x1
+                    E4(0xF84107E0);                  // pop s -> x0
+                    BLInternal("_zan_rt_substr3");
+                    return;
+                }
                 GenExpr(recv);
-                E4(0xF81F0FE0);                  // push s
+                E4(0xF81F0FE0);                      // push s
                 GenExpr(e.kids[0]);
-                E4(0xF81F0FE0);                  // push start
+                E4(0xF81F0FE0);                      // push start
                 GenExpr(e.kids[1]);
-                E4(0xF81F0FE0);                  // push len
-                E4(0xF84107E2);                  // pop len -> x2
-                E4(0xF84107E1);                  // pop start -> x1
-                E4(0xF84107E0);                  // pop s -> x0
-                BLInternal("_zan_rt_substr3");
+                E4(0xF81F0FE0);                      // push len
+                E4(0xF84107E2);                      // pop len -> x2
+                E4(0xF84107E1);                      // pop start -> x1
+                E4(0xF84107E0);                      // pop s -> x0
+                BLInternal("_zan_rt_substr_raw");
                 return;
             }
             if (e.kids.Count == 1 && IsStrExpr(recv)) {

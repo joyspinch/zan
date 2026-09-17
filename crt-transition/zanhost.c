@@ -15,6 +15,9 @@
 #include <sys/file.h>
 #include <sys/time.h>
 #include <time.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 static FILE *h2f(long h) { return (FILE *)(size_t)h; }
 
@@ -30,11 +33,47 @@ FILE *zan_file_fopen(const char *path, const char *mode) { return fopen(path, mo
 int zan_file_remove(const char *path) { return remove(path); }
 int zan_file_rename(const char *oldp, const char *newp) { return rename(oldp, newp); }
 
-/* ---- Directory.zan: fully-resolved absolute path (NULL on failure) ---- */
+/* ---- Directory.zan read-path resolution, matching rt_file.c semantics:
+ * NOT realpath. A relative path that exists in the working directory
+ * resolves to "" (the caller then keeps its own spelling); a missing
+ * relative path falls back to the packaged copy under $ZAN_PKG_DIR or next
+ * to the executable; absolute paths and misses return "". Returning the
+ * argument itself is never allowed (the managed side would release an
+ * unretained managed string). */
+static long zanh_exists(const char *p) {
+    struct stat st;
+    return (p && p[0] && stat(p, &st) == 0) ? 0 : -1;
+}
+
+static const char *zanh_app_dir(void) {
+    static char dir[4096];
+    const char *env = getenv("ZAN_APP_DIR");
+    if (env && env[0] && strlen(env) < sizeof(dir)) { return env; }
+    char exe[4096];
+    uint32_t cap = (uint32_t)sizeof(exe);
+    dir[0] = '\0';
+    if (_NSGetExecutablePath(exe, &cap) != 0) { return dir; }
+    char *sep = strrchr(exe, '/');
+    if (sep && sep != exe) {
+        *sep = '\0';
+        if (strlen(exe) < sizeof(dir)) { memcpy(dir, exe, strlen(exe) + 1); }
+    }
+    return dir;
+}
+
 char *zan_file_read_path(const char *path) {
-    char buf[4096];
-    if (!realpath(path, buf)) { return NULL; }
-    return strdup(buf);
+    if (zanh_exists(path) >= 0) { return strdup(""); }
+    if (path[0] != '/' && path[0] != '\\' && path[1] != ':') {
+        for (int which = 0; which < 2; which++) {
+            const char *base = which == 0 ? getenv("ZAN_PKG_DIR") : zanh_app_dir();
+            if (!base || !base[0]) { continue; }
+            char alt[4096];
+            if (strlen(base) + strlen(path) + 2 > sizeof(alt)) { continue; }
+            sprintf(alt, "%s/%s", base, path);
+            if (zanh_exists(alt) >= 0) { return strdup(alt); }
+        }
+    }
+    return strdup("");
 }
 
 /* ---- FileStream.zan: FILE*-backed handle, 0 = closed/failed ---- */
