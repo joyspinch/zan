@@ -155,6 +155,9 @@ partial class Ngen {
         // ---- raw memory intrinsics (System.Runtime.InteropServices) ----
         if (HostStatic(e, "NativeMemory", "Alloc", 1)
                 || HostStatic(e, "NativeMemory", "Sha256", 2)) { return "long"; }
+        // Crc32 is typed by its stdlib extern decl (int) and CallStaticNg
+        // skips the sext for it; no ret-ty arm here -- with the stdlib
+        // pulled this gate never fires anyway.
         if (HostStatic(e, "NativeMemory", "GetString", 3)) { return "string"; }
         if (HostStatic(e, "NativeMemory", "Free", 1)
                 || HostStatic(e, "NativeMemory", "PutString", 4)) { return "void"; }
@@ -4346,10 +4349,9 @@ partial class Ngen {
         HostEnd();
     }
 
-    // x0 = string -> x0 = byte[] copy, one byte per 8-byte slot (null
-    // converges to an empty array). Element reads b[j] see the byte value.
-    // x0 = dst array, x1 = src buffer, x2 = count. Copies count bytes into
-    // the array's 8-byte element slots (one byte per slot, low byte).
+    // x0 = dst array, x1 = src buffer, x2 = count -> copies count bytes
+    // into the array in the packed layout Zan element reads use (ArrElemSize:
+    // byte[] elements are one byte).
     void HostEmitSlotCopy() {
         HostBegin("_zan_ext_slot_copy");
         LoadImm(9, 0);                         // i
@@ -4358,8 +4360,7 @@ partial class Ngen {
         E4(0xEB02013F);                        // cmp x9, x2
         EmitBcond(2, done);                    // hs -> done
         ExtLdrbReg(10, 1, 9);                  // w10 = src[i]
-        ExtLsl(11, 9, 3);                      // x11 = i * 8
-        E4(0x8B00016B);                        // add x11, x11, x0
+        E4(0x8B09000B);                        // add x11, x0, x9
         ExtStrbImm(10, 11, 0);                 // dst[i] = w10
         AddImm(9, 9, 1);
         EmitB(loop);
@@ -4376,7 +4377,7 @@ partial class Ngen {
         ExtMov(0, 9);
         BLInternal("_zan_ext_arr_new");
         HostSave(0, 1);                        // arr
-        ExtMov(10, 0);                         // dst cursor (slots)
+        ExtMov(10, 0);                         // dst cursor (packed bytes)
         HostLoad(11, 2);                       // remaining
         HostLoad(12, 0);                       // src cursor
         int tbDone = NL();
@@ -4384,8 +4385,8 @@ partial class Ngen {
         Mark(tbLoop);
         CbzReg(11, tbDone);
         ExtLdrbImm(13, 12, 0);                 // byte -> w13
-        StrU(13, 10, 0);                       // slot = byte
-        AddImm(10, 10, 8);
+        ExtStrbImm(13, 10, 0);                 // dst[i] = byte (packed layout)
+        AddImm(10, 10, 1);
         AddImm(12, 12, 1);
         AddImm(11, 11, -1);
         EmitB(tbLoop);
@@ -4747,7 +4748,7 @@ partial class Ngen {
         HostLoad(9, 0); ExtLenOf(9, 9);
         HostLoad(0, 1); ExtMov(1, 9); ExtClampLen(); HostSave(0, 2);
         HostLoad(0, 0); HostLoad(1, 2); AddImm(2, 31, 64);
-        BLExtern("_CC_SHA512");
+        BLExtern("_zan_sha512");
         LoadImm(0, 64); BLInternal("_zan_ext_arr_new"); HostSave(0, 3);
         HostLoad(0, 3); AddImm(1, 31, 64); LoadImm(2, 64);
         BLInternal("_zan_ext_slot_copy");

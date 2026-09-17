@@ -91,7 +91,11 @@ long zan_file_write(long h, void *buf, long count) {
 }
 long zan_file_seek(long h, long off, int origin) {
     if (!h) { return -1; }
-    return fseek(h2f(h), (long)off, origin);
+    /* returns the resulting absolute offset (like the oracle's
+     * fseeko!=0 ? -1 : ftello), not fseek's success flag -- FileStream.Length
+     * reads the size as seek(handle, 0, SEEK_END) */
+    if (fseek(h2f(h), (long)off, origin) != 0) { return -1; }
+    return (long)ftell(h2f(h));
 }
 long zan_file_tell(long h) { return h ? (long)ftell(h2f(h)) : -1; }
 long zan_file_flush(long h) { return h ? (long)fflush(h2f(h)) : -1; }
@@ -100,17 +104,19 @@ long zan_file_eof(long h) { return h ? (feof(h2f(h)) ? 1 : 0) : 1; }
 
 /* ---- FileInfo.zan / FileInfoEx.zan ----
  * attributes: bit0 readonly, bit1 hidden (leading '.'), bit2 directory;
- * -1 = path missing. time: 0 = mtime, 1 = creation (birthtime), 2 = atime. */
+ * -1 = path missing. time: 0 = mtime, 1 = creation (st_ctime on POSIX,
+ * like the oracle), 2 = atime. length: -1 only when stat fails (the oracle
+ * reports directory sizes too). */
 long zan_file_length(const char *path) {
     struct stat st;
-    if (stat(path, &st) != 0 || (st.st_mode & S_IFMT) == S_IFDIR) { return -1; }
+    if (stat(path, &st) != 0) { return -1; }
     return (long)st.st_size;
 }
 long zan_file_attributes(const char *path) {
     struct stat st;
     if (stat(path, &st) != 0) { return -1; }
     long a = 0;
-    if ((st.st_mode & S_IFMT) != S_IFDIR && (st.st_mode & 0222) == 0) { a |= 1; }
+    if (access(path, W_OK) != 0) { a |= 1; }
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
     if (base[0] == '.') { a |= 2; }
@@ -118,13 +124,13 @@ long zan_file_attributes(const char *path) {
     return a;
 }
 long zan_file_time(const char *path, int which) {
+    /* oracle rt_file.c: missing/empty path -> 0 (not -1) */
+    if (!path || !path[0]) { return 0; }
     struct stat st;
-    if (stat(path, &st) != 0) { return -1; }
-    struct timespec ts;
-    if (which == 0) { ts = st.st_mtimespec; }
-    else if (which == 1) { ts = st.st_birthtimespec; }
-    else { ts = st.st_atimespec; }
-    return (long)ts.tv_sec;
+    if (stat(path, &st) != 0) { return 0; }
+    if (which == 1) { return (long)st.st_ctime; }
+    if (which == 2) { return (long)st.st_atime; }
+    return (long)st.st_mtime;
 }
 long zan_file_set_readonly(const char *path, int on) {
     struct stat st;
@@ -148,18 +154,54 @@ long zan_file_set_time(const char *path, int which, long unixSec) {
     return utimensat(AT_FDCWD, path, ts, 0) == 0 ? 1 : 0;
 }
 
-/* ---- File.zan TryLock/Unlock: the lock IS the open handle; the kernel
- * releases it when the process dies, so no stale pid-file markers. ---- */
-long zan_file_try_lock(const char *path) {
-    int fd = open(path, O_RDWR | O_CREAT, 0644);
-    if (fd < 0) { return 0; }
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0) { close(fd); return 0; }
-    return (long)fd;
+/* ---- File.zan TryLock/Unlock: handles encode (gen << 32) | slot into a
+ * small table, like the oracle (rt_file.c): the generation makes a second
+ * unlock of the same handle value fail (returns 0) instead of releasing
+ * whatever lock now occupies the slot. ---- */
+#define ZAN_LK_CAP 32
+static struct { int fd; int used; unsigned int gen; } g_lk_table[ZAN_LK_CAP];
+
+static long zan_lk_index(long long h) {
+    if (h <= 0) { return -1; }
+    unsigned long long u = (unsigned long long)h;
+    unsigned int gen = (unsigned int)(u >> 32);
+    unsigned long long slot = u & 0xFFFFFFFFULL;
+    if (slot >= ZAN_LK_CAP) { return -1; }
+    if (!g_lk_table[slot].used || g_lk_table[slot].gen != gen) { return -1; }
+    return (long)slot;
 }
-long zan_file_unlock(long h) {
-    if (!h) { return 0; }
-    flock((int)h, LOCK_UN);
-    close((int)h);
+
+long zan_file_try_lock(const char *path) {
+    if (!path || !path[0]) { return 0; }
+    long slot = -1;
+    for (long i = 0; i < ZAN_LK_CAP; i++) {
+        if (!g_lk_table[i].used) { slot = i; g_lk_table[i].used = 1; break; }
+    }
+    if (slot < 0) { return 0; }
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) { g_lk_table[slot].used = 0; return 0; }
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) { close(fd); g_lk_table[slot].used = 0; return 0; }
+    unsigned int next = g_lk_table[slot].gen + 1;
+    if (next == 0) {  /* wrap: retire the slot like the oracle */
+        close(fd);
+        g_lk_table[slot].used = 2;
+        return 0;
+    }
+    g_lk_table[slot].gen = next;
+    g_lk_table[slot].fd = fd;
+    return (long)(((unsigned long long)next << 32) | (unsigned long long)slot);
+}
+
+long zan_file_unlock(long long h) {
+    long slot = zan_lk_index(h);
+    if (slot < 0) { return 0; }
+    int fd = g_lk_table[slot].fd;
+    g_lk_table[slot].fd = -1;
+    g_lk_table[slot].used = 0;
+    unsigned int ng = g_lk_table[slot].gen + 1;
+    if (ng == 0) { ng = 1; }
+    g_lk_table[slot].gen = ng;   /* a second unlock of the same value fails */
+    close(fd);                   /* drops the flock */
     return 1;
 }
 

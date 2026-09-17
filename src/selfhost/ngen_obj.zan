@@ -78,6 +78,9 @@ partial class Ngen {
     int fmtwIdx;
     int fmtcIdx;
     int emptyIdx;
+    int fmtUnhandledIdx;      // "Unhandled exception: " (heap via strp)
+    int fmtUnhandledClsIdx;   // "Unhandled exception (class object)"
+    int fmtUnhandledBareIdx;  // "Unhandled exception"
 
     Cls FindClass(string n) {
         // instantiated generic names ("Pool<Conn>") resolve to the open
@@ -422,6 +425,12 @@ partial class Ngen {
         fmtcIdx = strs.Count - 1;
         strs.Add("");
         emptyIdx = strs.Count - 1;
+        strs.Add("Unhandled exception: ");
+        fmtUnhandledIdx = strs.Count - 1;
+        strs.Add("Unhandled exception (class object)");
+        fmtUnhandledClsIdx = strs.Count - 1;
+        strs.Add("Unhandled exception");
+        fmtUnhandledBareIdx = strs.Count - 1;
         dglbs.Add(new DGlob("zan_eh", 8, dataLen));
         dataLen = dataLen + 8;
         RtEmitAlloc();
@@ -995,6 +1004,31 @@ partial class Ngen {
             i = i + 1;
         }
         RtEpilogue();
+    }
+
+    // ptr _zan_eh_cls_name(long site): pure-code lookup returning the HEAP
+    // strpool string for a thrown object's site id (1-based), or 0. The
+    // uncaught-exception tail reports it like the oracle resolves names
+    // through its tid-name registry (irgen_stmt.c reh.cls). Returning the
+    // pool object (not the raw cstring) lets the tail feed it straight into
+    // _zan_rt_strcat2/_zan_rt_println -- the same path as Console.WriteLine.
+    void EmitClsNameFn() {
+        syms.Add(new Sym("_zan_eh_cls_name", txt.Count));
+        RtPrologue();
+        int i = 0;
+        while (i < classes.Count) {
+            LoadImm(1, i + 1);
+            E4(0xEB01001F);                    // cmp x0, x1
+            EmitBcond(1, NL());                // b.ne next
+            int hit = lblPos.Count - 1;
+            strs.Add(classes[i].name);
+            LoadStr(strs.Count - 1, 0);        // x0 = heap "Oops"
+            RtEpilogue();                      // return name
+            Mark(hit);
+            i = i + 1;
+        }
+        LoadImm(0, 0);
+        RtEpilogue();                          // unknown site: 0
     }
 
     // ptr _zan_rt_eh_state(): the exception-state block, allocated on first

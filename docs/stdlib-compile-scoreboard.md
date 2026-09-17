@@ -1,6 +1,48 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-17 · 编译器 187e3d2（00b5589 + 链式指数修复 + host 名字闸门）
+日期：2026-09-17 · v4 · 定点 run.H78JR0（本轮批次后）
+
+## v4 结果（2026-09-17，run.H78JR0 定点，顺序执行，alarm 120）
+
+| 桶 | 数量 | 定性 |
+|---|---|---|
+| 干净（no static Main） | 1218 | 96.1%，与 v3 持平：本批对 stdlib 零回归 |
+| Json.Deserialize<T> 类不在本文件 | 47 | 44 直接报类未知 + 3 Json mapper 字段不支持，与 v3 的 47 同一集合 |
+| 语法：嵌套集合初始化器 | 2 | CefBootstrap.zan、DownloadDialog.zan（v3 已知） |
+
+超时 0、崩溃 0。
+
+本轮批次内容（定点 run.whfZQX → run.H78JR0）：
+
+1. **NativeMemory.Crc32 零扩展**：stdlib 声明 int 但 oracle intrinsic 返回全宽
+   i64（`zext i32`），CallStaticNg 对 Crc32 按 long 收窄；zanstubs 的
+   `(int)` 截断一并去掉。native_memory/crypto_digests/stream_io 转绿。
+2. **file_info/file_lock 语义**：zan_file_time 缺失路径返 0（非 -1）、ctime 作
+   创建时间；file_length 不再排除目录；readonly 位改 access(W_OK)；
+   File.TryLock/Unlock 换 oracle 的 gen/slot 句柄表（二次 unlock 返 0）。
+3. **未捕获类异常报告**：oracle 把 "Unhandled exception: <类名>\n" 打到 stdout
+   （irgen_stmt.c reh.\*）。ngen 尾部改走 strpool 堆串 + strcat2/println（与
+   Console.WriteLine 同路），类名经 _zan_eh_cls_name 纯代码查表返回堆串；
+   此前 printf+raw cstring 路径打印空名。fileinfoex_mmap 转 matching。
+4. **ToBytes/slot_copy 密集写**：byte[] 是打包布局（ArrElemSize=1），但
+   _zan_ext_to_bytes/_zan_ext_slot_copy 按 8 字节 slot 落盘，产出 NUL 交错
+   字节——xlsx_write/xlsx_stream 的 zip 全部损坏。改 strb 步长 1。
+5. **新增 Tilde token（'!' 与 '~' 分离）**：lexer 曾把 `~` 折进 `!`，ngen 按
+   IsBoolExpr 分发逻辑/按位取反——`!d.ContainsKey(k)`（int 形 0/1 谓词）走
+   mvn 后 cbz 恒判真，dict_growth/list_string_search 全 miss。现 `!` 恒为
+   `cmp #0/cset eq`（与 irgen icmp-eq-0 一致），`~` 独立 token 走 mvn
+   （oracle 探针钉死两种语义）。
+
+同批 conformance sweep（549 例，/tmp/zanc-new）：pass 235→257、
+native_compile_failed 287→244、新 matching_nonzero_exit 桶 11（双侧一致失败，
+如 fileinfoex_mmap）；fileinfoex_mmap/file_info/file_lock/native_memory/
+xlsx_write/xlsx_stream 定向全绿；39/39 回归；bootstrap 定点逐字节一致
+（run.H78JR0）。v3 时代遗留（在 whfZQX 上同样失败、非本轮引入，立待办）：
+float/宽度/格式 output_mismatch 族（float_widths、unsigned_widths、
+int_format_boundaries、datetime_civil、float_list_slot、cs_b10_interp_format、
+cs_b16_keyvaluepair、interp_nested、lang_fixes、urldecode_nul）、链接失败
+extension_methods/native_memory_sha256/respack_roundtrip/win_ping_network、
+exit mismatch binding_\*3/objinit_ctor_field_overwrite/win_taskscheduler_smoke。
 
 ## v2 → v3 之间修掉了什么（挂死根因链）
 

@@ -210,6 +210,7 @@ partial class Ngen {
         }
         EmitDelegateThunks();
         HostEmitPackedSlice();
+        EmitClsNameFn();
         RtEmitStrpool();
         Patch();
         return BuildMachO();
@@ -601,6 +602,10 @@ partial class Ngen {
             AddSPImm(8 * sres + 16 * pushed, true);      // caller cleans dest + pushes
         }
         string rt = TypeFullName(m.type);
+        // the stdlib decl says int, but the oracle lowers this call as an
+        // intrinsic returning the full i64 CRC -- no sext may narrow it
+        // (conformance native_memory compares it against 3421780262)
+        if (m.sval == "Crc32" && methCls[mi] == "NativeMemory") { rt = "long"; }
         if (rt == "int") {
             E4(0x93407C00);                              // sxtw x0, w0 (e.g. EOF == -1)
         } else if (rt == "short") {
@@ -2544,10 +2549,15 @@ partial class Ngen {
                     if (ku32 != 0) { Wrap32(ku32); }
                 }
             } else if (e.op == TK.Bang()) {
-                // cset needs fresh flags: cmp against 1 so any nonzero-ish
-                // bool (0/1 in practice) negates correctly
-                E4(0xF100041F);                      // cmp x0, #1
-                E4(0x9A9F07E0);                      // cset x0, ne
+                // logical not on every operand shape: `!x` is (x == 0),
+                // matching the IR's icmp eq 0 (irgen_expr) -- this is what
+                // makes `!d.ContainsKey(k)` behave on an int-shaped 0/1
+                // predicate
+                E4(0xF100001F);                      // cmp x0, #0
+                E4(0x9A9F17E0);                      // cset x0, eq
+            } else if (e.op == TK.Tilde()) {
+                // source-level `~`: the C# bitwise complement
+                E4(0xAA2003E0);                      // orn x0, xzr, x0 (mvn)
             } else if (e.op == TK.PlusPlus() || e.op == TK.MinusMinus()) {
                 // prefix ++/--: yield the NEW value
                 GenIncDec(e.a, e.op == TK.PlusPlus(), true);
@@ -5525,8 +5535,10 @@ partial class Ngen {
                     && callee.sval == "CompareOrdinal" && e.kids.Count == 2) {
                 GenExpr(e.kids[0]);                      // a
                 E4(0xF81F0FE0);                          // push a
-                GenExpr(e.kids[1]);                      // b -> x0
-                E4(0xF84107E1);                          // pop a -> x1
+                GenExpr(e.kids[1]);                      // b
+                E4(0xF81F0FE0);                          // push b
+                E4(0xF84107E1);                          // pop b -> x1
+                E4(0xF84107E0);                          // pop a -> x0
                 BLExtern("_strcmp");
                 E4(0x93407C00);                          // sxtw x0, w0
                 return;
@@ -7242,8 +7254,9 @@ partial class Ngen {
 
     // unwind one frame: longjmp into the handler below the current top; with
     // no handler left, report and exit(1). A string exception prints its
-    // text like gen0; a class object exits without printing (gen0's uncaught
-    // note goes to stderr, which the stdout goldens never see).
+    // text; a class object prints its class name via the clsn registry --
+    // both to stdout with the "Unhandled exception: " prefix, matching the
+    // oracle's uncaught tail (irgen_stmt.c reh.*).
     void EhRethrowNg() {
         BLInternal("_zan_rt_eh_state");
         MovRR(1, 0);
@@ -7284,20 +7297,44 @@ partial class Ngen {
         LoadImm(1, 1);
         BLExtern("_longjmp");
         Mark(uncaught);
+        // report like the oracle (irgen_stmt.c reh.*): a string throw prints
+        // its text, a class throw the class name via _zan_eh_cls_name,
+        // nothing in flight the bare note -- then exit(1). Everything rides
+        // strpool heap strings + _zan_rt_strcat2/_zan_rt_println, the exact
+        // path Console.WriteLine uses, so no printf/raw-cstring variables.
         LdrU(0, 1, 8);                               // exc
-        LoadImm(2, 0);
-        int isObj = NL();
-        CbzReg(0, isObj);
+        int none = NL();
+        CbzReg(0, none);
         E4(0xF85F8002);                              // ldur x2, [x0, #-8] (desc)
         E4(0xD360FC42);                              // lsr x2, x2, #32 (site)
-        Mark(isObj);
-        LoadImm(3, classes.Count);
+        LoadImm(3, classes.Count + 1);
         E4(0xEB03005F);                              // cmp x2, x3
-        int skipPr = NL();
-        EmitBcond(9, skipPr);                        // b.ls (class object: silent)
-        LdrU(0, 1, 8);
+        int isStr = NL();
+        EmitBcond(8, isStr);                         // b.hi: not a class site
+        MovRR(0, 2);                                 // x0 = site
+        BLInternal("_zan_eh_cls_name");              // x0 = heap name or 0
+        int anon = NL();
+        CbzReg(0, anon);
+        MovRR(1, 0);                                 // x1 = name
+        LoadStr(fmtUnhandledIdx, 0);                 // x0 = prefix
+        BLInternal("_zan_rt_strcat2");
         BLInternal("_zan_rt_println");
-        Mark(skipPr);
+        int done = NL();
+        EmitB(done);
+        Mark(anon);
+        LoadStr(fmtUnhandledClsIdx, 0);
+        BLInternal("_zan_rt_println");
+        EmitB(done);
+        Mark(isStr);
+        MovRR(1, 0);                                 // x1 = exc string
+        LoadStr(fmtUnhandledIdx, 0);                 // x0 = prefix
+        BLInternal("_zan_rt_strcat2");
+        BLInternal("_zan_rt_println");
+        EmitB(done);
+        Mark(none);
+        LoadStr(fmtUnhandledBareIdx, 0);
+        BLInternal("_zan_rt_println");
+        Mark(done);
         LoadImm(0, 1);
         BLExtern("_exit");
     }
