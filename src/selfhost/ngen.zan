@@ -274,6 +274,9 @@ partial class Ngen {
         if (t == "short" || t == "ushort" || t == "byte" || t == "sbyte"
                 || t == "char" || t == "bool") { return true; }
         if (t == "float" || t == "double") { return true; }
+        // delegates pass as their closure value: a pointer to the
+        // {thunk, env} block, an ordinary integer-class word
+        if (IsDelegateTyNg(t)) { return true; }
         return IsArrTy(t);
     }
 
@@ -3427,8 +3430,10 @@ partial class Ngen {
     // declared static type name of an expression (before class identity
     // normalization), or null when nothing is known
     string StaticTyOf(Node e) {
-        // Depth guard: cyclic type chains (e.g. DownloadJob.zan's fluent
-        // chains) bottom out as unknown instead of recursing forever.
+        // Depth guard: cyclic type chains bottom out as unknown instead of
+        // recursing forever. Fluent chains are typed WITHOUT memoization:
+        // position keys mislabel sub-nodes sharing an expression start, and
+        // the chain walkers reuse already-computed receiver types instead.
         if (stTyDepth > 96) { return null; }
         stTyDepth = stTyDepth + 1;
         string r = StaticTyOfInner(e);
@@ -4890,9 +4895,40 @@ partial class Ngen {
     // `Box<string> b`, `b.At(i)` reads as `string`, not the bare `T`
     // (gen0 instantiates generics; ngen substitutes textually). Falls
     // back to the raw declared type whenever either side is unknown.
+    // type of a call's callee VALUE, typing the receiver chain once; mirrors
+    // StaticTyOfInner's MemberAccess arm for member callees. CallRetTy needs
+    // both the callee's type (delegate dispatch) and the receiver's class
+    // (generic SubstTy tail); typing each independently re-walks a fluent
+    // chain's prefix per level and turns a 12-call chain into an
+    // exponential number of walks (DownloadJob.SnapshotPolicy hang).
+    string CalleeTyOf(Node cc) {
+        if (cc == null) { return null; }
+        if (cc.kind != AK.MemberAccess()) { return StaticTyOf(cc); }
+        if ((cc.sval == "Keys" || cc.sval == "Values") && ExprCls(cc.a) == "Dict") {
+            return "List<" + DictSlotTy(cc.a, cc.sval == "Keys") + ">";
+        }
+        if (cc.a != null && cc.a.kind == AK.Ident() && FindEnum(cc.a.sval) >= 0) { return cc.a.sval; }
+        Fld f = FieldOf(cc);
+        return f != null ? f.ty : null;
+    }
+
     string CallRetTy(Node e) {
-        string dt = DelegateCallRetTy(e);
-        if (dt != null) { return dt; }
+        Node cc = DelegateCalleeNg(e);
+        if (cc == null) { cc = e.a; }
+        string recvTy = null;
+        string valTy = null;
+        if (cc != null && cc.kind == AK.MemberAccess() && cc.a != null) {
+            // one walk down the receiver chain; FieldOf's substitution is
+            // applied directly so the chain is not re-typed
+            recvTy = StaticTyOf(cc.a);
+            if (recvTy != null) {
+                Fld cf = FieldOfInst(recvTy, cc.sval);
+                if (cf != null) { valTy = cf.ty; }
+            }
+        } else {
+            valTy = StaticTyOf(cc);
+        }
+        if (valTy != null && IsDelegateTyNg(valTy)) { return DelegateRetNg(valTy); }
         string ht = HostCallRetTy(e);
         if (ht != null) { return ht; }
         string st = StringCallRetTy(e);
@@ -4918,12 +4954,13 @@ partial class Ngen {
         // (prints 0/1). Keep the model exact. The callee may carry a generic
         // spec suffix ("Remove$string"), so compare the bare name.
         if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.sval != null
-                && e.a.a != null && ExprCls(e.a.a) == "Dict"
                 && e.kids != null && e.kids.Count == 1) {
             string rname = e.a.sval;
             int rd = rname.IndexOf("$");
             if (rd > 0) { rname = rname.Substring(0, rd); }
-            if (rname == "Remove") { return "bool"; }
+            // name check BEFORE ExprCls: typing the receiver here re-walks
+            // fluent-chain prefixes and compounds per level
+            if (rname == "Remove" && e.a.a != null && ExprCls(e.a.a) == "Dict") { return "bool"; }
         }
         // File.Exists the runtime answers with a 0/1 bool (feeds `!`/if directly)
         if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.sval == "Exists"
@@ -4957,7 +4994,12 @@ partial class Ngen {
             : MethRetTy(e.a != null ? e.a.sval : null);
         if (rty == null || rty == "") { return rty; }
         if (e.a == null || e.a.kind != AK.MemberAccess() || e.a.a == null) { return rty; }
-        string recv = StaticTyOf(e.a.a);
+        // recvTy (typed above, cc == e.a here) IS StaticTyOf(e.a.a): re-typing
+        // it re-walks fluent-chain prefixes at every level, compounding
+        // exponentially (DownloadJob.SnapshotPolicy hang). Only the
+        // .Invoke-stripped shape needs a fresh type.
+        string recv = recvTy;
+        if (recv == null && e.a.sval == "Invoke") { recv = StaticTyOf(e.a.a); }
         if (recv == null) { return rty; }
         int lt = recv.IndexOf("<");
         if (lt <= 0 || recv.Substring(recv.Length - 1, 1) != ">") { return rty; }
