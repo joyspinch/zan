@@ -51,6 +51,36 @@ O(unit²) methNodes 扫描（ResolveStaticNg/FitPickIdx 线性查全表）另立
 | oracle-parity 失败 | 47 | Jd Json 类解析、Wechat List mapper 等，oracle 同样失败 |
 | 挂死/超时 | 194 | 本轮根因链（见上）——预期 v3 大部分转干净 |
 
+## v3 结果（2026-09-17，4b62eb6，run.whfZQX 定点，顺序执行，alarm 120）
+
+| 桶 | 数量 | 定性 |
+|---|---|---|
+| 干净（no static Main） | 1218 | 96.1%，单文件前端零失败 |
+| Json.Deserialize<T> 类不在本文件 | 47 | 探针假象：目标类在同空间其他文件（Jd/Wechat Sdk 等），fail-closed 正确，oracle 同样失败 |
+| 语法：嵌套集合初始化器 | 2 | CefBootstrap.zan、DownloadDialog.zan `Panel.Row() { Children = { … } }` |
+
+超时 0、崩溃 0、extern ABI 闸门 0。v2 的 194 个挂死/超时全部转干净；v1 的
+extern ABI 闸门（35）与 DownloadJob 挂死已在此前的 F 代理/拉取修复中根除。
+
+促成 v3 的四个修复（4b62eb6 + 811cbc4）：
+
+1. **按需拉取过滤器**（811cbc4，oracle pi_\* 移植）：单文件探针不再拖入整库，
+   挂死与跨文件错误噪声随之消失。
+2. **MACOS 预定义宏**：此前 `#elif MACOS` 的 Darwin 分支（dirent d_type@20/
+   d_name@21 等）静默编译了 LINUX 布局，目录列举把条目分错类。
+3. **opaque-string 数据流**：`string ent = readdir(d)` 这类 extern 初始化的
+   string 局部与全部 string 形参按 oracle 规则标记无长度头；其两参 Substring
+   走新的 `_zan_rt_substr_raw`（按字节裸切+实盖章），有界接收者仍走
+   `_zan_rt_substr3` 的窗口钳制。此前无头缓冲上的切片一律答空。
+4. **zan_file_read_path 语义**：ct 过渡层误写成 realpath；oracle 对工作目录
+   存在的路径返回 ""（保留调用方拼写），仅对缺失的相对路径做
+   `$ZAN_PKG_DIR`/应用目录兜底（directory_paths 测试钉住此契约）。
+
+同批 parity sweep（549 例）：239→241 pass；directory_paths exit_mismatch→pass；
+win_printing_raw_backend/smoke compile_failed→pass；clipboard_roundtrip
+compile_failed→output_mismatch（oracle 自身在 macOS 抛 PlatformNotSupportedException，
+环境性）。chart_\* 40 例 60s 编译超时为已知 O(unit²) methNodes 扫描（未变）。
+
 ---
 
 日期：2026-09-15 · 编译器：HEAD+jsongen 改名（self-build，含 ZedMapperCls 修复）
