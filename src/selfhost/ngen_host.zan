@@ -68,6 +68,24 @@ partial class Ngen {
             && HostIsBuilder(e.a);
     }
 
+    // cheap name gate: could (name, argc) name a DateTime instance member?
+    // Host arms MUST gate on this before StaticTyOf(e.a.a): typing the
+    // receiver re-walks fluent-chain prefixes at every level (exponential in
+    // chain length) whenever the stdlib class is absent from the compile.
+    bool IsDateTimeMemberName(string n, int argc) {
+        if (argc == 0) {
+            return n == "ToString" || n == "ToDateString" || n == "ToTimeString"
+                || n == "ToUnixSeconds" || n == "Year" || n == "Month"
+                || n == "Day" || n == "Hour" || n == "Minute" || n == "Second"
+                || n == "DayOfWeek";
+        }
+        if (argc == 1) {
+            return n == "AddSeconds" || n == "AddMinutes" || n == "AddHours"
+                || n == "AddDays" || n == "Equals" || n == "IsBefore" || n == "IsAfter";
+        }
+        return false;
+    }
+
     string HostCallRetTy(Node e) {
         if (e == null) { return null; }
         if (e.kind == AK.NewExpr() && e.type != null && e.type.sval == "StringBuilder"
@@ -97,6 +115,7 @@ partial class Ngen {
         // DateTime instance members (stdlib class absent from the compile)
         if (e.kind == AK.Call() && e.a != null && e.a.kind == AK.MemberAccess()
                 && e.a.a != null && FindClass("DateTime") == null
+                && IsDateTimeMemberName(e.a.sval, e.kids.Count)
                 && StaticTyOf(e.a.a) == "DateTime"
                 && !UserDefinesClsMember("DateTime", e.a.sval)) {
             string mn2 = e.a.sval;
@@ -115,6 +134,8 @@ partial class Ngen {
                     && e.kids.Count == 1) { return "bool"; }
         }
         if (e.kind == AK.Call() && e.a != null && e.a.kind == AK.MemberAccess()
+                && (e.a.sval == "ToString" || e.a.sval == "Append"
+                    || e.a.sval == "AppendLine")
                 && HostIsBuilder(e.a.a)) {
             if (e.a.sval == "ToString" && e.kids.Count == 0) { return "string"; }
             if ((e.a.sval == "Append" && e.kids.Count == 1)
@@ -143,16 +164,22 @@ partial class Ngen {
         if ((HostStatic(e, "int", "TryParse", 2)
                 || HostStatic(e, "long", "TryParse", 2))) { return "bool"; }
         // ---- AtomicInt instance members (stdlib class absent) ----
-        if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.a != null
-                && HostAtomicRecvTy(e.a.a) != null
-                && !UserDefinesClsMember("AtomicInt", e.a.sval)) {
+        if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.a != null) {
+            // name gate BEFORE typing the receiver (chain-prefix re-walks
+            // compound exponentially when the stdlib class is absent)
             string an = e.a.sval;
             if ((an == "Load" || an == "Add" || an == "Increment"
                     || an == "Decrement" || an == "Exchange"
-                    || an == "CompareExchange") && (e.kids.Count == 0
-                    || e.kids.Count == 1 || (an == "CompareExchange"
-                        && e.kids.Count == 2))) { return "long"; }
-            if (an == "Store" && e.kids.Count == 1) { return "void"; }
+                    || an == "CompareExchange" || an == "Store")
+                    && HostAtomicRecvTy(e.a.a) != null
+                    && !UserDefinesClsMember("AtomicInt", an)) {
+                if ((an == "Load" || an == "Add" || an == "Increment"
+                        || an == "Decrement" || an == "Exchange"
+                        || an == "CompareExchange") && (e.kids.Count == 0
+                        || e.kids.Count == 1 || (an == "CompareExchange"
+                            && e.kids.Count == 2))) { return "long"; }
+                if (an == "Store" && e.kids.Count == 1) { return "void"; }
+            }
         }
         if (HostStatic(e, "KnownFolders", "Home", 0)
                 || HostStatic(e, "KnownFolders", "Temp", 0)
@@ -183,18 +210,26 @@ partial class Ngen {
                 && e.a.a != null) {
             string mn3 = e.a.sval;
             int n3 = e.kids.Count;
-            if (FindClass("Stopwatch") == null && StaticTyOf(e.a.a) == "Stopwatch"
+            if (FindClass("Stopwatch") == null
+                    && (mn3 == "Start" || mn3 == "Stop" || mn3 == "Reset"
+                        || mn3 == "ElapsedMilliseconds")
+                    && StaticTyOf(e.a.a) == "Stopwatch"
                     && !UserDefinesClsMember("Stopwatch", mn3)) {
                 if ((mn3 == "Start" || mn3 == "Stop" || mn3 == "Reset")
                         && n3 == 0) { return "void"; }
                 if (mn3 == "ElapsedMilliseconds" && n3 == 0) { return "double"; }
             }
-            if (FindClass("Timer") == null && StaticTyOf(e.a.a) == "Timer"
+            if (FindClass("Timer") == null && (mn3 == "Start" || mn3 == "Stop")
+                    && StaticTyOf(e.a.a) == "Timer"
                     && !UserDefinesClsMember("Timer", mn3)) {
                 if (mn3 == "Start" && n3 == 0) { return "bool"; }
                 if (mn3 == "Stop" && n3 == 0) { return "void"; }
             }
-            if (FindClass("FileInfo") == null && StaticTyOf(e.a.a) == "FileInfo"
+            if (FindClass("FileInfo") == null
+                    && (mn3 == "Exists" || mn3 == "IsDirectory" || mn3 == "IsReadOnly"
+                        || mn3 == "NewerThan" || mn3 == "SetReadOnly" || mn3 == "Length"
+                        || mn3 == "LastWriteTime" || mn3 == "CreationTime" || mn3 == "FullName")
+                    && StaticTyOf(e.a.a) == "FileInfo"
                     && !UserDefinesClsMember("FileInfo", mn3)) {
                 if ((mn3 == "Exists" || mn3 == "IsDirectory" || mn3 == "IsReadOnly"
                         || mn3 == "NewerThan" || mn3 == "SetReadOnly") && n3 <= 1) { return "bool"; }
@@ -510,7 +545,9 @@ partial class Ngen {
         if (HostStatic(e, "DateTime", "DaysInMonth", 2)) { HostCallArgs(e, "_zan_dt_daysinmonth"); return true; }
         // ---- DateTime instance accessors/formatting (stdlib class absent) ----
         if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.a != null
-                && FindClass("DateTime") == null && StaticTyOf(e.a.a) == "DateTime") {
+                && FindClass("DateTime") == null
+                && IsDateTimeMemberName(e.a.sval, e.kids.Count)
+                && StaticTyOf(e.a.a) == "DateTime") {
             string mn = e.a.sval;
             int n = e.kids.Count;
             if (n == 0 && !UserDefinesClsMember("DateTime", mn)) {
@@ -973,11 +1010,14 @@ partial class Ngen {
         }
         // ---- AtomicInt instance members ----
         if (FindClass("AtomicInt") == null && e.a != null
-                && e.a.kind == AK.MemberAccess() && e.a.a != null
-                && HostAtomicRecvTy(e.a.a) != null
-                && !UserDefinesClsMember("AtomicInt", e.a.sval)) {
+                && e.a.kind == AK.MemberAccess() && e.a.a != null) {
             string an2 = e.a.sval;
             int an = e.kids.Count;
+            if (!(an2 == "Load" || an2 == "Add" || an2 == "Increment"
+                    || an2 == "Decrement" || an2 == "Exchange"
+                    || an2 == "CompareExchange" || an2 == "Store")) { an2 = null; }
+            if (an2 != null && HostAtomicRecvTy(e.a.a) != null
+                    && !UserDefinesClsMember("AtomicInt", an2)) {
             if (an2 == "Load" && an == 0) {
                 GenExpr(e.a.a);
                 E4(0xC8DFFC00);                    // ldar x0, [x0]
@@ -1023,10 +1063,15 @@ partial class Ngen {
                 ExtMov(0, 1);                      // old value
                 return true;
             }
+            }
         }
         if (TryGenHostExtCall(e)) { return true; }
-        if (e.a == null || e.a.kind != AK.MemberAccess() || !HostIsBuilder(e.a.a)) { return false; }
+        if (e.a == null || e.a.kind != AK.MemberAccess()) { return false; }
+        // name gate before HostIsBuilder: typing the receiver re-walks
+        // fluent-chain prefixes at every level
         string name = e.a.sval;
+        if (!(name == "ToString" || name == "Append" || name == "AppendLine")) { return false; }
+        if (!HostIsBuilder(e.a.a)) { return false; }
         if (name == "ToString" && e.kids.Count == 0) {
             GenExpr(e.a.a); BLInternal("_zan_host_sb_string"); return true;
         }
@@ -1463,8 +1508,14 @@ partial class Ngen {
         string name = e.a.sval;
         Node r = e.a.a;
         int n = e.kids.Count;
-        // instance families on string receivers (r may be any string expr)
-        if (r != null && IsStrExpr(r)) {
+        // instance families on string receivers (r may be any string expr);
+        // name gate BEFORE IsStrExpr: typing the receiver re-walks
+        // fluent-chain prefixes at every level (exponential in chain length)
+        if (r != null && (name == "ToBytes" || name == "LastIndexOf"
+                || name == "Contains" || name == "Split" || name == "Trim"
+                || name == "ToUpper" || name == "ToLower" || name == "StartsWith"
+                || name == "EndsWith" || name == "Equals" || name == "CompareTo")
+                && IsStrExpr(r)) {
             if (name == "ToBytes" && n == 0 && !UserDefinesClsMember(null, "ToBytes")) { return "byte[]"; }
             if (!UserDefinesClsMember(null, name)) {
                 if (name == "LastIndexOf" && n == 1) { return "int"; }
