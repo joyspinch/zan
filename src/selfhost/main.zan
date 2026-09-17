@@ -13,10 +13,85 @@ namespace Zan;
 // is written to <output.ll>. clang then compiles that to a native executable.
 //
 // Like the C host, stdlib modules are auto-included by PATH: every
-// `using X.Y.Z;` directive maps to <stdlib_root>/X/Y/Z and all *.zan files
-// there are compiled in, resolved to a fixpoint (a pulled-in module may itself
-// `using` another namespace). stdlib_root is discovered relative to the
-// compiler executable (exe_dir/../stdlib, else exe_dir/stdlib).
+// `using X.Y.Z;` directive maps to <stdlib_root>/X/Y/Z, resolved to a
+// fixpoint (a pulled-in module may itself `using` another namespace).
+// stdlib_root is discovered relative to the compiler executable
+// (exe_dir/../stdlib, else exe_dir/stdlib).
+//
+// Pull-in is demand-driven (the C host's pi_* filter): user sources seed a
+// live-name set, globbed stdlib files carry only lexed metadata, and a file
+// joins the parse when a live name can reach it -- see the Pi* classes and
+// PiSeedSource/PiCloseOnce below.
+
+// ---- demand-driven stdlib pull-in (port of the C host's pi_* filter) ----
+//
+// The glob-everything scan compiles every *.zan under each `using`-ed
+// namespace even when the program names a handful of types (`using System;`
+// parses 100+ files for one Console call). With the filter, globbed files
+// join the parse only when something live can name them:
+//
+//   - every identifier in the already-included user sources seeds a live
+//     name set (a deliberate over-approximation: namespace segments, member
+//     names and keywords only ever add candidates, never remove them);
+//   - a reached directory is scanned once per file with the real lexer for
+//     metadata only -- top-level declared type names, `using` directives, an
+//     extension-method marker and its own identifier set. No parse, no AST,
+//     so the scan is an order of magnitude cheaper than a parse;
+//   - a file joins the parse when one of its top-level names is live, or
+//     when it hosts extension methods (an extension call names the receiver
+//     and the method, never the host class, so the host file needs its own
+//     trigger);
+//   - including a file makes its identifiers live and reaches its `using`
+//     directories; the closure runs to a fixpoint before any file parses.
+//
+// Observable semantics are preserved: every name user code spells pulls the
+// declaring file exactly as the full glob did, so simple-name collision
+// mangling sees the same declaration pairs, and prune keeps everything
+// transitively referenced. What disappears is the parse of files whose names
+// appear nowhere reachable -- and with it the failure mode where a syntax
+// error in an unreachable stdlib file failed unrelated programs.
+class PiName {
+    public string str;
+    public int flagged;   // live: some parsed source spells this name
+    public int userDecl;  // declared as a top-level type by an input file:
+                          // unqualified mentions in user code resolve to the
+                          // user's own declaration, so they must not pull a
+                          // same-named stdlib file (qualified `Ns.Name`
+                          // mentions still do -- see PiSeedSource)
+    public int nsRoot;    // segment of a known namespace path
+    public PiName next;   // intern chain within the hash bucket
+    public PiName(string s) {
+        str = s; flagged = 0; userDecl = 0; nsRoot = 0; next = null;
+    }
+}
+
+class PiFile {
+    public string path;
+    public List<PiName> top;     // declared type names
+    public List<PiName> idents;  // every identifier
+    public List<string> usings;  // dotted subdirs
+    public int hasExt;           // hosts an extension method
+    public int included;         // joins the parse
+    public int parsed;           // already appended to the input list
+    public PiFile(string p) {
+        path = p;
+        top = new List<PiName>();
+        idents = new List<PiName>();
+        usings = new List<string>();
+        hasExt = 0; included = 0; parsed = 0;
+    }
+}
+
+class PiDir {
+    public string subdir;        // 'A/B/C' form, as written after `using`
+    public List<PiFile> files;
+    public int reached;          // globbed + metadata-scanned
+    public PiDir next;
+    public PiDir(string s) {
+        subdir = s; files = new List<PiFile>(); reached = 0; next = null;
+    }
+}
+
 class Program {
     static string stdlibRoot;
     static List<string> inclPaths;
@@ -59,54 +134,397 @@ class Program {
         return "stdlib";
     }
 
-    // Scan `src` for `using X.Y.Z;` directives (skipping alias forms with '=')
-    // and auto-include every .zan file under the matching stdlib directory.
-    static bool ScanUsings(string src) {
-        bool added = false;
-        int n = src.Length;
+    // ---- demand-driven pull-in state ----
+    static List<PiName> piTable;   // hash buckets, null-filled
+    static PiDir piDirs;
+    static PiDir piDirsTail;
+    static bool piDb;              // pull-in trace: marker file /tmp/zan_pullin_debug
+
+    // Dotted-name reader results (shared by seed + metadata scan).
+    static string piDotName;       // 'A/B/C' form
+    static int piDotStop;          // kind of the token that ended the run
+    static int piDotIdx;           // index of that token
+
+    static int PiHash(string s) {
+        long h = 2166136261;
         int i = 0;
-        while (i + 6 <= n) {
-            bool atStart = i == 0;
-            if (!atStart) {
-                string pv = src.Substring(i - 1, 1);
-                if (pv == "\n" || pv == "\r" || pv == " " || pv == "\t" || pv == ";") { atStart = true; }
-            }
-            if (atStart && src.Substring(i, 6) == "using ") {
-                int j = i + 6;
-                string ns = "";
-                bool alias = false;
-                while (j < n) {
-                    string c = src.Substring(j, 1);
-                    if (c == ";") { break; }
-                    if (c == "=") { alias = true; break; }
-                    if (c == "\n" || c == "\r") { break; }
-                    if (c != " " && c != "\t") { ns = ns + c; }
-                    j = j + 1;
-                }
-                if (!alias && ns != "" && j < n && src.Substring(j, 1) == ";") {
-                    string rel = "";
-                    int k = 0;
-                    while (k < ns.Length) {
-                        string c2 = ns.Substring(k, 1);
-                        if (c2 == ".") { c2 = "/"; }
-                        rel = rel + c2;
-                        k = k + 1;
-                    }
-                    if (AddStdlibDir(rel)) { added = true; }
-                }
-                i = j;
+        while (i < s.Length) {
+            h = h ^ (int)s[i];
+            h = h * 16777619;
+            h = h & 4294967295;
+            i = i + 1;
+        }
+        return (int)(h & 16383);
+    }
+
+    static PiName PiIntern(string s) {
+        int b = PiHash(s);
+        PiName p = piTable[b];
+        while (p != null) {
+            if (p.str == s) { return p; }
+            p = p.next;
+        }
+        PiName q = new PiName(s);
+        q.next = piTable[b];
+        piTable[b] = q;
+        return q;
+    }
+
+    static void PiInit() {
+        piTable = new List<PiName>();
+        int i = 0;
+        while (i < 16384) { piTable.Add(null); i = i + 1; }
+        piDirs = null;
+        piDirsTail = null;
+    }
+
+    static void PiReach(string subdir) {
+        if (subdir == "") { return; }
+        PiDir d = piDirs;
+        while (d != null) {
+            if (d.subdir == subdir) { return; }
+            d = d.next;
+        }
+        PiDir nd = new PiDir(subdir);
+        if (piDirsTail != null) { piDirsTail.next = nd; } else { piDirs = nd; }
+        piDirsTail = nd;
+    }
+
+    // Record a dotted `using A.B.C;` target (already in 'A/B/C' form) as a
+    // reached directory.
+    static void PiNoteUsing(PiFile f, string subdir) {
+        if (subdir == "") { return; }
+        f.usings.Add(subdir);
+        PiReach(subdir);
+    }
+
+    // Read `A.B.C` after a USING/NAMESPACE token (index i = first candidate).
+    // piDotName gets the 'A/B/C' path, piDotStop/piDotIdx the stop token.
+    static void PiReadDotted(List<Token> toks, int i) {
+        piDotName = "";
+        piDotStop = TK.Eof();
+        piDotIdx = toks.Count;
+        int n = toks.Count;
+        if (i >= n || toks[i].kind != TK.Ident()) {
+            // Mirror the C host's malformed-using quirk (prev = TK_IDENT).
+            piDotStop = TK.Ident();
+            piDotIdx = i;
+            return;
+        }
+        for (;;) {
+            if (piDotName != "") { piDotName = piDotName + "/"; }
+            piDotName = piDotName + toks[i].text;
+            i = i + 1;
+            if (i >= n || toks[i].kind != TK.Dot()) { break; }
+            i = i + 1;
+            if (i >= n || toks[i].kind != TK.Ident()) { break; }
+        }
+        if (i < n) {
+            piDotStop = toks[i].kind;
+            piDotIdx = i;
+        }
+    }
+
+    static void PiMarkSegments(string dotted) {
+        // Every segment of a known namespace path is a namespace root.
+        int start = 0;
+        int i = 0;
+        while (i <= dotted.Length) {
+            if (i == dotted.Length || dotted.Substring(i, 1) == "/") {
+                PiName s = PiIntern(dotted.Substring(start, i - start));
+                s.nsRoot = 1;
+                start = i + 1;
             }
             i = i + 1;
         }
-        return added;
     }
 
-    // Include every *.zan directly under stdlib_root/<rel>. Returns true when
-    // a new file was added.
-    static bool AddStdlibDir(string rel) {
-        string dir = stdlibRoot + "/" + rel;
+    // Token kinds a declaration's return type can start with (the
+    // method/property-declaration shape check in PiSeedSource).
+    static bool PiTypeishTok(int k) {
+        return k == TK.Ident() || k == TK.String() || k == TK.Bool()
+            || k == TK.Char() || k == TK.Int() || k == TK.Long()
+            || k == TK.Short() || k == TK.Byte() || k == TK.Double()
+            || k == TK.Float() || k == TK.Uint() || k == TK.Ulong()
+            || k == TK.Object() || k == TK.Void();
+    }
+
+    // Lex one globbed file for pull-in metadata: top-level declared type
+    // names (brace depth <= 1 covers the block `namespace X { ... }` spelling
+    // too), `using` directives, extension-method marker and the full
+    // identifier set. A token-level pass cannot be a perfect declaration
+    // parser -- it does not need to be: missed names only ever under-include,
+    // and the prev!=Colon/Comma guard keeps the generic-constraint spelling
+    // (`where T : class`) from minting bogus candidates.
+    static void PiScanFile(PiFile f) {
+        if (!File.Exists(f.path)) {
+            // Unreadable: include it so the real parse reports the error the
+            // full-glob path produced ("cannot read '<path>'").
+            f.included = 1;
+            return;
+        }
+        string src = File.ReadAllText(f.path);
+        Lexer lx = new Lexer(src);
+        List<Token> toks = lx.Run();
+        int depth = 0;
+        int prev = TK.Eof();
+        string lastId = null;   // previous chain segment (Task.WhenAll mirror)
+        int n = toks.Count;
+        int i = 0;
+        while (i < n) {
+            Token t = toks[i];
+            int k = t.kind;
+            if (k == TK.LBrace()) { depth = depth + 1; prev = k; i = i + 1; continue; }
+            if (k == TK.RBrace()) { if (depth > 0) { depth = depth - 1; } prev = k; i = i + 1; continue; }
+            if (k == TK.Using()) {
+                PiReadDotted(toks, i + 1);
+                if (piDotStop == TK.Semicolon()) { PiNoteUsing(f, piDotName); }
+                prev = piDotStop;
+                i = piDotIdx + 1;
+                continue;
+            }
+            if ((k == TK.Class() || k == TK.Struct() || k == TK.Enum() || k == TK.Interface())
+                    && depth <= 1 && prev != TK.Colon() && prev != TK.Comma()) {
+                if (i + 1 < n && toks[i + 1].kind == TK.Ident()) {
+                    f.top.Add(PiIntern(toks[i + 1].text));
+                    prev = TK.Ident();
+                    i = i + 2;
+                    continue;
+                }
+                prev = k;
+                i = i + 1;
+                continue;
+            }
+            if (k == TK.Ident() && t.text == "delegate"
+                    && depth <= 1 && prev != TK.Colon() && prev != TK.Comma()) {
+                // `delegate ReturnType Name<T>(...)` -- the declared name is
+                // the last identifier outside angle brackets before the
+                // parameter list's '('; identifiers inside <...> are the
+                // delegate's own type parameters and must not mint names (a
+                // bare `T` top name would match every generic mention in
+                // every later file).
+                int j = i + 1;
+                int angle = 0;
+                PiName dname = null;
+                int stop = TK.Eof();
+                while (j < n) {
+                    int kk = toks[j].kind;
+                    if (kk == TK.Eof() || kk == TK.Semicolon()) { stop = kk; break; }
+                    if (kk == TK.LParen() && angle == 0) { stop = kk; break; }
+                    if (kk == TK.Less()) { angle = angle + 1; }
+                    else if (kk == TK.Greater()) { if (angle > 0) { angle = angle - 1; } }
+                    else if (kk == TK.Ident() && angle == 0) { dname = PiIntern(toks[j].text); }
+                    j = j + 1;
+                }
+                if (dname != null && stop == TK.LParen()) { f.top.Add(dname); }
+                prev = stop;
+                i = j + 1;
+                continue;
+            }
+            if (k == TK.This()) {
+                // Extension-declaration shape: `( this Type name` -- `this`
+                // right after '(' AND followed by a type token. The receiver
+                // is frequently a builtin (`this string s`), where the type
+                // is a KEYWORD token. Expression mentions (`M(this.x)`,
+                // `M(this)`) have '.' / ')' after, and `this` inside an
+                // argument list has a non-'(' before, so they never trigger.
+                if (prev == TK.LParen() && i + 1 < n
+                        && toks[i + 1].kind != TK.Void()
+                        && PiTypeishTok(toks[i + 1].kind)) {
+                    f.hasExt = 1;
+                }
+                prev = k;
+                i = i + 1;
+                continue;
+            }
+            if (k == TK.Ident()) {
+                // `record Name(...)` lowers to a class; the name is the next
+                // identifier, and 'record' itself is a contextual keyword.
+                if (t.text == "record" && depth <= 1 && i + 1 < n
+                        && toks[i + 1].kind == TK.Ident()) {
+                    f.top.Add(PiIntern(toks[i + 1].text));
+                    prev = TK.Ident();
+                    i = i + 2;
+                    continue;
+                }
+                if (prev != TK.Dot()) { lastId = t.text; }
+                f.idents.Add(PiIntern(t.text));
+                // Mirror the parser's Task.WhenAll/WhenAny -> TaskJoin rewrite
+                // (desugar_task_join): the call survives in this file's own
+                // references as TaskJoin, so the closure must pull its file.
+                if (prev == TK.Dot() && lastId == "Task"
+                        && (t.text == "WhenAll" || t.text == "WhenAny")) {
+                    f.idents.Add(PiIntern("TaskJoin"));
+                }
+            }
+            prev = k;
+            i = i + 1;
+        }
+    }
+
+    // Seed the live-name worklist and the reached-directory set from one
+    // already-included source. Identifiers become live, with one carve-out: a
+    // top-level type declared by an input file shadows its own name for every
+    // unqualified use in user code, so those mentions do not pull a same-named
+    // stdlib file -- otherwise the customary `class App` template drags in the
+    // whole Gui framework via stdlib Gui.App. Qualified (dotted) mentions still
+    // seed, preserving the rare `Gui.App`-style escapes to the shadowed type.
+    //
+    // Pass 1 collects namespace roots -- segments of `using` targets and of
+    // the file's own `namespace` declaration. Pass 2 needs them to tell a
+    // namespace-qualified type (`Gui.App`, `System.String`) apart from a
+    // member access on a variable (`b.Label()`): only chains rooted at a
+    // namespace segment can name a pull-in candidate. Usings conventionally
+    // sit at the top of the file, but a second lex keeps the order irrelevant.
+    static void PiSeedSource(string src) {
+        Lexer lx = new Lexer(src);
+        List<Token> toks = lx.Run();
+        int n = toks.Count;
+        int pass = 0;
+        while (pass < 2) {
+            int depth = 0;
+            int prev = TK.Eof();
+            string chain = null;   // first segment of the dotted chain
+            int i = 0;
+            while (i < n) {
+                Token t = toks[i];
+                int k = t.kind;
+                if (k == TK.LBrace()) { depth = depth + 1; }
+                else if (k == TK.RBrace()) { if (depth > 0) { depth = depth - 1; } }
+                else if (k == TK.Using()) {
+                    PiReadDotted(toks, i + 1);
+                    if (piDotStop == TK.Semicolon() && piDotName != "") {
+                        PiReach(piDotName);
+                        // every segment is a namespace root for pass 2
+                        PiMarkSegments(piDotName);
+                    }
+                    prev = piDotStop;
+                    chain = null;
+                    i = piDotIdx + 1;
+                    continue;
+                }
+                else if (k == TK.Namespace()) {
+                    // the file's own namespace: its segments are roots too
+                    PiReadDotted(toks, i + 1);
+                    if ((piDotStop == TK.Semicolon() || piDotStop == TK.LBrace())
+                            && piDotName != "") {
+                        PiMarkSegments(piDotName);
+                    }
+                    prev = piDotStop;
+                    chain = null;
+                    i = piDotIdx + 1;
+                    continue;
+                }
+                else if ((k == TK.Class() || k == TK.Struct() || k == TK.Enum() || k == TK.Interface())
+                        && depth <= 1 && prev != TK.Colon() && prev != TK.Comma() && pass == 1) {
+                    if (i + 1 < n && toks[i + 1].kind == TK.Ident()) {
+                        PiName dnm = PiIntern(toks[i + 1].text);
+                        dnm.userDecl = 1;
+                        prev = TK.Ident();
+                        chain = null;
+                        i = i + 2;
+                        continue;
+                    }
+                    // peek failed: the C host breaks out of the switch with
+                    // prev = the keyword itself
+                }
+                else if (k == TK.Ident() && t.text == "delegate") {
+                    if (depth <= 1 && prev != TK.Colon() && prev != TK.Comma() && pass == 1) {
+                        int j = i + 1;
+                        int angle = 0;
+                        string dname = null;
+                        int stop = TK.Eof();
+                        while (j < n) {
+                            int kk = toks[j].kind;
+                            if (kk == TK.Eof() || kk == TK.Semicolon()) { stop = kk; break; }
+                            if (kk == TK.LParen() && angle == 0) { stop = kk; break; }
+                            if (kk == TK.Less()) { angle = angle + 1; }
+                            else if (kk == TK.Greater()) { if (angle > 0) { angle = angle - 1; } }
+                            else if (kk == TK.Ident() && angle == 0) { dname = toks[j].text; }
+                            j = j + 1;
+                        }
+                        if (dname != null && stop == TK.LParen()) {
+                            PiName dnm = PiIntern(dname);
+                            dnm.userDecl = 1;
+                        }
+                        prev = stop;
+                        chain = null;
+                        i = j + 1;
+                        continue;
+                    }
+                    // fall-through in the C host ends the chain (a non-IDENT
+                    // token kind always does)
+                    chain = null;
+                }
+                else if (k == TK.Ident()) {
+                    // `record Name(...)` lowers to a class.
+                    if (t.text == "record" && depth <= 1 && i + 1 < n
+                            && toks[i + 1].kind == TK.Ident() && pass == 1) {
+                        PiName rnm = PiIntern(toks[i + 1].text);
+                        rnm.userDecl = 1;
+                        prev = TK.Ident();
+                        chain = null;
+                        i = i + 2;
+                        continue;
+                    }
+                    if (pass == 1) {
+                        PiName name = PiIntern(t.text);
+                        if (prev != TK.Dot()) {
+                            chain = name.str;
+                            // Mirror the parser's Task.WhenAll/WhenAny ->
+                            // TaskJoin rewrite (desugar_task_join): flag
+                            // TaskJoin when this bare `Task` is followed by
+                            // `.WhenAll`/`.WhenAny`. Kept as a shape-only
+                            // check, independent of whether `Task` sits
+                            // under a namespace root.
+                            if (t.text == "Task" && i + 1 < n && toks[i + 1].kind == TK.Dot()
+                                    && i + 2 < n && toks[i + 2].kind == TK.Ident()
+                                    && (toks[i + 2].text == "WhenAll" || toks[i + 2].text == "WhenAny")) {
+                                PiName tj = PiIntern("TaskJoin");
+                                tj.flagged = 1;
+                            }
+                            Token nx = null;
+                            if (i + 1 < n) { nx = toks[i + 1]; }
+                            if (depth >= 1 && PiTypeishTok(prev) && nx != null
+                                    && (nx.kind == TK.LParen() || nx.kind == TK.LBrace())) {
+                                // `string Label(` / `string Label {` inside a
+                                // type body: a method or property DECLARATION.
+                                // Method names collide with stdlib type names
+                                // constantly (a widget named Label, a method
+                                // named Label) and a declaration never
+                                // references a stdlib type. `new Label(...)`
+                                // keeps prev==New, so real constructor calls
+                                // still pull.
+                            } else if (name.userDecl == 0) {
+                                name.flagged = 1;
+                            }
+                        } else if (chain != null && PiIntern(chain).nsRoot == 1) {
+                            // `Ns.Segment` under a known namespace root.
+                            name.flagged = 1;
+                        } else if (chain == "Task"
+                                && (t.text == "WhenAll" || t.text == "WhenAny")) {
+                            // parser desugars Task.WhenAll/WhenAny to class
+                            // TaskJoin; the seed sees the pre-desugar
+                            // spelling, so mirror the rewrite or TaskJoin.zan
+                            // is never pulled.
+                            PiName tj = PiIntern("TaskJoin");
+                            tj.flagged = 1;
+                        }
+                    }
+                }
+                // An IDENT may have just started a chain and must survive to
+                // the dot that follows it; every other token ends the chain.
+                if (k != TK.Dot() && k != TK.Ident()) { chain = null; }
+                prev = k;
+                i = i + 1;
+            }
+            pass = pass + 1;
+        }
+    }
+
+    static void PiGlobInto(PiDir d) {
+        string dir = stdlibRoot + "/" + d.subdir;
         string names = Directory.ListNames(dir + "/*.zan");
-        bool added = false;
         int n = names.Length;
         int i = 0;
         string cur = "";
@@ -114,21 +532,82 @@ class Program {
             string c = "";
             if (i < n) { c = names.Substring(i, 1); }
             if (c == "\n" || i == n) {
-                if (cur != "") {
-                    string full = dir + "/" + cur;
-                    string norm = NormPath(full);
-                    if (!Included(norm)) {
-                        AddInput(full);
-                        added = true;
-                    }
-                }
+                if (cur != "") { d.files.Add(new PiFile(dir + "/" + cur)); }
                 cur = "";
             } else {
                 cur = cur + c;
             }
             i = i + 1;
         }
-        return added;
+    }
+
+    // Glob a reached directory and metadata-scan every file once.
+    static void PiProcessDir(PiDir d) {
+        if (d.reached == 1) { return; }
+        d.reached = 1;
+        PiGlobInto(d);
+        int i = 0;
+        while (i < d.files.Count) {
+            PiScanFile(d.files[i]);
+            i = i + 1;
+        }
+    }
+
+    // One closure round over every reached directory. Newly reached dirs are
+    // appended to the chain as we walk, so the walk covers them in-round.
+    static int PiCloseOnce() {
+        int changed = 0;
+        PiDir d = piDirs;
+        while (d != null) {
+            if (d.reached == 0) { PiProcessDir(d); }
+            int i = 0;
+            while (i < d.files.Count) {
+                PiFile f = d.files[i];
+                if (f.included == 0) {
+                    int hit = f.hasExt;
+                    string why = "ext";
+                    int kk = 0;
+                    while (kk < f.top.Count) {
+                        if (f.top[kk].flagged == 1) { hit = 1; why = f.top[kk].str; break; }
+                        kk = kk + 1;
+                    }
+                    if (hit == 1) {
+                        f.included = 1;
+                        changed = 1;
+                        if (piDb) { Console.WriteLine("[pullin] incl " + f.path + " because " + why); }
+                        int q = 0;
+                        while (q < f.idents.Count) {
+                            f.idents[q].flagged = 1;
+                            q = q + 1;
+                        }
+                        int u = 0;
+                        while (u < f.usings.Count) {
+                            PiReach(f.usings[u]);
+                            u = u + 1;
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+            d = d.next;
+        }
+        return changed;
+    }
+
+    static void PiAppendIncluded() {
+        PiDir d = piDirs;
+        while (d != null) {
+            int i = 0;
+            while (i < d.files.Count) {
+                PiFile f = d.files[i];
+                if (f.included == 1 && f.parsed == 0) {
+                    f.parsed = 1;
+                    AddInput(f.path);
+                }
+                i = i + 1;
+            }
+            d = d.next;
+        }
     }
 
     static void Main() {
@@ -146,17 +625,22 @@ class Program {
                 i = i + 1;
             }
 
-            // stdlib auto-include to a fixpoint, mirroring the C host.
+            // stdlib auto-include: demand-driven pull-in (mirrors the C
+            // host). User sources seed the live-name set and the reached
+            // directories; globbed stdlib files join the parse only when a
+            // live name or an extension-method host requires them, to a
+            // fixpoint, before anything parses.
             stdlibRoot = FindStdlibRoot();
-            bool changed = true;
-            while (changed) {
-                changed = false;
-                int fi = 0;
-                while (fi < inclSrcs.Count) {
-                    if (ScanUsings(inclSrcs[fi])) { changed = true; }
-                    fi = fi + 1;
-                }
+            piDb = File.Exists("/tmp/zan_pullin_debug");
+            PiInit();
+            int pi = 0;
+            while (pi < inclSrcs.Count) {
+                PiSeedSource(inclSrcs[pi]);
+                pi = pi + 1;
             }
+            while (PiCloseOnce() == 1) { }
+            PiAppendIncluded();
+            if (piDb) { Console.WriteLine("[pullin] total " + inclPaths.Count + " files"); }
 
             string src = "";
             List<int> fileStarts = new List<int>();
