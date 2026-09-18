@@ -610,6 +610,39 @@ class Program {
         }
     }
 
+    // Top-level type dedup. User sources sit before the stdlib pull-ins in
+    // inclSrcs, so when user code declares a type the stdlib also has (the
+    // customary `class StringExtensions` extension host), the FIRST
+    // declaration wins and same-named later declarations are dropped. The C
+    // host reaches the same shape by pruning the unreferenced stdlib decl
+    // before the binder's duplicate-type check; without this ngen collects
+    // both decls' synthesized ctors under one symbol name and the link
+    // fails (ld: atomShouldReplaceExisting).
+    static void DedupTopTypes(Node unit) {
+        List<string> seen = new List<string>();
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            int k = d.kind;
+            bool isType = k == AK.ClassDecl() || k == AK.StructDecl()
+                || k == AK.EnumDecl() || k == AK.DelegateDecl();
+            bool dup = false;
+            if (isType) {
+                int j = 0;
+                while (j < seen.Count) {
+                    if (seen[j] == d.sval) { dup = true; break; }
+                    j = j + 1;
+                }
+            }
+            if (dup) {
+                unit.kids.RemoveAt(i);
+                continue;
+            }
+            if (isType) { seen.Add(d.sval); }
+            i = i + 1;
+        }
+    }
+
     static void Main() {
         int argc = Environment.ArgCount();
         if (argc < 2) {
@@ -667,6 +700,7 @@ class Program {
             d.SetFiles(inclPaths, fileStarts);
             Parser ps = new Parser(toks, d);
             Node unit = ps.ParseUnit();
+            DedupTopTypes(unit);
 
             Binder b = new Binder();
             b.Bind(unit);

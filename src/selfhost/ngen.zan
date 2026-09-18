@@ -209,6 +209,7 @@ partial class Ngen {
             ci = ci + 1;
         }
         EmitDelegateThunks();
+        EmitBindingAccessors();
         HostEmitPackedSlice();
         EmitClsNameFn();
         RtEmitStrpool();
@@ -508,9 +509,46 @@ partial class Ngen {
         return res;
     }
 
+    // the NativeMemory.Sha256 intrinsic: zan_sha256(data, len, out32) into
+    // an sp scratch block, then the oracle's string shape — str_alloc(33),
+    // memcpy of the 32 raw digest bytes, header stamped len=32 — so the
+    // caller owns an ARC string exactly like any other produced string
+    void EmitSha256CallNg(Node e) {
+        GenExpr(e.kids[0]);                          // x0 = data ptr (nint)
+        AddSPImm(48, false);                         // sub sp, sp, #48
+        StrU(0, 31, 0);                              // sp[0] = data
+        GenExpr(e.kids[1]);                          // x0 = len
+        E4(0xF100001F);                              // cmp x0, #0
+        E4(0x9A80B042);                              // csel x2, xzr, x0, lt
+        LdrU(0, 31, 0);                              // x0 = data
+        E4(0xAA0203E1);                              // mov x1, x2 (clamped len)
+        AddImm(2, 31, 16);                           // x2 = sp+16 (out32)
+        BLExtern("_zan_sha256");                     // FIPS 180-4 digest
+        LoadImm(0, 33);                              // 32 bytes + NUL
+        BLInternal("_zan_rt_str_alloc");             // x0 = buf
+        AddImm(1, 31, 16);                           // x1 = sp+16
+        LoadImm(2, 32);
+        BLExtern("_memcpy");                         // returns buf
+        LoadImm(1, 0x5A414E5300000000);
+        LoadImm(2, 32);
+        E4(0xAA020021);                              // orr x1, x1, x2
+        SubImm(0, 0, 8);
+        StrU(1, 0, 0);                               // stamp [buf-8] len=32
+        AddSPImm(48, true);                          // add sp, sp, #48
+        AddImm(0, 0, 8);                             // x0 = buf
+    }
+
     void CallStaticNg(int mi, Node e) {
         Node m = methNodes[mi];
         bool ext = HasMod(m, MOD.Extern());
+        // the [DllImport] Sha256 decl only types the call: like the oracle
+        // (irgen_expr.c emit_native_memory_call) the compiler lowers it as
+        // an intrinsic producing an owned 32-raw-byte string
+        if (m.sval == "Sha256" && methCls[mi] == "NativeMemory"
+                && e.kids.Count == 2) {
+            EmitSha256CallNg(e);
+            return;
+        }
         List<string> ats = ext ? ExternArgClassTys(m, e) : null;
         int pushed = PushCallArgs(m, e);
         // AAPCS64 allocation (extern only): the first eight integer-class
@@ -1742,7 +1780,7 @@ partial class Ngen {
             if (s.b != null) {
                 string vt = s.type != null ? TypeFullName(s.type) : null;
                 if (vt == null || vt == "") { vt = InferExprTyNg(s.b); }   // silent: ReserveLocals already diagnosed
-                GenConversionValueNg(s.b, vt);
+                if (!TryGenBindingValue(s.b, vt)) { GenConversionValueNg(s.b, vt); }
                 StoreLocal(DeclSlotNg(s), 0);
             }
             int dsi = 0;
@@ -1751,7 +1789,7 @@ partial class Ngen {
                 if (d.b != null) {
                     string dvt = d.type != null ? TypeFullName(d.type) : null;
                     if (dvt == null || dvt == "") { dvt = InferExprTyNg(d.b); }
-                    GenConversionValueNg(d.b, dvt);
+                    if (!TryGenBindingValue(d.b, dvt)) { GenConversionValueNg(d.b, dvt); }
                     StoreLocal(DeclSlotNg(d), 0);
                 }
                 dsi = dsi + 1;
@@ -2777,6 +2815,8 @@ partial class Ngen {
                 GenExpr(bin2);
                 if (tgtTy == "double" && !IsDblExpr(bin2)) { ConvI2D(); }
                 else if (tgtTy == "int" && !IsDblExpr(bin2) && !IsStrExpr(bin2)) { E4(0x93407C00); }   // sxtw x0, w0
+            } else if (TryGenBindingValue(e.b, tgtTy)) {
+                // Binding<T> sugar: x0 already holds the fresh binding object
             } else {
                 GenConversionValueNg(e.b, tgtTy);
             }
@@ -3197,7 +3237,9 @@ partial class Ngen {
                     if (initFld == null) {
                         diags.Error("ngen: unknown field '" + it.a.sval + "' in initializer", it.line, it.col);
                     } else {
-                        GenExpr(it.b);
+                        if (!TryGenBindingValue(it.b, initFld.ty)) {
+                            GenExpr(it.b);
+                        }
                         if (IsDblTy(initFld.ty) && !IsDblExpr(it.b)) { ConvI2D(); }
                         E4(0xF81F0FE0);                  // push value
                         E4(0xF84107E1);                  // pop value -> x1 (top)
