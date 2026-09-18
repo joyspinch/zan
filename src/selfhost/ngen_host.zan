@@ -1082,13 +1082,20 @@ partial class Ngen {
                 || (name == "AppendLine" && e.kids.Count <= 1)) {
             GenExpr(e.a.a);
             if (e.kids.Count == 1) {
-                E4(0xF81F0FE0);
+                // sb rides the stack across the length helper (and across
+                // HostStringArg, which clobbers x0): the raw fallback's
+                // strlen may trash caller-saved x0/x1.
+                E4(0xF81F0FE0);                    // push sb
                 HostStringArg(e.kids[0]);
-                MovRR(1, 0); E4(0xF84107E0);
+                MovRR(1, 0);                       // x1 = rendered
+                BLInternal("_zan_host_sblen");     // x0 = byte length
+                MovRR(2, 0);                       // x2 = len
+                E4(0xF84107E0);                    // pop sb
                 BLInternal("_zan_host_sb_append");
             }
             if (name == "AppendLine") {
                 LoadStr(hostNL, 1);
+                LoadImm(2, 1);
                 BLInternal("_zan_host_sb_append");
             }
             return true;
@@ -1160,7 +1167,7 @@ partial class Ngen {
         BLExtern("_puts");
         LoadImm(0, 1); BLExtern("_exit"); E4(0xD4200000); // brk if exit returns
         HostEnd();
-        HostEmitCopy(); HostEmitArgs(); HostEmitFiles(); HostEmitPaths(); HostEmitSb();
+        HostEmitCopy(); HostEmitSbLen(); HostEmitArgs(); HostEmitFiles(); HostEmitPaths(); HostEmitSb();
         HostEmitExt();
         HostEmitHost2();
     }
@@ -1173,6 +1180,41 @@ partial class Ngen {
         HostLoad(1, 0); HostLoad(2, 1); BLExtern("_memcpy");
         HostLoad(0, 2); HostLoad(1, 1); AddRR(2, 0, 1); Strb0(2); HostStamp();
         HostEnd();
+    }
+
+    // x0 = string value -> x0 = byte length, trusting nothing about the
+    // producer. Managed strings carry a stamp at ptr-8: the low 32 bits
+    // hold the byte length and the high word the magic 0x5A414E53. That
+    // magic alone is not proof -- the str_alloc sentinel 0x54524D47_.53
+    // lives at raw+8 and shares the same high word, and an unstamped
+    // pointer can land right after one -- so the sentinel slot itself is
+    // ruled out too. Anything failing the check is raw (extern renders,
+    // getenv, digit buffers), where strlen is exact; raw consumers can
+    // reach this helper through locals and returns that call-shape
+    // peepholing cannot follow. Null -> 0.
+    void HostEmitSbLen() {
+        HostBegin("_zan_host_sblen");
+        HostSave(0, 0); HostSave(1, 1);
+        int isNull = NL(); CbzReg(0, isNull);
+        AddImm(9, 0, -8);
+        E4(0xF9400129);                        // ldr x9, [x9] (stamp)
+        E4(0xD360FD2A);                        // lsr x10, x9, #32 (magic word)
+        LoadImm(11, 0x5A414E53);
+        HostCmp(10, 11);
+        int rawLen = NL(); EmitBcond(1, rawLen);
+        E4(0xD3407D2A);                        // ubfm x10, x9, #0, #31 (len)
+        LoadImm(11, 0x54524D47);
+        HostCmp(10, 11);
+        EmitBcond(0, rawLen);                  // len == sentinel low word: it is
+                                               // the str_alloc sentinel, not a stamp
+        MovRR(0, 10);
+        int fin = NL(); EmitB(fin);
+        Mark(rawLen);
+        HostLoad(0, 0); BLExtern("_strlen"); EmitB(fin);
+        Mark(isNull); LoadImm(0, 0);
+        Mark(fin);
+        HostLoad(1, 1);                        // x1 is caller-saved: strlen
+        HostEnd();                             // may trash the rendered ptr
     }
 
     void HostEmitArgs() {
@@ -1285,10 +1327,15 @@ partial class Ngen {
         HostEnd();
 
         HostBegin("_zan_host_sb_append");
-        HostSave(0, 0); HostSave(1, 1);
+        // (ptr sb, ptr s, i64 len): the CALL SITE supplies the length --
+        // the managed stamp word for strings, strlen for the digit renders
+        // (int2str's raw malloc buffer has no stamp, but its digits can
+        // never hold a NUL). A strlen on a managed string would drop any
+        // embedded NUL (UrlDecode's %00), so it is wrong there.
+        HostSave(0, 0); HostSave(1, 1); HostSave(2, 2);
         int empty = NL(); CbzReg(1, empty); // null append is empty
-        MovRR(0, 1); BLExtern("_strlen"); HostSave(0, 2);
         HostLoad(1, 0); LdrU(2, 1, 0); HostSave(2, 3);
+        HostLoad(0, 2);                        // x0 = len (call-site supplied)
         // need=count+len, reject carry and signed overflow before allocation.
         E4(0xAB020000); // adds x0, x0, x2
         int sumOK = NL(); EmitBcond(3, sumOK); HostFailAt("sb.append.size_carry"); Mark(sumOK);

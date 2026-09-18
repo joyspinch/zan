@@ -350,7 +350,7 @@ partial class Ngen {
                             fw = 8;
                         }
                         int eo = m.fieldOffset;
-                        if (eo < 0 || eo > 0x7fffffff - fw) {
+                        if (eo < 0 || eo > 0x7FFFFFFF - fw) {
                             diags.Error("ngen: explicit-layout field offset out of range or missing", m.line, m.col);
                             eo = 0;
                         }
@@ -624,27 +624,147 @@ partial class Ngen {
         RtEpilogue();
     }
 
-    // ptr zan_rt_chrstr(i64 cp) -- render one codepoint as a heap string
-    // via snprintf("%lc") (libc does the UTF-8 multibyte encoding), then a
-    // strcat2 copy so the result carries a stamped header like gen0's
+    // ptr zan_rt_chrstr(i64 cp) -- render one codepoint as a heap string.
+    // Pure UTF-8 arithmetic like gen0's emit_char_to_cstr: snprintf("%lc")
+    // is locale-dependent (the C locale drops anything above 0xFF), so the
+    // lead/continuum bytes are built and packed into one little-endian i64,
+    // covering all four encoded lengths with a single memcpy. Like the
+    // oracle, the length stays implicit: char 0 encodes as one NUL byte,
+    // whose string length is 0, so the stamp reads zero for it.
+    // Frame: [0]=cp [8]=packed [16]=len [24]=dst.
     void RtEmitChrstr() {
         syms.Add(new Sym("_zan_rt_chrstr", txt.Count));
         RtPrologue();
-        AddSPImm(32, false);                   // buf[16] | variadic slot
-        StrU(0, 31, 0);                        // [sp] = cp (Darwin stack variadic)
-        if (EnvTargetElf() == 1) {
-            LdrU(3, 31, 0);                    // Linux: x3 = cp
-        }
-        E4(0x910043E0);                        // x0 = buf (sp+16)
-        LoadImm(1, 16);
-        LoadSymRef("l_.str." + fmtcIdx, 2);    // x2 = "%lc"
-        BLExtern("_snprintf");
-        E4(0x910043E0);                        // x0 = buf (sp+16)
-        MovRR(9, 0);
-        LoadSymRef("l_.str." + emptyIdx, 0);   // x0 = ""
-        MovRR(1, 9);
-        BLInternal("_zan_rt_strcat2");
-        AddSPImm(32, true);
+        AddSPImm(48, false);
+        StrU(0, 31, 0);                        // [sp] = cp
+        LoadImm(9, 0x1FFFFF);
+        E4(0x8A090009);                        // and x9, x0, x9 (cp = cp & mask)
+        StrU(9, 31, 0);
+        // len = cp<0x80 ? 1 : cp<0x800 ? 2 : cp<0x10000 ? 3 : 4
+        LdrU(9, 31, 0);
+        LoadImm(10, 0x80);
+        E4(0xEB0A013F);                        // cmp x9, x10
+        int l1 = NL(); EmitBcond(3, l1);
+        LoadImm(10, 0x800);
+        E4(0xEB0A013F);
+        int l2 = NL(); EmitBcond(3, l2);
+        LoadImm(10, 0x10000);
+        E4(0xEB0A013F);
+        int l3 = NL(); EmitBcond(3, l3);
+        LoadImm(10, 4);
+        int lend = NL(); EmitB(lend);
+        Mark(l3); LoadImm(10, 3); EmitB(lend);
+        Mark(l2); LoadImm(10, 2); EmitB(lend);
+        Mark(l1); LoadImm(10, 1);
+        Mark(lend);
+        StrU(10, 31, 16);                      // [sp+16] = len
+        // packed select: byte(n) = payload | tag, packed at 8*n bits
+        LdrU(9, 31, 0);
+        LoadImm(10, 0x80);
+        E4(0xEB0A013F);
+        int p1 = NL(); EmitBcond(3, p1);
+        LoadImm(10, 0x800);
+        E4(0xEB0A013F);
+        int p2 = NL(); EmitBcond(3, p2);
+        LoadImm(10, 0x10000);
+        E4(0xEB0A013F);
+        int p3 = NL(); EmitBcond(3, p3);
+        // 4-byte form: 0xF0|(cp>>18) | b1<<8 | b2<<16 | b3<<24
+        LoadImm(11, 0x3F);
+        E4(0x8A0B012C);                        // and x12, x9, x11
+        LoadImm(13, 0x80);
+        E4(0xAA0D018C);                        // orr x12, x12, x13
+        LoadImm(13, 24);
+        E4(0x9ACD218C);                        // lslv x12, x12, x13
+        LoadImm(14, 6);
+        E4(0x9ACE252F);                        // lsrv x15, x9, x14
+        LoadImm(13, 0x80);
+        E4(0xAA0D01EF);                        // orr x15, x15, x13
+        LoadImm(13, 16);
+        E4(0x9ACD21EF);                        // lslv x15, x15, x13
+        E4(0xAA0F018C);                        // orr x12, x12, x15
+        LoadImm(14, 12);
+        E4(0x9ACE252F);                        // lsrv x15, x9, x14
+        E4(0x8A0B01EF);                        // and x15, x15, x11
+        LoadImm(13, 0x80);
+        E4(0xAA0D01EF);                        // orr x15, x15, x13
+        LoadImm(13, 8);
+        E4(0x9ACD21EF);                        // lslv x15, x15, x13
+        E4(0xAA0F018C);                        // orr x12, x12, x15
+        LoadImm(14, 18);
+        E4(0x9ACE252F);                        // lsrv x15, x9, x14
+        LoadImm(13, 0xF0);
+        E4(0xAA0D01EF);                        // orr x15, x15, x13
+        E4(0xAA0C01EA);                        // orr x10, x15, x12
+        int pd = NL(); EmitB(pd);
+        Mark(p3);
+        // 3-byte form: 0xE0|(cp>>12) | b1<<8 | b2<<16
+        LoadImm(11, 0x3F);
+        E4(0x8A0B012C);                        // and x12, x9, x11
+        LoadImm(13, 0x80);
+        E4(0xAA0D018C);                        // orr x12, x12, x13
+        LoadImm(13, 16);
+        E4(0x9ACD218C);                        // lslv x12, x12, x13
+        LoadImm(14, 6);
+        E4(0x9ACE252F);                        // lsrv x15, x9, x14
+        E4(0x8A0B01EF);                        // and x15, x15, x11
+        LoadImm(13, 0x80);
+        E4(0xAA0D01EF);                        // orr x15, x15, x13
+        LoadImm(13, 8);
+        E4(0x9ACD21EF);                        // lslv x15, x15, x13
+        E4(0xAA0F018C);                        // orr x12, x12, x15
+        LoadImm(14, 12);
+        E4(0x9ACE252F);                        // lsrv x15, x9, x14
+        LoadImm(13, 0xE0);
+        E4(0xAA0D01EF);                        // orr x15, x15, x13
+        E4(0xAA0C01EA);                        // orr x10, x15, x12
+        EmitB(pd);
+        Mark(p2);
+        // 2-byte form: 0xC0|(cp>>6) | b1<<8
+        LoadImm(11, 0x3F);
+        E4(0x8A0B012C);                        // and x12, x9, x11
+        LoadImm(13, 0x80);
+        E4(0xAA0D018C);                        // orr x12, x12, x13
+        LoadImm(13, 8);
+        E4(0x9ACD218C);                        // lslv x12, x12, x13
+        LoadImm(14, 6);
+        E4(0x9ACE252F);                        // lsrv x15, x9, x14
+        LoadImm(13, 0xC0);
+        E4(0xAA0D01EF);                        // orr x15, x15, x13
+        E4(0xAA0C01EA);                        // orr x10, x15, x12
+        EmitB(pd);
+        Mark(p1);
+        MovRR(10, 9);                          // 1-byte form: packed = cp
+        Mark(pd);
+        StrU(10, 31, 8);                       // [sp+8] = packed
+        // char 0 keeps len 0 (single NUL byte, empty string)
+        LdrU(9, 31, 0);
+        int nz = NL(); CbnzReg(9, nz);
+        LoadImm(10, 0);
+        StrU(10, 31, 16);
+        Mark(nz);
+        // dst = str_alloc(len + 1); memcpy(dst, &packed, len); dst[len] = 0
+        LdrU(10, 31, 16);
+        AddImm(0, 10, 1);
+        BLInternal("_zan_rt_str_alloc");
+        StrU(0, 31, 24);
+        LdrU(0, 31, 24);
+        AddImm(1, 31, 8);                      // x1 = &packed
+        LdrU(2, 31, 16);
+        BLExtern("_memcpy");
+        LdrU(0, 31, 24);
+        LdrU(9, 31, 16);
+        AddRR(0, 0, 9);
+        Strb0(0);
+        // stamp the real length header: [dst-8] = MAGIC | len
+        LdrU(0, 31, 24);
+        E4(0xD1002009);                        // sub x9, x0, #8
+        LoadImm(10, 0x5A414E5300000000);
+        LdrU(11, 31, 16);
+        E4(0xAA0B014A);                        // orr x10, x10, x11
+        StrU(10, 9, 0);
+        LdrU(0, 31, 24);
+        AddSPImm(48, true);
         RtEpilogue();
     }
 
@@ -1033,7 +1153,7 @@ partial class Ngen {
 
     // ptr _zan_rt_eh_state(): the exception-state block, allocated on first
     // use: { i32 top, ptr exc, 256 x 1024-byte setjmp slots }. A 1024-byte
-    // slot is generous (setjmp's buf is ~0xb0 bytes) but keeps the frame
+    // slot is generous (setjmp's buf is ~0xB0 bytes) but keeps the frame
     // arithmetic a plain shift.
     void RtEmitEhState() {
         syms.Add(new Sym("_zan_rt_eh_state", txt.Count));
@@ -1637,6 +1757,8 @@ partial class Ngen {
             ConvI2D();
         } else if (StaticTyOf(recv) == "List<int>" && !IsDblExpr(arg) && !IsStrExpr(arg)) {
             E4(0x93407C00);                          // sxtw x0, w0
+        } else if (StaticTyOf(recv) == "List<float>" && !IsStrExpr(arg)) {
+            NarrowF32();                             // float slots round on the way in
         }
         GenCloneIfStruct(arg);                       // element copies by value
         MovRR(1, 0);                                 // x1 = value
@@ -1672,6 +1794,7 @@ partial class Ngen {
         RtEmitListIndexOf(true);
         RtEmitListAddRange();
         RtEmitListToArray();
+        RtEmitListToArrayF32();
         RtEmitDictIndex();
         RtEmitDictSet();
         RtEmitDictGet();
@@ -2295,6 +2418,51 @@ partial class Ngen {
         BLExtern("_memcpy");
         RtLdur(0, 29, -24);
         AddImm(0, 0, 32);                      // arr = raw + 32
+        RtListReturn();
+    }
+
+    // List<float>.ToArray(): repack the 8-byte widened-double slots into a
+    // real packed float[] (4-byte single bits), like the reference host
+    void RtEmitListToArrayF32() {
+        RtListFrame("_zan_rt_list_toarray_f32");
+        RtStur(0, 29, -16);
+        LdrU(20, 0, 0);                        // x20 = n (callee-saved; calloc preserves)
+        AddRR(4, 20, 20);                      // x4 = n*4
+        AddRR(4, 4, 4);
+        AddImm(4, 4, 32);                      // bytes = n*4 + 32
+        MovRR(0, 4);
+        LoadImm(1, 1);
+        BLExtern("_calloc");
+        MovRR(23, 0);                          // x23 = raw
+        LoadImm(2, 1);
+        StrU(2, 0, 0);                         // rc = 1
+        LoadImm(2, 25404552263127619);
+        StrU(2, 0, 8);                         // rcmagic
+        RtLdur(2, 29, -16);
+        LdrU(2, 2, 0);
+        StrU(2, 0, 16);                        // count
+        LoadImm(2, 6503565379360670041);
+        StrU(2, 0, 24);                        // magic2
+        RtLdur(21, 29, -16);
+        LdrU(21, 21, 16);                      // x21 = data
+        AddImm(19, 23, 32);                    // x19 = dst (raw + 32)
+        LoadImm(22, 0);                        // x22 = i
+        int loop = NL();
+        int done = NL();
+        Mark(loop);
+        E4(0xEB1402DF);                        // cmp x22, x20
+        EmitBcond(10, done);
+        E4(0xF8767AA9);                        // ldr x9, [x21, x22, lsl #3]
+        E4(0x9E67013F);                        // fmov d31, x9
+        E4(0x1E6243FF);                        // fcvt s31, d31
+        E4(0x1E2603E0);                        // fmov w0, s31 (single bits)
+        AddRR(11, 22, 22);                     // x11 = i*4
+        AddRR(11, 11, 11);
+        E4(0xB82B6A60);                        // str w0, [x19, x11]
+        AddImm(22, 22, 1);
+        EmitB(loop);
+        Mark(done);
+        MovRR(0, 19);                          // arr = raw + 32
         RtListReturn();
     }
 

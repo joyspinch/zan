@@ -1,6 +1,53 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-17 · v4 · 定点 run.H78JR0（本轮批次后）
+日期：2026-09-17 · v5 · 定点 run.H78JR0（本轮批次后）
+
+## v5 结果（2026-09-17，run.H78JR0 定点 + 本批二进制，549 例 sweep）
+
+549 例全量 sweep（顺序执行）：pass 257→279、output_mismatch 11→0、
+exit_mismatch 9→4（仅剩 v3 遗留 async-EH 4 例）、native_link_failed 5→0、
+native_compile_failed 244→243、matching_nonzero_exit 11（双侧一致失败桶）、
+reference_compile_failed 12。
+
+本批内容（定点 run.H78JR0 → /tmp/zanc-new，工作树 5 文件 +386/−62）：
+
+1. **chrstr 纯 UTF-8 重写**（ngen_obj.zan）：snprintf("%lc") 受 locale 支配
+   （C locale 下 >0xFF 全部丢弃/单字节落盘），改为镜像 oracle
+   emit_char_to_cstr 的纯算术编码——lead/continuum 字节打包进一个小端 i64，
+   一次 memcpy 覆盖 1–4 字节四种长度；char 0 编码为单个 NUL（stamp 读 0，
+   与 oracle 一致）。char_and_ulong_text 的 €/ñ 渲染转绿。
+2. **IsCharExpr 补 Call 分支**（ngen.zan）：返回类型为 char 的调用表达式
+   现在识别为 char 表达式（CallRetTy 判定），`ch[0] & 255` 一类链路不再
+   误走 int 渲染。
+3. **int 宽度语义重构**（ngen.zan）：无符号 64 位 add/sub/mul 保留全宽
+   i64 结果（声明的槽宽在 store 处截断，同 gen0 的 64 位 uint 读）；移位
+   只有 count 按左操作数声明宽度掩码（ShiftMask32，裸字面量按 int）；
+   取负只在 32 位有符号域包裹；uint 目标 store 用 ubfm 零扩展低 32 位。
+   float 族：打包 float[] 槽位（ArrElemSize=4）store 走 NarrowF32Bits 取
+   单精度位型，8 字节 float 槽（局部/List/字段/转换入参）走 NarrowF32
+   在写入时舍入（ngen.zan/ngen_conversion.zan/ngen_delegate.zan）。
+   float_widths/unsigned_widths/datetime_civil/float_list_slot 族转绿。
+4. **sb.Append 长度 ABI 重做**（ngen_host.zan）：新增运行时助手
+   `_zan_host_sblen`——读 ptr-8 stamp，校验高 32 位 magic 0x5A414E53 且
+   低 32 位 ≠ str_alloc 哨兵低字 0x54524D47（哨兵与 stamp 同高字，单纯
+   magic 会误判），失败即 strlen 回退（extern 渲染、getenv、经局部/字段/
+   返回值流转的 raw 数字缓冲——调用点形状窥探 AppendArgIsRawRender 因此
+   删除）；null 返 0；strlen 是 libc 调用会踩 caller-saved x1，助手内部
+   存/取 x1（arm64 x0-x17 全部 caller-saved，20 位长度的向量化 strlen
+   实测踩 x1、短串不踩——曾致 int_format_boundaries 只打尾巴）。sb 跨
+   HostStringArg/sblen 压栈。此前 astr 直接信任 stamp 的路径对
+   Interop.getenv 的 raw libc 指针读出垃圾长度 → known_folders 在 stdlib
+   模式 SIGSEGV（memmove 源=栈顶环境区、长度=垃圾），现转 pass；
+   urldecode_nul（%00 内嵌 NUL 靠 stamp 保长）保持 pass。
+5. 同批验证：定向 14 例全 pass（known_folders、xlsx_write、xlsx_stream、
+   int_format_boundaries、urldecode_nul、float_widths、unsigned_widths、
+   datetime_civil、float_list_slot、cs_b10_interp_format、
+   cs_b16_keyvaluepair、interp_nested、lang_fixes、char_and_ulong_text）；
+   39/39 回归；bootstrap 定点 gen1==gen2（新一代二进制两次自举输出逐
+   字节一致；与 H78JR0 stage2 的差异是合法的字符串 intern 位置）。
+   v3 时代遗留 exit_mismatch 4 例（string_throw_dispatch、null_conditional、
+   generic_class_async_generic_method、exception_rethrow——async EH 的
+   rethrow/帧描述符问题，在旧定点二进制上同样失败，非本轮引入）。
 
 ## v4 结果（2026-09-17，run.H78JR0 定点，顺序执行，alarm 120）
 

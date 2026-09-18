@@ -347,8 +347,8 @@ partial class Ngen {
     void EmitSpanElemLoad(string el, int esz) {
         if (el == "byte") { E4(0x38606820); return; }          // ldrb w0, [x1, x0]
         if (el == "sbyte") { E4(0x38A06820); return; }         // ldrsb x0, [x1, x0]
-        if (el == "short") { E4(0x78A06820); return; }         // ldrsh x0, [x1, x0]
-        if (el == "ushort" || el == "char") { E4(0x78606820); return; }    // ldrh w0
+        if (el == "short") { E4(0x78A07820); return; }         // ldrsh x0, [x1, x0, lsl #1]
+        if (el == "ushort" || el == "char") { E4(0x78607820); return; }    // ldrh w0, [x1, x0, lsl #1]
         if (el == "int") { E4(0xB8A07820); return; }           // ldrsw x0, [x1, x0, lsl #2]
         if (el == "uint") { E4(0xB8607820); return; }          // ldr w0, [x1, x0, lsl #2]
         if (el == "float") {
@@ -370,7 +370,7 @@ partial class Ngen {
     // internal value convention
     void EmitSpanElemStore(string el, int esz) {
         if (el == "byte" || el == "sbyte") { E4(0x38206823); return; }     // strb w3, [x1, x0]
-        if (el == "short" || el == "ushort" || el == "char") { E4(0x78206823); return; }   // strh w3
+        if (el == "short" || el == "ushort" || el == "char") { E4(0x78207823); return; }   // strh w3, [x1, x0, lsl #1]
         if (el == "int" || el == "uint") { E4(0xB8207823); return; }       // str w3, [x1, x0, lsl #2]
         if (el == "float") {
             E4(0x9E670064);                                    // fmov d4, x3
@@ -1178,6 +1178,7 @@ partial class Ngen {
                 if (ity == "int" && !IsDblExpr(sfInitExpr[si2]) && !IsStrExpr(sfInitExpr[si2])) {
                     E4(0x93407C00);                      // sxtw x0, w0
                 }
+                if (ity == "float") { NarrowF32(); }
                 LoadSymRef(sfInitSym[si2], 9);
                 StrU(0, 9, 0);
             }
@@ -2416,19 +2417,17 @@ partial class Ngen {
                 int op = e.op;
                 if (IsUlongExpr(e.a) || IsUlongExpr(e.b)
                         || (Int32Kind(e.a) == 2 && Int32Kind(e.b) == 2)) {
-                    // unsigned 64-bit: add/sub/mul wrap identically, but
-                    // division drops the MIN/-1 fold, comparisons go
-                    // unsigned, and >> is logical (mirrors gen0's IR)
+                    // unsigned 64-bit: add/sub/mul keep the full i64 result
+                    // (gen0's uint reads are 64-bit; the declared-width slot
+                    // store truncates), division drops the MIN/-1 fold,
+                    // comparisons go unsigned, and >> is logical
                     bool bothU = Int32Kind(e.a) == 2 && Int32Kind(e.b) == 2;
                     if (op == TK.Plus()) {
                         E4(0x8B000020);                  // add x0, x1, x0
-                        if (bothU) { Wrap32(2); }
                     } else if (op == TK.Minus()) {
                         E4(0xCB000020);                  // sub x0, x1, x0
-                        if (bothU) { Wrap32(2); }
                     } else if (op == TK.Star()) {
                         E4(0x9B007C20);                  // mul x0, x1, x0
-                        if (bothU) { Wrap32(2); }
                     } else if (op == TK.Slash() || op == TK.Percent()) {
                         int bad = NL();
                         int cont = NL();
@@ -2472,7 +2471,6 @@ partial class Ngen {
                     } else if (op == TK.LessLess()) {
                         if (bothU) { E4(0x92401000); }   // and x0, x0, #31
                         E4(0x9AC02020);                  // lslv x0, x1, x0
-                        if (bothU) { Wrap32(2); }
                     } else if (op == TK.GreaterGreater()) {
                         if (bothU) { E4(0x92401000); }   // and x0, x0, #31
                         E4(0x9AC02420);                  // lsrv x0, x1, x0
@@ -2549,20 +2547,18 @@ partial class Ngen {
                     E4(0xEB00003F);                      // cmp x1, x0
                     E4(0x9A9F07E0);                      // cset x0, ne
                 } else if (op == TK.LessLess()) {
-                    int sl32 = Int32Kind(e.a);
-                    if (sl32 != 0) { E4(0x92401000); }   // and x0, x0, #31
+                    // shifts compute at 64 bits; only the count masks, by the
+                    // left operand's DECLARED width (a bare literal declares
+                    // int), and an int target narrows the result at the store
+                    if (ShiftMask32(e.a)) { E4(0x92401000); }   // and x0, x0, #31
                     E4(0x9AC02020);                      // lslv x0, x1, x0
-                    if (sl32 != 0) { Wrap32(sl32); }
                 } else if (op == TK.GreaterGreater()) {
-                    int sr32 = Int32Kind(e.a);
-                    if (sr32 != 0) { E4(0x92401000); }   // and x0, x0, #31
+                    if (ShiftMask32(e.a)) { E4(0x92401000); }   // and x0, x0, #31
                     E4(0x9AC02820);                      // asrv x0, x1, x0
-                    if (sr32 != 0) { Wrap32(sr32); }
                 } else if (op == TK.GreaterGreaterGreater()) {
                     // always logical; the 64-bit result stays untruncated
                     // here -- an int target narrows it at the store
-                    int su32 = Int32Kind(e.a);
-                    if (su32 != 0) { E4(0x92401000); }   // and x0, x0, #31
+                    if (ShiftMask32(e.a)) { E4(0x92401000); }   // and x0, x0, #31
                     E4(0x9AC02420);                      // lsrv x0, x1, x0
                 } else if (op == TK.Amp()) {
                     E4(0x8A000020);                      // and x0, x1, x0
@@ -2583,8 +2579,9 @@ partial class Ngen {
                     E4(0x9E660000);                  // fmov x0, d0
                 } else {
                     E4(0xCB0003E0);                  // neg x0, x0 (sub x0, xzr, x0)
-                    int ku32 = Int32Kind(e.a);
-                    if (ku32 != 0) { Wrap32(ku32); }
+                    // only a 32-bit-domain signed operand wraps at the neg
+                    // (uint reads are 64-bit; literals are 64-bit)
+                    if (Int32Kind(e.a) == 1) { Wrap32(1); }
                 }
             } else if (e.op == TK.Bang()) {
                 // logical not on every operand shape: `!x` is (x == 0),
@@ -2817,13 +2814,24 @@ partial class Ngen {
                 bin2.b = e.b;
                 GenExpr(bin2);
                 if (tgtTy == "double" && !IsDblExpr(bin2)) { ConvI2D(); }
+                else if (tgtTy == "float") {
+                    // packed float[] slots take single bits; 8-byte float
+                    // slots (locals, lists, fields) keep the widened double
+                    if (e.a != null && e.a.kind == AK.Index() && ArrContainerTy(e.a.a) != null) { NarrowF32Bits(); }
+                    else { NarrowF32(); }
+                }
                 else if (tgtTy == "int" && !IsDblExpr(bin2) && !IsStrExpr(bin2)) { E4(0x93407C00); }   // sxtw x0, w0
+                else if (tgtTy == "uint" && !IsDblExpr(bin2) && !IsStrExpr(bin2)) { E4(0xD3407C00); }  // ubfm: zero-extend low 32
             } else if (TryGenBindingValue(e.b, tgtTy)) {
                 // Binding<T> sugar: x0 already holds the fresh binding object
             } else {
                 GenConversionValueNg(e.b, tgtTy);
             }
             if (TryGenStringStore(e.a)) { return; }
+            if (e.a != null && e.a.kind == AK.Index() && ArrContainerTy(e.a.a) != null
+                    && ArrElemName(ArrContainerTy(e.a.a)) == "float") {
+                NarrowF32Bits();                     // packed float slots hold single bits
+            }
             if (e.a != null && e.a.kind == AK.Ident()) {
                 int li = LocalIdx(e.a.sval);
                 if (li < 0) {
@@ -3247,6 +3255,7 @@ partial class Ngen {
                             GenExpr(it.b);
                         }
                         if (IsDblTy(initFld.ty) && !IsDblExpr(it.b)) { ConvI2D(); }
+                        if (initFld.ty == "float") { NarrowF32(); }
                         E4(0xF81F0FE0);                  // push value
                         E4(0xF84107E1);                  // pop value -> x1 (top)
                         E4(0xF84107E0);                  // pop obj -> x0
@@ -3270,10 +3279,12 @@ partial class Ngen {
         Node cnt = new Node(AK.IntLit());
         cnt.ival = n;
         GenArrNew(cnt, esz);
+        bool f32 = esz == 4 && ArrElemName(TypeFullName(e.type) + "[]") == "float";
         E4(0xF81F0FE0);                                  // push arr
         int k = 0;
         while (k < n) {
             GenExpr(e.kids[k]);                          // x0 = element value
+            if (f32) { NarrowF32Bits(); }
             E4(0xF84107E1);                              // pop arr -> x1
             E4((int)(0xD2800000 | (((long)k) << 5) | 2)); // movz x2, #k
             if (esz == 1) {
@@ -3596,10 +3607,34 @@ partial class Ngen {
             // EnumType.Member constants carry their enum identity
             if (e.a != null && e.a.kind == AK.Ident() && FindEnum(e.a.sval) >= 0) { return e.a.sval; }
             Fld f = FieldOf(e);
-            return f != null ? f.ty : null;
+            if (f != null) { return f.ty; }
+            return PropGetterTy(e);
         }
         if (e.kind == AK.Index()) { return ElemTyOf(e); }
         return null;
+    }
+
+    // declared type of an instance property read (obj.Prop with no backing
+    // field): resolve the desugared get_Prop accessor in the receiver's
+    // class chain and substitute generic arguments
+    // (KeyValuePair<string,int>.Key -> string). Only Ident/this receivers
+    // are typed -- cheap slot lookups; chaining into deeper expressions
+    // would re-walk fluent prefixes from every StaticTyOf query.
+    string PropGetterTy(Node mem) {
+        if (mem == null || mem.kind != AK.MemberAccess()) { return null; }
+        if (mem.a == null || (mem.a.kind != AK.Ident() && mem.a.kind != AK.ThisExpr())) { return null; }
+        string recvTy = StaticTyOf(mem.a);
+        if (recvTy == null) { return null; }
+        string cn = ClassTyOf(recvTy);
+        if (cn == null) { return null; }
+        Node gm = AccessorInChain(cn, "get_" + mem.sval);
+        if (gm == null || gm.type == null) { return null; }
+        string rty = TypeFullName(gm.type);
+        int lt = recvTy.IndexOf("<");
+        Cls rc = FindClass(cn);
+        if (lt <= 0 || rc == null || rc.tps.Count == 0) { return rty; }
+        List<string> targs = SplitTyArgs(recvTy.Substring(lt + 1, recvTy.Length - lt - 2));
+        return SubstTy(rty, rc.tps, targs);
     }
 
     // map an interpolation format specifier to a printf pattern, mirroring
@@ -3718,7 +3753,9 @@ partial class Ngen {
             return;
         }
         GenExpr(recv);
-        if (SpecWantsDouble(spec) && sty == "int") { ConvI2D(); }
+        // gen0 widens an integer receiver to double for fixed/scientific
+        // patterns (its SIToFP sees the same signed bits scvtf does)
+        if (SpecWantsDouble(spec) && (sty == "int" || sty == "ulong")) { ConvI2D(); }
         LoadStr(InternStr(pf), 1);
         BLInternal("_zan_rt_fmt");
     }
@@ -4450,8 +4487,15 @@ partial class Ngen {
         } else if (esz == 4) {
             if (el == "int") {
                 E4(0xB8A07800 | (idxReg << 16) | (arrReg << 5) | dstReg);  // ldrsw xd, [xn, xi, lsl #2]
+            } else if (el == "float") {
+                // widen on the way out: single bits in the packed slot
+                // (x16 is scratch: register 31 would be the zero register)
+                E4(0xB8607800 | (idxReg << 16) | (arrReg << 5) | 16);  // ldr w16, [xn, xi, lsl #2]
+                E4(0x1E27021F);                                        // fmov s31, w16
+                E4(0x1E22C3FF);                                        // fcvt d31, s31
+                E4(0x9E6603E0 | dstReg);                               // fmov xd, d31
             } else {
-                E4(0xB8607800 | (idxReg << 16) | (arrReg << 5) | dstReg);  // ldr wd (uint/char/float bits)
+                E4(0xB8607800 | (idxReg << 16) | (arrReg << 5) | dstReg);  // ldr wd (uint/char bits)
             }
         } else {
             E4(0xF8607800 | (idxReg << 16) | (arrReg << 5) | dstReg);      // ldr xd, [xn, xi, lsl #3]
@@ -4722,11 +4766,13 @@ partial class Ngen {
         if (e.kind == AK.MemberAccess()) {
             Fld f = FieldOf(e);
             if (f != null && f.ty == "string") { return true; }
-            // class-qualified static field (`Registry.tag`)
+            // class-qualified static field (`Registry.tag`); an unresolved
+            // name may still be an instance property read (kv.Key)
             if (e.a != null && e.a.kind == AK.Ident()) {
-                return FindStaticTy(QualifiedCls(e.a.sval, e.a.sval2), e.sval) == "string";
+                string st2 = FindStaticTy(QualifiedCls(e.a.sval, e.a.sval2), e.sval);
+                if (st2 != null) { return st2 == "string"; }
             }
-            return false;
+            return PropGetterTy(e) == "string";
         }
         if (e.kind == AK.Ident()) {
             int li = LocalIdx(e.sval);
@@ -4752,6 +4798,11 @@ partial class Ngen {
                 if (rj != null && rj.kind == AK.Ident() && rj.sval == "Convert"
                         && e.a.sval == "ToString" && e.kids.Count == 1
                         && !UserDefinesClsMember("Convert", "ToString")) { return true; }
+                // scalar x.ToString("spec"): the printf-render intrinsic
+                // (spliced from interpolation holes) yields a heap string
+                if (e.a.sval == "ToString" && e.kids.Count == 1
+                        && e.kids[0] != null && e.kids[0].kind == AK.StringLit()
+                        && ScalarToStringTy(e.a.a) != null) { return true; }
             }
             return CallRetTy(e) == "string";
         }
@@ -4834,7 +4885,9 @@ partial class Ngen {
         }
         if (e.kind == AK.MemberAccess()) {
             Fld f = FieldOf(e);
-            return f != null && IsDblTy(f.ty);
+            if (f != null) { return IsDblTy(f.ty); }
+            string pt = PropGetterTy(e);
+            return pt != null && IsDblTy(pt);
         }
         if (e.kind == AK.Ident()) {
             int li = LocalIdx(e.sval);
@@ -4893,6 +4946,7 @@ partial class Ngen {
             if (f != null && f.ty == "char") { return true; }
             return FindStaticTy(curCls, e.sval) == "char";
         }
+        if (e.kind == AK.Call() && e.a != null) { return CallRetTy(e) == "char"; }
         return false;
     }
 
@@ -4941,11 +4995,10 @@ partial class Ngen {
     int Int32Kind(Node e) {
         if (e == null) { return 0; }
         if (e.kind == AK.IntLit()) {
-            // lexer code: 1 = L, 2 = U, 3 = UL; only a bare or U-suffixed
-            // literal stays in the 32-bit domain
-            int sfx = e.suffix - (e.suffix / 4) * 4;
-            if (sfx == 0 && e.ival >= -2147483648 && e.ival <= 2147483647) { return 1; }
-            if (sfx == 2 && e.ival >= 0 && e.ival <= 4294967295) { return 2; }
+            // literals emit as 64-bit values in gen0: `a * 3` reconciles the
+            // i32 local up to i64 and never wraps, while `a + b` (two i32
+            // locals) wraps at the operation. Only a shift's declared-width
+            // count masking still treats a bare literal as int (ShiftMask32).
             return 0;
         }
         if (e.kind == AK.Unary() && e.op == TK.Minus()) { return Int32Kind(e.a); }
@@ -4999,6 +5052,18 @@ partial class Ngen {
         else if (kind == 2) { E4(0xD3407C00); }      // ubfm x0, x0, #0, #31
     }
 
+    // does this shift's LEFT operand declare a <=32-bit width? gen0 masks
+    // the count by the declared width (a bare literal declares int; only
+    // an L/UL suffix declares long), regardless of its 64-bit register form
+    bool ShiftMask32(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.IntLit()) {
+            int sfx = e.suffix - (e.suffix / 4) * 4;   // 1 = L, 3 = UL
+            return sfx != 1 && sfx != 3;
+        }
+        return Int32Kind(e) != 0;
+    }
+
     // does this expression evaluate to a bool? (comparisons / bool locals,
     // fields and method results -- WriteLine renders those true/false)
     bool IsBoolExpr(Node e) {
@@ -5014,7 +5079,8 @@ partial class Ngen {
         if (e.kind == AK.Unary()) { return e.op == TK.Bang(); }
         if (e.kind == AK.MemberAccess()) {
             Fld f = FieldOf(e);
-            return f != null && f.ty == "bool";
+            if (f != null) { return f.ty == "bool"; }
+            return PropGetterTy(e) == "bool";
         }
         if (e.kind == AK.Ident()) {
             int li = LocalIdx(e.sval);
@@ -5024,6 +5090,15 @@ partial class Ngen {
             return FindStaticTy(curCls, e.sval) == "bool";
         }
         if (e.kind == AK.Call() && e.a != null) {
+            // string.IsNullOrEmpty(s): gen0's inference fails on the
+            // extension-method-in-static form, so WriteLine renders its
+            // 0/1 result numerically instead of true/false
+            if (e.a.kind == AK.MemberAccess() && e.a.sval == "IsNullOrEmpty"
+                    && e.kids.Count == 1 && e.a.a != null
+                    && e.a.a.kind == AK.Ident()
+                    && (e.a.a.sval == "string" || e.a.a.sval == "String")) {
+                return false;
+            }
             return CallRetTy(e) == "bool";
         }
         return false;
@@ -5970,7 +6045,9 @@ partial class Ngen {
                 }
                 if (callee.sval == "ToArray" && e.kids.Count == 0) {
                     GenExpr(recv);
-                    BLInternal("_zan_rt_list_toarray");
+                    // float elements repack into a real packed float[]
+                    BLInternal(StaticTyOf(recv) == "List<float>"
+                        ? "_zan_rt_list_toarray_f32" : "_zan_rt_list_toarray");
                     return;
                 }
                 diags.Error("ngen: unsupported List operation '" + callee.sval + "'", e.line, e.col);
@@ -6344,6 +6421,25 @@ partial class Ngen {
         E4(0x9E660000);                                  // fmov x0, d0
     }
 
+    // double -> float -> double round trip in x0: a float-typed value rounds
+    // to single precision on the way into any float slot and widens on the
+    // way out (registers keep the double-bit representation throughout, so
+    // this is idempotent on already-narrowed values)
+    void NarrowF32() {
+        E4(0x9E67001F);                                  // fmov d31, x0
+        E4(0x1E6243FF);                                  // fcvt s31, d31
+        E4(0x1E22C3FF);                                  // fcvt d31, s31
+        E4(0x9E6603E0);                                  // fmov x0, d31
+    }
+
+    // same round trip but x0 ends holding the SINGLE bits (low 32, zero
+    // extended) -- the representation packed 4-byte array slots store
+    void NarrowF32Bits() {
+        E4(0x9E67001F);                                  // fmov d31, x0
+        E4(0x1E6243FF);                                  // fcvt s31, d31
+        E4(0x1E2603E0);                                  // fmov w0, s31
+    }
+
     // implicit int->double conversion for argument `idx` of method m when
     // the declared parameter is double but the argument expression is not
     void ConvArg(Node m, int idx, Node arg) {
@@ -6351,7 +6447,12 @@ partial class Ngen {
         if (p == null || p.type == null) { return; }
         if (TryEmitConversionNg(arg, TypeFullName(p.type), false, false)) { return; }
         string pt = TypeFullName(p.type);
-        if (IsDblTy(pt) && !IsDblExpr(arg)) { ConvI2D(); return; }
+        if (IsDblTy(pt) && !IsDblExpr(arg)) {
+            ConvI2D();
+            if (pt == "float") { NarrowF32(); }          // float params round on entry
+            return;
+        }
+        if (pt == "float" && !IsStrExpr(arg)) { NarrowF32(); return; }
         if (pt == "int" && !IsDblExpr(arg) && !IsStrExpr(arg)) { E4(0x93407C00); }     // sxtw x0, w0
     }
 
