@@ -1,6 +1,18 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-17 · v5 · 定点 run.H78JR0（本轮批次后）
+日期：2026-09-20 · v5 · 定点 run.dsdoIT（本轮批次后的正式自举检查点）
+
+## v5 自举（2026-09-20，run.H78JR0 → run.dsdoIT，正式链）
+
+`SEED=run.H78JR0/stage2 RT_OBJS=crt-transition 重建对象 scripts/native_bootstrap.sh`
+一次通过：stage1 → stage2 → stage3，**stage2.o == stage3.o 逐字节一致**
+（compare.log 留档），新检查点 build/native-bootstrap/run.dsdoIT（stdlib
+冻结拷贝 + 源/种子/runtime sha256 齐全）。以 run.dsdoIT/stage2 复验：
+39/39 回归、known_folders/urldecode_nul/int_format_boundaries/
+char_and_ulong_text/xlsx_write 定向 parity 全 pass。
+注意：/tmp 于 2026-09-20 再次被清空，crt-transition 的 zanstubs.o/
+zanhost.o 按 README 从源码重建（哈希与 run.H78JR0 记录的不同——clang
+版本差异，以回归+定点+sweep 行为为准）。
 
 ## v5 结果（2026-09-17，run.H78JR0 定点 + 本批二进制，549 例 sweep）
 
