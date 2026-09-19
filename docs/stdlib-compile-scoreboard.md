@@ -14,6 +14,32 @@ char_and_ulong_text/xlsx_write 定向 parity 全 pass。
 zanhost.o 按 README 从源码重建（哈希与 run.H78JR0 记录的不同——clang
 版本差异，以回归+定点+sweep 行为为准）。
 
+## v5 交叉目标（2026-09-20，执行级验收重建 + 脚本化）
+
+基线 json 里"qemu boot byte-exact"的验证脚手架随 /tmp 被清而丢失，本轮
+重建为**可重复脚本** `scripts/crossboot/cross_boot_check.sh`（每批照跑）：
+
+1. **ELF64 执行车道**：stdlib-free 编译器拷贝（fixture 只用编译器内建的
+   Dictionary/List/Console，pull-in 记录 total 1 files）以
+   `ZAN_TARGET=aarch64-linux` 编译 5 个 conformance fixture →
+   elfcheck → `ld.lld -m aarch64linux -static -nostdlib -T stub.ld` 链接
+   freestanding 半托管 stub → `qemu-system-aarch64 -M virt -cpu max`
+   裸机引导 → 与 tests/selfhost golden **逐字节对拍**。5/5 PASS：
+   dict_minimal、dict_growth、native_string_ops（含软越界段）、
+   list_string_search、host_args_bounds。
+2. **PE-COFF 结构车道**：同一批源以 `.obj` 输出名（无需 env）走
+   ngen_coff → coffcheck 5/5 PASS（同一脚本第二车道）。
+3. **stub.c 要点**（scripts/crossboot/）：半托管 WRITE0/EXIT_EXTENDED；
+   bump 堆 + 整数/字符串 mini-printf；_start 里 `msr cpacr_el1` 打开
+   FP/SIMD（bare metal 默认陷阱，runtime 的 `stp q0,q1` 会打到 0x200
+   异常向量）；boot 以 main(1,{NULL}) 交参数（否则 host_argc 读垃圾，
+   Environment.ArgCount()>0 误入 probe 分支静默退出）；runtime 引用的
+   macOS 专属宿主面（glob/CC_SHA256/mach 等）用 UNREACHED abort 占位——
+   引导成功即证明执行路径未触达；软越界守卫（ngen_guard）按其设计喂
+   文件/时间失败值（fopen→NULL、localtime_r→NULL 等）优雅降级，stdout
+   不受影响；os_unfair_lock 单线程 no-op（interning 路径真调用）。
+4. 同批复验：39/39 回归。基线 json targets 记录已更新指向本脚本。
+
 ## v5 结果（2026-09-17，run.H78JR0 定点 + 本批二进制，549 例 sweep）
 
 549 例全量 sweep（顺序执行）：pass 257→279、output_mismatch 11→0、
