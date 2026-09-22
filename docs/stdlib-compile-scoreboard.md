@@ -1,6 +1,46 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-20 · v5 · 定点 run.dsdoIT（本轮批次后的正式自举检查点）
+日期：2026-09-22 · v6 · 定点 run.IkNm6s（真 bug 修复后的全收敛检查点）
+
+## v6 验证与真 bug（2026-09-22，\u/\x 双重编码 + 全量复验）
+
+**环境变化（重要）**：用户 2026-09-22 拉取 zan-lang（只读目录）：conformance
+549→624 例（+113，含 15 个新 zandb_*）；stdlib 收缩为 {Gui,System}，
+Game/Sdk/Commercial 移入 packages/（feffa89f/fd1dd4c2，09-18）。而
+zan-lang/build/zanc 二进制是 09-13 构建（HEAD 83996719），**早于 packages
+功能**——DYLD opendir 插桩证实它从不扫描包存储，因此 119 例
+reference_compile_failed 全部是 oracle 侧陈旧（ZANPKG_MISSING），
+**需要用户重建 zan-lang**（我方保持只读）。新旧 sweep 数字不可直接比。
+
+**真 bug（已修）**：`\u`/`\x` 转义在 native 字面量池**双重编码**。ngen.zan
+`RawByteStr(b)` 用 `Convert.ToString((char)b)`，而 b38ad09 的 chrstr 重写后
+char→string 是诚实 UTF-8：b≥0x80 渲染成多字节 → `\u4e2d` 进池变成
+C3 A4 C2 B8 C2 AD（len 6，应为 E4 B8 AD len 3）。最小复现 + string_escapes
+golden 均证。修复：`Substring(0,1)` 切出全新 1 字节串再 `s[0]=b` 原始覆写
+（字符串索引写按 native_string_ops 语义截断为 u8）。
+
+**修后复验**：最小复现（E4 B8 AD/3）✓；string_escapes golden "all pass" ✓；
+39/39 回归 ✓；定向 parity 8/8（string_escapes、char_and_ulong_text、
+urldecode_nul、int_format_boundaries、known_folders、interp_nested、
+cs_b10_interp_format、string_index_char_text）✓；正式自举
+`SEED=Sk0XRV/stage2` 重跑得 **run.IkNm6s：stage1.o == stage2.o == stage3.o
+全收敛**（强于脚本的 stage2==stage3 验收），新检查点 39/39 ✓。
+
+**全量 sweep（624 例，run.IkNm6s/stage2，对照组 Sk0XRV pre-fix 277）**：
+pass **278**（+1 = string_escapes 归位）、output_mismatch 6→3、
+exit_mismatch 6、matching_nonzero_exit 9→11、native_compile_failed 207、
+reference_compile_failed 119。**8 个异常全归因**：
+
+| 例 | 判定 |
+|---|---|
+| arr_lit_rc、enum_257_members | 我们与 golden 逐字节一致，oracle 漂移 |
+| async_shadow_same_name_across_await、struct_arc_lifetime | oracle 段错误(-11)，我们输出与 golden 一致 |
+| fileinfoex_mmap、mmap_owner | 本轮移入 matching_nonzero（oracle 侧漂移） |
+| binding_temp_source | **我方真缺口**：A310 活绑定对接收者为 owned 临时时应降级 const 快照，golden 0 vs 我们 1（下批修） |
+| reference_compile_failed ×119 | oracle 二进制缺 packages 功能，重建即清 |
+
+其余 207 例 native_compile_failed 为真实能力缺口（HTTP 客户端/socket 族、
+DB 驱动含 15 个新 zandb_*、JSON bind、ORM、LINQ、反射、线程/锁）。
 
 ## v5 自举（2026-09-20，run.H78JR0 → run.dsdoIT，正式链）
 
