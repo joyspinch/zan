@@ -3459,9 +3459,53 @@ partial class Ngen {
         E4(0xF84107E0);                                  // pop arr -> x0
     }
 
+    // a literal node for a primitive-type constant read (`int.MaxValue`),
+    // or null when `mem` is not one
+    Node PrimitiveConstLit(Node mem) {
+        if (mem == null || mem.a == null || mem.a.kind != AK.Ident()) { return null; }
+        string recv = mem.a.sval;
+        // host math constants fold like primitive constants (no storage);
+        // a user-declared Math member keeps its own identity
+        if (recv == "Math" && (mem.sval == "PI" || mem.sval == "E")
+                && FindStaticTy("Math", mem.sval) == null) {
+            return FloatLitNg(mem.sval == "PI" ? "3.141592653589793" : "2.718281828459045");
+        }
+        if (recv != "int" && recv != "long" && recv != "double") { return null; }
+        if (mem.sval != "MaxValue" && mem.sval != "MinValue" && mem.sval != "Epsilon") { return null; }
+        if (recv == "int") {
+            if (mem.sval == "MaxValue") { return IntLitNg(2147483647); }
+            if (mem.sval == "MinValue") { return IntLitNg(0 - 2147483648); }
+            return null;
+        }
+        if (recv == "long") {
+            if (mem.sval == "MaxValue") { return IntLitNg(9223372036854775807); }
+            if (mem.sval == "MinValue") { return IntLitNg(-9223372036854775807 - 1); }
+            return null;
+        }
+        if (mem.sval == "MaxValue") { return FloatLitNg("1.7976931348623157e308"); }
+        if (mem.sval == "MinValue") { return FloatLitNg("-1.7976931348623157e308"); }
+        return FloatLitNg("2.2250738585072014e-308");
+    }
+
+    Node IntLitNg(long v) {
+        Node n = new Node(AK.IntLit());
+        n.ival = v;
+        return n;
+    }
+
+    Node FloatLitNg(string txt) {
+        Node n = new Node(AK.FloatLit());
+        n.sval = txt;
+        return n;
+    }
+
     void GenFieldLoad(Node mem) {
         Fld f = FieldOf(mem);
         if (f == null) {
+            // primitive-type constants: int.MaxValue / long.MinValue /
+            // double.MaxValue ... fold to literals (no runtime storage)
+            Node pcl = PrimitiveConstLit(mem);
+            if (pcl != null) { GenExpr(pcl); return; }
             // qualified static read: ClsName.field
             if (mem.a != null && mem.a.kind == AK.Ident()) {
                 string ssym = FindStaticSym(QualifiedCls(mem.a.sval, mem.sval2), mem.sval);
@@ -3529,7 +3573,14 @@ partial class Ngen {
             // field chains resolve to the field's declared class
             // (`x.next.n` needs ExprCls of `x.next`)
             Fld mf = FieldOf(e);
-            return mf != null ? ClassTyOf(mf.ty) : null;
+            if (mf != null) { return ClassTyOf(mf.ty); }
+            // qualified static field chains: `Store.items.Count` types the
+            // receiver from the static field's declared type
+            if (e.a != null && e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0
+                    && FindClass(e.a.sval) != null) {
+                return ClassTyOf(FindStaticTy(QualifiedCls(e.a.sval, e.sval2), e.sval));
+            }
+            return null;
         }
         return null;
     }
@@ -3758,6 +3809,13 @@ partial class Ngen {
         if (e.kind == AK.Ident()) { return NamedSlotTy(e.sval); }
         if (e.kind == AK.Call()) { return CallRetTy(e); }
         if (e.kind == AK.MemberAccess()) {
+            // primitive-type constants type as their primitive
+            // (double.MaxValue prints as a double)
+            if (PrimitiveConstLit(e) != null) {
+                if (e.a.sval == "double" || e.a.sval == "Math") { return "double"; }
+                if (e.a.sval == "long") { return "long"; }
+                return "int";
+            }
             if ((e.sval == "Keys" || e.sval == "Values") && ExprCls(e.a) == "Dict") {
                 return "List<" + DictSlotTy(e.a, e.sval == "Keys") + ">";
             }
@@ -3765,6 +3823,13 @@ partial class Ngen {
             if (e.a != null && e.a.kind == AK.Ident() && FindEnum(e.a.sval) >= 0) { return e.a.sval; }
             Fld f = FieldOf(e);
             if (f != null) { return f.ty; }
+            // qualified static field read: ClsName.field carries the
+            // field's declared type (Store.items.Count)
+            if (e.a != null && e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0
+                    && FindClass(e.a.sval) != null) {
+                string qst = FindStaticTy(QualifiedCls(e.a.sval, e.sval2), e.sval);
+                if (qst != null) { return qst; }
+            }
             return PropGetterTy(e);
         }
         if (e.kind == AK.Index()) { return ElemTyOf(e); }
@@ -5052,7 +5117,10 @@ partial class Ngen {
             Fld f = FieldOf(e);
             if (f != null) { return IsDblTy(f.ty); }
             string pt = PropGetterTy(e);
-            return pt != null && IsDblTy(pt);
+            if (pt != null && pt != "") { return IsDblTy(pt); }
+            // qualified static reads (Store.d, double.MaxValue) type
+            // through StaticTyOf
+            return IsDblTy(StaticTyOf(e));
         }
         if (e.kind == AK.Ident()) {
             int li = LocalIdx(e.sval);
@@ -5264,6 +5332,15 @@ partial class Ngen {
                     && (e.a.a.sval == "string" || e.a.a.sval == "String")) {
                 return false;
             }
+            // gen0 lowers string/List Contains to a 0/1 int probe, so
+            // WriteLine renders it numerically (log_rolling_file golden
+            // prints 0/1, not true/false)
+            if (e.a.kind == AK.MemberAccess() && e.a.sval != null) {
+                string cn9 = e.a.sval;
+                int d9 = cn9.IndexOf("$");
+                if (d9 > 0) { cn9 = cn9.Substring(0, d9); }
+                if (cn9 == "Contains") { return false; }
+            }
             return CallRetTy(e) == "bool";
         }
         return false;
@@ -5385,8 +5462,28 @@ partial class Ngen {
                 wcls = wc != null ? wc.baseName : null;
             }
         }
-        string rty = staticIdx >= 0 ? TypeFullName(methNodes[staticIdx].type)
-            : MethRetTy(e.a != null ? e.a.sval : null);
+        string rty = null;
+        if (staticIdx >= 0) {
+            rty = TypeFullName(methNodes[staticIdx].type);
+        } else if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.a != null) {
+            // the receiver's class chain outranks the global name table:
+            // same-named methods across classes are common (SignalString.Get
+            // vs SignalInt.Get) and the global pick is arbitrary
+            string rcv = recvTy != null ? recvTy : StaticTyOf(e.a.a);
+            if (rcv != null && !IsDelegateTyNg(rcv)) {
+                string w2 = rcv;
+                int lt9 = w2.IndexOf("<");
+                if (lt9 > 0) { w2 = w2.Substring(0, lt9); }
+                List<int> ic = new List<int>();
+                while (w2 != null && ic.Count == 0) {
+                    InstanceCands(w2, e.a.sval, ic);
+                    if (ic.Count == 0) { Cls c9 = FindClass(w2); w2 = c9 != null ? c9.baseName : null; }
+                }
+                int pick9 = ic.Count == 1 ? ic[0] : (ic.Count > 1 ? FitPickIdx(ic, e) : -1);
+                if (pick9 >= 0) { rty = TypeFullName(methNodes[pick9].type); }
+            }
+        }
+        if (rty == null || rty == "") { rty = MethRetTy(e.a != null ? e.a.sval : null); }
         if (rty == null || rty == "") { return rty; }
         if (e.a == null || e.a.kind != AK.MemberAccess() || e.a.a == null) { return rty; }
         // recvTy (typed above, cc == e.a here) IS StaticTyOf(e.a.a): re-typing
@@ -5598,6 +5695,31 @@ partial class Ngen {
         while (save >= 19) { E4(0xF84107E0 | save); save = save - 1; }
     }
 
+    // nearest instance implementation of `name` strictly above curCls in the
+    // base chain (base-call semantics: curCls's own overrides are skipped,
+    // abstract declarations do not terminate the walk)
+    int ResolveBaseImplNg(string name, Node call) {
+        Cls mine = curCls != null ? FindClass(curCls) : null;
+        string cur = mine != null ? mine.baseName : null;
+        while (cur != null) {
+            Cls cc = FindClass(cur);
+            string cn = cc != null ? cc.name : cur;
+            List<int> cands = new List<int>();
+            List<int> cc2 = MethCandsClsName(cn, name);
+            if (cc2 != null) {
+                int q = 0;
+                while (q < cc2.Count) {
+                    if (methStat[cc2[q]] != 1) { cands.Add(cc2[q]); }
+                    q = q + 1;
+                }
+            }
+            int pick = cands.Count > 0 ? FitPickIdx(cands, call) : -1;
+            if (pick >= 0 && !HasMod(methNodes[pick], MOD.Abstract())) { return pick; }
+            cur = cc != null ? cc.baseName : null;
+        }
+        return -1;
+    }
+
     void GenCall(Node e) {
         if (TryGenDelegateCall(e)) { return; }
         if (TryGenPackedSlice(e)) { return; }
@@ -5606,6 +5728,21 @@ partial class Ngen {
         Node callee = e.a;
         if (callee != null && callee.kind == AK.MemberAccess()) {
             Node recv = callee.a;
+            // base.Method(args): invoke the nearest implementation above
+            // curCls directly (nonvirtual) with `this` as the receiver
+            if (recv != null && recv.kind == AK.Ident() && recv.sval == "base") {
+                int bi2 = ResolveBaseImplNg(callee.sval, e);
+                if (bi2 >= 0) {
+                    GenExpr(new Node(AK.ThisExpr()));
+                    E4(0xF81F0FE0);                          // str x0, [sp, #-16]!
+                    int pushed2 = PushCallArgs(methNodes[bi2], e);
+                    int r2 = pushed2;
+                    while (r2 >= 1) { E4(0xF84107E0 | r2); r2 = r2 - 1; }
+                    E4(0xF84107E0);                          // ldr x0, [sp], #16 (this)
+                    BLInternal(MethSymNg(methCls[bi2], methNodes[bi2]));
+                    return;
+                }
+            }
             if (recv != null && recv.kind == AK.Ident() && recv.sval == "Console"
                     && callee.sval == "WriteLine" && e.kids.Count == 1) {
                 // own runtime core: print_int(i64) / println(str)

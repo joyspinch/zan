@@ -1,6 +1,52 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-23 · v8 · 定点见下方 v8 节
+日期：2026-09-23 · v9 · 定点见下方 v9 节
+
+## v9 语言修复批（2026-09-23，static const 位叠加 + 四个解析缺口，chart 524→80 错）
+
+**真 bug（本批锚点）**：parser 修饰符扫描把 `const` 记作
+`m = m + MOD.Static()`，而 `MOD.Static()=16`——**`static const` 叠加成
+32 == MOD.Virtual()**，const 字段被当成 virtual **实例字段**（占布局槽、
+不可 `ClsName.字段` 限定读）。一行修复（`|` 代替 `+`）消灭 chart 主家族
+374 个 `unknown field` 错中的 312 个。stdlib 里 Log.TRACE、
+QueryCapabilities.Filter 等全部归位。
+
+**同批四个解析缺口**（chart 错误 212→99→80）：
+
+1. **静态字段链类型传播**：`Store.items.Count`——StaticTyOf/ExprCls 的
+   MemberAccess 分支只认实例字段；加 `ClsName.field` 分支
+   （FindStaticTy 经 QualifiedCls），内层读的类型喂给外层成员。
+   `unsupported index target` 24 错因此全消。
+2. **基元/Math 常量折叠**：`int/long.MaxValue|MinValue`、
+   `double.MaxValue|MinValue|Epsilon`、`Math.PI|E` 折叠为字面量
+   （PrimitiveConstLit + StaticTyOf 类型标注 + IsDblExpr 兜底走
+   StaticTyOf）；用户自己声明的 Math 成员不劫持。
+3. **base.Method(args) 调用**：GenCall 识别接收者 Ident("base")，沿基类
+   链找最近实现（跳过 curCls 自身 override、abstract 不终止），`this` 作
+   接收者直接 BL（非虚）——ResolveBaseImplNg。
+4. **CallRetTy 接收者链解析**：成员调用回退类型原来是 MethRetTy
+   **全局同名第一匹配**（`Get` 在 SignalString→string / SignalInt→int
+   间凭注册顺序二选一）；改为先沿接收者静态类链 InstanceCands +
+   FitPickIdx，全局表兜底。`model.Get().Length` 一族归位。
+5. **Contains 的 WriteLine 渲染**（sweep 揭示的潜伏分歧，非本批回归）：
+   static const 修复让 log_rolling_file 首次编译通过，暴露 gen0 把
+   string/List Contains 降级为 0/1 int、golden 打 `0/1` 而我们打
+   `true/false`——值全对、渲染分派错。IsBoolExpr 对 Contains 调用（含
+   `$` spec 后缀剥离）按 gen0 模型返回数值渲染。修后与 golden 逐字节
+   一致（`true true 0 1 1`），om→pass。
+
+**剖面**：chart_kinds_complete 524 → 80 错（-85%）；剩余约半是
+**instance async**（Worker.onDown 等，~38 错/编译，每个 chart 用例拖同一
+stdlib 所以全体卡此）+ 其级联（too many arguments 等多为方法注册失败的
+错位解析）。**下批 = instance async + 泛型 spec 调用解析（Get$T）**，
+是 53 个 chart_* 用例翻绿的闸门（golden 都在，oracle 因缺 packages 全部
+reference_compile_failed，修好即直接对 golden）。
+
+**复验**：五个探针（限定 const 读/基元常量/静态字段链/base 调用/同名
+方法解析）逐字节正确；39/39 回归 ✓；crossboot ELF 5/5 + PE-COFF 5/5 ✓；
+定向 parity 9 pass（property_accessors/orm_table_accessor 存量 ncf，批前
+checkpoint 同判）；正式自举新检查点 **run.OniEz2：stage1==stage2==stage3
+全收敛**（972767e4e564467f，连续第五个）；624 sweep 分布见 json。
 
 ## v8 编译器性能批（2026-09-23，大输入编译 36×/17× 提速，零行为变化）
 
