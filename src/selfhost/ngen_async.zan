@@ -588,6 +588,133 @@ partial class Ngen {
                 && inner.a.sval == "Delay" && inner.kids.Count == 1;
     }
 
+    // the IO-reactor / gate suspension intrinsics the compiler lowers
+    // itself (irgen_async.zan IsSocketIntrinsic, C host irgen_expr.c
+    // 8147-8540): 0 = none, 1 = Gate.Park, 2 = readiness probe,
+    // 3 = RecvOv, 4 = RecvToOv, 5 = AcceptOv, 6 = ResolveSockAddr
+    int CoIntrinsicKindNg(Node inner) {
+        if (inner == null || inner.kind != AK.Call() || inner.a == null
+                || inner.a.kind != AK.MemberAccess() || inner.a.a == null
+                || inner.a.a.kind != AK.Ident()) { return 0; }
+        string cn = inner.a.a.sval;
+        string mn = inner.a.sval;
+        if (cn == "Gate" && mn == "Park" && inner.kids.Count == 1) { return 1; }
+        if (cn != "Socket") { return 0; }
+        if ((mn == "ReadReady" || mn == "WriteReady") && inner.kids.Count == 1) { return 2; }
+        if (mn == "RecvOv" && inner.kids.Count == 3) { return 3; }
+        if (mn == "RecvToOv" && inner.kids.Count == 4) { return 4; }
+        if (mn == "AcceptOv" && inner.kids.Count == 1) { return 5; }
+        if (mn == "ResolveSockAddr" && inner.kids.Count == 4) { return 6; }
+        return 0;
+    }
+
+    // lower one suspension intrinsic: evaluate the args (the statement head
+    // already hoisted any awaits inside them), spill live slots, call the
+    // self-emitted runtime helper -- frame + $resume + &result slot are the
+    // tail arguments -- then suspend; resume-k reloads and delivers the
+    // helper's result (frame+32) for the value-yielding kinds
+    void EmitCoIntrinsicNg(int kind, Node inner, Node aw, bool resUsed, int k, int kLbl) {
+        if (kind <= 2 && resUsed) {
+            diags.Error("ngen: 'await Gate.Park / Socket.ReadReady / Socket.WriteReady' yields no value and is only supported as a discard statement inside an async method", aw.line, aw.col);
+        }
+        int i = 0;
+        while (i < inner.kids.Count) {
+            GenExpr(inner.kids[i]);
+            E4(0xF81F0FE0);                          // push arg (16-aligned)
+            i = i + 1;
+        }
+        SaveSlotsNg();
+        if (kind == 1) {
+            E4(0xF84107E0);                          // handle -> x0
+        } else if (kind == 2) {                      // fd -> x0; the interest
+            E4(0xF84107E0);                          // is a lowered constant
+            if (inner.a.sval == "WriteReady") { LoadImm(1, 2); } else { LoadImm(1, 1); }
+        } else if (kind == 3) {                      // RecvOv: len,buf,fd
+            E4(0xF84107E2);
+            E4(0xF84107E1);
+            E4(0xF84107E0);
+        } else if (kind == 4) {                      // RecvToOv: tmo,len,buf,fd
+            E4(0xF84107E3);
+            E4(0xF84107E2);
+            E4(0xF84107E1);
+            E4(0xF84107E0);
+        } else if (kind == 5) {
+            E4(0xF84107E0);                          // fd -> x0
+        } else {                                     // ResolveSockAddr: cap,buf,port,name
+            E4(0xF84107E3);
+            E4(0xF84107E2);
+            E4(0xF84107E1);
+            E4(0xF84107E0);                          // name -> x0 (the handle IS
+        }                                            //  the char* on this lane)
+        if (kind == 1) {
+            LoadLocal(asyncFrameLocal, 1);           // park(g, frame, resume)
+            LoadSymRef(asyncResumeSym, 2);
+            BLExtern("_zan_gate_park");
+        } else if (kind == 2) {
+            LoadLocal(asyncFrameLocal, 2);           // wait_co(fd, interest, frame, resume)
+            LoadSymRef(asyncResumeSym, 3);
+            BLExtern("_zan_io_wait_co");
+        } else if (kind == 3) {
+            LoadLocal(asyncFrameLocal, 3);           // recv_co(fd, buf, len, frame, resume, &res)
+            LoadSymRef(asyncResumeSym, 4);
+            LoadLocal(asyncFrameLocal, 5);
+            AddImm(5, 5, 32);
+            BLExtern("_zan_io_recv_co");
+        } else if (kind == 4) {
+            LoadLocal(asyncFrameLocal, 4);           // recv_to_co(fd, buf, len, tmo, frame, resume, &res)
+            LoadSymRef(asyncResumeSym, 5);
+            LoadLocal(asyncFrameLocal, 6);
+            AddImm(6, 6, 32);
+            BLExtern("_zan_io_recv_to_co");
+        } else if (kind == 5) {
+            LoadLocal(asyncFrameLocal, 1);           // accept_co(fd, frame, resume, &res)
+            LoadSymRef(asyncResumeSym, 2);
+            LoadLocal(asyncFrameLocal, 3);
+            AddImm(3, 3, 32);
+            BLExtern("_zan_io_accept_co");
+        } else {
+            LoadLocal(asyncFrameLocal, 4);           // resolve_sa_co(name, port, buf, cap, frame, resume, &res)
+            LoadSymRef(asyncResumeSym, 5);
+            LoadLocal(asyncFrameLocal, 6);
+            AddImm(6, 6, 32);
+            BLExtern("_zan_resolve_sa_co");
+        }
+        LoadLocal(asyncFrameLocal, 1);
+        LoadImm(0, k);
+        StrU(0, 1, 0);                               // state = k
+        AsyncEhUnarmNg();                            // suspend disarms
+        Epilogue();                                  // ret to the scheduler
+        Mark(kLbl);
+        // ---- resume-k ----
+        ReloadSlotsNg();
+        int rti = 0;
+        while (rti < asyncTryCatchLs.Count) {        // re-arm trys open around
+            ArmAsyncTryBufNg(asyncTryCatchLs[rti]);  // the suspension
+            rti = rti + 1;
+        }
+        if (kind >= 3) {                             // Recv*/Accept/Resolve yield
+            LoadLocal(asyncFrameLocal, 9);           // the helper's result slot
+            LdrU(0, 9, 32);
+        } else {
+            LoadImm(0, 0);                           // Park / probe yield 0
+        }
+    }
+
+    // the awaited callee is itself a delegate VALUE (local, field,
+    // parameter -- `await onDown(conn);`): its thunk dispatches to a
+    // method-group ramp that yields the frame handle like any instance
+    // call, and the general await reads the SELF resume out of the frame
+    // for indirect calls (irgen_expr.c:8540). Only await paths consult
+    // this -- statement-level detach recognition (PrepareAsyncStmtNg)
+    // must NOT see a -2 for an ordinary delegate invocation.
+    bool IsDelegateCalleeNg(Node call) {
+        if (call == null || call.a == null) { return false; }
+        Node callee = call.a;
+        if (callee.kind != AK.Ident() && callee.kind != AK.MemberAccess()) { return false; }
+        string dt = StaticTyOf(callee);
+        return dt != null && IsDelegateTyNg(dt);
+    }
+
     // classify an awaited/detached call: -1 = not an async call, >= 0 = the
     // static method index (CallStaticNg emits the ramp call), -2 = an
     // instance/interface/virtual dispatch (GenExpr emits it -- the vtable
@@ -692,7 +819,14 @@ partial class Ngen {
             LoadImm(0, 0);                           // Delay yields 0
             return;
         }
+        int ci = CoIntrinsicKindNg(inner);
+        if (ci > 0) {
+            EnsureAsyncRuntimeNg();
+            EmitCoIntrinsicNg(ci, inner, aw, resUsed, k, kLbl);
+            return;
+        }
         int mi = AsyncResolveCallNg(inner);
+        if (mi == -1 && IsDelegateCalleeNg(inner)) { mi = -2; }
         if (mi == -1) {
             string nm = inner != null && inner.a != null ? inner.a.sval : "?";
             diags.Error("ngen: 'await' of '" + nm + "' is not supported by the native backend (only calls to non-generic async methods) [" + asyncWhyNg + "]", aw.line, aw.col);
@@ -1354,6 +1488,7 @@ partial class Ngen {
             return true;
         }
         int mi = AsyncResolveCallNg(inner);
+        if (mi == -1 && IsDelegateCalleeNg(inner)) { mi = -2; }
         if (mi == -1) {
             diags.Error("ngen: 'await' of this expression is not supported by the native backend (only calls to non-generic async methods) [" + asyncWhyNg + "]", e.line, e.col);
             LoadImm(0, 0);
@@ -1695,6 +1830,232 @@ partial class Ngen {
         // pump accounting identical to the reference.
         syms.Add(new Sym("_zan_co_reap", txt.Count));
         RtPrologue();
+        RtEpilogue();
+
+        // ---- gate + io suspension primitives ----
+        // Gate/Socket declare these as DllImport EntryPoints; they are
+        // emitted next to the co scheduler into every async module, so the
+        // extern table resolves them locally (BLExtern scans local syms
+        // before exts). Semantics mirror rt_io.c 5060-5160.
+
+        // zan_gate_new() -> gate{head,tail,surplus} (zeroed)
+        syms.Add(new Sym("_zan_gate_new", txt.Count));
+        RtPrologue();
+        LoadImm(0, 24);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");
+        RtEpilogue();
+
+        // zan_gate_park(g, frame, step): consume a surplus signal or enqueue
+        // the (frame, step) waiter. A null gate, a zero step or a failed
+        // allocation degrade to an immediate wake (rt_io.c's released-gate
+        // Wait returns at once).
+        syms.Add(new Sym("_zan_gate_park", txt.Count));
+        RtPrologue();
+        int gpImm = NL();
+        int gpEnq = NL();
+        int gpDone = NL();
+        int gpEmpty = NL();
+        CbzReg(0, gpImm);
+        CbzReg(2, gpImm);
+        LdrU(3, 0, 16);                              // surplus
+        CbzReg(3, gpEnq);
+        LdrU(3, 0, 16);
+        SubImm(3, 3, 1);
+        StrU(3, 0, 16);                              // surplus-- : consumed
+        Mark(gpImm);                                 // immediate wake
+        MovRR(0, 1);
+        MovRR(1, 2);
+        BLInternal("_zan_co_ready");
+        EmitB(gpDone);
+        Mark(gpEnq);                                 // waiter{next,frame,step}
+        E4(0xF81F0FE0);                              // hold gate (the alloc call
+        E4(0xF81F0FE1);                              // below clobbers x0)
+        E4(0xF81F0FE2);                              // hold step
+        LoadImm(0, 24);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");
+        MovRR(9, 0);
+        E4(0xF84107E2);                              // step -> x2
+        E4(0xF84107E1);                              // frame -> x1
+        E4(0xF84107E0);                              // gate -> x0 (restored)
+        CbzReg(9, gpImm);                            // alloc failed: fire now
+        StrU(1, 9, 8);
+        StrU(2, 9, 16);
+        LdrU(3, 0, 0);                               // head
+        CbzReg(3, gpEmpty);
+        LdrU(4, 0, 8);                               // tail
+        StrU(9, 4, 0);                               // tail.next = waiter
+        EmitB(gpDone);
+        Mark(gpEmpty);
+        StrU(9, 0, 0);                               // head = waiter
+        StrU(9, 0, 8);                               // tail = waiter
+        Mark(gpDone);
+        RtEpilogue();
+
+        // zan_gate_signal(g): wake the head waiter, else bank a surplus
+        syms.Add(new Sym("_zan_gate_signal", txt.Count));
+        RtPrologue();
+        int gsOut = NL();
+        int gsBank = NL();
+        int gsTail = NL();
+        int gsDone = NL();
+        CbzReg(0, gsOut);
+        LdrU(3, 0, 0);                               // head
+        CbzReg(3, gsBank);
+        LdrU(1, 3, 0);                               // head.next
+        StrU(1, 0, 0);                               // head = next
+        EmitCbnz(1, gsTail);
+        StrU(1, 0, 8);                               // drained: tail = 0 (x1)
+        Mark(gsTail);
+        LdrU(0, 3, 8);                               // waiter.frame
+        LdrU(1, 3, 16);                              // waiter.step
+        BLInternal("_zan_co_ready");
+        EmitB(gsDone);
+        Mark(gsBank);
+        LdrU(3, 0, 16);
+        AddImm(3, 3, 1);
+        StrU(3, 0, 16);                              // surplus++
+        Mark(gsDone);
+        Mark(gsOut);
+        RtEpilogue();
+
+        // zan_gate_free(g): release -- every parked waiter re-readies
+        // (rt_io.c's drain). Storage itself is not freed (no-free lane).
+        syms.Add(new Sym("_zan_gate_free", txt.Count));
+        RtPrologue();
+        int gfOut = NL();
+        int gfLoop = NL();
+        CbzReg(0, gfOut);
+        LdrU(3, 0, 0);
+        Mark(gfLoop);
+        CbzReg(3, gfOut);
+        LdrU(4, 3, 0);                               // next
+        LdrU(0, 3, 8);
+        LdrU(1, 3, 16);
+        BLInternal("_zan_co_ready");
+        MovRR(3, 4);
+        EmitB(gfLoop);
+        Mark(gfOut);
+        RtEpilogue();
+
+        // _zan_io_wait_co(fd, interest, frame, step): the native lane has no
+        // kqueue bridge -- the fd is immediately ready (matching the
+        // non-blocking reactor shapes; readiness is re-checked per syscall)
+        syms.Add(new Sym("_zan_io_wait_co", txt.Count));
+        RtPrologue();
+        MovRR(0, 2);
+        MovRR(1, 3);
+        BLInternal("_zan_co_ready");
+        RtEpilogue();
+
+        // _zan_io_recv_co(fd, buf, len, frame, step, i64* outn): a single
+        // libc recv with no real suspension; the byte count lands in the
+        // frame result slot and the waiter re-readies. A negative
+        // errno-style return propagates (WouldBlock -> callers loop).
+        syms.Add(new Sym("_zan_io_recv_co", txt.Count));
+        RtPrologue();
+        E4(0xF81F0FE3);                              // hold frame
+        E4(0xF81F0FE4);                              // hold step
+        E4(0xF81F0FE5);                              // hold outn
+        LoadImm(3, 0);                               // flags = 0
+        BLExtern("_recv");
+        E4(0xF84107E5);                              // outn -> x5
+        StrU(0, 5, 0);                               // *outn = n
+        E4(0xF84107E4);                              // step -> x4
+        E4(0xF84107E3);                              // frame -> x3
+        MovRR(0, 3);
+        MovRR(1, 4);
+        BLInternal("_zan_co_ready");
+        RtEpilogue();
+
+        // _zan_io_recv_to_co(fd, buf, len, tmo_ms, frame, step, i64* outn):
+        // deadline form -- the timeout is not enforced on the native lane
+        // (documented deviation); the recv is identical to RecvOv's
+        syms.Add(new Sym("_zan_io_recv_to_co", txt.Count));
+        RtPrologue();
+        E4(0xF81F0FE4);                              // hold frame
+        E4(0xF81F0FE5);                              // hold step
+        E4(0xF81F0FE6);                              // hold outn
+        LoadImm(3, 0);                               // flags = 0
+        BLExtern("_recv");
+        E4(0xF84107E6);                              // outn -> x6
+        StrU(0, 6, 0);
+        E4(0xF84107E5);                              // step -> x5
+        E4(0xF84107E4);                              // frame -> x4
+        MovRR(0, 4);
+        MovRR(1, 5);
+        BLInternal("_zan_co_ready");
+        RtEpilogue();
+
+        // _zan_io_accept_co(fd, frame, step, i64* outfd): libc accept with
+        // NULL addr; the new fd lands in the frame result slot
+        syms.Add(new Sym("_zan_io_accept_co", txt.Count));
+        RtPrologue();
+        E4(0xF81F0FE1);                              // hold frame
+        E4(0xF81F0FE2);                              // hold step
+        E4(0xF81F0FE3);                              // hold outfd
+        LoadImm(1, 0);
+        LoadImm(2, 0);
+        BLExtern("_accept");
+        E4(0xF84107E3);                              // outfd -> x3
+        StrU(0, 3, 0);
+        E4(0xF84107E2);                              // step -> x2
+        E4(0xF84107E1);                              // frame -> x1
+        MovRR(0, 1);
+        MovRR(1, 2);
+        BLInternal("_zan_co_ready");
+        RtEpilogue();
+
+        // _zan_resolve_sa_co(name, port, buf, cap, frame, step, i64* outn):
+        // IPv4-literal resolution into a 16-byte darwin sockaddr_in
+        // {len=16, AF_INET, BE16 port, addr, zero pad} (rt_io.c's
+        // zan_resolve_sa_co darwin shape). Hostnames needing DNS are a
+        // documented native gap: *outn = 0.
+        syms.Add(new Sym("_zan_resolve_sa_co", txt.Count));
+        RtPrologue();
+        E4(0xF81F0FE0);                              // hold name
+        E4(0xF81F0FE1);                              // hold port
+        E4(0xF81F0FE2);                              // hold buf
+        E4(0xF81F0FE3);                              // hold cap
+        E4(0xF81F0FE4);                              // hold frame
+        E4(0xF81F0FE5);                              // hold step
+        E4(0xF81F0FE6);                              // hold outn
+        AddSPImm(16, false);                         // 16-byte inet_pton scratch
+        LoadImm(0, 2);                               // AF_INET
+        LdrU(1, 31, 112);                            // name
+        AddImm(2, 31, 0);                            // &scratch ([sp])
+        BLExtern("_inet_pton");
+        int rsFail = NL();
+        int rsDone = NL();
+        EmitCBZ(0, rsFail);                          // not a dotted quad
+        LdrU(1, 31, 64);                             // cap
+        LoadImm(3, 16);
+        E4(0xEB03003F);                              // cmp x1, x3 (cap, 16)
+        EmitBcond(11, rsFail);                       // b.lt: too small
+        LdrU(9, 31, 80);                             // buf
+        LoadImm(1, 16);
+        E4(0x39000121);                              // strb w1, [x9]      sin_len
+        LoadImm(1, 2);
+        E4(0x39000521);                              // strb w1, [x9, #1]  sin_family
+        LdrU(1, 31, 96);                             // port
+        E4(0x5AC00421);                              // rev16 w1, w1       -> BE16
+        E4(0x79000521);                              // strh w1, [x9, #2]  sin_port
+        StrU(31, 9, 8);                              // sin_zero = 0 (xzr store)
+        E4(0xB94003E1);                              // ldr w1, [sp]       parsed addr
+        E4(0xB9001121);                              // str w1, [x9, #4]   sin_addr
+        LdrU(3, 31, 16);                             // outn
+        LoadImm(1, 16);
+        StrU(1, 3, 0);                               // *outn = 16
+        EmitB(rsDone);
+        Mark(rsFail);
+        LdrU(3, 31, 16);
+        StrU(31, 3, 0);                              // *outn = 0
+        Mark(rsDone);
+        LdrU(0, 31, 48);                             // frame
+        LdrU(1, 31, 32);                             // step
+        BLInternal("_zan_co_ready");
+        AddSPImm(128, true);                         // 7 holds + scratch
         RtEpilogue();
     }
 }

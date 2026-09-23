@@ -1,6 +1,55 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-23 · v9 · 定点见下方 v9 节
+日期：2026-09-23 · v10 · 定点见下方 v10 节
+
+## v10 async/门/套接字批（2026-09-23，await 家族解锁，sweep 284→286，检查点 run.8ymewr）
+
+全部改动在 `src/selfhost/ngen_async.zan`。这是 chart_* 用例卡住的主闸门
+（每编译 ~38 个 await 错误）的根修批：
+
+1. **委托值 await**（Worker.onDown 族，`await h(x)` / `await this.cb(x)`）：
+   IsDelegateCalleeNg 在 **await 路径**把解析失败的 -1 提升为 -2（thunk
+   派发到 method-group ramp，返回帧句柄；一般 await 从帧读 SELF resume，
+   irgen_expr.c:8540）。** placements 是本批最重要的教训**：起初把检查放进
+   AsyncResolveCallNg 内部，而 PrepareAsyncStmtNg（Hook B 分离调用识别）
+   对**每条调用语句**都跑它 —— 普通委托字段调用 `sink(3);` 被当成"分离
+   异步调用"发射，void thunk 返回值被当帧句柄二次唤醒 → SIGSEGV
+   （delegate_field_call 崩溃、8 em + 2 om 假回归、无 async 模块被塞进
+   co runtime）。sweep 抓住，挪到 await 上下文后全部还原。
+2. **自降级挂起内建**（CoIntrinsicKindNg/EmitCoIntrinsicNg，以 IR lane
+   EmitSocketIntrinsic 为规格）：Gate.Park、Socket.ReadReady/WriteReady
+   （native lane 立即可读，interest 1/2 是降级常量）、RecvOv/RecvToOv
+   （一次 libc recv，负数 errno 式返回原样传播，超时不强制=已记录偏差）、
+   AcceptOv（libc accept，失败闭合）、ResolveSockAddr（IPv4 字面量经
+   inet_pton 填 16 字节 darwin sockaddr_in；DNS 名 *outn=0 已记录缺口）。
+   无值类（Park/ready）resUsed=true 报错；有值类从 frame+32 结果槽交付。
+3. **gate/io runtime 自发射**（EnsureAsyncRuntimeNg 内，asyncRtDone 守卫）：
+   DllImport EntryPoint（zan_gate_new/signal/free）经 BLExtern 本地符号
+   优先解析到自发射实现。Gate={head,tail,surplus} 24B，waiter=
+   {next,frame,step} 24B，盈余暂存语义照 rt_io.c 5060-5160；gate_free
+   排干等待者（native lane 无 free）。
+
+**探针抓到的两个发射 bug**：park 入队把 gate 留在 x0 跨过 _zan_rt_alloc
+调用（返回值覆盖 → waiter 自环，Signal 永远唤醒不了；修复=gate 一并压
+栈）；rev16 编码写成 REV（0x5AC00C21 应为 0x5AC00421）→
+_zan_resolve_sa_co 内 SIGILL。
+
+**chart 真实剖面**（必须从 zan-selfhost 跑让 stdlib 兜底生效；此前从
+tests/conformance 跑出 34 错是**无 stdlib 的伪剖面**）：81 → 44。剩余
+族：Get$T 显式泛型 spec（8）、委托捕获/7 参形状（6）、Html
+Dictionary<Action>（3）、awaited DllImport（2，irgen_expr.c:7969
+blocking-extern 规格）、FindNotAnyOf（2）、Task.Delay 实参/ToStr 元数
+级联、Interop Com。
+
+**复验**：qa1（委托 await 局部+字段）/qa2（Gate park/signal/盈余/关门
+往返）/qa3（recv/accept -1 传播 + 127.0.0.1:8080 的 sockaddr 字节
+16,2,31,144,127 + DNS→0）全对；delegate_field_call 复归探针 ✓；39/39 ✓；
+crossboot ELF 5/5 + PE-COFF 5/5 ✓；正式自举 **run.8ymewr**
+stage2.o==stage3.o；624 sweep **286 pass**（+2），em 6 / om 3 / mne 11
+案例清单与 run.OniEz2 基线完全一致；17 例脱离 ncf，其中 15 例编译已解锁
+但链接需要线程 runtime 外链面（_zan_thread_*/monitor/semaphore 族：
+atomic_shared_table、thread_* 等）—— crt-transition stub 扩面是下批
+前置，不是回归。
 
 ## v9 语言修复批（2026-09-23，static const 位叠加 + 四个解析缺口，chart 524→80 错）
 
