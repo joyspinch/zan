@@ -74,14 +74,24 @@ partial class Ngen {
     // symbol-table index of a referenced symbol: null, string literals,
     // data globals, defined methods, then undefined externs (locals first,
     // then globals, matching the sh_info convention)
-    int ElfRefSym(string name, List<string> exts, int extBase) {
+    // ELF numbering: 0 = null, then strs, dglbs, syms, then externs
+    MethIndex BuildElfRefIdx(List<string> exts, int extBase) {
+        MethIndex ix = new MethIndex();
         int i = 0;
-        while (i < strs.Count) { if (StrSym(i) == name) { return 1 + i; } i = i + 1; }
+        while (i < strs.Count) { ix.Add(StrSym(i), 1 + i); i = i + 1; }
         i = 0;
-        while (i < dglbs.Count) { if (DGlobalSym(dglbs[i].name) == name) { return 1 + strs.Count + i; } i = i + 1; }
+        while (i < dglbs.Count) { ix.Add(DGlobalSym(dglbs[i].name), 1 + strs.Count + i); i = i + 1; }
         i = 0;
-        while (i < syms.Count) { if (syms[i].name == name) { return 1 + strs.Count + dglbs.Count + i; } i = i + 1; }
-        return extBase + IndexOf(exts, name);
+        while (i < syms.Count) { ix.Add(syms[i].name, 1 + strs.Count + dglbs.Count + i); i = i + 1; }
+        i = 0;
+        while (i < exts.Count) { ix.Add(exts[i], extBase + i); i = i + 1; }
+        return ix;
+    }
+
+    int ElfRefSym(string name, MethIndex ix, int extBase) {
+        List<int> hit = ix.Get(name);
+        if (hit != null) { return hit[0]; }
+        return extBase - 1;
     }
 
     // classify the second half of a strRef pair: the relocation type that
@@ -101,19 +111,46 @@ partial class Ngen {
         return 277;                                          // ADD_ABS_LO12_NC
     }
 
-    // sorted-by-offset reloc bookkeeping
+    // sorted-by-offset reloc bookkeeping: entries are appended in arrival
+    // order and sorted once before emission (heapsort in SortReloc4), so a
+    // big object costs O(R log R) instead of the O(R^2) insertion sort
     void ElfAddRelo(List<int> offs, List<int> symsI, List<int> tys, List<int> adds,
                     int off, int symi, int ty, int add) {
-        int at = offs.Count;
-        int i = 0;
-        while (i < offs.Count) {
-            if (offs[i] > off) { at = i; break; }
-            i = i + 1;
+        offs.Add(off);
+        symsI.Add(symi);
+        tys.Add(ty);
+        adds.Add(add);
+    }
+
+    void SortReloc4(List<int> a, List<int> s, List<int> t, List<int> ad) {
+        int n = a.Count;
+        if (n < 2) { return; }
+        int i = n / 2;
+        while (i > 0) { i = i - 1; SiftReloc4(a, s, t, ad, i, n); }
+        i = n - 1;
+        while (i > 0) {
+            int x = a[0]; a[0] = a[i]; a[i] = x;
+            x = s[0]; s[0] = s[i]; s[i] = x;
+            x = t[0]; t[0] = t[i]; t[i] = x;
+            x = ad[0]; ad[0] = ad[i]; ad[i] = x;
+            SiftReloc4(a, s, t, ad, 0, i);
+            i = i - 1;
         }
-        offs.Insert(at, off);
-        symsI.Insert(at, symi);
-        tys.Insert(at, ty);
-        adds.Insert(at, add);
+    }
+
+    void SiftReloc4(List<int> a, List<int> s, List<int> t, List<int> ad, int root, int n) {
+        while (true) {
+            int l = root * 2 + 1;
+            if (l >= n) { break; }
+            int m = l;
+            if (l + 1 < n && a[l + 1] > a[m]) { m = l + 1; }
+            if (a[root] >= a[m]) { break; }
+            int x = a[root]; a[root] = a[m]; a[m] = x;
+            x = s[root]; s[root] = s[m]; s[m] = x;
+            x = t[root]; t[root] = t[m]; t[m] = x;
+            x = ad[root]; ad[root] = ad[m]; ad[m] = x;
+            root = m;
+        }
     }
 
     // byte length of .strtab for the emission order below
@@ -145,6 +182,7 @@ partial class Ngen {
         int firstGlobal = 1 + strs.Count + dglbs.Count;
         int extBase = firstGlobal + syms.Count;
         int nsyms = 1 + nloc + exts.Count;
+        MethIndex refIdx = BuildElfRefIdx(exts, extBase);
 
         List<int> rOff = new List<int>();
         List<int> rSym = new List<int>();
@@ -157,14 +195,14 @@ partial class Ngen {
                 // BL extern: imm26 stays zero; the linker resolves the call
                 // to the symbol address itself (addend 0, matching clang)
                 ElfAddRelo(rOff, rSym, rTy, rAdd, f.pos,
-                           ElfRefSym(f.sym, exts, extBase), 283, 0);
+                           ElfRefSym(f.sym, refIdx, extBase), 283, 0);
             }
             i = i + 1;
         }
         i = 0;
         while (i < strRefs.Count) {
             StrRef r = strRefs[i];
-            int sn = ElfRefSym(r.sym, exts, extBase);
+            int sn = ElfRefSym(r.sym, refIdx, extBase);
             if (r.got != 0) {
                 ElfAddRelo(rOff, rSym, rTy, rAdd, r.adrpPos, sn, 311, 0); // ADR_GOT_PAGE
                 ElfAddRelo(rOff, rSym, rTy, rAdd, r.addPos, sn, 312, 0);  // LD64_GOT_LO12_NC
@@ -174,6 +212,7 @@ partial class Ngen {
             }
             i = i + 1;
         }
+        SortReloc4(rOff, rSym, rTy, rAdd);
         int nrel = rOff.Count;
 
         // ---- file layout ----

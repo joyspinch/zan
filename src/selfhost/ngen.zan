@@ -13,6 +13,100 @@ namespace Zan;
 // Kernel subset: static methods, int params/locals/returns, int literals,
 // `+ - * <`, if/while, plain calls (recursion ok), Console.WriteLine(int).
 // Anything else is a compile error, not a silent fallback.
+
+// Open-addressed string -> insertion-ordered bucket index over the method
+// tables. Our builtin Dictionary is a linear walk (_zan_rt_dict_index), so
+// it cannot speed up the very scans it appears in; this table gives O(1)
+// key probes. Buckets chain in append order, so iteration inside a bucket
+// matches the old flat table scan exactly.
+class MethIndex {
+    List<string> keys;
+    List<int> head;
+    List<int> tail;
+    List<int> entVal;
+    List<int> entNext;
+    List<int> slots;
+
+    public MethIndex() {
+        keys = new List<string>();
+        head = new List<int>();
+        tail = new List<int>();
+        entVal = new List<int>();
+        entNext = new List<int>();
+        slots = new List<int>();
+        int i = 0;
+        while (i < 4096) { slots.Add(-1); i = i + 1; }
+    }
+
+    int HashOf(string s) {
+        int h = 17;
+        int i = 0;
+        while (i < s.Length) { h = h * 31 + (int)s[i] + 1; i = i + 1; }
+        if (h < 0) { h = 0 - h; }
+        if (h < 0) { h = 0; }
+        return h;
+    }
+
+    // find-or-insert the key id
+    int KeyId(string k) {
+        int n = slots.Count;
+        int j = HashOf(k) % n;
+        while (slots[j] >= 0) {
+            if (keys[slots[j]] == k) { return slots[j]; }
+            j = j + 1;
+            if (j == n) { j = 0; }
+        }
+        int id = keys.Count;
+        keys.Add(k);
+        head.Add(-1);
+        tail.Add(-1);
+        slots[j] = id;
+        if (keys.Count * 2 >= n) { Rehash(); }
+        return id;
+    }
+
+    void Rehash() {
+        List<string> oldKeys = keys;
+        slots = new List<int>();
+        int n = oldKeys.Count * 8 + 1;
+        int i = 0;
+        while (i < n) { slots.Add(-1); i = i + 1; }
+        int q = 0;
+        while (q < oldKeys.Count) {
+            int j = HashOf(oldKeys[q]) % n;
+            while (slots[j] >= 0) { j = j + 1; if (j == n) { j = 0; } }
+            slots[j] = q;
+            q = q + 1;
+        }
+    }
+
+    public void Add(string k, int v) {
+        int id = KeyId(k);
+        int e = entVal.Count;
+        entVal.Add(v);
+        entNext.Add(-1);
+        if (tail[id] < 0) { head[id] = e; } else { entNext[tail[id]] = e; }
+        tail[id] = e;
+    }
+
+    // method indices for k in insertion order, or null on miss
+    public List<int> Get(string k) {
+        int n = slots.Count;
+        int j = HashOf(k) % n;
+        while (slots[j] >= 0) {
+            if (keys[slots[j]] == k) {
+                List<int> r = new List<int>();
+                int e = head[slots[j]];
+                while (e >= 0) { r.Add(entVal[e]); e = entNext[e]; }
+                return r;
+            }
+            j = j + 1;
+            if (j == n) { j = 0; }
+        }
+        return null;
+    }
+}
+
 class Fixup {
     public int pos;    // text offset of the patched instruction
     public int kind;   // 0=B 1=CBZ 2=Bcond 3=BL-internal 4=BL-extern
@@ -102,6 +196,15 @@ partial class Ngen {
     List<Node> methNodes;
     List<string> methCls;
     List<int> methStat;     // 0 = instance, 1 = static, 2 = ctor
+    // incremental indexes over methNodes. Big inputs (Chart/Gui families)
+    // made every call-site resolution walk the whole method table
+    // (O(sites x methods)); lookups now touch only same-shape candidates.
+    // Buckets append in table order, so iteration inside a bucket matches
+    // the old flat scan exactly. Everything goes through AddMethNg so an
+    // append can never bypass the indexes.
+    MethIndex mIdxClsName;   // cls | name -> indices
+    MethIndex mIdxName;      // name -> indices
+    MethIndex mIdxCls;       // cls -> indices
     string mainCls;
     bool mainAsync;     // Main is async: the shim ramps + pumps instead of calling it
     Node curMeth;           // method being emitted (spec sval2 = this type)
@@ -133,9 +236,36 @@ partial class Ngen {
         methNodes = new List<Node>();
         methCls = new List<string>();
         methStat = new List<int>();
+        mIdxClsName = new MethIndex();
+        mIdxName = new MethIndex();
+        mIdxCls = new MethIndex();
         specMeth = new List<string>();
         instCls = new List<string>();
         nlabel = 0;
+    }
+
+    // single mutation point for the method tables so the indexes can never
+    // fall behind the flat lists
+    void AddMethNg(Node m, string cls, int stat) {
+        methNodes.Add(m);
+        methCls.Add(cls);
+        methStat.Add(stat);
+        int i = methNodes.Count - 1;
+        mIdxClsName.Add(cls + "|" + m.sval, i);
+        mIdxName.Add(m.sval, i);
+        mIdxCls.Add(cls, i);
+    }
+
+    List<int> MethCandsClsName(string cls, string name) {
+        return mIdxClsName.Get(cls + "|" + name);
+    }
+
+    List<int> MethCandsName(string name) {
+        return mIdxName.Get(name);
+    }
+
+    List<int> MethCandsCls(string cls) {
+        return mIdxCls.Get(cls);
     }
 
     // ---- entry: returns the object file bytes ----
@@ -231,9 +361,7 @@ partial class Ngen {
                     mainCls = cls.sval;
                     mainAsync = IsAsync(m);
                 }
-                methNodes.Add(m);
-                methCls.Add(cls.sval);
-                methStat.Add(HasMod(m, MOD.Static()) ? 1 : 0);
+                AddMethNg(m, cls.sval, HasMod(m, MOD.Static()) ? 1 : 0);
             }
             if (m.kind == AK.CtorDecl()) {
                 // `static T()` is a type initializer (methStat 3), not a
@@ -241,9 +369,7 @@ partial class Ngen {
                 // `new T(...)`, and runs once at program entry in
                 // declaration order (gen0 parity)
                 if (!HasMod(m, MOD.Static())) { hasCtor = true; }
-                methNodes.Add(m);
-                methCls.Add(cls.sval);
-                methStat.Add(HasMod(m, MOD.Static()) ? 3 : 2);
+                AddMethNg(m, cls.sval, HasMod(m, MOD.Static()) ? 3 : 2);
             }
             i = i + 1;
         }
@@ -253,9 +379,7 @@ partial class Ngen {
         if (!hasCtor) {
             Node dc = new Node(AK.CtorDecl());
             dc.mods = HasMod(cls, MOD.Static()) ? MOD.Static() : 0;
-            methNodes.Add(dc);
-            methCls.Add(cls.sval);
-            methStat.Add(2);
+            AddMethNg(dc, cls.sval, 2);
         }
     }
 
@@ -710,9 +834,11 @@ partial class Ngen {
     }
 
     Node FindStatic(string name) {
+        List<int> cs = MethCandsName(name);
+        if (cs == null) { return null; }
         int i = 0;
-        while (i < methNodes.Count) {
-            if (methNodes[i].sval == name && methStat[i] == 1) { return methNodes[i]; }
+        while (i < cs.Count) {
+            if (methStat[cs[i]] == 1) { return methNodes[cs[i]]; }
             i = i + 1;
         }
         return null;
@@ -720,9 +846,11 @@ partial class Ngen {
 
     // find an instance method by name (first match across classes)
     int FindInstanceIdx(string name) {
+        List<int> cs = MethCandsName(name);
+        if (cs == null) { return -1; }
         int i = 0;
-        while (i < methNodes.Count) {
-            if (methNodes[i].sval == name && methStat[i] == 0) { return i; }
+        while (i < cs.Count) {
+            if (methStat[cs[i]] == 0) { return cs[i]; }
             i = i + 1;
         }
         return -1;
@@ -740,9 +868,12 @@ partial class Ngen {
     }
 
     int MethodCountNg(string cls, string name) {
-        int n = 0; int i = 0;
-        while (i < methNodes.Count) {
-            if (methStat[i] != 2 && methCls[i] == cls && methNodes[i].sval == name) { n = n + 1; }
+        int n = 0;
+        List<int> cs = MethCandsClsName(cls, name);
+        if (cs == null) { return 0; }
+        int i = 0;
+        while (i < cs.Count) {
+            if (methStat[cs[i]] != 2) { n = n + 1; }
             i = i + 1;
         }
         return n;
@@ -770,10 +901,13 @@ partial class Ngen {
     void CollectVSlotsNg(string cls, List<string> slots) {
         Cls c = FindClass(cls);
         if (c != null && c.baseName != null) { CollectVSlotsNg(c.baseName, slots); }
+        List<int> mine = MethCandsCls(cls);
+        if (mine == null) { return; }
         int i = 0;
-        while (i < methNodes.Count) {
-            if (methStat[i] == 0 && methCls[i] == cls && IsSlotMod(methNodes[i])
-                    && IndexOfStrNg(slots, methNodes[i].sval) < 0) { slots.Add(methNodes[i].sval); }
+        while (i < mine.Count) {
+            int mi = mine[i];
+            if (methStat[mi] == 0 && IsSlotMod(methNodes[mi])
+                    && IndexOfStrNg(slots, methNodes[mi].sval) < 0) { slots.Add(methNodes[mi].sval); }
             i = i + 1;
         }
     }
@@ -791,10 +925,13 @@ partial class Ngen {
     void InstanceCands(string rc, string name, List<int> outIdx) {
         string cur = rc;
         while (cur != null) {
-            int i = 0;
-            while (i < methNodes.Count) {
-                if (methStat[i] == 0 && methCls[i] == cur && methNodes[i].sval == name) { outIdx.Add(i); }
-                i = i + 1;
+            List<int> cs = MethCandsClsName(cur, name);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    if (methStat[cs[i]] == 0) { outIdx.Add(cs[i]); }
+                    i = i + 1;
+                }
             }
             Cls cc = FindClass(cur);
             cur = cc != null ? cc.baseName : null;
@@ -812,15 +949,19 @@ partial class Ngen {
         string rt = ExtRecvTy(recv);
         if (rt == null) { return -1; }
         List<int> cands = new List<int>();
-        int i = 0;
-        while (i < methNodes.Count) {
-            Node m = methNodes[i];
-            if (methStat[i] == 1 && m.ival == 1 && m.sval == name && m.kids.Count > 0) {
-                Node p0 = ParamAt(m, 0);
-                string pt = p0 != null && p0.type != null ? TypeFullName(p0.type) : null;
-                if (pt == rt || (pt != null && IndexOfStrNg(DeclTps(m), pt) >= 0)) { cands.Add(i); }
+        List<int> nc = MethCandsName(name);
+        if (nc != null) {
+            int i = 0;
+            while (i < nc.Count) {
+                int mi = nc[i];
+                Node m = methNodes[mi];
+                if (methStat[mi] == 1 && m.ival == 1 && m.kids.Count > 0) {
+                    Node p0 = ParamAt(m, 0);
+                    string pt = p0 != null && p0.type != null ? TypeFullName(p0.type) : null;
+                    if (pt == rt || (pt != null && IndexOfStrNg(DeclTps(m), pt) >= 0)) { cands.Add(mi); }
+                }
+                i = i + 1;
             }
-            i = i + 1;
         }
         if (cands.Count == 0) { return -1; }
         callNode.kids.Insert(0, recv);
@@ -865,12 +1006,8 @@ partial class Ngen {
     // first method of any kind whose declared name matches, or -1
     // (specialization lookups by mangled name)
     int FindMethByNameNg(string name) {
-        int i = 0;
-        while (i < methNodes.Count) {
-            if (methNodes[i].sval == name) { return i; }
-            i = i + 1;
-        }
-        return -1;
+        List<int> cs = MethCandsName(name);
+        return cs != null && cs.Count > 0 ? cs[0] : -1;
     }
 
     // property-accessor lookup: `name` (get_X / set_X) in cls's base chain,
@@ -880,14 +1017,17 @@ partial class Ngen {
     Node AccessorInChain(string cls, string name) {
         string cur = cls;
         while (cur != null) {
-            int i = 0;
-            while (i < methNodes.Count) {
-                if ((methStat[i] == 0 || methStat[i] == 1) && methCls[i] == cur
-                        && methNodes[i].sval == name) {
-                    accOwnerCls = cur;
-                    return methNodes[i];
+            List<int> cs = MethCandsClsName(cur, name);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    int st = methStat[cs[i]];
+                    if (st == 0 || st == 1) {
+                        accOwnerCls = cur;
+                        return methNodes[cs[i]];
+                    }
+                    i = i + 1;
                 }
-                i = i + 1;
             }
             Cls cc = FindClass(cur);
             cur = cc != null ? cc.baseName : null;
@@ -903,25 +1043,29 @@ partial class Ngen {
         int bestScore = -2000000000;
         string cur = cls;
         while (cur != null) {
-            int i = 0;
-            while (i < methNodes.Count) {
-                if (methStat[i] == 0 && methCls[i] == cur && methNodes[i].sval == name) {
-                    Node m = methNodes[i];
-                    Node ip = ParamAt(m, 0);
-                    if (ip == null || ip.type == null) { i = i + 1; continue; }
-                    int s1 = ArgParamScore(idxExpr, TypeFullName(ip.type));
-                    if (s1 <= -100) { i = i + 1; continue; }
-                    int score = s1;
-                    if (valExpr != null) {
-                        Node vp = ParamAt(m, 1);
-                        if (vp == null || vp.type == null) { i = i + 1; continue; }
-                        int s2 = ArgParamScore(valExpr, TypeFullName(vp.type));
-                        if (s2 <= -100) { i = i + 1; continue; }
-                        score = score + s2;
+            List<int> cs = MethCandsClsName(cur, name);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    int mi = cs[i];
+                    if (methStat[mi] == 0) {
+                        Node m = methNodes[mi];
+                        Node ip = ParamAt(m, 0);
+                        if (ip == null || ip.type == null) { i = i + 1; continue; }
+                        int s1 = ArgParamScore(idxExpr, TypeFullName(ip.type));
+                        if (s1 <= -100) { i = i + 1; continue; }
+                        int score = s1;
+                        if (valExpr != null) {
+                            Node vp = ParamAt(m, 1);
+                            if (vp == null || vp.type == null) { i = i + 1; continue; }
+                            int s2 = ArgParamScore(valExpr, TypeFullName(vp.type));
+                            if (s2 <= -100) { i = i + 1; continue; }
+                            score = score + s2;
+                        }
+                        if (score > bestScore) { bestScore = score; best = m; }
                     }
-                    if (score > bestScore) { bestScore = score; best = m; }
+                    i = i + 1;
                 }
-                i = i + 1;
             }
             Cls cc = FindClass(cur);
             cur = cc != null ? cc.baseName : null;
@@ -932,13 +1076,15 @@ partial class Ngen {
     string VSlotImplCls(string cls, string name) {
         string cur = cls;
         while (cur != null) {
-            int i = 0;
-            while (i < methNodes.Count) {
-                // an abstract declaration does not implement its own slot;
-                // the search continues down the chain to the concrete body
-                if (methStat[i] == 0 && methCls[i] == cur && methNodes[i].sval == name
-                        && !HasMod(methNodes[i], MOD.Abstract())) { return cur; }
-                i = i + 1;
+            List<int> cs = MethCandsClsName(cur, name);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    // an abstract declaration does not implement its own slot;
+                    // the search continues down the chain to the concrete body
+                    if (methStat[cs[i]] == 0 && !HasMod(methNodes[cs[i]], MOD.Abstract())) { return cur; }
+                    i = i + 1;
+                }
             }
             Cls cc = FindClass(cur);
             cur = cc != null ? cc.baseName : null;
@@ -947,9 +1093,11 @@ partial class Ngen {
     }
 
     Node FindInstanceInCls(string cls, string name) {
+        List<int> cs = MethCandsClsName(cls, name);
+        if (cs == null) { return null; }
         int i = 0;
-        while (i < methNodes.Count) {
-            if (methStat[i] == 0 && methCls[i] == cls && methNodes[i].sval == name) { return methNodes[i]; }
+        while (i < cs.Count) {
+            if (methStat[cs[i]] == 0) { return methNodes[cs[i]]; }
             i = i + 1;
         }
         return null;
@@ -1050,10 +1198,13 @@ partial class Ngen {
         }
         List<int> cands = new List<int>();
         while (cls != null) {
-            int i = 0;
-            while (i < methNodes.Count) {
-                if (methStat[i] == 1 && methCls[i] == cls && methNodes[i].sval == callee.sval) { cands.Add(i); }
-                i = i + 1;
+            List<int> cs = MethCandsClsName(cls, callee.sval);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    if (methStat[cs[i]] == 1) { cands.Add(cs[i]); }
+                    i = i + 1;
+                }
             }
             Cls c = FindClass(cls);
             cls = c != null ? c.baseName : null;
@@ -1066,10 +1217,13 @@ partial class Ngen {
                 InstanceCands(curCls, callee.sval, inst);
                 if (inst.Count > 0) { return -1; }
             }
-            int i = 0;
-            while (i < methNodes.Count) {
-                if (methStat[i] == 1 && methNodes[i].sval == callee.sval) { cands.Add(i); }
-                i = i + 1;
+            List<int> gs = MethCandsName(callee.sval);
+            if (gs != null) {
+                int i = 0;
+                while (i < gs.Count) {
+                    if (methStat[gs[i]] == 1) { cands.Add(gs[i]); }
+                    i = i + 1;
+                }
             }
         }
         if (cands.Count == 0) { return -1; }
@@ -1080,9 +1234,11 @@ partial class Ngen {
     // find a static method declared by exactly this class (Class.Method()
     // form -- FindStaticIdx only matches by bare name)
     int FindStaticInCls(string cls, string name) {
+        List<int> cs = MethCandsClsName(cls, name);
+        if (cs == null) { return -1; }
         int i = 0;
-        while (i < methNodes.Count) {
-            if (methStat[i] == 1 && methCls[i] == cls && methNodes[i].sval == name) { return i; }
+        while (i < cs.Count) {
+            if (methStat[cs[i]] == 1) { return cs[i]; }
             i = i + 1;
         }
         return -1;
@@ -1090,9 +1246,11 @@ partial class Ngen {
 
     // does the named class declare a constructor?
     bool ClassHasCtor(string cls) {
+        List<int> mine = MethCandsCls(cls);
+        if (mine == null) { return false; }
         int i = 0;
-        while (i < methNodes.Count) {
-            if (methStat[i] == 2 && methCls[i] == cls) { return true; }
+        while (i < mine.Count) {
+            if (methStat[mine[i]] == 2) { return true; }
             i = i + 1;
         }
         return false;
@@ -1102,12 +1260,7 @@ partial class Ngen {
     // name? (gen0 steps its built-ins aside per member, so defining one
     // Convert or Math method does not disable the others)
     bool UserDefinesClsMember(string cls, string name) {
-        int i = 0;
-        while (i < methNodes.Count) {
-            if (methCls[i] == cls && methNodes[i].sval == name) { return true; }
-            i = i + 1;
-        }
-        return false;
+        return MethCandsClsName(cls, name) != null;
     }
 
     // which scalar flavour does this expression carry, for x.ToString()
@@ -1434,11 +1587,13 @@ partial class Ngen {
         }
         int found = 0;
         while (cls != null && found == 0) {
-            int i = 0;
-            while (i < methNodes.Count) {
-                if (methStat[i] == 1 && methCls[i] == cls && methNodes[i].sval == name
-                        && HasMod(methNodes[i], MOD.Extern())) { found = 1; break; }
-                i = i + 1;
+            List<int> cs = MethCandsClsName(cls, name);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    if (methStat[cs[i]] == 1 && HasMod(methNodes[cs[i]], MOD.Extern())) { found = 1; break; }
+                    i = i + 1;
+                }
             }
             if (found == 0) {
                 Cls c = FindClass(cls);
@@ -1447,11 +1602,13 @@ partial class Ngen {
         }
         if (found == 0 && bare) {
             // legacy global-static fallback for bare names
-            int i = 0;
-            while (i < methNodes.Count) {
-                if (methStat[i] == 1 && methNodes[i].sval == name
-                        && HasMod(methNodes[i], MOD.Extern())) { found = 1; break; }
-                i = i + 1;
+            List<int> gs = MethCandsName(name);
+            if (gs != null) {
+                int i = 0;
+                while (i < gs.Count) {
+                    if (methStat[gs[i]] == 1 && HasMod(methNodes[gs[i]], MOD.Extern())) { found = 1; break; }
+                    i = i + 1;
+                }
             }
         }
         return found == 1;
@@ -3980,9 +4137,7 @@ partial class Ngen {
                     RegisterInstCls(rt);
                 }
             }
-            methNodes.Add(spec);
-            methCls.Add(methCls[di]);
-            methStat.Add(methStat[di]);
+            AddMethNg(spec, methCls[di], methStat[di]);
             specMeth.Add(mangled);
         }
         callNode.a.sval = mangled;
@@ -4021,11 +4176,13 @@ partial class Ngen {
         List<int> cands = new List<int>();
         string owner = open;
         while (owner != null) {
-            int i = 0;
-            while (i < methNodes.Count) {
-                if (methStat[i] == wantStat && methCls[i] == owner
-                        && methNodes[i].sval == methName && !HasTypeParams(methNodes[i])) { cands.Add(i); }
-                i = i + 1;
+            List<int> cs = MethCandsClsName(owner, methName);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    if (methStat[cs[i]] == wantStat && !HasTypeParams(methNodes[cs[i]])) { cands.Add(cs[i]); }
+                    i = i + 1;
+                }
             }
             Cls oc = FindClass(owner);
             owner = oc != null ? oc.baseName : null;
@@ -4045,18 +4202,18 @@ partial class Ngen {
         spec.sval = mangled;
         if (!isStatic) { spec.sval2 = instName; }   // spec's `this` type
         SubstTypeNode(spec, c.tps, args);
-        methNodes.Add(spec);
-        methCls.Add(open);                       // dispatch walks the open name
-        methStat.Add(wantStat);
+        AddMethNg(spec, open, wantStat);         // dispatch walks the open name
         specMeth.Add(mangled);
         callNode.a.sval = mangled;
     }
 
     int FindGenericDecl(string name) {
+        List<int> cs = MethCandsName(name);
+        if (cs == null) { return -1; }
         int i = 0;
-        while (i < methNodes.Count) {
-            if (methStat[i] != 2 && methStat[i] != 3 && methNodes[i].sval == name
-                    && HasTypeParams(methNodes[i])) { return i; }
+        while (i < cs.Count) {
+            int mi = cs[i];
+            if (methStat[mi] != 2 && methStat[mi] != 3 && HasTypeParams(methNodes[mi])) { return mi; }
             i = i + 1;
         }
         return -1;
@@ -5113,11 +5270,13 @@ partial class Ngen {
     }
 
     string MethRetTy(string name) {
+        List<int> cs = MethCandsName(name);
+        if (cs == null) { return ""; }
         int i = 0;
-        while (i < methNodes.Count) {
+        while (i < cs.Count) {
             // TypeFullName keeps the array suffix and generic argument;
             // type.sval alone would turn a `byte[]` return into "byte"
-            if (methNodes[i].sval == name && methNodes[i].type != null) { return TypeFullName(methNodes[i].type); }
+            if (methNodes[cs[i]].type != null) { return TypeFullName(methNodes[cs[i]].type); }
             i = i + 1;
         }
         return "";
@@ -5214,10 +5373,13 @@ partial class Ngen {
             // real stdlib compiles (jsongen.GenClass vs irgen.GenClass)
             string wcls = curCls;
             while (wcls != null && staticIdx < 0) {
-                int wi = 0;
-                while (wi < methNodes.Count) {
-                    if (methStat[wi] == 1 && methCls[wi] == wcls && methNodes[wi].sval == e.a.sval) { staticIdx = wi; break; }
-                    wi = wi + 1;
+                List<int> wc2 = MethCandsClsName(wcls, e.a.sval);
+                if (wc2 != null) {
+                    int wi = 0;
+                    while (wi < wc2.Count) {
+                        if (methStat[wc2[wi]] == 1) { staticIdx = wc2[wi]; break; }
+                        wi = wi + 1;
+                    }
                 }
                 Cls wc = FindClass(wcls);
                 wcls = wc != null ? wc.baseName : null;
@@ -5352,11 +5514,12 @@ partial class Ngen {
 
     // symbol of a static op_* method declared on cls, or null
     string OpStaticSym(string cls, string name) {
+        List<int> cs = MethCandsClsName(cls, name);
+        if (cs == null) { return null; }
         int i = 0;
-        while (i < methNodes.Count) {
-            if (methStat[i] == 1 && methCls[i] == cls
-                    && methNodes[i].sval == name) {
-                return MethSymNg(cls, methNodes[i]);
+        while (i < cs.Count) {
+            if (methStat[cs[i]] == 1) {
+                return MethSymNg(cls, methNodes[cs[i]]);
             }
             i = i + 1;
         }
@@ -6278,10 +6441,13 @@ partial class Ngen {
                 List<int> scands = new List<int>();
                 string sc = rc;
                 while (sc != null) {
-                    int si3 = 0;
-                    while (si3 < methNodes.Count) {
-                        if (methStat[si3] == 1 && methCls[si3] == sc && methNodes[si3].sval == callee.sval) { scands.Add(si3); }
-                        si3 = si3 + 1;
+                    List<int> scc = MethCandsClsName(sc, callee.sval);
+                    if (scc != null) {
+                        int si3 = 0;
+                        while (si3 < scc.Count) {
+                            if (methStat[scc[si3]] == 1) { scands.Add(scc[si3]); }
+                            si3 = si3 + 1;
+                        }
                     }
                     Cls cc3 = FindClass(sc);
                     sc = cc3 != null ? cc3.baseName : null;
@@ -6382,9 +6548,11 @@ partial class Ngen {
     }
 
     int FindStaticIdx(string name) {
+        List<int> cs = MethCandsName(name);
+        if (cs == null) { return -1; }
         int i = 0;
-        while (i < methNodes.Count) {
-            if (methNodes[i].sval == name && methStat[i] == 1) { return i; }
+        while (i < cs.Count) {
+            if (methStat[cs[i]] == 1) { return cs[i]; }
             i = i + 1;
         }
         return -1;
@@ -6978,18 +7146,23 @@ partial class Ngen {
     }
 
     int FindCtorIdx(string cls) {
+        List<int> mine = MethCandsCls(cls);
+        if (mine == null) { return -1; }
         int i = 0;
-        while (i < methNodes.Count) {
-            if (methStat[i] == 2 && methCls[i] == cls) { return i; }
+        while (i < mine.Count) {
+            if (methStat[mine[i]] == 2) { return mine[i]; }
             i = i + 1;
         }
         return -1;
     }
 
     int CtorCountNg(string cls) {
-        int n = 0; int i = 0;
-        while (i < methNodes.Count) {
-            if (methStat[i] == 2 && methCls[i] == cls) { n = n + 1; }
+        int n = 0;
+        List<int> mine = MethCandsCls(cls);
+        if (mine == null) { return 0; }
+        int i = 0;
+        while (i < mine.Count) {
+            if (methStat[mine[i]] == 2) { n = n + 1; }
             i = i + 1;
         }
         return n;
@@ -7094,15 +7267,18 @@ partial class Ngen {
         int argc = callNode != null ? callNode.kids.Count : 0;
         int exact = -1; int exactScore = -2000000000;
         int filled = -1; int filledScore = -2000000000;
+        List<int> mine = MethCandsCls(cls);
+        if (mine == null) { return -1; }
         int i = 0;
-        while (i < methNodes.Count) {
-            if (methStat[i] == 2 && methCls[i] == cls && methNodes[i] != exclude
-                    && CtorAcceptsArity(methNodes[i], argc)) {
+        while (i < mine.Count) {
+            int ti = mine[i];
+            if (methStat[ti] == 2 && methNodes[ti] != exclude
+                    && CtorAcceptsArity(methNodes[ti], argc)) {
                 int score = 0;
                 bool compatible = true;
                 int j = 0;
                 while (j < argc && compatible) {
-                    Node p = ParamAt(methNodes[i], j);
+                    Node p = ParamAt(methNodes[ti], j);
                     string pt = p != null && p.type != null ? TypeFullName(p.type) : null;
                     int s = ArgParamScore(callNode.kids[j], pt);
                     if (s <= -100) { compatible = false; }
@@ -7110,11 +7286,11 @@ partial class Ngen {
                     j = j + 1;
                 }
                 if (compatible) {
-                    bool isExact = ParamCount(methNodes[i]) == argc;
+                    bool isExact = ParamCount(methNodes[ti]) == argc;
                     if (isExact) {
-                        if (score > exactScore) { exactScore = score; exact = i; }
+                        if (score > exactScore) { exactScore = score; exact = ti; }
                     } else if (!exactOnly) {
-                        if (score > filledScore) { filledScore = score; filled = i; }
+                        if (score > filledScore) { filledScore = score; filled = ti; }
                     }
                 }
             }
@@ -7726,12 +7902,16 @@ partial class Ngen {
         return m;
     }
 
+    MethIndex symPosIdx;   // name -> syms index; built at first SymPos call
+                           // (Patch time, after all symbols are declared)
+
     int SymPos(string name) {
-        int i = 0;
-        while (i < syms.Count) {
-            if (syms[i].name == name) { return syms[i].pos; }
-            i = i + 1;
+        if (symPosIdx == null) {
+            symPosIdx = new MethIndex();
+            int i = 0;
+            while (i < syms.Count) { symPosIdx.Add(syms[i].name, i); i = i + 1; }
         }
-        return -1;
+        List<int> hit = symPosIdx.Get(name);
+        return hit != null ? syms[hit[0]].pos : -1;
     }
 }

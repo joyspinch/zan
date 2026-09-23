@@ -89,9 +89,10 @@ partial class Ngen {
         if (lt > 0 && n.Substring(n.Length - 1, 1) == ">") {
             n = n.Substring(0, lt);
         }
-        int i = 0;
-        while (i < classes.Count) { if (classes[i].name == n) { return classes[i]; } i = i + 1; }
-        return null;
+        if (clsByName == null) { return null; }
+        List<int> hit = clsByName.Get(n);
+        if (hit == null) { return null; }
+        return classes[hit[0]];
     }
 
     Fld FindField(Cls c, string n) {
@@ -175,7 +176,7 @@ partial class Ngen {
             Cls ec = new Cls("Exception");
             ec.flds.Add(new Fld("Message", 0, "string"));
             ec.size = 8;
-            classes.Add(ec);
+            RegCls(ec);
             Node pt = new Node(AK.TypeRef()); pt.sval = "string";
             Node pm = new Node(AK.Param()); pm.type = pt; pm.sval = "m";
             Node ms2 = new Node(AK.Ident()); ms2.sval = "Message";
@@ -184,9 +185,9 @@ partial class Ngen {
             Node es2 = new Node(AK.ExprStmt()); es2.a = asg2;
             Node body2 = new Node(AK.Block()); body2.Add(es2);
             Node c1 = new Node(AK.CtorDecl()); c1.Add(pm); c1.d = body2;
-            methNodes.Add(c1); methCls.Add("Exception"); methStat.Add(2);
+            AddMethNg(c1, "Exception", 2);
             Node c0 = new Node(AK.CtorDecl()); c0.d = new Node(AK.Block());
-            methNodes.Add(c0); methCls.Add("Exception"); methStat.Add(2);
+            AddMethNg(c0, "Exception", 2);
         }
         i = 0;
         while (i < classes.Count) { classes[i].site = i + 1; i = i + 1; }
@@ -220,14 +221,17 @@ partial class Ngen {
     }
 
     bool ClassDeclaresVirtual(string cls) {
+        List<int> mine = MethCandsCls(cls);
+        if (mine == null) { return false; }
         int i = 0;
-        while (i < methNodes.Count) {
+        while (i < mine.Count) {
             // abstract methods count too: an interface is modelled as an
             // all-abstract class, and its implementers must carry a vtable
             // so interface-typed references reach the concrete body
-            if (methStat[i] == 0 && methCls[i] == cls
-                    && (HasMod(methNodes[i], MOD.Virtual()) || HasMod(methNodes[i], MOD.Override())
-                        || HasMod(methNodes[i], MOD.Abstract()))) { return true; }
+            int mi = mine[i];
+            if (methStat[mi] == 0
+                    && (HasMod(methNodes[mi], MOD.Virtual()) || HasMod(methNodes[mi], MOD.Override())
+                        || HasMod(methNodes[mi], MOD.Abstract()))) { return true; }
             i = i + 1;
         }
         return false;
@@ -264,34 +268,44 @@ partial class Ngen {
     // static field storage: one 8-byte data-global slot per field; lookup
     // prefers the given class, then falls back to any (ngen dispatches by
     // name everywhere else too)
-    string FindStaticSym(string cls, string name) {
-        if (cls != null) {
-            int i = 0;
-            while (i < sfNames.Count) {
-                if (sfNames[i] == name && sfCls[i] == cls) { return sfSyms[i]; }
-                i = i + 1;
-            }
+    // static-field indexes: same shape and rationale as the method indexes
+    MethIndex sfByClsName;
+    MethIndex sfByName;
+
+    void AddSf(string name, string cls, string sym, string ty) {
+        sfNames.Add(name);
+        sfCls.Add(cls);
+        sfSyms.Add(sym);
+        sfTy.Add(ty);
+        int i = sfNames.Count - 1;
+        if (sfByClsName == null) {
+            sfByClsName = new MethIndex();
+            sfByName = new MethIndex();
         }
-        int j = 0;
-        while (j < sfNames.Count) {
-            if (sfNames[j] == name) { return sfSyms[j]; }
-            j = j + 1;
+        sfByClsName.Add(cls + "|" + name, i);
+        sfByName.Add(name, i);
+    }
+
+    string FindStaticSym(string cls, string name) {
+        if (cls != null && sfByClsName != null) {
+            List<int> hit = sfByClsName.Get(cls + "|" + name);
+            if (hit != null) { return sfSyms[hit[0]]; }
+        }
+        if (sfByName != null) {
+            List<int> hit = sfByName.Get(name);
+            if (hit != null) { return sfSyms[hit[0]]; }
         }
         return null;
     }
 
     string FindStaticTy(string cls, string name) {
-        if (cls != null) {
-            int i = 0;
-            while (i < sfNames.Count) {
-                if (sfNames[i] == name && sfCls[i] == cls) { return sfTy[i]; }
-                i = i + 1;
-            }
+        if (cls != null && sfByClsName != null) {
+            List<int> hit = sfByClsName.Get(cls + "|" + name);
+            if (hit != null) { return sfTy[hit[0]]; }
         }
-        int j = 0;
-        while (j < sfNames.Count) {
-            if (sfNames[j] == name) { return sfTy[j]; }
-            j = j + 1;
+        if (sfByName != null) {
+            List<int> hit = sfByName.Get(name);
+            if (hit != null) { return sfTy[hit[0]]; }
         }
         return null;
     }
@@ -319,10 +333,7 @@ partial class Ngen {
                     string dn = "fld." + c.name + "." + m.sval;
                     dglbs.Add(new DGlob(dn, 8, dataLen));
                     dataLen = dataLen + 8;
-                    sfNames.Add(m.sval);
-                    sfCls.Add(c.name);
-                    sfSyms.Add(DGlobalSym(dn));
-                    sfTy.Add(TypeFullName(m.type));
+                    AddSf(m.sval, c.name, DGlobalSym(dn), TypeFullName(m.type));
                     // `static int[] shared = new int[3]` runs before Main
                     if (m.b != null) {
                         sfInitCls.Add(c.name);
@@ -367,7 +378,18 @@ partial class Ngen {
             k = k + 1;
         }
         c.size = off;
+        RegCls(c);
+    }
+
+    // class-name -> classes index; FindClass is on every resolution path
+    // (base-chain walks, static typing) and the linear name scan dominated
+    // profiles on big inputs
+    MethIndex clsByName;
+
+    void RegCls(Cls c) {
         classes.Add(c);
+        if (clsByName == null) { clsByName = new MethIndex(); }
+        clsByName.Add(c.name, classes.Count - 1);
     }
 
     // ---- register-op helpers (encodings verified against clang -arch arm64) ----
@@ -1630,10 +1652,7 @@ partial class Ngen {
                             string dn = "fld." + inst + "." + sfNames[si];
                             dglbs.Add(new DGlob(dn, 8, dataLen));
                             dataLen = dataLen + 8;
-                            sfNames.Add(sfNames[si]);
-                            sfCls.Add(inst);
-                            sfSyms.Add(DGlobalSym(dn));
-                            sfTy.Add(SubstTy(sfTy[si], c.tps, args));
+                            AddSf(sfNames[si], inst, DGlobalSym(dn), SubstTy(sfTy[si], c.tps, args));
                             // clone this field's initializer, if any
                             int j = 0;
                             while (j < i0) {

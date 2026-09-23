@@ -81,15 +81,38 @@ partial class Ngen {
     }
 
     void InsertCoffReloc(List<int> addrs, List<int> atSym, List<int> typs, int addr, int symnum, int typ) {
-        int at = addrs.Count;
-        int i = 0;
-        while (i < addrs.Count) {
-            if (addrs[i] > addr) { at = i; break; }
-            i = i + 1;
+        addrs.Add(addr);
+        atSym.Add(symnum);
+        typs.Add(typ);
+    }
+
+    void SortReloc3(List<int> a, List<int> s, List<int> t) {
+        int n = a.Count;
+        if (n < 2) { return; }
+        int i = n / 2;
+        while (i > 0) { i = i - 1; SiftReloc3(a, s, t, i, n); }
+        i = n - 1;
+        while (i > 0) {
+            int x = a[0]; a[0] = a[i]; a[i] = x;
+            x = s[0]; s[0] = s[i]; s[i] = x;
+            x = t[0]; t[0] = t[i]; t[i] = x;
+            SiftReloc3(a, s, t, 0, i);
+            i = i - 1;
         }
-        addrs.Insert(at, addr);
-        atSym.Insert(at, symnum);
-        typs.Insert(at, typ);
+    }
+
+    void SiftReloc3(List<int> a, List<int> s, List<int> t, int root, int n) {
+        while (true) {
+            int l = root * 2 + 1;
+            if (l >= n) { break; }
+            int m = l;
+            if (l + 1 < n && a[l + 1] > a[m]) { m = l + 1; }
+            if (a[root] >= a[m]) { break; }
+            int x = a[root]; a[root] = a[m]; a[m] = x;
+            x = s[root]; s[root] = s[m]; s[m] = x;
+            x = t[root]; t[root] = t[m]; t[m] = x;
+            root = m;
+        }
     }
 
     int Align8(int v) {
@@ -112,6 +135,7 @@ partial class Ngen {
         List<string> exts = CoffExternSyms();
         int extBase = syms.Count + strs.Count + dglbs.Count;
         int symBase = 6;
+        MethIndex refIdx = BuildRefSymIdx(exts, extBase, symBase);
 
         List<int> rAddr = new List<int>();
         List<int> rSym = new List<int>();
@@ -120,14 +144,14 @@ partial class Ngen {
         while (i < fixups.Count) {
             Fixup f = fixups[i];
             if (f.kind == 4) {
-                InsertCoffReloc(rAddr, rSym, rTyp, f.pos, symBase + extBase + IndexOf(exts, f.sym), 3); // BRANCH26
+                InsertCoffReloc(rAddr, rSym, rTyp, f.pos, RefSymNum(f.sym, refIdx, symBase + extBase), 3); // BRANCH26
             }
             i = i + 1;
         }
         i = 0;
         while (i < strRefs.Count) {
             StrRef r = strRefs[i];
-            int symnum = symBase + RefSymNum(r.sym, exts, extBase);
+            int symnum = RefSymNum(r.sym, refIdx, symBase + extBase);
             InsertCoffReloc(rAddr, rSym, rTyp, r.adrpPos, symnum, 4); // PAGEBASE_REL21
             if (r.got != 0) {
                 InsertCoffReloc(rAddr, rSym, rTyp, r.addPos, symnum, 7); // PAGEOFFSET_12L (ldr)
@@ -136,6 +160,7 @@ partial class Ngen {
             }
             i = i + 1;
         }
+        SortReloc3(rAddr, rSym, rTyp);
         int nrel = rAddr.Count;
         if (nrel > 65535) { diags.Error("ngen_coff: more than 65535 relocations in .text$mn", 0, 0); }
 

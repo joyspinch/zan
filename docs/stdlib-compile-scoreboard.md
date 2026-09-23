@@ -1,6 +1,43 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-23 · v7 · 定点见下方 v7 节
+日期：2026-09-23 · v8 · 定点见下方 v8 节
+
+## v8 编译器性能批（2026-09-23，大输入编译 36×/17× 提速，零行为变化）
+
+**动机**：chart_kinds_complete.zan（错误恢复路径，524 错）编译 ~259s；
+自举 stage1（29 个 selfhost 源 ~500KB，成功路径）~31s。`sample` 采样
+叶子自时间定位出五波 O(N²)：
+
+1. **三容器写器的 reloc 有序插入**（62% 样本）：InsertReloc /
+   InsertCoffReloc / ElfAddRelo 为保地址序线性找位 + List.Insert = O(R²)。
+   改为追加 + 发射前一次堆排序（SortReloc2/3/4，稳定升序，语义同旧）。
+2. **methNodes 平表线性扫**：自研开放定址 MethIndex（**builtin Dictionary
+   内部是线性游走——ngen_obj.zan `_zan_rt_dict_index` 注释明言，不能拿来
+   做索引**）；`(cls|name)`、`name`、`cls` 三个桶，~20 个查找函数换桶查询
+   （FindStatic/InstanceCands/ResolveExtNg/AccessorInChain/FitCtorIdx 等）。
+   键分隔符用 `"|"`（**Zan 源串不解码 \x 转义**，DecodeStr 只认 \n\t\r\0）。
+3. **FindClass / 静态字段**：ngen_obj 加 clsByName 与
+   sfByClsName/sfByName 索引，RegCls/AddSf 单点收口。
+4. **Patch/容器构建期**：SymPos 懒建 symPosIdx；macho/coff 的
+   BuildRefSymIdx + ELF 的 BuildElfRefIdx（保留各自编号序），每 fixup /
+   strRef 一次的 RefSymNum/ElfRefSym 全表扫 → 桶查询。
+5. **diag LineOf 每条诊断全量扫源**（剩余热点 44%+25% runtime 串助手）：
+   524 错 × MB 级 TU ≈ GB 级逐字节扫。改懒建行偏移表，越界行号语义
+   （<1 → 文本首、超尾 → 末换行后）逐分支保留。
+
+**数字**：chart_kinds_complete 259s →（reloc 排序）158s →（全部索引）
+21.8s →（diag 行表）**7.1s（36×）**；selfhost 全源成功路径 30.9s →
+**1.8s（17×）**。
+
+**零行为变化的证据**：成功路径新 checkpoint stage1.o 与批前编译器输出
+**逐字节一致**（cmp 通过）；chart 错误输出 1575 行日志在每步后 diff 为空；
+39/39 回归 ✓；crossboot ELF 5/5 + PE-COFF 5/5（ELF/COFF 写器都动了）✓；
+定向 parity resolution 敏感族 delegate_dispatch/extension_methods/
+indexer_overload/interface_dispatch/cs_b09_indexer 5/5 ✓
+（property_accessors/orm_table_accessor 为存量 ncf，批前 checkpoint 复核
+同判）；全量 sweep 分布与 run.8GMa65 基线持平（见 json）。正式自举新
+检查点 **run.aAlTLD：stage1.o == stage2.o == stage3.o 全收敛**
+（sha256 前 16 位 f6e23b45af0200db，连续第三个全收敛检查点）。
 
 ## v7 A310 活绑定 owned-temp 降级（2026-09-23，binding_temp_source 归位）
 

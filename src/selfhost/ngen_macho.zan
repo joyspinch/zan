@@ -79,9 +79,31 @@ partial class Ngen {
         return -1;
     }
 
+    // O(1) name -> symbol-number map over [syms | strs | dglbs | exts],
+    // built once per object write; first occurrence wins, like the old
+    // per-reference linear scans
+    MethIndex BuildRefSymIdx(List<string> exts, int extBase, int numOff) {
+        MethIndex ix = new MethIndex();
+        int i = 0;
+        while (i < syms.Count) { ix.Add(syms[i].name, numOff + i); i = i + 1; }
+        i = 0;
+        while (i < strs.Count) { ix.Add(StrSym(i), numOff + syms.Count + i); i = i + 1; }
+        i = 0;
+        while (i < dglbs.Count) { ix.Add(DGlobalSym(dglbs[i].name), numOff + syms.Count + strs.Count + i); i = i + 1; }
+        i = 0;
+        while (i < exts.Count) { ix.Add(exts[i], numOff + extBase + i); i = i + 1; }
+        return ix;
+    }
+
+    int RefSymNum(string name, MethIndex ix, int extBase) {
+        List<int> hit = ix.Get(name);
+        if (hit != null) { return hit[0]; }
+        return extBase - 1;         // mirrors the old IndexOf miss fallthrough
+    }
+
     // symbol-table index of a referenced symbol: defined syms first, then
     // string literals, then data globals, then undefined externs
-    int RefSymNum(string name, List<string> exts, int extBase) {
+    int RefSymNumScan(string name, List<string> exts, int extBase) {
         int i = 0;
         while (i < syms.Count) { if (syms[i].name == name) { return i; } i = i + 1; }
         i = 0;
@@ -116,6 +138,7 @@ partial class Ngen {
         // then data globals, then undefined externs
         List<string> exts = ExternSyms();
         int extBase = syms.Count + strs.Count + dglbs.Count;
+        MethIndex refIdx = BuildRefSymIdx(exts, extBase, 0);
 
         List<int> rAddr = new List<int>();
         List<int> rWord = new List<int>();
@@ -123,7 +146,7 @@ partial class Ngen {
         while (i < fixups.Count) {
             Fixup f = fixups[i];
             if (f.kind == 4) {
-                int symnum = extBase + IndexOf(exts, f.sym);
+                int symnum = RefSymNum(f.sym, refIdx, extBase);
                 // word: symbolnum:24 | pcrel:1 | length:2 | extern:1 | type:4
                 int rw = symnum + (1 << 24) + (2 << 25) + (1 << 27) + (2 << 28);
                 InsertReloc(rAddr, rWord, f.pos, rw);
@@ -133,7 +156,7 @@ partial class Ngen {
         i = 0;
         while (i < strRefs.Count) {
             StrRef r = strRefs[i];
-            int symnum = RefSymNum(r.sym, exts, extBase);
+            int symnum = RefSymNum(r.sym, refIdx, extBase);
             if (r.got != 0) {
                 // GOT-indirect pair: adrp @GOTPAGE (type 5) then
                 // ldr @GOTPAGEOFF (type 6), both pcrel
@@ -145,6 +168,7 @@ partial class Ngen {
             }
             i = i + 1;
         }
+        SortReloc2(rAddr, rWord);
         int relocOff = dataOff + dataLen;
         int nrel = rAddr.Count;
         int nsyms = extBase + exts.Count;
@@ -310,15 +334,39 @@ partial class Ngen {
         return n;
     }
 
+    // relocation entries must reach the writer sorted by offset; sorting
+    // once after collection replaced the per-item insertion sort, which was
+    // O(R^2) and ~60% of compile time on big inputs (Chart family)
     void InsertReloc(List<int> addrs, List<int> words, int addr, int w) {
-        int at = addrs.Count;
-        int i = 0;
-        while (i < addrs.Count) {
-            if (addrs[i] > addr) { at = i; break; }
-            i = i + 1;
+        addrs.Add(addr);
+        words.Add(w);
+    }
+
+    void SortReloc2(List<int> a, List<int> w) {
+        int n = a.Count;
+        if (n < 2) { return; }
+        int i = n / 2;
+        while (i > 0) { i = i - 1; SiftReloc2(a, w, i, n); }
+        i = n - 1;
+        while (i > 0) {
+            int t = a[0]; a[0] = a[i]; a[i] = t;
+            t = w[0]; w[0] = w[i]; w[i] = t;
+            SiftReloc2(a, w, 0, i);
+            i = i - 1;
         }
-        addrs.Insert(at, addr);
-        words.Insert(at, w);
+    }
+
+    void SiftReloc2(List<int> a, List<int> w, int root, int n) {
+        while (true) {
+            int l = root * 2 + 1;
+            if (l >= n) { break; }
+            int m = l;
+            if (l + 1 < n && a[l + 1] > a[m]) { m = l + 1; }
+            if (a[root] >= a[m]) { break; }
+            int t = a[root]; a[root] = a[m]; a[m] = t;
+            t = w[root]; w[root] = w[m]; w[m] = t;
+            root = m;
+        }
     }
 
     void Put32(List<int> img, int v) {
