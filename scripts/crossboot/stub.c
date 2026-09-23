@@ -531,6 +531,13 @@ extern char __bss_end[];
  * convention for "no arguments": argc=1, argv={NULL}. */
 char *stub_argv[1] = { 0 };
 
+/* Per-thread EH state storage for the compiler-emitted _zan_rt_eh_state.
+ * The guest is single-threaded bare metal, so one static block is the
+ * honest per-"thread" state; the block layout is compiler-owned
+ * ({i32 top, ptr exc, 256 x 1024-byte setjmp slots}). */
+static char zan_eh_block[16 + 256 * 1024] __attribute__((aligned(16)));
+void *zan_eh_tls_state(void) { return zan_eh_block; }
+
 __attribute__((used)) void boot(void) {
     for (char *p = __bss_start; p < __bss_end; p = p + 1) { *p = 0; }
     int rc = main(1, stub_argv);

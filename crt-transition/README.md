@@ -9,8 +9,12 @@
     cc -o zanc zanc.o zanstubs.o zanhost.o -lSystem
 
 - `zanstubs.c`：Zan 运行时原语（Alloc/Free/Copy/…/Crc32）、
-  `zan_monotonic_ns`、Win 代码页 API、`zan_audio_*` 桩。语义无歧义的用
-  libc 实现；语义未移植的路径 abort()（宁可炸也别静默错）。
+  `zan_monotonic_ns`、Win 代码页 API、`zan_audio_*` 桩、
+  `zan_thread_*`/`zan_atomic_int_*`/`zan_shared_table_*` 同步族
+  （语义对照 oracle `src/runtime/rt_sync.c`；shared_table 为单进程诚实
+  移植，跨进程面 OsHandle/Attach 诚实失败）、`zan_eh_tls_state`（每线程
+  EH 状态块存储）。语义无歧义的用 libc 实现；语义未移植的路径
+  abort()（宁可炸也别静默错）。
 - `zanhost.c`：被拉取 stdlib 声明的 `zan_file_*`/`zan_embed_*`/
   `zan_mmap_*`/`zan_pkg_fopen` 族。编译器本体只用 `zan_pkg_fopen` +
   libc（ReadAllText/WriteAllText/ListNames）；其余成员的存在只是为了

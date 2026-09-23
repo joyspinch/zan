@@ -566,3 +566,889 @@ int zan_audio_play(long long c, int loop) { (void)c;(void)loop; return -1; }
 int zan_audio_voice_playing(int v) { (void)v; return 0; }
 void zan_audio_voice_stop(int v) { (void)v; }
 void zan_audio_voice_set_gain(int v, double g) { (void)v;(void)g; }
+
+/* ---- lock-statement monitor (spec: oracle rt_sync.c zan_monitor_*) ----
+ * `lock (obj)` 给每个对象一个监视器；进程级单把锁会让锁无关对象的线程
+ * 互相等待，所以按对象地址条纹化：指针折叠哈希选 64 把递归锁之一。
+ * 两个对象共享条纹只会过度串行，不丢互斥；递归保证重入合法。 */
+#include <pthread.h>
+#define ZT_MONITOR_STRIPES 64
+
+static pthread_mutex_t zt_monitor_mx[ZT_MONITOR_STRIPES];
+static pthread_once_t zt_monitor_once = PTHREAD_ONCE_INIT;
+
+static unsigned zt_monitor_stripe(void *obj) {
+    uintptr_t bits = (uintptr_t)obj;
+    bits ^= bits >> 20;
+    bits ^= bits >> 8;
+    return (unsigned)((bits >> 4) & (ZT_MONITOR_STRIPES - 1));
+}
+
+static void zt_monitor_init(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    for (unsigned i = 0; i < ZT_MONITOR_STRIPES; i++)
+        pthread_mutex_init(&zt_monitor_mx[i], &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+
+void zan_monitor_enter(void *obj) {
+    pthread_once(&zt_monitor_once, zt_monitor_init);
+    pthread_mutex_lock(&zt_monitor_mx[zt_monitor_stripe(obj)]);
+}
+
+void zan_monitor_exit(void *obj) {
+    pthread_mutex_unlock(&zt_monitor_mx[zt_monitor_stripe(obj)]);
+}
+
+/* ---- threads (spec: oracle src/runtime/rt_sync.c zan_thread_*) ----
+ * 本过渡运行时只服务我们自己 ngen 产出的目标码：那边传入的 ThreadStart
+ * 委托对象就是 {fn@0, env@8}，调用约定 fn(env)，且目标码不引用
+ * _zan_delegate_retain/release（已 nm 核实），所以 trampoline 不做引用
+ * 计数，也不碰异常栈状态。 */
+#include <pthread.h>
+#include <stdint.h>
+
+/* 每线程 EH 状态块（oracle 用 C TLV __zan_eh_self）。块布局由编译器
+ * 拥有（{i32 top, ptr exc, 256 x 1024 字节 setjmp 槽}），这里只负责把
+ * 存储做成每线程一份：之前状态块指针缓存在进程级全局里，线程会把
+ * longjmp 打进别人 armed 的槽（exception_threads 正是抓这个的）。 */
+static __thread void *zan_eh_tls;
+void *zan_eh_tls_state(void) {
+    if (!zan_eh_tls) {
+        zan_eh_tls = calloc(1, 16 + 256 * 1024);
+        if (!zan_eh_tls) abort();
+    }
+    return zan_eh_tls;
+}
+
+static void *zan_thread_trampoline(void *arg) {
+    void **closure = (void **)arg;
+    void (*fn)(void *) = (void (*)(void *))closure[0];
+    void *env = closure[1];
+    if (fn) fn(env);
+    return NULL;
+}
+
+int32_t zan_thread_start(void *body) {
+    if (!body) return 0;
+    pthread_t t;
+    if (pthread_create(&t, NULL, zan_thread_trampoline, body) != 0) return 0;
+    pthread_detach(t);
+    return 1;
+}
+
+int64_t zan_thread_current_id(void) {
+    /* pthread_self() 是指针、逐次漂移；pthread_threadid_np 给出稳定的
+     * 每线程数值 id（与 oracle 的 macOS 分支一致）。 */
+    uint64_t tid = 0;
+    if (pthread_threadid_np(NULL, &tid) != 0) return 0;
+    return (int64_t)tid;
+}
+
+/* ---- atomic int (spec: oracle rt_sync.c zan_atomic_int_*，C11 __atomic) ---- */
+
+int64_t zan_atomic_int_create(int64_t initial_value) {
+    int64_t *p = (int64_t *)malloc(sizeof(int64_t));
+    if (!p) return 0;
+    *p = initial_value;
+    return (int64_t)(intptr_t)p;
+}
+
+void zan_atomic_int_destroy(int64_t handle) {
+    free((void *)(intptr_t)handle);
+}
+
+int64_t zan_atomic_int_load(int64_t handle) {
+    int64_t *p = (int64_t *)(intptr_t)handle;
+    if (!p) return 0;
+    return __atomic_load_n(p, __ATOMIC_SEQ_CST);
+}
+
+void zan_atomic_int_store(int64_t handle, int64_t new_value) {
+    int64_t *p = (int64_t *)(intptr_t)handle;
+    if (!p) return;
+    __atomic_store_n(p, new_value, __ATOMIC_SEQ_CST);
+}
+
+int64_t zan_atomic_int_add(int64_t handle, int64_t delta) {
+    int64_t *p = (int64_t *)(intptr_t)handle;
+    if (!p) return 0;
+    return __atomic_add_fetch(p, delta, __ATOMIC_SEQ_CST);
+}
+
+int64_t zan_atomic_int_exchange(int64_t handle, int64_t new_value) {
+    int64_t *p = (int64_t *)(intptr_t)handle;
+    if (!p) return 0;
+    return __atomic_exchange_n(p, new_value, __ATOMIC_SEQ_CST);
+}
+
+int64_t zan_atomic_int_compare_exchange(
+    int64_t handle, int64_t expected, int64_t desired) {
+    int64_t *p = (int64_t *)(intptr_t)handle;
+    if (!p) return 0;
+    int64_t seen = expected;
+    (void)__atomic_compare_exchange_n(
+        p, &seen, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return seen; /* oracle 语义：返回比较时看到的旧值 */
+}
+
+/* ---- shared table（单进程诚实移植，规格：oracle rt_sync.c）----
+ * oracle 用跨进程 mmap + 哈希槽；回归测试全是单进程的，这里换成
+ * 进程内注册表 + 堆上行式存储，但语义逐条对齐：
+ *   - 列 schema "i:name;"/"f:name;"/"s:<n>:name;"，字符串列占 n+1 字节
+ *     （含 NUL），int/float 8 字节且按 8 对齐，重名列/坏 schema 拒绝；
+ *   - 键哈希 = oracle 同款 FNV-1a 64、强制非零，_at 族按哈希寻行；
+ *   - 过期用 wall clock（CLOCK_REALTIME 毫秒），expire/purge/rate/lock
+ *     算法从 rt_sync.c 原样移植（含 rate 的 count/window_start 双 int 列、
+ *     lock 的 INT 列 "owner"、仅 absent 建行、min 时 0 视为未设）；
+ *   - 容量到达 7/8（oracle 载荷因子）拒绝建行；
+ *   - Destroy 只把名字从注册表摘除（POSIX unlink 语义：既有句柄仍可
+ *     读写）；表永不 free，避免悬垂句柄——测试进程即退即收。
+ * 跨进程面（OsHandle/Attach）在过渡运行时没有承载物，诚实失败：具名表
+ * 按 Oracle 文档本就返回 0，匿名表与 Attach 返回 0（打开失败的表）。 */
+
+#define ZT_MAX_COLUMNS 32
+#define ZT_MAX_STRING 65536
+#define ZT_MAX_CAPACITY (1 << 20)
+
+typedef struct {
+    char name[64];
+    int type;   /* 0 int, 1 float, 2 string */
+    int size;   /* int/float 8；字符串 = 解析值 + 1 */
+    int offset;
+} zt_col;
+
+typedef struct zt_row {
+    struct zt_row *next;
+    uint64_t hash;
+    char *key;          /* 建行时的键副本 */
+    int alive;          /* 0 = tombstone，保留槽位 */
+    int64_t expires_at; /* 0 = 无期限 */
+    void *data;         /* stride 字节 */
+} zt_row;
+
+typedef struct zt_table {
+    char *name;         /* NULL = 匿名 */
+    int cap, keysize, ncol, stride;
+    zt_col cols[ZT_MAX_COLUMNS];
+    zt_row *rows;       /* 含 tombstone 的单链表 */
+    int count;          /* alive 行数 */
+    int linked;         /* 在注册表里（可被 Open） */
+    pthread_mutex_t mu;
+} zt_table;
+
+static zt_table *zt_registry[64];
+static int zt_reg_n;
+static pthread_mutex_t zt_reg_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int64_t zt_wall_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static uint64_t zt_hash(const char *value) {
+    uint64_t h = UINT64_C(1469598103934665603);
+    const unsigned char *p = (const unsigned char *)(value ? value : "");
+    while (*p) {
+        h ^= *p++;
+        h *= UINT64_C(1099511628211);
+    }
+    return h ? h : 1;
+}
+
+static int zt_align8(int v) { return (v + 7) & ~7; }
+
+static int zt_parse_schema(const char *schema, zt_table *t) {
+    const char *p = schema;
+    int offset = 0;
+    if (!schema || !*schema) return 0;
+    while (*p) {
+        if (t->ncol >= ZT_MAX_COLUMNS) return 0;
+        zt_col *c = &t->cols[t->ncol];
+        if (*p == 'i') {
+            c->type = 0; c->size = 8; p++;
+            if (*p++ != ':') return 0;
+        } else if (*p == 'f') {
+            c->type = 1; c->size = 8; p++;
+            if (*p++ != ':') return 0;
+        } else if (*p == 's') {
+            char *end = NULL;
+            unsigned long parsed;
+            c->type = 2; p++;
+            if (*p++ != ':') return 0;
+            parsed = strtoul(p, &end, 10);
+            if (end == p || !end || *end != ':' ||
+                parsed == 0 || parsed > ZT_MAX_STRING) return 0;
+            c->size = (int)parsed + 1; /* 含 NUL，同 oracle */
+            p = end + 1;
+        } else {
+            return 0;
+        }
+        const char *name = p;
+        while (*p && *p != ';') p++;
+        size_t name_len = (size_t)(p - name);
+        if (*p != ';' || name_len == 0 || name_len >= sizeof(c->name)) return 0;
+        for (int i = 0; i < t->ncol; i++) {
+            if (strlen(t->cols[i].name) == name_len &&
+                memcmp(t->cols[i].name, name, name_len) == 0) return 0;
+        }
+        memset(c->name, 0, sizeof(c->name));
+        memcpy(c->name, name, name_len);
+        if (c->type == 0 || c->type == 1) offset = zt_align8(offset);
+        c->offset = offset;
+        offset += c->size;
+        t->ncol++;
+        p++;
+    }
+    t->stride = offset;
+    return 1;
+}
+
+static zt_table *zt_new_table(const char *name, int cap, int keysize) {
+    zt_table *t = (zt_table *)calloc(1, sizeof(zt_table));
+    if (!t) return NULL;
+    if (name) {
+        t->name = strdup(name);
+        if (!t->name) { free(t); return NULL; }
+    }
+    t->cap = cap;
+    t->keysize = keysize;
+    pthread_mutex_init(&t->mu, NULL);
+    return t;
+}
+
+int64_t zan_shared_table_create(
+    const char *name, int32_t capacity, int32_t key_size, const char *schema) {
+    if (!name || !*name || capacity <= 0 || capacity > ZT_MAX_CAPACITY ||
+        key_size <= 0 || key_size > 4096)
+        return 0;
+    zt_table *t = zt_new_table(name, capacity, key_size);
+    if (!t) return 0;
+    if (!zt_parse_schema(schema, t)) {
+        free(t->name);
+        free(t);
+        return 0;
+    }
+    int ok = 1;
+    pthread_mutex_lock(&zt_reg_mu);
+    for (int i = 0; i < zt_reg_n; i++) {
+        if (zt_registry[i]->linked && strcmp(zt_registry[i]->name, name) == 0) {
+            ok = 0; /* 已有同名具名表：拒绝（O_CREAT|O_EXCL 语义） */
+            break;
+        }
+    }
+    if (ok && zt_reg_n < (int)(sizeof(zt_registry) / sizeof(zt_registry[0]))) {
+        t->linked = 1;
+        zt_registry[zt_reg_n++] = t;
+    } else {
+        ok = 0;
+    }
+    pthread_mutex_unlock(&zt_reg_mu);
+    if (!ok) { free(t->name); free(t); return 0; }
+    return (int64_t)(intptr_t)t;
+}
+
+int64_t zan_shared_table_create_anon(
+    int32_t capacity, int32_t key_size, const char *schema) {
+    if (capacity <= 0 || capacity > ZT_MAX_CAPACITY ||
+        key_size <= 0 || key_size > 4096)
+        return 0;
+    zt_table *t = zt_new_table(NULL, capacity, key_size);
+    if (!t) return 0;
+    if (!zt_parse_schema(schema, t)) { free(t); return 0; }
+    return (int64_t)(intptr_t)t; /* 不入注册表：匿名 */
+}
+
+int64_t zan_shared_table_open(const char *name) {
+    if (!name) return 0;
+    pthread_mutex_lock(&zt_reg_mu);
+    zt_table *found = NULL;
+    for (int i = 0; i < zt_reg_n; i++) {
+        if (zt_registry[i]->linked && strcmp(zt_registry[i]->name, name) == 0) {
+            found = zt_registry[i];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&zt_reg_mu);
+    return found ? (int64_t)(intptr_t)found : 0;
+}
+
+long zan_shared_table_handle(int64_t handle) {
+    /* 具名表按文档返回 0；匿名表本该返回可继承的描述符——过渡运行时
+     * 没有跨进程承载物，诚实返回 0。 */
+    (void)handle;
+    return 0;
+}
+
+int64_t zan_shared_table_attach(int64_t os_handle) {
+    (void)os_handle;
+    return 0; /* 跨进程附着在过渡运行时不存在 */
+}
+
+void zan_shared_table_close(int64_t handle) {
+    /* 表有意不 free（防悬垂句柄），Close 无需做事。 */
+    (void)handle;
+}
+
+int32_t zan_shared_table_destroy(int64_t handle) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t) return 0;
+    int was_linked = 0;
+    pthread_mutex_lock(&zt_reg_mu);
+    if (t->linked) {
+        t->linked = 0;
+        was_linked = 1;
+    }
+    pthread_mutex_unlock(&zt_reg_mu);
+    return was_linked;
+}
+
+/* 以下操作都要求已持有 t->mu。 */
+
+static void zt_purge_locked(zt_table *t, int64_t now) {
+    for (zt_row *r = t->rows; r; r = r->next) {
+        if (r->alive && r->expires_at != 0 && r->expires_at <= now) {
+            r->alive = 0;
+            t->count--;
+        }
+    }
+}
+
+static zt_row *zt_find_row(zt_table *t, const char *key) {
+    for (zt_row *r = t->rows; r; r = r->next)
+        if (r->alive && strcmp(r->key, key) == 0) return r;
+    return NULL;
+}
+
+static zt_row *zt_find_row_hash(zt_table *t, uint64_t hash) {
+    for (zt_row *r = t->rows; r; r = r->next)
+        if (r->alive && r->hash == hash) return r;
+    return NULL;
+}
+
+/* oracle 载荷因子：7/8 满即拒绝建行；tombstone 槽位优先复用。 */
+static zt_row *zt_row_for(zt_table *t, const char *key) {
+    zt_row *r = zt_find_row(t, key);
+    if (r) return r;
+    if ((int64_t)t->count * 8 >= (int64_t)t->cap * 7) return NULL;
+    for (r = t->rows; r; r = r->next)
+        if (!r->alive) break;
+    if (!r) {
+        r = (zt_row *)calloc(1, sizeof(zt_row));
+        if (!r) return NULL;
+        r->key = strdup(key);
+        r->data = calloc(1, (size_t)(t->stride > 0 ? t->stride : 1));
+        if (!r->key || !r->data) {
+            free(r->key);
+            free(r->data);
+            free(r);
+            return NULL;
+        }
+        r->next = t->rows;
+        t->rows = r;
+    }
+    r->hash = zt_hash(key);
+    r->expires_at = 0;
+    memset(r->data, 0, (size_t)t->stride);
+    r->alive = 1;
+    t->count++;
+    return r;
+}
+
+static zt_col *zt_find_col(zt_table *t, const char *name, int type) {
+    for (int i = 0; i < t->ncol; i++)
+        if (t->cols[i].type == type && strcmp(t->cols[i].name, name) == 0)
+            return &t->cols[i];
+    return NULL;
+}
+
+int32_t zan_shared_table_set_int(
+    int64_t handle, const char *key, const char *column, int64_t value) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t || !key) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_col *c = zt_find_col(t, column, 0);
+    zt_row *r = c ? zt_row_for(t, key) : NULL;
+    if (r) *(int64_t *)((char *)r->data + c->offset) = value;
+    pthread_mutex_unlock(&t->mu);
+    return r != NULL;
+}
+
+int64_t zan_shared_table_get_int(
+    int64_t handle, const char *key, const char *column) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t || !key) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_col *c = zt_find_col(t, column, 0);
+    zt_row *r = c ? zt_find_row(t, key) : NULL;
+    int64_t v = r ? *(int64_t *)((char *)r->data + c->offset) : 0;
+    pthread_mutex_unlock(&t->mu);
+    return v;
+}
+
+int32_t zan_shared_table_set_float(
+    int64_t handle, const char *key, const char *column, double value) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t || !key) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_col *c = zt_find_col(t, column, 1);
+    zt_row *r = c ? zt_row_for(t, key) : NULL;
+    if (r) *(double *)((char *)r->data + c->offset) = value;
+    pthread_mutex_unlock(&t->mu);
+    return r != NULL;
+}
+
+double zan_shared_table_get_float(
+    int64_t handle, const char *key, const char *column) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t || !key) return 0.0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_col *c = zt_find_col(t, column, 1);
+    zt_row *r = c ? zt_find_row(t, key) : NULL;
+    double v = r ? *(double *)((char *)r->data + c->offset) : 0.0;
+    pthread_mutex_unlock(&t->mu);
+    return v;
+}
+
+int32_t zan_shared_table_set_string(
+    int64_t handle, const char *key, const char *column, const char *value) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t || !key || !value) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_col *c = zt_find_col(t, column, 2);
+    zt_row *r = NULL;
+    if (c && strlen(value) < (size_t)c->size) r = zt_row_for(t, key);
+    if (r) {
+        char *dst = (char *)r->data + c->offset;
+        memcpy(dst, value, strlen(value));
+        dst[strlen(value)] = '\0';
+    }
+    pthread_mutex_unlock(&t->mu);
+    return r != NULL;
+}
+
+const char *zan_shared_table_get_string(
+    int64_t handle, const char *key, const char *column) {
+    char *result = (char *)malloc(1);
+    if (result) result[0] = '\0'; /* 缺失 → 空串，同 oracle */
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!result || !t || !key) return result;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_col *c = zt_find_col(t, column, 2);
+    zt_row *r = c ? zt_find_row(t, key) : NULL;
+    if (r) {
+        const char *src = (const char *)r->data + c->offset;
+        size_t len = strnlen(src, (size_t)(c->size - 1));
+        char *copy = (char *)malloc(len + 1);
+        if (copy) {
+            memcpy(copy, src, len);
+            copy[len] = '\0';
+            free(result);
+            result = copy;
+        }
+    }
+    pthread_mutex_unlock(&t->mu);
+    return result;
+}
+
+int64_t zan_shared_table_increment(
+    int64_t handle, const char *key, const char *column, int64_t delta) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t || !key) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_col *c = zt_find_col(t, column, 0);
+    zt_row *r = c ? zt_row_for(t, key) : NULL;
+    int64_t v = 0;
+    if (r) {
+        v = *(int64_t *)((char *)r->data + c->offset) + delta;
+        *(int64_t *)((char *)r->data + c->offset) = v;
+    }
+    pthread_mutex_unlock(&t->mu);
+    return v;
+}
+
+int32_t zan_shared_table_expire_at(
+    int64_t handle, const char *key, int64_t expires_at_ms);
+
+int32_t zan_shared_table_expire(
+    int64_t handle, const char *key, int64_t ttl_ms) {
+    if (ttl_ms < 0) return 0;
+    int64_t now = zt_wall_now();
+    if (ttl_ms > INT64_MAX - now) return 0;
+    return zan_shared_table_expire_at(handle, key, now + ttl_ms);
+}
+
+int32_t zan_shared_table_expire_at(
+    int64_t handle, const char *key, int64_t expires_at_ms) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t || !key || expires_at_ms < 0) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_row *r = zt_find_row(t, key);
+    if (r) r->expires_at = expires_at_ms;
+    pthread_mutex_unlock(&t->mu);
+    return r != NULL;
+}
+
+int64_t zan_shared_table_expires_at(int64_t handle, const char *key) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t || !key) return -1;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_row *r = zt_find_row(t, key);
+    int64_t at = r ? r->expires_at : -1;
+    pthread_mutex_unlock(&t->mu);
+    return at;
+}
+
+int64_t zan_shared_table_purge_expired(int64_t handle, int64_t now_ms) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t) return 0;
+    if (now_ms < 0) now_ms = zt_wall_now();
+    pthread_mutex_lock(&t->mu);
+    int64_t before = t->count;
+    zt_purge_locked(t, now_ms);
+    int64_t removed = before - t->count;
+    pthread_mutex_unlock(&t->mu);
+    return removed;
+}
+
+int32_t zan_shared_table_rate_allow(
+    int64_t handle, const char *key, int64_t now_ms,
+    int64_t window_ms, int64_t limit) {
+    if (limit <= 0) return 1;
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t || !key || window_ms <= 0) return 0;
+    if (now_ms < 0) now_ms = zt_wall_now();
+    if (window_ms > INT64_MAX - now_ms) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_col *count_col = zt_find_col(t, "count", 0);
+    zt_col *start_col = zt_find_col(t, "window_start", 0);
+    zt_row *r = NULL;
+    int allowed = 0;
+    if (count_col && start_col) {
+        zt_purge_locked(t, now_ms);
+        r = zt_find_row(t, key);
+        if (!r) r = zt_row_for(t, key);
+        if (r) {
+            int64_t *count = (int64_t *)((char *)r->data + count_col->offset);
+            int64_t *start = (int64_t *)((char *)r->data + start_col->offset);
+            if (*start <= 0 || now_ms - *start >= window_ms) {
+                *count = 1;
+                *start = now_ms;
+                r->expires_at = now_ms + window_ms;
+                allowed = 1;
+            } else if (*count < limit) {
+                (*count)++;
+                allowed = 1;
+            }
+        }
+    }
+    pthread_mutex_unlock(&t->mu);
+    return allowed;
+}
+
+int32_t zan_shared_table_lock_acquire(
+    int64_t handle, const char *key, int64_t owner,
+    int64_t now_ms, int64_t lease_ms) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t || !key || owner == 0 || lease_ms <= 0) return 0;
+    if (now_ms < 0) now_ms = zt_wall_now();
+    if (lease_ms > INT64_MAX - now_ms) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_col *owner_col = zt_find_col(t, "owner", 0);
+    int acquired = 0;
+    if (owner_col) {
+        zt_purge_locked(t, now_ms);
+        zt_row *r = zt_find_row(t, key);
+        if (!r) {
+            r = zt_row_for(t, key); /* 仅 absent 建行，同 oracle */
+            if (r) {
+                *(int64_t *)((char *)r->data + owner_col->offset) = owner;
+                r->expires_at = now_ms + lease_ms;
+                acquired = 1;
+            }
+        }
+    }
+    pthread_mutex_unlock(&t->mu);
+    return acquired;
+}
+
+int32_t zan_shared_table_lock_release(
+    int64_t handle, const char *key, int64_t owner) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t || !key || owner == 0) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_col *owner_col = zt_find_col(t, "owner", 0);
+    int released = 0;
+    if (owner_col) {
+        zt_purge_locked(t, zt_wall_now());
+        zt_row *r = zt_find_row(t, key);
+        if (r && *(int64_t *)((char *)r->data + owner_col->offset) == owner) {
+            r->alive = 0;
+            t->count--;
+            released = 1;
+        }
+    }
+    pthread_mutex_unlock(&t->mu);
+    return released;
+}
+
+int32_t zan_shared_table_delete(int64_t handle, const char *key) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t || !key) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_row *r = zt_find_row(t, key);
+    if (r) {
+        r->alive = 0;
+        t->count--;
+    }
+    pthread_mutex_unlock(&t->mu);
+    return r != NULL;
+}
+
+int32_t zan_shared_table_exists(int64_t handle, const char *key) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t || !key) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_row *r = zt_find_row(t, key);
+    pthread_mutex_unlock(&t->mu);
+    return r != NULL;
+}
+
+int64_t zan_shared_table_count(int64_t handle) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    int64_t n = t->count;
+    pthread_mutex_unlock(&t->mu);
+    return n;
+}
+
+void zan_shared_table_clear(int64_t handle) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t) return;
+    pthread_mutex_lock(&t->mu);
+    for (zt_row *r = t->rows; r; r = r->next) r->alive = 0;
+    t->count = 0;
+    pthread_mutex_unlock(&t->mu);
+}
+
+int64_t zan_shared_table_hash(const char *value) {
+    return (int64_t)zt_hash(value);
+}
+
+long zan_shared_table_stat(int64_t handle, int32_t what) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t) return 0;
+    switch (what) {
+        case 0: /* RESERVED：oracle 返回映射字节数 */
+        case 1: /* RESIDENT：全堆存储，全部驻留 */
+            return (int64_t)t->stride * t->cap;
+        case 2: return t->cap;      /* CAPACITY */
+        case 3: return t->count;    /* COUNT */
+        case 4: return t->stride;   /* ROW_STRIDE */
+        case 5: return t->keysize;  /* KEY_SIZE */
+        case 6: return t->ncol;     /* COLUMNS */
+        default: return 0;
+    }
+}
+
+int32_t zan_shared_table_set_int_at(
+    int64_t handle, int64_t key_hash, const char *column, int64_t value) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_col *c = zt_find_col(t, column, 0);
+    zt_row *r = NULL;
+    if (c) {
+        r = zt_find_row_hash(t, (uint64_t)key_hash);
+        if (!r) {
+            /* 哈希寻径建行：键取哈希的十进制形式占位（该 API 本就无键） */
+            char keybuf[32];
+            snprintf(keybuf, sizeof(keybuf), "%lld", (long long)key_hash);
+            r = zt_row_for(t, keybuf);
+            if (r) r->hash = (uint64_t)key_hash;
+        }
+        if (r) *(int64_t *)((char *)r->data + c->offset) = value;
+    }
+    pthread_mutex_unlock(&t->mu);
+    return r != NULL;
+}
+
+int64_t zan_shared_table_get_int_at(
+    int64_t handle, int64_t key_hash, const char *column) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_col *c = zt_find_col(t, column, 0);
+    zt_row *r = c ? zt_find_row_hash(t, (uint64_t)key_hash) : NULL;
+    int64_t v = r ? *(int64_t *)((char *)r->data + c->offset) : 0;
+    pthread_mutex_unlock(&t->mu);
+    return v;
+}
+
+int64_t zan_shared_table_increment_at(
+    int64_t handle, int64_t key_hash, const char *column, int64_t delta) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_col *c = zt_find_col(t, column, 0);
+    zt_row *r = NULL;
+    int64_t v = 0;
+    if (c) {
+        r = zt_find_row_hash(t, (uint64_t)key_hash);
+        if (!r) {
+            char keybuf[32];
+            snprintf(keybuf, sizeof(keybuf), "%lld", (long long)key_hash);
+            r = zt_row_for(t, keybuf);
+            if (r) r->hash = (uint64_t)key_hash;
+        }
+        if (r) {
+            v = *(int64_t *)((char *)r->data + c->offset) + delta;
+            *(int64_t *)((char *)r->data + c->offset) = v;
+        }
+    }
+    pthread_mutex_unlock(&t->mu);
+    return v;
+}
+
+int64_t zan_shared_table_extreme_at(
+    int64_t handle, int64_t key_hash, const char *column, int64_t value,
+    int64_t keep_larger) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_col *c = zt_find_col(t, column, 0);
+    zt_row *r = NULL;
+    int64_t stored = 0;
+    if (c) {
+        r = zt_find_row_hash(t, (uint64_t)key_hash);
+        if (!r) {
+            char keybuf[32];
+            snprintf(keybuf, sizeof(keybuf), "%lld", (long long)key_hash);
+            r = zt_row_for(t, keybuf);
+            if (r) r->hash = (uint64_t)key_hash;
+        }
+        if (r) {
+            int64_t *slot = (int64_t *)((char *)r->data + c->offset);
+            stored = *slot;
+            int replace = keep_larger ? (value > stored)
+                                      : (stored == 0 || value < stored);
+            if (replace) {
+                *slot = value;
+                stored = value;
+            }
+        }
+    }
+    pthread_mutex_unlock(&t->mu);
+    return stored;
+}
+
+int32_t zan_shared_table_set_string_at(
+    int64_t handle, int64_t key_hash, const char *column, const char *value) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t || !value) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_col *c = zt_find_col(t, column, 2);
+    zt_row *r = NULL;
+    if (c && strlen(value) < (size_t)c->size) {
+        r = zt_find_row_hash(t, (uint64_t)key_hash);
+        if (!r) {
+            char keybuf[32];
+            snprintf(keybuf, sizeof(keybuf), "%lld", (long long)key_hash);
+            r = zt_row_for(t, keybuf);
+            if (r) r->hash = (uint64_t)key_hash;
+        }
+        if (r) {
+            char *dst = (char *)r->data + c->offset;
+            memcpy(dst, value, strlen(value));
+            dst[strlen(value)] = '\0';
+        }
+    }
+    pthread_mutex_unlock(&t->mu);
+    return r != NULL;
+}
+
+const char *zan_shared_table_get_string_at(
+    int64_t handle, int64_t key_hash, const char *column) {
+    char *result = (char *)malloc(1);
+    if (result) result[0] = '\0';
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!result || !t) return result;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_col *c = zt_find_col(t, column, 2);
+    zt_row *r = c ? zt_find_row_hash(t, (uint64_t)key_hash) : NULL;
+    if (r) {
+        const char *src = (const char *)r->data + c->offset;
+        size_t len = strnlen(src, (size_t)(c->size - 1));
+        char *copy = (char *)malloc(len + 1);
+        if (copy) {
+            memcpy(copy, src, len);
+            copy[len] = '\0';
+            free(result);
+            result = copy;
+        }
+    }
+    pthread_mutex_unlock(&t->mu);
+    return result;
+}
+
+int32_t zan_shared_table_match_at(
+    int64_t handle, int64_t key_hash, const char *column, const char *text) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t || !text) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_col *c = zt_find_col(t, column, 2);
+    zt_row *r = c ? zt_find_row_hash(t, (uint64_t)key_hash) : NULL;
+    int equal = 0;
+    if (r)
+        equal = strncmp(
+            (const char *)r->data + c->offset, text, (size_t)c->size) == 0;
+    pthread_mutex_unlock(&t->mu);
+    return equal;
+}
+
+int32_t zan_shared_table_exists_at(int64_t handle, int64_t key_hash) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_row *r = zt_find_row_hash(t, (uint64_t)key_hash);
+    pthread_mutex_unlock(&t->mu);
+    return r != NULL;
+}
+
+int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t) return 0;
+    pthread_mutex_lock(&t->mu);
+    zt_purge_locked(t, zt_wall_now());
+    zt_row *r = zt_find_row_hash(t, (uint64_t)key_hash);
+    if (r) {
+        r->alive = 0;
+        t->count--;
+    }
+    pthread_mutex_unlock(&t->mu);
+    return r != NULL;
+}

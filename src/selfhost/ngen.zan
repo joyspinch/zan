@@ -149,6 +149,7 @@ partial class Ngen {
     List<int> brkFinBase;   // finallys base for each break target
     List<int> cntFinBase;   // finallys base at each loop's continue point
     int finCur = -1;        // index of the finally body being emitted right now
+    int lockSeq = 0;        // unique temp names for lowered lock statements
     List<int> cntL;         // innermost-enclosing-loop continue targets
     bool curHasTry;         // method being emitted contains a try anywhere
     int ehTopLocal;         // #ehtop: mirror of the runtime EH top
@@ -1525,6 +1526,9 @@ partial class Ngen {
     bool HasTry(Node n) {
         if (n == null) { return false; }
         if (n.kind == AK.TryStmt()) { return true; }
+        // lock lowers to try/finally at emission: its EH bookkeeping slots
+        // and the state-top mirror must be reserved exactly like a try's
+        if (n.kind == AK.LockStmt()) { return true; }
         if (n.kind == AK.CatchClause()) {
             Node cc = n;
             while (cc != null) {
@@ -1805,6 +1809,21 @@ partial class Ngen {
                 cc = cc.b;
             }
             ReserveScopedNg(s.c);
+        } else if (k == AK.LockStmt()) {
+            // the lock's temp lives in the frame: allocate the slot NOW
+            // (ReserveLocals runs before the frame size freezes and before
+            // the #ehtop/#ehbase/#ehbrk slots are appended) and stash the
+            // decl node in s.c for the emission pass
+            ReserveOutDecls(s.a);
+            Node d = new Node(AK.VarDecl());
+            d.sval = "$lock" + lockSeq;
+            lockSeq = lockSeq + 1;
+            d.b = s.a;
+            AddDeclNg(d, d.sval, InferExprTyNg(s.a));
+            s.c = d;
+            int saved = locHead;
+            ReserveScopedNg(s.b);
+            locHead = saved;
         } else if (k == AK.SwitchStmt()) {
             int saved = locHead;
             ReserveOutDecls(s.a);
@@ -2071,6 +2090,11 @@ partial class Ngen {
             }
         } else if (k == AK.TryStmt()) {
             GenTry(s);
+        } else if (k == AK.LockStmt()) {
+            GenLockStmt(s);
+        } else if (k == AK.MonitorExitStmt()) {
+            LoadLocal(DeclSlotNg(s.a), 0);
+            BLExtern("_zan_monitor_exit");
         } else if (k == AK.ThrowStmt()) {
             GenThrow(s);
         } else {
@@ -7438,10 +7462,36 @@ partial class Ngen {
     }
 
     // ---- exceptions: try / catch / throw ----
-    // EH state (single-thread approximation): one global pointer in
-    // __DATA,__data (l_.g.zan_eh) to a lazily calloc'd { i32 top, ptr exc,
-    // buf[64] of 1024-byte setjmp slots } = 16 + 64*1024 bytes. Mirrors the
-    // observable semantics of gen0's TLS-backed %zan.eh.state.
+    // EH state is per-thread: the block ({ i32 top, ptr exc, 256 x 1024-byte
+    // setjmp slots }) comes from _zan_eh_tls_state in the transition runtime
+    // (a static block in the qemu stub). Mirrors the observable semantics of
+    // gen0's TLS-backed %zan.eh.state.
+    // lock (obj) body: the striped recursive monitor (zan_monitor_enter/
+    // exit, oracle rt_sync.c), with the release riding a REAL try/finally so
+    // every exit path releases it exactly like the oracle's lowering
+    // (irgen_stmt.c AST_LOCK_STMT lowers lock to try/finally): a throw runs
+    // the release at the throw site, return/break/continue walk it via the
+    // pending-fin machinery, and a nested unwind lands in this try's own
+    // armed buf. Desugared here, after checking:
+    //   { var $lockN = obj; monitor_enter($lockN);
+    //     try body finally monitor_exit($lockN) }
+    // The temp's slot is allocated in ReserveLocals (see the LockStmt arm
+    // there) and stashed in s.c; HasTry counts LockStmt so the method gets
+    // the EH bookkeeping slots and the frame covers everything.
+    void GenLockStmt(Node s) {
+        string vt = InferExprTyNg(s.a);
+        if (!TryGenBindingValue(s.a, vt)) { GenConversionValueNg(s.a, vt); }
+        StoreLocal(DeclSlotNg(s.c), 0);
+        BLExtern("_zan_monitor_enter");              // x0 = obj
+        Node fin = new Node(AK.MonitorExitStmt());
+        fin.a = s.c;
+        Node t = new Node(AK.TryStmt());
+        t.a = s.b;
+        t.b = null;
+        t.c = fin;
+        GenStmt(t);
+    }
+
     void GenTry(Node s) {
         BLInternal("_zan_rt_eh_state");              // x0 = state (lazy alloc)
         E4(0xF81F0FE0);                              // push state

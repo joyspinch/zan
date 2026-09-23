@@ -1,6 +1,69 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-23 · v10 · 定点见下方 v10 节
+日期：2026-09-23 · v11 · 定点见下方 v11 节
+
+## v11 线程运行时批（2026-09-23，nlf 15→0，sweep 286→301，检查点 run.dfN3PV）
+
+三部分：crt-transition 补齐 Threading 的 45 个 DllImport 符号、EH 状态
+每线程化、`lock` 真互斥降级。sweep 分布：pass 301 / ncf 184 / nlf 0 /
+om 3（仍是三例 oracle 陈旧归因）/ em 6 / mne 11 / rcf 119，零回归。
+
+1. **45 符号 runtime**（`crt-transition/zanstubs.c`，语义逐条对照
+   oracle `src/runtime/rt_sync.c`）：
+   - `zan_thread_start`（pthread_create 分离；我们车道的 ThreadStart
+     委托对象是 {fn@0, env@8}、调用 fn(env)，nm 核实车道不引用
+     _zan_delegate_*，trampoline 不做引用计数）+ `zan_thread_current_id`
+     （pthread_threadid_np，同 oracle macOS 分支）。
+   - 7 个 `zan_atomic_int_*`：C11 `__atomic` SEQ_CST，add 返回新值、
+     compare_exchange 返回旧值（oracle 语义）。
+   - 36 个 `zan_shared_table_*`：单进程诚实移植——进程内名字注册表 +
+     堆列式行存储；schema `i:n;`/`f:n;`/`s:size:n;`（字符串列 size+1
+     含 NUL，同 zan_parse_schema；重名列拒绝；int/float 8 字节对齐）；
+     FNV-1a 64 强制非零哈希（hash() 与 _at 族共用）；wall-clock 过期 +
+     oracle 清扫语义；rate_allow/lock_acquire/lock_release/extreme_at/
+     match_at 逐行移植（INT 列 "count"/"window_start"/"owner"、仅
+     absent 建行加锁、min 时 0 视为未设）；7/8 载荷因子拒建行；
+     OsHandle/Attach 诚实失败（过渡运行时无跨进程承载物）；表有意
+     不 free（句柄不悬垂）。
+2. **EH 每线程化**（exception_threads 抓的正面竞态）：_zan_rt_eh_state
+   原本把状态块指针缓存在进程级全局——线程会把 longjmp 打进别的线程
+   armed 的槽。RtEmitEhState（ngen_obj.zan）改为尾调 zanstubs.c 新增的
+   `zan_eh_tls_state`（`static __thread` 存储，块布局不变；
+   crossboot/stub.c 用静态块顶单线程 qemu 客场）。**教训**：Mach-O 的
+   BLExtern 名必须带前导下划线（ELF 写入器恰好剥一个，两边通吃）。
+3. **lock 真互斥**（monitor_striped 抓的降级缺口）：parser 原把
+   `lock (e) body` 降成普通块（写注释时还没有线程）。现在 parser 产
+   AK.LockStmt，ngen GenLockStmt 在检查后脱糖为
+   `{ var $lockN = obj; monitor_enter($lockN); try body finally
+   monitor_exit($lockN) }`，底层是 rt_sync.c 同款 64 条纹递归互斥
+   （指针折叠哈希）。骑真 try 机制白拿 oracle 的释放纪律
+   （irgen_stmt.c AST_LOCK_STMT）：throw 在 throw 点释放、
+   return/break/continue 走 pending-fin、嵌套 unwind 落进 lock 自己
+   armed 的 buf。
+
+**探针抓到的两个 ngen bug（都关乎"合成节点必须对编译器全程可见"）**：
+(a) $lock 临时槽在发射期才 AddDeclNg——晚于 `frame = 16 * nloc` 定型，
+写进帧外（qa4/qa11/qa13 SEGV；二分定位：内联循环没事、方法内循环 +
+后随 try 必崩）。修复：ReserveLocals 的 LockStmt 臂里分配槽、把声明
+节点存进 s.c。(b) HasTry 不认识 LockStmt → curHasTry=false →
+#ehtop/#ehbase/#ehbrk 槽根本不保留、state-top 镜像不初始化。HasTry
+现在把 LockStmt 算作 try。
+
+**探针族**：qa4（单线程 lock/重入/throw 释放）、qa5（纯嵌套
+try/finally 基线）、qa6（lock 内真 try/finally）、qa8（无 throw +
+throw 形状）、qa10–qa13（300/1000 轮、内联 vs 跨方法）全部字节精确；
+monitor_striped 40000/40000/reentrant ×3 稳定；线程族 7/7 parity。
+
+**验证**：39/39；crossboot ELF 5/5 + PE-COFF 5/5；正式自举
+run.dfN3PV stage2.o==stage3.o；全量 sweep 如上。
+
+**下一批**（按既定顺序）：awaited DllImport 阻塞外存降级
+（NativeResolveAllAsync/NativeConnectSockAddr，irgen_expr.c:7969：
+≤4 标量参数、同步调用、结果进 frame+32、立即再就绪；需要
+zan_io_resolve_all_async/zan_io_connect_sa 桩）→ Get$T 显式泛型
+spec 调用（8 个 chart 错）。之后：委托捕获/7 参形状（6）、Html
+Dictionary<Action>（3）、FindNotAnyOf（2）、Task.Delay-arg/
+ToStr-arity 级联、Interop Com。
 
 ## v10 async/门/套接字批（2026-09-23，await 家族解锁，sweep 284→286，检查点 run.8ymewr）
 
