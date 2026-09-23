@@ -36,6 +36,36 @@ partial class Ngen {
         return ty.Substring(p + 1, ty.Length - p - 2);
     }
 
+    // Does this expression materialize an object that dies at statement end?
+    // Trimmed mirror of the C host's expr_yields_owned_rc_value, covering the
+    // forms our codegen lowers as fresh results: call/new/await results,
+    // chains off them, custom-getter property reads (get_Prop calls) and
+    // op_index element reads. Bare locals / this / real fields / static
+    // reads are borrowed and stay live-bindable.
+    bool YieldsOwnedTempNg(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.Call() || e.kind == AK.NewExpr()
+                || e.kind == AK.AwaitExpr()) { return true; }
+        if (e.kind == AK.Conditional()) {
+            return YieldsOwnedTempNg(e.b) || YieldsOwnedTempNg(e.c);
+        }
+        if (e.kind == AK.Index()) {
+            if (YieldsOwnedTempNg(e.a)) { return true; }
+            string oc = ExprCls(e.a);
+            return oc != null && OpIndexMethod(oc) != null;
+        }
+        if (e.kind == AK.MemberAccess()) {
+            if (YieldsOwnedTempNg(e.a)) { return true; }
+            if (FieldOf(e) != null) { return false; }    // field/auto-prop slot
+            // static-qualified reads (ClsName.Prop) are shared globals
+            if (e.a != null && e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0
+                    && FindClass(e.a.sval) != null) { return false; }
+            string gc = ExprCls(e.a);
+            return gc != null && AccessorInChain(gc, "get_" + e.sval) != null;
+        }
+        return false;
+    }
+
     // shared accessor thunk id for one (field offset, direction); registering
     // also guarantees the delegate intern runtime gets emitted
     int InternBindAcc(int off, bool isSet) {
@@ -76,6 +106,16 @@ partial class Ngen {
         if (rhs2.kind == AK.MemberAccess()) {
             Fld mf = FieldOf(rhs2);
             if (mf != null && BindingElemTyNg(slotTy) == mf.ty) { ff = mf; }
+        }
+        // A310: the live target is a NON-OWNING reference (cycle avoidance),
+        // so a receiver that yields an owned temp (`f().name`) would dangle
+        // once the statement ends -- divert to the const path and snapshot
+        // the field value instead (mirrors emit_binding_value's
+        // owned-receiver check). A held root (local, this, field, element of
+        // a held container) owns nothing here and keeps live bindings.
+        if (ff != null && rhs2.a != null && ExprCls(rhs2.a) != null
+                && YieldsOwnedTempNg(rhs2.a)) {
+            ff = null;
         }
         Cls bc = FindClass("Binding");
         if (bc == null) { return false; }

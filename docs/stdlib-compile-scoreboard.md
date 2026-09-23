@@ -1,6 +1,36 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-22 · v6 · 定点 run.IkNm6s（真 bug 修复后的全收敛检查点）
+日期：2026-09-23 · v7 · 定点见下方 v7 节
+
+## v7 A310 活绑定 owned-temp 降级（2026-09-23，binding_temp_source 归位）
+
+**真缺口（已修）**：`comp.prop = f().field;`（接收者产出 owned 临时）我们
+合成的是活绑定（IsLive()=1），golden 要求降级 const 快照。更早的对拍里
+oracle 输出 `1 (null) ... 1 0`——`(null)` 正是悬空 target 的
+use-after-free、`33` 读成 `0`：**Sep-13 旧 oracle 二进制早于其仓库的 A310
+修复**。修复后我们与 golden 逐字节一致（`0 snapshot 1 alice carol dave
+0 33`），是三方（oracle/native/golden）中唯一正确的；待用户重建
+zan-lang 后该例在 parity harness 里翻绿。
+
+**修法**（ngen_binding.zan，镜像 C host emit_binding_value 的
+owned-receiver 分流）：`TryGenBindingValue` 在字段左值成立后检查接收者
+`ExprCls(接收者) != null && YieldsOwnedTempNg(接收者)`，成立则 `ff=null`
+落 const 路径。`YieldsOwnedTempNg` 覆盖我们代码生成里"产出即死"的形态：
+Call/New/Await 结果、其链式成员、自定义 getter 属性（get_Prop 调用）、
+op_index 元素、owned 分支的条件表达式；裸局部/this/真字段/静态读是
+borrowed，保持活绑定。**注意顺序**：先递归接收者链再查 FieldOf（否则
+`F().inner.name` 会误判为字段槽）。
+
+**复验**：binding_temp_source 直跑 rc=0 逐字节 == golden；定向 parity
+binding 族 + record_with_expr 5/6 pass（唯一 mismatch 即上述 oracle 陈旧）、
+临时接收者族 arc_temp_receiver_methodgroup/async_receiver_temp/
+arc_chained_temp/index_temp_release 4/4 pass；39/39 回归 ✓；正式自举
+（SEED=run.IkNm6s/stage2）新检查点见 json。
+
+**对 stale oracle 的 sweep 已饱和**：binding_temp_source/arr_lit_rc/
+enum_257_members 在 harness 口径下会一直 output_mismatch（reference 侧
+输出陈旧），但三者 native 输出均与 golden 逐字节一致——zan-lang 重建前
+全量 sweep 数字不再有信息量，跳过。
 
 ## v6 验证与真 bug（2026-09-22，\u/\x 双重编码 + 全量复验）
 
