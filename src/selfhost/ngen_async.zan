@@ -700,6 +700,103 @@ partial class Ngen {
         }
     }
 
+    // the awaited callee is a DllImport static extern (`await
+    // Socket.NativeResolveAllAsync(...)`, irgen_expr.c:7969
+    // emit_await_blocking_extern): returns its static method index, -1 if
+    // the callee is not one. Await paths only -- statement-level detach
+    // recognition must not see this.
+    int BlockingExternMiNg(Node call) {
+        if (call == null || call.kind != AK.Call() || call.a == null) { return -1; }
+        int mi = ResolveStaticNg(call);
+        if (mi < 0) { return -1; }
+        if (!HasMod(methNodes[mi], MOD.Extern())) { return -1; }
+        return mi;
+    }
+
+    // lower `await <DllImport extern>(scalars)` (irgen_expr.c:7969). The
+    // reference hands a function pointer + the scalar args to the rt
+    // blocking worker and wakes this frame on completion; the native lane
+    // has no worker pool (the recv/accept deviation), so the call runs
+    // inline and the waiter re-readies itself via _zan_co_ready -- the
+    // exact suspend/resume shape of the co-intrinsics. The oracle's
+    // validation mirrors here: at most four arguments, only integer,
+    // nint, bool, and enum scalars across the suspension, and only int,
+    // long, nint, or void returns; diagnostics fire but emission stays on
+    // the one consistent path so the state chain keeps its label.
+    void EmitBlockingExternNg(int mi, Node inner, Node aw, int k, int kLbl) {
+        Node m = methNodes[mi];
+        int n = inner.kids.Count;
+        if (n > 4) {
+            diags.Error("ngen: awaited native extern call has " + Convert.ToString(n) + " arguments; at most four scalar arguments are supported", aw.line, aw.col);
+        }
+        string rt = TypeFullName(m.type);
+        bool hasRes = rt != "void";
+        if (hasRes && rt != "int" && rt != "long" && rt != "nint") {
+            diags.Error("ngen: awaited native extern call returns '" + rt + "', but only int, long, nint, or void can cross a suspension safely", aw.line, aw.col);
+        }
+        int pc = ParamCount(m);
+        int pi = 0;
+        while (pi < pc) {
+            Node p = ParamAt(m, pi);
+            if (p == null) { break; }
+            string pt = TypeFullName(p.type);
+            if (pt != "int" && pt != "long" && pt != "nint" && pt != "bool"
+                    && pt != "byte" && pt != "sbyte" && pt != "short"
+                    && pt != "char" && pt != "uint" && pt != "ushort"
+                    && pt != "ulong" && FindEnum(pt) < 0) {
+                diags.Error("ngen: awaited native extern argument " + Convert.ToString(pi + 1) + " has type '" + pt + "'; only integer, nint, bool, and enum scalars are safe across suspension", aw.line, aw.col);
+            }
+            pi = pi + 1;
+        }
+        EnsureAsyncRuntimeNg();
+        int pushN = n > 4 ? 4 : n;
+        int ai = 0;
+        while (ai < n) {
+            GenExpr(inner.kids[ai]);
+            if (ai < pushN) { E4(0xF81F0FE0); }      // push arg (16-aligned)
+            ai = ai + 1;
+        }
+        SaveSlotsNg();
+        if (pushN >= 4) { E4(0xF84107E3); }          // pop in reverse into x0..x3
+        if (pushN >= 3) { E4(0xF84107E2); }
+        if (pushN >= 2) { E4(0xF84107E1); }
+        if (pushN >= 1) { E4(0xF84107E0); }
+        BLExtern(ExternSymNg(m));                    // x0 = raw result
+        if (rt == "int") {
+            E4(0x93407C00);                          // sxtw x0, w0 (EOF == -1)
+        } else if (rt == "short") {
+            E4(0x93403C00);                          // sxth x0, w0
+        }
+        if (hasRes) {
+            LoadLocal(asyncFrameLocal, 9);
+            StrU(0, 9, 32);                          // frame.result = raw
+        }
+        LoadLocal(asyncFrameLocal, 1);
+        LoadImm(0, k);
+        StrU(0, 1, 0);                               // state = k
+        LoadLocal(asyncFrameLocal, 1);               // x1 = frame
+        LoadSymRef(asyncResumeSym, 2);               // x2 = self $resume
+        MovRR(0, 1);                                 // co_ready(frame, step)
+        MovRR(1, 2);
+        BLInternal("_zan_co_ready");                 // immediate re-ready
+        AsyncEhUnarmNg();                            // suspend disarms
+        Epilogue();                                  // ret to the scheduler
+        Mark(kLbl);
+        // ---- resume-k ----
+        ReloadSlotsNg();
+        int rti = 0;
+        while (rti < asyncTryCatchLs.Count) {        // re-arm trys open around
+            ArmAsyncTryBufNg(asyncTryCatchLs[rti]);  // the suspension
+            rti = rti + 1;
+        }
+        if (hasRes) {
+            LoadLocal(asyncFrameLocal, 9);
+            LdrU(0, 9, 32);                          // the result slot
+        } else {
+            LoadImm(0, 0);
+        }
+    }
+
     // the awaited callee is itself a delegate VALUE (local, field,
     // parameter -- `await onDown(conn);`): its thunk dispatches to a
     // method-group ramp that yields the frame handle like any instance
@@ -827,6 +924,13 @@ partial class Ngen {
         }
         int mi = AsyncResolveCallNg(inner);
         if (mi == -1 && IsDelegateCalleeNg(inner)) { mi = -2; }
+        if (mi == -1) {
+            int bxi = BlockingExternMiNg(inner);
+            if (bxi >= 0) {
+                EmitBlockingExternNg(bxi, inner, aw, k, kLbl);
+                return;
+            }
+        }
         if (mi == -1) {
             string nm = inner != null && inner.a != null ? inner.a.sval : "?";
             diags.Error("ngen: 'await' of '" + nm + "' is not supported by the native backend (only calls to non-generic async methods) [" + asyncWhyNg + "]", aw.line, aw.col);
@@ -1484,6 +1588,13 @@ partial class Ngen {
         Node inner = e.a;
         if (inner == null || inner.kind != AK.Call()) {
             diags.Error("ngen: 'await' target must be a call to an async method", e.line, e.col);
+            LoadImm(0, 0);
+            return true;
+        }
+        if (BlockingExternMiNg(inner) >= 0) {
+            // the reference rejects these outside an async method outright
+            // (emit_await_blocking_extern needs a frame to suspend)
+            diags.Error("ngen: awaited native extern calls are only supported inside an async method", e.line, e.col);
             LoadImm(0, 0);
             return true;
         }

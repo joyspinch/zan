@@ -9,12 +9,16 @@
     cc -o zanc zanc.o zanstubs.o zanhost.o -lSystem
 
 - `zanstubs.c`：Zan 运行时原语（Alloc/Free/Copy/…/Crc32）、
-  `zan_monotonic_ns`、Win 代码页 API、`zan_audio_*` 桩、
+  `zan_monotonic_ns/us`、Win 代码页 API、`zan_audio_*` 桩、
   `zan_thread_*`/`zan_atomic_int_*`/`zan_shared_table_*` 同步族
   （语义对照 oracle `src/runtime/rt_sync.c`；shared_table 为单进程诚实
   移植，跨进程面 OsHandle/Attach 诚实失败）、`zan_eh_tls_state`（每线程
-  EH 状态块存储）。语义无歧义的用 libc 实现；语义未移植的路径
-  abort()（宁可炸也别静默错）。
+  EH 状态块）、`zan_io_*` 套接字/解析器族 + `zan_monitor_*`（语义对照
+  oracle `src/runtime/rt_io.c`/`rt_sync.c`：send 的 -1/-2 分类与 SIGPIPE
+  惰性忽略、resolve_sa/resolve_all 的 v4 优先与 stride-32 去重、
+  sockaddr_is_safe 的内嵌 v4 分类、connect_sa 非阻塞+select 截止；
+  close_notify 因车道无 reactor 为 no-op）。语义无歧义的用 libc 实现；
+  语义未移植的路径 abort()（宁可炸也别静默错）。
 - `zanhost.c`：被拉取 stdlib 声明的 `zan_file_*`/`zan_embed_*`/
   `zan_mmap_*`/`zan_pkg_fopen` 族。编译器本体只用 `zan_pkg_fopen` +
   libc（ReadAllText/WriteAllText/ListNames）；其余成员的存在只是为了

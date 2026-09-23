@@ -1,6 +1,63 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-23 · v11 · 定点见下方 v11 节
+日期：2026-09-23 · v12 · 定点见下方 v12 节
+
+## v12 awaited DllImport 阻塞外存批（2026-09-23，socket 族首绿，sweep 301→305，检查点 run.LrJ84X）
+
+`await Socket.NativeResolveAllAsync/NativeConnectSockAddr`（irgen_expr.c:7969
+emit_await_blocking_extern）此前是 web 栈的编译闸门：**52 个 chart 用例各吃
+2 个错**（Socket.zan 一进编译闭包就报）。本批解锁后 12 个 ncf 用例进入
+链接/运行，分布：pass 305 / ncf 172 / nlf 0 / om 6 / em 11 / mne 11 /
+rcf 119——**旧 pass 零回归**，新增 om/em 全部是首次能编译的 socket 用例。
+
+1. **降级发射**（`src/selfhost/ngen_async.zan`）：BlockingExternMiNg
+   （ResolveStaticNg + MOD.Extern，只跑在 await 路径，不碰 Hook B）→
+   EmitBlockingExternNg 完全复用 co-intrinsic 形状：oracle 同款校验
+   （≤4 参、integer/nint/bool/enum 参、int/long/nint/void 返回；诊断照发
+   但发射走同一条路径，状态链的 label 不脱节）、参数求值压栈 →
+   SaveSlotsNg → 逆序弹入 x0..x3 → BLExtern(EntryPoint) **内联执行**
+   （oracle 传 fnptr 给阻塞 worker；本车道没有 worker 池，与 recv/accept
+   同款已记录偏差）→ int 返回 sxtw（EOF==-1）→ 结果进 frame+32 →
+   state=k → `_zan_co_ready(frame,$resume)` 立即再就绪 → 解臂、Epilogue、
+   resume-k 重载重臂交付。TryGenAwaitExprNg 在非 async 上下文显式拒绝
+   （oracle：没有帧可挂起）。
+2. **探针抓到的寄存器 bug**：首版调 `_zan_co_ready` 时 x0 还揣着状态号
+   k、x1 是帧——调度器把帧地址当代码"调用"，qa14 SIGBUS（PC=
+   0x157608400）。修复 = `MovRR(0,1)/MovRR(1,2)`（`_zan_io_wait_co` 的
+   x0=frame、x1=step 形状）。修后 qa14（ResolveAllAsync "localhost"）
+   与 oracle 字节一致（n=2，v6+v4）。
+3. **zanstubs.c 网络族**（语义逐条对照 oracle rt_io.c/rt_sync.c）：新
+   编译的 12 例要过链接，zan_io_* 一个都不能缺——socket_send
+   （EAGAIN→-1/致命→-2 分类 + 惰性 SIGPIPE 忽略，oracle zan_io_init 同
+   款）、recv/ready/alive/connect_status/cleanup、sockaddr_ip_str
+   （__thread + inet_ntop）与两个 *_into 拷出变体、resolve_sa（v4 优先
+   + AF_UNSPEC 兜底）、resolve_ipv4、sockaddr_family/is_safe（含
+   v4-mapped/Teredo/6to4/NAT64 内嵌地址分类）、resolve_all（stride-32
+   稳定去重、永不半集）、resolve_all_async、connect_sa（非阻塞 connect
+   + select 截止）、close_notify（无 reactor → no-op）、monotonic_us、
+   socket_cleanup。nlf 保持 0。zan_plat_net_interfaces 原本就在
+   zanhost.c（第一次打桩重复了）。
+4. **探针**（oracle `zanc src.zan -o exe`）：qa14 解析字节一致；
+   qa15 TcpClient.ConnectAsync 回环连接+发送一致；qa16 活对端
+   RecvAsync 无超时/5000ms 超时两形态字节一致。qa15 首版 recv 空串
+   = v10 记录在案的 RecvOv/RecvToOv 单发不真挂起偏差（数据已在途；
+   qa16 证明数据排队后交付正确），本批未动。
+5. **sweep 迁移**（workdir 逐例 diff）：+pass {async_echo,
+   socket_errors, socket_handle_nint, socket_ready}；ncf→om
+   {async_asocket_echo, async_socket_async_echo, ipv6}；ncf→em
+   {accept_after_close, async_concurrent_echo, async_dns, async_mt,
+   socket_close_wakes}——全是 reactor 时序语义（真挂起、close 唤醒、
+   并发回显），是 socket 下一前线。
+
+**验证**：39/39；crossboot ELF 5/5 + PE-COFF 5/5；正式自举
+run.LrJ84X stage2.o==stage3.o；chart 剖面 awaited-DllImport 错
+104→0；全量 sweep 如上。
+
+**下一批**（按既定顺序）：Get$T 显式泛型 spec 调用（8 个 chart
+错，JsonValue.zan Get<string> ×5 等）→ 委托捕获/7 参形状（6）、Html
+Dictionary<Action>（3）、FindNotAnyOf（2）、Task.Delay-arg/
+ToStr-arity 级联、Interop Com。socket om/em 8 例挂在 reactor 真挂起
+（RecvOv/RecvToOv/AcceptOv 诚实化 + close 唤醒），排在 Get$T 之后。
 
 ## v11 线程运行时批（2026-09-23，nlf 15→0，sweep 286→301，检查点 run.dfN3PV）
 

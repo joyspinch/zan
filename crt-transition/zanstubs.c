@@ -1452,3 +1452,403 @@ int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
     pthread_mutex_unlock(&t->mu);
     return r != NULL;
 }
+
+/* ---- sockets / resolver (spec: oracle src/runtime/rt_io.c zan_io_*) ----
+ * stdlib System/Net pulls this family through DllImport EntryPoints; the
+ * awaited forms (zan_io_resolve_all_async / zan_io_connect_sa) run inline on
+ * the coroutine thread on this lane (no blocking-worker pool), which is the
+ * documented recv/accept deviation. POSIX/darwin branches only. */
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <net/if.h>
+#include <net/if_dl.h>
+#include <ifaddrs.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <signal.h>
+
+#define ZAN_IO_SA_STRIDE 32
+
+/* The oracle's zan_io_init installs this once: a peer hanging up mid-send
+ * must be a return value, not a process killer (rt_io.c:68-86). */
+static void zt_io_ignore_sigpipe(void) {
+    struct sigaction sa;
+    struct sigaction cur;
+    if (sigaction(SIGPIPE, NULL, &cur) == 0 && cur.sa_handler != SIG_DFL) {
+        return;
+    }
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGPIPE, &sa, NULL);
+}
+
+void zan_io_socket_cleanup(void) {}
+
+/* rt_io.c:444: >=0 bytes accepted; -1 would block; -2 fatal. */
+int64_t zan_io_socket_send(intptr_t fd, const void *buf, int64_t len,
+                           int32_t flags) {
+    zt_io_ignore_sigpipe();
+    if (len <= 0) return len == 0 ? 0 : -2;
+    if (len > 0x7FFFFFFF) len = 0x7FFFFFFF;
+    for (;;) {
+        ssize_t r = send((int)fd, buf, (size_t)len, (int)flags);
+        if (r >= 0) return (int64_t)r;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
+        if (errno == EINTR) continue;
+        return -2;
+    }
+}
+
+int64_t zan_io_socket_recv(intptr_t fd, void *buf, int64_t len,
+                           int32_t flags) {
+    if (len < 0) return -2;
+    if (len > 0x7FFFFFFF) len = 0x7FFFFFFF;
+    return (int64_t)recv((int)fd, buf, (size_t)len, (int)flags);
+}
+
+/* rt_io.c:509: thread-local so an adopted text survives the next call. */
+const char *zan_io_sockaddr_ip_str(const void *sa) {
+    static __thread char address[128];
+    const struct sockaddr *a = (const struct sockaddr *)sa;
+    if (a->sa_family == AF_INET) {
+        const struct sockaddr_in *in = (const struct sockaddr_in *)a;
+        if (!inet_ntop(AF_INET, &in->sin_addr, address, sizeof(address)))
+            return "";
+        return address;
+    }
+    if (a->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)a;
+        if (!inet_ntop(AF_INET6, &in6->sin6_addr, address, sizeof(address)))
+            return "";
+        return address;
+    }
+    return "";
+}
+
+const char *zan_io_socket_peer_ip(intptr_t fd) {
+    struct sockaddr_storage peer;
+    socklen_t length = (socklen_t)sizeof(peer);
+    if (getpeername((int)fd, (struct sockaddr *)&peer, &length) != 0) return "";
+    return zan_io_sockaddr_ip_str(&peer);
+}
+
+/* rt_io.c:552: copy-out variants; length excluding NUL, or -1. */
+static int32_t zan_io_ip_copy_out(const char *text, char *buf, int32_t cap) {
+    if (!buf || cap <= 0) return -1;
+    size_t n = strlen(text);
+    if ((size_t)cap <= n) return -1;
+    memcpy(buf, text, n + 1);
+    return (int32_t)n;
+}
+
+int32_t zan_io_socket_peer_ip_into(intptr_t fd, char *buf, int32_t cap) {
+    struct sockaddr_storage peer;
+    socklen_t length = (socklen_t)sizeof(peer);
+    if (getpeername((int)fd, (struct sockaddr *)&peer, &length) != 0)
+        return -1;
+    return zan_io_ip_copy_out(zan_io_sockaddr_ip_str(&peer), buf, cap);
+}
+
+int32_t zan_io_sockaddr_ip_str_into(const void *sa, char *buf, int32_t cap) {
+    return zan_io_ip_copy_out(zan_io_sockaddr_ip_str(sa), buf, cap);
+}
+
+/* rt_io.c:573: literal ':' names are v6-or-nothing, everything else prefers
+ * v4 with an AF_UNSPEC fallback for v6-only hostnames. Length 16/28 or 0. */
+int32_t zan_io_resolve_sa(const char *name, int32_t port, void *buf,
+                          int32_t cap) {
+    if (!name || !*name) return 0;
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = strchr(name, ':') ? AF_UNSPEC : AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(name, portstr, &hints, &res) != 0 || !res) {
+        if (hints.ai_family == AF_INET) {
+            hints.ai_family = AF_UNSPEC;
+            if (getaddrinfo(name, portstr, &hints, &res) != 0 || !res)
+                return 0;
+        } else {
+            return 0;
+        }
+    }
+    int len = (res->ai_family == AF_INET6) ? (int)sizeof(struct sockaddr_in6)
+             : (res->ai_family == AF_INET) ? (int)sizeof(struct sockaddr_in)
+             : 0;
+    int32_t r = 0;
+    if (len && len <= cap && res->ai_addrlen == (size_t)len) {
+        memcpy(buf, res->ai_addr, (size_t)len);
+        r = len;
+    }
+    freeaddrinfo(res);
+    return r;
+}
+
+/* rt_io.c:607: IPv4 address in inet_addr byte order, 0 on failure. */
+int32_t zan_io_resolve_ipv4(const char *hostname) {
+    if (!hostname || !*hostname) return 0;
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(hostname, NULL, &hints, &res) != 0 || !res) return 0;
+    struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
+    int32_t addr = 0;
+    if (res->ai_family == AF_INET && sin->sin_family == AF_INET)
+        addr = (int32_t)sin->sin_addr.s_addr;
+    freeaddrinfo(res);
+    return addr;
+}
+
+int32_t zan_io_sockaddr_family(const void *sa, int32_t len) {
+    if (!sa || len < 2) return 0;
+    const struct sockaddr *a = (const struct sockaddr *)sa;
+    if (a->sa_family == AF_INET && len >= (int32_t)sizeof(struct sockaddr_in))
+        return AF_INET;
+    if (a->sa_family == AF_INET6 && len >= (int32_t)sizeof(struct sockaddr_in6))
+        return AF_INET6;
+    return 0;
+}
+
+/* rt_io.c:638: 1 only for a usable public address (or an explicit loopback
+ * exception); embedded IPv4 forms are judged by the v4 rules. */
+int32_t zan_io_sockaddr_is_safe(const void *sa, int32_t len,
+                               int32_t allow_loopback) {
+    int family = zan_io_sockaddr_family(sa, len);
+    if (family == AF_INET) {
+        const struct sockaddr_in *v4 = (const struct sockaddr_in *)sa;
+        uint32_t a = ntohl(v4->sin_addr.s_addr);
+        uint32_t first = a >> 24;
+        uint32_t second = (a >> 16) & 255u;
+        if (first == 127u) return allow_loopback ? 1 : 0;
+        if (first == 0u || first == 10u || first >= 224u || first >= 240u)
+            return 0;
+        if (first == 169u && second == 254u) return 0;
+        if (first == 172u && second >= 16u && second <= 31u) return 0;
+        if (first == 192u && second == 168u) return 0;
+        if (first == 192u && second == 0u) return 0;
+        uint32_t third = (a >> 8) & 255u;
+        if (first == 192u && second == 2u) return 0;
+        if (first == 192u && second == 88u && third == 99u) return 0;
+        if (first == 198u && second >= 18u && second <= 19u) return 0;
+        if (first == 198u && second == 51u && third == 100u) return 0;
+        if (first == 203u && second == 0u && third == 113u) return 0;
+        if (first == 100u && second >= 64u && second <= 127u) return 0;
+        if (a == 0xffffffffu) return 0;
+        return 1;
+    }
+    if (family == AF_INET6) {
+        const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)sa;
+        const unsigned char *b = (const unsigned char *)&v6->sin6_addr;
+        int all_zero = 1;
+        for (int i = 0; i < 16; i++) if (b[i] != 0) all_zero = 0;
+        if (all_zero) return 0;
+        int loop = 1;
+        for (int i = 0; i < 15; i++) if (b[i] != 0) loop = 0;
+        if (loop && b[15] == 1) return allow_loopback ? 1 : 0;
+        if ((b[0] & 0xfeu) == 0xfcu) return 0;
+        if ((b[0] & 0xfeu) == 0xfeu && (b[1] & 0xc0u) == 0x80u) return 0;
+        if (b[0] == 0xffu) return 0;
+        if (b[0] == 0x20u && b[1] == 0x01u && b[2] == 0x0du && b[3] == 0xb8u)
+            return 0;
+        int mapped = 1;
+        for (int i = 0; i < 10; i++) if (b[i] != 0) mapped = 0;
+        if (mapped && b[10] == 0xffu && b[11] == 0xffu) {
+            struct sockaddr_in mapped4;
+            memset(&mapped4, 0, sizeof(mapped4));
+            mapped4.sin_family = AF_INET;
+            memcpy(&mapped4.sin_addr, b + 12, 4);
+            return zan_io_sockaddr_is_safe(&mapped4,
+                (int32_t)sizeof(mapped4), allow_loopback);
+        }
+        if (b[0] == 0x20u && b[1] == 0x01u && b[2] == 0x00u && b[3] == 0x00u) {
+            struct sockaddr_in t4;
+            unsigned char cli[4];
+            memset(&t4, 0, sizeof(t4));
+            t4.sin_family = AF_INET;
+            memcpy(&t4.sin_addr, b + 4, 4);
+            if (!zan_io_sockaddr_is_safe(&t4, (int32_t)sizeof(t4), allow_loopback))
+                return 0;
+            for (int i = 0; i < 4; i++) cli[i] = (unsigned char)(b[12 + i] ^ 0xffu);
+            memcpy(&t4.sin_addr, cli, 4);
+            return zan_io_sockaddr_is_safe(&t4, (int32_t)sizeof(t4), allow_loopback);
+        }
+        int v4_off = -1;
+        if (b[0] == 0x20u && b[1] == 0x02u)
+            v4_off = 2;
+        else if (b[0] == 0x00u && b[1] == 0x64u && b[2] == 0xffu && b[3] == 0x9bu)
+            v4_off = 12;
+        else if (mapped)
+            v4_off = 12;
+        if (v4_off >= 0) {
+            struct sockaddr_in e4;
+            memset(&e4, 0, sizeof(e4));
+            e4.sin_family = AF_INET;
+            memcpy(&e4.sin_addr, b + v4_off, 4);
+            return zan_io_sockaddr_is_safe(&e4, (int32_t)sizeof(e4), allow_loopback);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* rt_io.c:727: stable de-dup into caller slots; never a partial set --
+ * overflow clears the buffer and returns 0. */
+int32_t zan_io_resolve_all(const char *name, int32_t port, void *buf,
+                           int32_t cap) {
+    if (!buf || cap <= 0) return 0;
+    if (!name || !*name || cap < ZAN_IO_SA_STRIDE) {
+        memset(buf, 0, (size_t)cap);
+        return 0;
+    }
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(name, portstr, &hints, &res) != 0 || !res) {
+        memset(buf, 0, (size_t)cap);
+        return 0;
+    }
+    int32_t capacity = cap / ZAN_IO_SA_STRIDE;
+    int32_t count = 0;
+    for (struct addrinfo *p = res; p; p = p->ai_next) {
+        int32_t family = zan_io_sockaddr_family(p->ai_addr,
+            (int32_t)p->ai_addrlen);
+        int32_t len = family == AF_INET6 ? (int32_t)sizeof(struct sockaddr_in6)
+                     : family == AF_INET ? (int32_t)sizeof(struct sockaddr_in) : 0;
+        if (!len || p->ai_addrlen < (size_t)len) continue;
+        int duplicate = 0;
+        for (int32_t i = 0; i < count; i++) {
+            unsigned char *old = (unsigned char *)buf + i * ZAN_IO_SA_STRIDE;
+            int oldfam = zan_io_sockaddr_family(old, len);
+            if (oldfam == family && memcmp(old, p->ai_addr, (size_t)len) == 0) {
+                duplicate = 1; break;
+            }
+        }
+        if (duplicate) continue;
+        if (count >= capacity) {
+            memset(buf, 0, (size_t)cap);
+            freeaddrinfo(res);
+            return 0;
+        }
+        unsigned char *dst = (unsigned char *)buf + count * ZAN_IO_SA_STRIDE;
+        memset(dst, 0, ZAN_IO_SA_STRIDE);
+        memcpy(dst, p->ai_addr, (size_t)len);
+        count++;
+    }
+    freeaddrinfo(res);
+    return count;
+}
+
+int64_t zan_io_resolve_all_async(intptr_t name_ptr, int32_t port,
+                                 intptr_t buf_ptr, int32_t cap) {
+    return (int64_t)zan_io_resolve_all((const char *)name_ptr, port,
+                                       (void *)buf_ptr, cap);
+}
+
+static int32_t zan_io_set_nonblocking(intptr_t fd) {
+    int flags = fcntl((int)fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl((int)fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/* rt_io.c:881: nonblocking connect; 0 established, -2 in progress, else a
+ * positive errno code or -1. */
+static int32_t zan_io_connect_sa_start(intptr_t fd, const void *sa,
+                                       int32_t salen) {
+    if (!sa || zan_io_sockaddr_family(sa, salen) == 0) return -1;
+    if (zan_io_set_nonblocking(fd) != 0) return -1;
+    int r = connect((int)fd, (const struct sockaddr *)sa, (socklen_t)salen);
+    if (r == 0) return 0;
+    if (errno == EINPROGRESS || errno == EWOULDBLOCK || errno == EALREADY)
+        return -2;
+    return errno > 0 ? errno : -1;
+}
+
+/* rt_io.c:903: the blocking-worker exact connect; on this lane it runs
+ * inline. 0 established, positive SO_ERROR, -3 timed out, -1 failed. */
+int64_t zan_io_connect_sa(intptr_t fd, const void *sa, int32_t salen,
+                           int32_t timeout_ms) {
+    zt_io_ignore_sigpipe();
+    int32_t r = zan_io_connect_sa_start(fd, sa, salen);
+    if (r == 0 || r != -2) return r;
+    fd_set wfds, efds;
+    FD_ZERO(&wfds); FD_ZERO(&efds);
+    if (fd < 0 || fd >= FD_SETSIZE) return -1;
+    FD_SET((int)fd, &wfds); FD_SET((int)fd, &efds);
+    struct timeval tv, *ptv = NULL;
+    if (timeout_ms >= 0) { tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000; ptv = &tv; }
+    int sr;
+    do { sr = select((int)fd + 1, NULL, &wfds, &efds, ptv); }
+    while (sr < 0 && errno == EINTR);
+    if (sr <= 0) return sr == 0 ? -3 : -1;
+    int err = 0;
+    socklen_t len = (socklen_t)sizeof(err);
+    if (getsockopt((int)fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0)
+        return -1;
+    return err == 0 ? 0 : err;
+}
+
+/* rt_io.c:853: 0 established, positive SO_ERROR (or -1), -2 in progress. */
+int32_t zan_io_connect_status(intptr_t fd) {
+    fd_set wfds, efds;
+    FD_ZERO(&wfds);
+    FD_ZERO(&efds);
+    struct timeval timeout = {0, 0};
+    int err = 0;
+    socklen_t elen = (socklen_t)sizeof(err);
+    if (fd < 0 || fd >= FD_SETSIZE) return -1;
+    int sock = (int)fd;
+    FD_SET(sock, &wfds);
+    FD_SET(sock, &efds);
+    if (select(sock + 1, NULL, &wfds, &efds, &timeout) < 0) return -1;
+    if (FD_ISSET(sock, &efds)) {
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&err, &elen) != 0)
+            return -1;
+        return err != 0 ? (int32_t)err : -1;
+    }
+    if (FD_ISSET(sock, &wfds)) {
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&err, &elen) != 0)
+            return -1;
+        return (int32_t)err;
+    }
+    return -2;
+}
+
+/* rt_io.c:833: immediate readiness probe via select. */
+int32_t zan_io_socket_ready(intptr_t fd, int32_t write_ready) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    struct timeval timeout = {0, 0};
+    if (fd < 0 || fd >= FD_SETSIZE) return -1;
+    int sock = (int)fd;
+    FD_SET(sock, &fds);
+    return (int32_t)select(sock + 1, write_ready ? NULL : &fds,
+                           write_ready ? &fds : NULL, NULL, &timeout);
+}
+
+/* rt_io.c:869: SO_TYPE getsockopt (Windows) / F_GETFD (POSIX). */
+int32_t zan_io_socket_alive(intptr_t fd) {
+    if (fd < 0) return 0;
+    return fcntl((int)fd, F_GETFD) != -1;
+}
+
+/* No reactor on this lane, so there is nothing to fail-wake; the stdlib's
+ * close path closes the fd itself right after. */
+void zan_io_close_notify(intptr_t fd) { (void)fd; }
+
+int64_t zan_monotonic_us(void) {
+    return zan_monotonic_ns() / 1000;
+}
+
