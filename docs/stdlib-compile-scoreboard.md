@@ -1,6 +1,52 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-23 · v12 · 定点见下方 v12 节
+日期：2026-09-23 · v13 · 定点见下方 v13 节
+
+## v13 Get$T 显式泛型 spec 批（2026-09-23，chart 错 2866→2138，sweep 305→306，检查点 run.00JWPU）
+
+`CollectSpecsInEnvNg` 的两条 SpecRegister 路径（显式类型实参、首参推断）用
+**全局裸名** `FindGenericDecl(name)`（首个匹配即中）找泛型声明，同类名方法
+互相劫持：`Control.Get<T>(string name)`（Gui/Control.zan:3696）劫持
+`Com.Get(iface,index)`（Interop.zan:588，chart 371×"too many arguments
+calling 'Get$nint'"），`JsonValue.Get(key)`（System/Json/JsonValue.zan:150
+被 ：520/:527 调用）报 "unknown static method 'Get$string'"——合起来正是
+Get$T 批的全部 chart 闸门。
+
+1. **receiver 限定重载集**（`src/selfhost/ngen.zan`）：SpecRecvClsNg 解出
+   receiver 的类链（StaticTyOf / ExtRecvTy / 类名 Ident 静态限定），
+   OwnedGenericDeclNg 沿链找"该链自己声明的单类型参泛型"——链上找不到才回
+   退全局裸名规则（扩展方法 db.Query<T> 的宿主在别类，必须保留）。SpecRegister
+   改收调用方定界的 decl 下标，内部不再自行裸名查找。qa17
+   （Kennel.Get<T> 泛型 + Store.Get 非泛型 + Other.Get 静态双参 + Echo<T>）
+   与 oracle 字节一致。
+2. **关键回归**：旧推断分支条件 `FindGenericDecl(name)>=0` 身兼
+   **fall-through 过滤器**——非泛型名要落到下面的实例化类分支
+   （SpecRegisterClass）。重写后分支 2 只在 TryPlanInferenceSpecNg
+   （receiver 链有单类型参泛型 + 首参具体类型可推断）真正注册时才认领，
+   否则照旧下落；修回 Box<Square> 实例调用特化（generic_constraint_dispatch
+   曾一度 16→0 output_mismatch，现回到 pass；7 个泛型 spec 定向例全部
+   与 v12 基线逐例相同或更好）。
+3. **sweep 305→306**：+pass fuzzy_bm25（`idx.Remove(2)` 曾被 'Remove$int'
+   劫持）；hashset_basic ncf→em **新暴露**：泛型类**构造器从不特化**
+   （SpecRegisterClass 过滤 methStat∈{0,1}，ctor=2），HashSet<T> 构造器里的
+   `new Dict<T,int>()` 以擦除模式发射（key-kind 位清零 = string 模式），
+   int 键被 strcmp（lldb 定位 _platform_strcmp，地址 0x1）。HashSet<string>
+   探针 qa18/qa19 字节一致（擦除模式恰好匹配引用键），qa22 Bag<int> 最小
+   复现。修复 = 逐实例化构造器 spec，列为下一批；零既有 pass 回归。
+4. chart 剖面：Get 族错误归零，总错 2866→2138，唯一 delta 是一个用例正确
+   走到已知委托限制（"requires concrete word-value signature" 52→104），
+   无新错误种类。
+
+**验证**：39/39；crossboot ELF 5/5 + PE-COFF 5/5；正式自举 run.00JWPU
+stage2.o==stage3.o；定向 7 泛型例 + qa17/qa18/qa19/qa20/qa21/qa22 探针；
+全量 624 sweep 零回归（pass 306 / ncf 170 / nlf 0 / om 6 / em 12 /
+mne 11 / rcf 119）。
+
+**下一批**：泛型类逐实例化构造器 spec（hashset_basic em，顺带解
+Dict<T,...> 构造路径家族）→ socket om/em 8 例 reactor 真挂起
+（RecvOv/RecvToOv/AcceptOv 诚实化 + close 唤醒）→ 委托捕获/7 参形状
+（6 chart 错）、Html Dictionary<Action>（3）、FindNotAnyOf（2）、
+Task.Delay-arg/ToStr-arity 级联、Interop Com。
 
 ## v12 awaited DllImport 阻塞外存批（2026-09-23，socket 族首绿，sweep 301→305，检查点 run.LrJ84X）
 

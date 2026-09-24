@@ -4184,17 +4184,18 @@ partial class Ngen {
     // on first use and rewrite the call site's callee to the mangled name.
     // Open type parameters as arguments mean the call lives in an
     // unspecialized template body -- skip; the template's own
-    // specialization re-scans with concrete args.
-    void SpecRegister(string name, List<string> args, Node callNode) {
+    // specialization re-scans with concrete args. `di` is the declaration
+    // to instantiate, scoped by the caller (the receiver's own chain, or
+    // the global bare-name rule for extension methods) so a same-named
+    // method in an unrelated class is never hijacked.
+    void SpecRegister(string name, List<string> args, Node callNode, int di) {
         bool open = false;
         int oi = 0;
         while (oi < args.Count) {
             if (!KnownTyName(args[oi])) { open = true; }
             oi = oi + 1;
         }
-        if (open) { return; }
-        int di = FindGenericDecl(name);
-        if (di < 0) { return; }
+        if (open || di < 0) { return; }
         string mangled = name + "$";
         int mj = 0;
         while (mj < args.Count) {
@@ -4308,6 +4309,88 @@ partial class Ngen {
         return -1;
     }
 
+    // strip an instantiation suffix ("Pool<Conn>" -> "Pool") for table walks
+    string OpenClsNameNg(string t) {
+        if (t == null) { return null; }
+        int lt = t.IndexOf("<");
+        return lt > 0 ? t.Substring(0, lt) : t;
+    }
+
+    // the class a call's receiver scopes resolution to: explicit receivers
+    // use their static type, bare calls the enclosing class (an instance
+    // body via `this`, a static body directly)
+    string SpecRecvClsNg(Node call) {
+        if (call.a.kind == AK.MemberAccess() && call.a.a != null) {
+            string rc = StaticTyOf(call.a.a);
+            if (rc == null) { rc = ExtRecvTy(call.a.a); }
+            if (rc == null && call.a.a.kind == AK.Ident()
+                    && FindClass(call.a.a.sval) != null) {
+                return call.a.a.sval;    // class-qualified static call
+            }
+            return OpenClsNameNg(rc);
+        }
+        if (call.a.kind == AK.Ident()) { return curCls; }
+        return null;
+    }
+
+    // first generic declaration of `name` on the receiver's class chain --
+    // normal scoping: the receiver, not the global bare name, selects the
+    // overload set. -1 when the chain declares no generic of that name.
+    int OwnedGenericDeclNg(Node call, string name) {
+        string rc = SpecRecvClsNg(call);
+        while (rc != null) {
+            List<int> cs = MethCandsClsName(rc, name);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    int mi = cs[i];
+                    if (methStat[mi] != 2 && methStat[mi] != 3 && HasTypeParams(methNodes[mi])) { return mi; }
+                    i = i + 1;
+                }
+            }
+            Cls oc = FindClass(rc);
+            rc = oc != null ? oc.baseName : null;
+        }
+        return -1;
+    }
+
+    // does the receiver's class chain declare `name` at all (any overload)?
+    bool ReceiverHasNameNg(Node call, string name) {
+        string rc = SpecRecvClsNg(call);
+        while (rc != null) {
+            List<int> cs = MethCandsClsName(rc, name);
+            if (cs != null && cs.Count > 0) { return true; }
+            Cls oc = FindClass(rc);
+            rc = oc != null ? oc.baseName : null;
+        }
+        return false;
+    }
+
+    int inferDi;       // planned decl for the next inference registration
+    string inferArgTy; // planned inferred type argument
+
+    // plan an un-annotated generic call: the receiver's own scope must
+    // declare a single-type-param generic of that name (extension
+    // inference keeps the global rule when the chain names nothing) and
+    // the first argument's concrete type fills the parameter. Returns
+    // false when nothing can be registered, so the caller's else-if
+    // chain keeps falling through to the instantiated-class branches.
+    bool TryPlanInferenceSpecNg(Node n) {
+        int udi = OwnedGenericDeclNg(n, n.a.sval);
+        if (udi < 0 && n.a.kind == AK.MemberAccess() && !ReceiverHasNameNg(n, n.a.sval)) {
+            udi = FindGenericDecl(n.a.sval);
+        }
+        if (udi < 0) { return false; }
+        List<string> tps0 = DeclTps(methNodes[udi]);
+        if (tps0.Count != 1) { return false; }
+        string st = StaticTyOf(n.kids[0]);
+        if (st == null) { st = ExtRecvTy(n.kids[0]); }
+        if (st == null || !KnownTyName(st)) { return false; }
+        inferDi = udi;
+        inferArgTy = st;
+        return true;
+    }
+
     void CollectSpecs(Node n) {
         if (n == null) { return; }
         int saved = EnterEnvNg(n);
@@ -4340,23 +4423,30 @@ partial class Ngen {
                 } else { i = i + 1; }
             }
             args.Add(s2.Substring(start, s2.Length - start));
-            SpecRegister(name, args, n);
+            // the receiver scopes the overload set: instantiate the generic
+            // the receiver's own chain declares. Only when the chain names
+            // nothing does the global bare-name rule apply (extension
+            // methods: db.Query<T> lives in another class) -- a same-named
+            // method in an unrelated class (Com.Get vs Control.Get<T>) must
+            // never be hijacked by the bare-name match.
+            int odi = OwnedGenericDeclNg(n, name);
+            if (odi < 0 && !ReceiverHasNameNg(n, name)) { odi = FindGenericDecl(name); }
+            SpecRegister(name, args, n, odi);
         } else if (n.kind == AK.Call() && n.a != null
                 && (n.a.kind == AK.Ident() || n.a.kind == AK.MemberAccess())
                 && (n.sval2 == null || n.sval2 == "")
-                && n.kids.Count > 0 && FindGenericDecl(n.a.sval) >= 0) {
+                && n.kids.Count > 0
+                && TryPlanInferenceSpecNg(n)) {
             // un-annotated call: infer the single type parameter from the
-            // first argument (gen0's inference)
-            List<string> tps0 = DeclTps(methNodes[FindGenericDecl(n.a.sval)]);
-            if (tps0.Count == 1) {
-                string st = StaticTyOf(n.kids[0]);
-                if (st == null) { st = ExtRecvTy(n.kids[0]); }   // literal args
-                if (st != null && KnownTyName(st)) {
-                    List<string> iargs = new List<string>();
-                    iargs.Add(st);
-                    SpecRegister(n.a.sval, iargs, n);
-                }
-            }
+            // first argument (gen0's inference) -- but only when the
+            // receiver's own scope declares a single-type-param generic of
+            // that name; a same-named non-generic (JsonValue.Get(key),
+            // Com.Get) resolves normally, and calls that infer nothing must
+            // FALL THROUGH to the instantiated-class branches below (the
+            // old FindGenericDecl gate doubled as that filter).
+            List<string> iargs = new List<string>();
+            iargs.Add(inferArgTy);
+            SpecRegister(n.a.sval, iargs, n, inferDi);
         } else if (n.a != null && n.a.kind == AK.MemberAccess() && n.a.a != null
                 && n.a.a.kind == AK.Ident() && n.a.sval2 != null && n.a.sval2 != "") {
             // qualified static call on an instantiated generic class:
@@ -6648,7 +6738,7 @@ partial class Ngen {
                         string rt2 = ExtRecvTy(recv);
                         List<string> xargs = new List<string>();
                         xargs.Add(rt2);
-                        SpecRegister(callee.sval, xargs, e);
+                        SpecRegister(callee.sval, xargs, e, xi);
                         int spx = FindMethByNameNg(e.a.sval);
                         if (spx >= 0) { xi = spx; }
                     }
