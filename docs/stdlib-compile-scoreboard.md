@@ -1,6 +1,44 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-23 · v13 · 定点见下方 v13 节
+日期：2026-09-23 · v14 · 定点见下方 v14 节
+
+## v14 泛型类构造器逐实例化 spec 批（2026-09-23，hashset_basic em→pass，sweep 306→307，检查点 run.gHqSU9）
+
+v13 收尾时定位的 hashset_basic 段错误根因：**泛型类构造器从不特化**。
+SpecRegisterClass 只认 methStat∈{0,1}（ctor=2 永不命中），开放 ctor 以擦除
+形式一次性编译——构造器体内任何类型敏感的降级都退到引用形状：
+`new Dict<T, int>()` 的 key-kind 位清零（string 模式），int 键实例化把键当
+指针 strcmp（lldb：_platform_strcmp，地址 0x1；qa22 Bag<int> 最小复现，
+HashSet<string> 恰好不炸 = 擦除模式与引用键一致）。
+
+1. **GenNew 路由**：泛型类 new（TypeFullName 带 "<" 且类有类型参）→
+   InstCtorSpecNg——克隆开放 ctor、剔除 TypeParam kids、SubstTypeNode
+   代入实例化实参、AddMethNg 挂在**开放类名**下（stat 2，sval2=实例化名
+   使 `this` 字段访问走代入后的类型）、BLInternal 到逐实例化符号。
+2. **符号一致性**：EmitMethod 用 CtorSpecSymOf 镜像调用点符号（多 ctor
+   类按 CtorSymNg 同款追加代入后参数 tag——首版漏 tag，Transfer<string>
+   双 ctor 链接失败，**chart 剖面在出货前抓到**）。CtorCountNg 与
+   FitCtorIdx 忽略 sval2 ctor，克隆注册永不翻转开放类的单/多 ctor 符号
+   形状、也永不劫持开放 ctor 解析。
+3. **字段初始化器**：ctor 前奏对 spec'd ctor 代入克隆节点
+   （`Dict<T,int> f = new Dict<T,int>()` 字段初始化器同样特化），字段类型
+   用 SubstTy 代入后再做 double/int 判定。
+4. 已知边界（套件未触发，记录在案）：spec'd ctor 内 `: this(...)` 链落到
+   开放兄弟 ctor；泛型基类 ctor 链仍跑开放基 ctor。另记预存限制：
+   `Console.WriteLine(<直接 spec 方法调用>)` 重载挑选把实参当 int
+   （true/false 打成 1/0，值正确，本批之前就在，套件未覆盖）。
+
+**验证**：39/39；crossboot ELF 5/5 + PE-COFF 5/5；正式自举 run.gHqSU9
+stage2.o==stage3.o；qa22（Bag<int>/<string>）、qa17/qa18/qa19 探针字节
+一致；hashset_basic/fuzzy_bm25/dict_remove_churn/generic_constraint_
+dispatch/generic_statics 定向全 pass；chart 剖面与 v13 逐字节相同
+（2138，零 delta）；全量 sweep 零回归（pass 307 / ncf 170 / nlf 0 /
+om 6 / em 11 / mne 11 / rcf 119）。
+
+**下一批**（按既定顺序）：socket om/em 8 例 reactor 真挂起（RecvOv/
+RecvToOv/AcceptOv 诚实化 + close 唤醒）→ 委托捕获/7 参形状（6 chart
+错）、Html Dictionary<Action>（3）、FindNotAnyOf（2）、Task.Delay-arg/
+ToStr-arity 级联（含上面 WriteLine 直参 bool 标签族）、Interop Com。
 
 ## v13 Get$T 显式泛型 spec 批（2026-09-23，chart 错 2866→2138，sweep 305→306，检查点 run.00JWPU）
 

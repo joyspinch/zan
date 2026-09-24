@@ -242,6 +242,8 @@ partial class Ngen {
         mIdxCls = new MethIndex();
         specMeth = new List<string>();
         instCls = new List<string>();
+        ctorSpecKey = new List<string>();
+        ctorSpecSym = new List<string>();
         nlabel = 0;
     }
 
@@ -1392,7 +1394,11 @@ partial class Ngen {
         curMeth = m;
         bool inst = methStat[mi] == 0 || methStat[mi] == 2;
         if (methStat[mi] == 2) {
-            syms.Add(new Sym(CtorSymNg(cls, m), txt.Count));
+            // a per-instantiation ctor spec emits under its own symbol
+            // (the open class's _Cls_ctor symbol would collide); the tag
+            // shape must match what InstCtorSpecNg emitted at call sites
+            syms.Add(new Sym(m.sval2 != null && m.sval2 != ""
+                ? CtorSpecSymOf(m.sval, cls, m) : CtorSymNg(cls, m), txt.Count));
         } else if (methStat[mi] == 3) {
             syms.Add(new Sym("_" + cls + "_cctor", txt.Count));
         } else {
@@ -1498,14 +1504,31 @@ partial class Ngen {
         // the body, once per ctor (a `: this(...)` delegator lets the
         // chain target run them, so it skips its own)
         if (methStat[mi] == 2 && m.c == null) {
+            // a per-instantiation ctor spec substitutes T in field
+            // initializers too -- they lower through the same open nodes
+            // (a `new Dict<T, int>()` initializer must specialize as well)
+            bool specCtor = m.sval2 != null && m.sval2 != "";
+            Cls sc = specCtor ? FindClass(cls) : null;
+            List<string> sargs = null;
+            if (specCtor) {
+                int slt = m.sval2.IndexOf("<");
+                sargs = SplitTyArgs(m.sval2.Substring(slt + 1, m.sval2.Length - slt - 2));
+            }
             int fi2 = 0;
             while (fi2 < ifInitCls.Count) {
                 if (ifInitCls[fi2] == cls) {
                     Fld initFld = FindField(FindClass(cls), ifInitName[fi2]);
-                    GenExpr(ifInitExpr[fi2]);
-                    if (IsDblTy(initFld.ty) && !IsDblExpr(ifInitExpr[fi2])) {
+                    string fty = initFld.ty;
+                    Node iex = ifInitExpr[fi2];
+                    if (specCtor) {
+                        fty = SubstTy(fty, sc.tps, sargs);
+                        iex = CloneNode(iex);
+                        if (iex != null) { SubstTypeNode(iex, sc.tps, sargs); }
+                    }
+                    GenExpr(iex);
+                    if (IsDblTy(fty) && !IsDblExpr(iex)) {
                         ConvI2D();
-                    } else if (initFld.ty == "int" && !IsDblExpr(ifInitExpr[fi2]) && !IsStrExpr(ifInitExpr[fi2])) {
+                    } else if (fty == "int" && !IsDblExpr(iex) && !IsStrExpr(iex)) {
                         E4(0x93407C00);                  // sxtw x0, w0 (long literal -> int)
                     }
                     E4(0xF81F0FE0);                          // push value
@@ -3405,6 +3428,22 @@ partial class Ngen {
             callN = tmp;
         }
         int cix = FitCtorIdx(cls, callN, false, null);
+        string ctorSym = null;
+        if (cix >= 0) {
+            ctorSym = CtorSymNg(cls, methNodes[cix]);
+            // a generic-class instantiation needs its OWN ctor body: the
+            // open ctor is a template compiled with erasure, so any
+            // type-sensitive lowering inside it degrades to the reference
+            // form (a `new Dict<T, int>()` keeps the key-kind bits clear
+            // and int-key instantiations strcmp their keys)
+            string inst = TypeFullName(e.type);
+            if (inst != null && inst.IndexOf("<") > 0) {
+                Cls gc = FindClass(cls);
+                if (gc != null && gc.tps.Count > 0) {
+                    ctorSym = InstCtorSpecNg(inst, cls, gc, cix);
+                }
+            }
+        }
         int pushed;
         if (cix >= 0) {
             pushed = PushCallArgs(methNodes[cix], callN);
@@ -3419,8 +3458,8 @@ partial class Ngen {
         while (r >= 1) { E4(0xF84107E0 | r); r = r - 1; } // ldr xr, [sp], #16 (args reversed)
         E4(0xF84107E0);                                  // ldr x0, [sp], #16 (obj)
         E4(0xF81F0FE0);                                  // str x0, [sp, #-16]! (keep obj across the void ctor)
-        if (cix >= 0) {
-            BLInternal(CtorSymNg(cls, methNodes[cix]));
+        if (ctorSym != null) {
+            BLInternal(ctorSym);
         }
         // field initializers store through the object still on the stack
         if (e.ival == 2) {
@@ -4143,6 +4182,8 @@ partial class Ngen {
 
     List<string> specMeth;  // mangled names of registered specializations
     List<string> instCls;   // instantiated generic classes in use ("Stat<int>")
+    List<string> ctorSpecKey;  // per-instantiation ctor specs built ("Inst$di")
+    List<string> ctorSpecSym;  // emit symbol of the matching ctor spec
 
     // find the generic method declaration for a call name: an instance or
     // static method with type parameters; first match wins
@@ -4295,6 +4336,67 @@ partial class Ngen {
         AddMethNg(spec, open, wantStat);         // dispatch walks the open name
         specMeth.Add(mangled);
         callNode.a.sval = mangled;
+    }
+
+    // emit symbol of a per-instantiation ctor spec: the instantiation
+    // keeps the class unique; multi-ctor classes append the substituted
+    // param tags exactly like CtorSymNg (an empty tag run stays "__")
+    string CtorSpecSymOf(string instName, string cls, Node spec) {
+        string sym = "_" + instName + "_ctor";
+        if (CtorCountNg(cls) > 1) {
+            sym = sym + "__";
+            int pk = 0;
+            while (pk < spec.kids.Count) {
+                Node p = spec.kids[pk];
+                if (p.kind == AK.Param()) { sym = sym + "_" + TypeTagNg(p.type); }
+                pk = pk + 1;
+            }
+        }
+        return sym;
+    }
+
+    // open class name of an instantiation ("Transfer<string>" -> "Transfer")
+    string QualifiedClsNameNg(string instName) {
+        int lt = instName.IndexOf("<");
+        return lt > 0 ? instName.Substring(0, lt) : instName;
+    }
+
+    // per-instantiation ctor specialization. Generic-class ctors are
+    // templates too: the open ctor is compiled once with erasure, so any
+    // type-sensitive lowering inside it degrades to the reference form and
+    // value-type instantiations misbehave at runtime. Mirror
+    // SpecRegisterClass for stat-2 methods: clone+substitute per
+    // instantiation, emit under a per-instantiation symbol.
+    string InstCtorSpecNg(string instName, string cls, Cls c, int cix) {
+        string key = instName + "$" + cix;
+        int hit = IndexOfStrNg(ctorSpecKey, key);
+        if (hit >= 0) { return ctorSpecSym[hit]; }
+        int lt = instName.IndexOf("<");
+        List<string> args = SplitTyArgs(instName.Substring(lt + 1, instName.Length - lt - 2));
+        bool open = false;
+        int oi = 0;
+        while (oi < args.Count) {
+            if (!KnownTyName(args[oi])) { open = true; }
+            oi = oi + 1;
+        }
+        string sym = CtorSymNg(cls, methNodes[cix]);
+        if (!open) {
+            Node spec = CloneNode(methNodes[cix]);
+            if (spec == null) { spec = new Node(methNodes[cix].kind); }
+            int nk = 0;
+            while (nk < spec.kids.Count) {
+                if (spec.kids[nk].kind == AK.TypeParam()) { spec.kids.RemoveAt(nk); }
+                else { nk = nk + 1; }
+            }
+            spec.sval = instName;    // unique "class name" per instantiation
+            spec.sval2 = instName;   // spec's `this` type: field types substitute
+            SubstTypeNode(spec, c.tps, args);
+            sym = CtorSpecSymOf(instName, cls, spec);
+            AddMethNg(spec, cls, 2);   // dispatch walks the open name
+            ctorSpecKey.Add(key);
+            ctorSpecSym.Add(sym);
+        }
+        return sym;
     }
 
     int FindGenericDecl(string name) {
@@ -7408,12 +7510,15 @@ partial class Ngen {
     }
 
     int CtorCountNg(string cls) {
+        // per-instantiation ctor specs live here too (stat 2, sval2 set):
+        // they must not flip the open class's single-vs-multi mangling
         int n = 0;
         List<int> mine = MethCandsCls(cls);
         if (mine == null) { return 0; }
         int i = 0;
         while (i < mine.Count) {
-            if (methStat[mine[i]] == 2) { n = n + 1; }
+            Node m2 = methNodes[mine[i]];
+            if (methStat[mine[i]] == 2 && (m2.sval2 == null || m2.sval2 == "")) { n = n + 1; }
             i = i + 1;
         }
         return n;
@@ -7524,6 +7629,7 @@ partial class Ngen {
         while (i < mine.Count) {
             int ti = mine[i];
             if (methStat[ti] == 2 && methNodes[ti] != exclude
+                    && (methNodes[ti].sval2 == null || methNodes[ti].sval2 == "")
                     && CtorAcceptsArity(methNodes[ti], argc)) {
                 int score = 0;
                 bool compatible = true;
