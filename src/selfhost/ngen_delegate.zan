@@ -34,6 +34,7 @@ partial class Ngen {
     bool dlgInternDone;         // _zan_dlg_intern emitted for this object
     List<string> dlgSubTps;     // last DelegateDeclTyNg match: decl type params
     List<string> dlgSubArgs;    // and the reference's substituted arguments
+    int lastInferGroupMi = -1;  // method InferGroupTyNg invented a signature from
 
     void InitDelegateNg() {
         if (delegateThunks != null) { return; }
@@ -84,7 +85,11 @@ partial class Ngen {
             if (d.kids[i].kind == AK.TypeParam()) { tps.Add(d.kids[i].sval); }
             i = i + 1;
         }
-        if (tps.Count == 0) { dlgSubTps = tps; dlgSubArgs = new List<string>(); return d; }
+        // the reference must carry exactly as many type arguments as the decl
+        // declares: "Action<nint>" against the stdlib's non-generic
+        // `delegate void Action()` (Gui/Event.zan) must fall back to the
+        // builtin string shape, not hijack the 0-arity decl and read a
+        // zero-parameter signature out of it
         List<string> as2 = SplitTyArgs(ty.Substring(p + 1, ty.Length - p - 2));
         if (as2.Count != tps.Count) { return null; }
         dlgSubTps = tps; dlgSubArgs = as2;
@@ -149,8 +154,19 @@ partial class Ngen {
         // a type parameter travels as a word under erasure (open generic
         // bodies emit before any instantiation is known)
         if (IsTypeParamErasedNg(ty)) { return true; }
-        Cls c = ty != null ? FindClass(ty) : null;
-        return c != null && c.isStruct == 0 && c.tps.Count == 0;
+        // instantiated reference values (List<int> as a GridNums<T> return, a
+        // captured List<DataColumn>) travel as one word like their bare
+        // definitions; struct values still do not. List/Dictionary/Dict/
+        // StringBuilder are compiler builtins and never reach the class table.
+        if (ty != null) {
+            int p = ty.IndexOf("<");
+            string base2 = p >= 0 ? ty.Substring(0, p) : ty;
+            if (base2 == "List" || base2 == "Dictionary" || base2 == "Dict"
+                    || base2 == "StringBuilder") { return true; }
+            Cls c = FindClass(base2);
+            if (c != null) { return c.isStruct == 0; }
+        }
+        return false;
     }
 
     bool CheckDelegateTyNg(string ty, Node site) {
@@ -344,6 +360,7 @@ partial class Ngen {
             }
         }
         if (found < 0) { return null; }
+        lastInferGroupMi = found;
         string ty = "";
         int q = 0;
         while (q < ParamCount(methNodes[found])) {
@@ -356,6 +373,26 @@ partial class Ngen {
             return "Action<" + ty.Substring(0, ty.Length - 1) + ">";
         }
         return "Func<" + ty + rt + ">";
+    }
+
+    // `(nint)Cls.StaticMethod` and friends: the oracle lowers a static method
+    // group used as a value to the raw function pointer on native
+    // (irgen_expr.c:4995 -- only wasm32 wraps one in a closure record), and
+    // zan_gui_guard_call calls the nint it receives as code. The {thunk, env}
+    // pair exists only for delegate-typed destinations. Returns the method's
+    // index, or -1 when the operand is not a unique static method group.
+    int StaticGroupCastIdxNg(Node cast) {
+        if (cast == null || cast.type == null || cast.b == null) { return -1; }
+        string to = TypeFullName(cast.type);
+        if (to != "nint" && to != "int" && to != "uint" && to != "long"
+                && to != "ulong" && to != "short" && to != "ushort"
+                && to != "byte" && to != "sbyte") { return -1; }
+        Node g = cast.b;
+        if (g.kind != AK.Ident() && g.kind != AK.MemberAccess()) { return -1; }
+        lastInferGroupMi = -1;
+        if (InferGroupTyNg(g) == null) { return -1; }
+        if (lastInferGroupMi < 0 || methStat[lastInferGroupMi] != 1) { return -1; }
+        return lastInferGroupMi;
     }
 
     // Free-name walk uses lexical declaration order. Lambda/block declarations
@@ -636,7 +673,11 @@ partial class Ngen {
         if (found < 0) { diags.Error("ngen delegate: no concrete compatible method group", e.line, e.col); return; }
         if (methStat[found] == 0) {
             Cls cls = FindClass(owner);
-            if (cls == null || cls.isStruct != 0 || cls.poly == 1) {
+            // virtualness of the TARGET method decides, not the class's poly
+            // flag: a nonvirtual member of a polymorphic class (Upload's
+            // OnPicked beside its override Kind) dispatches statically, while
+            // a virtual/override target needs the vtable a thunk cannot read
+            if (cls == null || cls.isStruct != 0 || IsVirtualMod(methNodes[found])) {
                 diags.Error("ngen delegate: bound group requires nonvirtual reference receiver", e.line, e.col); return;
             }
             if (receiver == null) {

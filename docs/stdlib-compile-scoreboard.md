@@ -1,6 +1,56 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-23 · v15 · 定点见下方 v15 节
+日期：2026-09-23 · v16 · 定点见下方 v16 节
+
+## v16 委托捕获/方法组形状批（2026-09-23，chart 2138→1670，sweep 315→316，检查点 run.xwRh1F）
+
+委托批的 6 个 chart 错误（App.GuardBody×2、DataGrid 委托字段调用、
+Upload this 绑定、Realtime 捕获 List\<DataColumn\>×2）全绿，且修复像预
+期那样把整条 stdlib 级联一起带绿。五个根因、五个修复：
+
+1. **Func/Action 名被同名校劫持**（App.GuardBody "no concrete compatible
+   method group" 的真根因）：stdlib Gui/Event.zan 声明了非泛型
+   `delegate void Action()`；InferGroupTyNg 从 GuardBody 本体发明
+   `Action<nint>` 后，DelegateDeclTyNg 查 FindDelegate("Action") 命中
+   0 参 decl 且 `tps.Count==0` 提前返回，把 `Action<nint>` 读成 0 参签名
+   → GenDelegateGroupNg 以 ParamCount 1≠0 拒绝一切候选。qa26d 之所以复
+   现不出，是它的最小 pull-in 没拖进 Event.zan。修复：DelegateDeclTyNg
+   一律校验"引用的类型实参数 == decl 的类型形参数"，不等即回落到内建
+   字符串形状（`Action<nint>` → [nint]/void）。
+2. **实例化引用类的词形**（DelegateWordNg）：`List<int>` 作为
+   GridNums\<T\> 返回类型、`List<DataColumn>` 被闭包捕获，都被
+   `c.tps.Count == 0` 拒绝——而 List/Dictionary/Dict/StringBuilder 是编
+   译器内建、根本不在类表里。修复：剥掉 `<...>` 按开放名判——内建引用
+   容器直接放行，普通类按 isStruct 放行（struct 值仍拒绝）。
+3. **绑定组的虚门槛过粗**（Upload:844）：按 `cls.poly == 1` 拒绝一切多
+   态类的绑定组，但 Upload.OnPicked 本身非虚，静态直呼就是精确语义。修
+   复：改按目标方法自身的 IsVirtualMod（virtual/override）把关，非虚成
+   员照发直呼 thunk，虚/override 仍拒绝（thunk 读不到 vtable）。
+4. **静态方法组 → 整数 cast 发的是 pair 指针**（qa26c 反汇编
+   `bl _zan_dlg_intern`）：oracle 原生面把静态方法组值降为裸函数指针
+   （irgen_expr.c:4995，只有 wasm32 包 closure record），zan_gui_guard_
+   call 也按代码指针调用。修复：CastExpr 数值分支先经
+   StaticGroupCastIdxNg（复用 InferGroupTyNg 的唯一性搜索，要求
+   methStat==1），命中则 LoadSymRef(方法自身符号)——qa26c 现在的
+   adrp/add 直接指到 `_Derived2_Stat`，与 oracle 输出字节一致；委托类
+   目的地照旧走 {thunk, env} pair。
+5. **Main 的 int 返回值被丢弃**（顺手抓到的 rc 奇偶 bug）：EmitMainShim
+   在 `bl _Cls_Main` 后无条件 `movz x0, #0`，`static int Main(){return
+   7;}` 永远 exit 0（oracle exit 7；async Main 的驱动明明留下退出码也被
+   抹掉）。修复：仅 void Main / 无 Main 形状清零 x0，非 void 透传。电池
+   39 例全是 `return 0` 所以从未暴露。
+
+验证：qa26_delg 四形状（泛型委托字段调用、多态类 this 绑定、匿名方法
+捕获 List\<string\>、静态组→nint cast）与 oracle 输出+退出码全同；
+qa27（真实 stdlib pull-in 复现）委托错全清；电池 39/39；crossboot 10
+PASS；新定点 run.xwRh1F（stage2.o==stage3.o）；全量 sweep 零回归
+（pass 315→316 / ncf 170→169 / om 3 / em 6 / mne 11 / rcf 119，total
+624，翻绿案例 ns_conflict_generic_arity）；chart 剖面 2138→1670
+（−468，52 例逐例对拍零回归，级联修正远超 6 个点名错误）。
+
+**下一批**（按既定顺序）：Html Dictionary\<Action\>（3）→
+FindNotAnyOf（2）→ Task.Delay-arg/ToStr-arity 级联（含 v14 记录的
+WriteLine 直参 bool 标签族）→ Interop Com。
 
 ## v15 socket om/em 8 例 reactor 真挂起批（2026-09-23，om 6→3、em 11→6，sweep 307→315，检查点 run.7mjxpH）
 
