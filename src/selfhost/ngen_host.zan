@@ -154,7 +154,8 @@ partial class Ngen {
         if (HostStatic(e, "Interop", "Unload", 1)) { return "void"; }
         // ---- raw memory intrinsics (System.Runtime.InteropServices) ----
         if (HostStatic(e, "NativeMemory", "Alloc", 1)
-                || HostStatic(e, "NativeMemory", "Sha256", 2)) { return "long"; }
+                || HostStatic(e, "NativeMemory", "Sha256", 2)
+                || HostStatic(e, "NativeMemory", "FindNotAnyOf", 4)) { return "long"; }
         // Crc32 is typed by its stdlib extern decl (int) and CallStaticNg
         // skips the sext for it; no ret-ty arm here -- with the stdlib
         // pulled this gate never fires anyway.
@@ -957,6 +958,31 @@ partial class Ngen {
             GenExpr(e.kids[1]); ExtPush(0);
             ExtPop(1); ExtPop(0);
             BLInternal("_zan_nm_sha256");
+            return true;
+        }
+        // FindNotAnyOf(p, off, rejectSet, n) -> strcspn(p + off, rejectSet),
+        // offset of the first byte in the reject set relative to p, or -1
+        // when the window holds none (oracle irgen_expr.c:785; the reject
+        // set is a strpool literal, NUL-terminated by _zan_rt_strpool_init)
+        if (HostStatic(e, "NativeMemory", "FindNotAnyOf", 4)) {
+            GenExpr(e.kids[0]); ExtPush(0);        // p (nint)
+            GenExpr(e.kids[1]); ExtPush(0);        // offset
+            GenExpr(e.kids[2]); ExtPush(0);        // reject set
+            GenExpr(e.kids[3]); ExtPush(0);        // limit n
+            ExtPop(3); ExtPop(2); ExtPop(1); ExtPop(0);
+            AddRR(0, 0, 1);                        // start = p + off
+            MovRR(1, 2);                           // x1 = reject set
+            ExtPush(3);                            // keep n across the call
+            BLExtern("_strcspn");                  // x0 = run (stops at NUL)
+            ExtPop(1);                             // x1 = n
+            ExtMov(2, 0);                          // x2 = run
+            E4(0xEB01005F);                        // cmp x2, x1 (unsigned)
+            int clean = NL(); int done2 = NL();
+            EmitBcond(2, clean);                   // b.hs clean: run >= n
+            EmitB(done2);                          // hit: x0 = run
+            Mark(clean);
+            E4(0x92800000);                        // movn x0, #0 (-1)
+            Mark(done2);
             return true;
         }
         // ---- current working directory ----
