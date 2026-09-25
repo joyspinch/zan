@@ -1195,9 +1195,22 @@ partial class Ngen {
         string cls = curCls;
         bool bare = callee.kind == AK.Ident();
         if (!bare) {
-            if (callee.kind != AK.MemberAccess() || callee.a == null
-                    || callee.a.kind != AK.Ident() || FindClass(callee.a.sval) == null) { return -1; }
-            cls = callee.a.sval;
+            if (callee.kind != AK.MemberAccess() || callee.a == null) { return -1; }
+            // namespace-qualified static call `Ns.Sub.Cls.Method(args)`:
+            // the receiver is a pure dotted identifier path whose LAST
+            // segment names the class (types register by simple name, so
+            // the namespace prefix is decoration). The head must not be a
+            // local, so genuine instance chains (`a.b.Method()`) fall
+            // through to the instance handlers (irgen_call.c:4878).
+            if (callee.a.kind == AK.MemberAccess()) {
+                Node head = callee.a;
+                while (head.kind == AK.MemberAccess()) { head = head.a; }
+                if (head.kind != AK.Ident() || LocalIdx(head.sval) >= 0
+                        || FindClass(callee.a.sval) == null) { return -1; }
+                cls = callee.a.sval;
+            } else if (callee.a.kind != AK.Ident()
+                    || FindClass(callee.a.sval) == null) { return -1; }
+            else { cls = callee.a.sval; }
         }
         List<int> cands = new List<int>();
         while (cls != null) {
@@ -2353,6 +2366,11 @@ partial class Ngen {
                     BLInternal(MethSymNg(accOwnerCls, bg));
                     return;
                 }
+                // out-of-block local read: the name still types method-wide
+                // (NamedSlotTy), but the scoped slot lookup misses -- the
+                // oracle's irgen falls back to constant 0 here, so field
+                // reads on the null receiver guard to 0 (qa34 probe parity)
+                if (DeclaredLocIdxNg(e.sval) >= 0) { LoadImm(0, 0); return; }
                 diags.Error("ngen: unknown identifier '" + e.sval + "'", e.line, e.col);
                 LoadImm(0, 0);
                 return;
@@ -2594,6 +2612,12 @@ partial class Ngen {
                 } else if (op == TK.Slash()) {
                     E4(0x1E611800);                  // fdiv d0, d0, d1 (IEEE: no guard, like gen0)
                     E4(0x9E660000);
+                } else if (op == TK.Percent()) {
+                    // C# `%` on doubles keeps the dividend's sign (C fmod):
+                    // the oracle lowers to LLVM frem, which the ARM64
+                    // backend realizes as a libm fmod call
+                    BLExtern("_fmod");
+                    E4(0x9E660000);                  // fmov x0, d0
                 } else if (op == TK.Less()) {
                     E4(0x1E612000);                  // fcmp d0, d1
                     E4(0x9A9F57E0);                  // cset x0, mi
@@ -4790,13 +4814,30 @@ partial class Ngen {
     }
 
     // declared type of a local, field or static of that name (locals shadow
-    // fields shadow statics, matching the binder's lookup order)
+    // fields shadow statics, matching the binder's lookup order). A local
+    // declared in a closed sibling block still types by name (the oracle
+    // binder's method-flat table): ChartViewPolar reads `p.radiusInner`
+    // after the loop that declared `p` has closed.
     string NamedSlotTy(string name) {
         int li = LocalIdx(name);
         if (li >= 0) { return locTy[li]; }
         Fld f = CurField(name);
         if (f != null) { return f.ty; }
-        return FindStaticTy(curCls, name);
+        string st = FindStaticTy(curCls, name);
+        if (st != null) { return st; }
+        int di = DeclaredLocIdxNg(name);
+        return di >= 0 ? locTy[di] : null;
+    }
+
+    // the latest method-wide slot declaring `name`: the reserve walk adds
+    // declarations in program order, so the last index wins
+    int DeclaredLocIdxNg(string name) {
+        int i = nloc - 1;
+        while (i >= 0) {
+            if (locName[i] == name) { return i; }
+            i = i - 1;
+        }
+        return -1;
     }
 
     string TypeFullName(Node t) {
