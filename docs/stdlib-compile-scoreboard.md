@@ -39,8 +39,9 @@ zan_co_ready_hook 自注册（弱符号在 macOS ld 静态链接下不可用，�
 stage2.o==stage3.o；qa15（TcpClient 全回显，v10 偏差保持修复）、qa16
 （延迟门控 recv 双形态字节一致）探针复验；定向 8/8（async_asocket_echo/
 async_socket_async_echo/ipv6/accept_after_close/async_concurrent_echo/
-async_dns/async_mt/socket_close_wakes）；全量 sweep 零回归（pass 315 /
-ncf 170 / nlf 0 / om 3 / em 6 / mne 11 /
+async_dns/async_mt/socket_close_wakes）；chart 剖面零 delta（2138，v15
+全量重跑后确认）；全量 sweep 零回归（pass 315 / ncf 170 / nlf 0 / om 3 /
+em 6 / mne 11 /
 rcf 119，total 624）。
 
 **下一批**（按既定顺序）：委托捕获/7 参形状（6 chart 错）→ Html
