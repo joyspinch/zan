@@ -1844,9 +1844,400 @@ int32_t zan_io_socket_alive(intptr_t fd) {
     return fcntl((int)fd, F_GETFD) != -1;
 }
 
-/* No reactor on this lane, so there is nothing to fail-wake; the stdlib's
- * close path closes the fd itself right after. */
-void zan_io_close_notify(intptr_t fd) { (void)fd; }
+/* ---- native io reactor (spec: oracle rt_co.c/rt_io.c reactor loop) ----
+ * The five awaited io helpers (wait_co/recv_co/recv_to_co/accept_co/
+ * resolve_sa_co) used to re-ready their frame immediately around a one-shot
+ * syscall: readiness races lost data (RecvToOv's in-flight one-shot),
+ * accepts parked under a closed listener hung, and hostname resolution was
+ * a documented gap. This is the honest shape: watchers park in a table the
+ * emitted scheduler's pump polls (zan_io_poll), close_notify wakes and
+ * retires dead fds, and hostnames resolve on a detached worker signalled
+ * through a self-pipe. Single-threaded coroutine engine: every watch-table
+ * mutation happens on the main thread; the DNS worker only fills its own
+ * job and hands it over under a mutex via the pipe. zan_co_ready is
+ * emitted by the compiler into async programs; non-async links leave it
+ * unresolved (weak), where these functions are unreachable anyway. */
+
+#include <poll.h>
+
+/* The emitted async runtime registers its _zan_co_ready through this hook
+ * (the first co_ready call stores its own address, idempotently). A plain
+ * pointer keeps zanstubs.o linkable into non-async programs (the compiler
+ * itself) where no weak-undefined trick is portable across linkers. */
+void (*zan_co_ready_hook)(long long frame, long long step);
+
+/* watcher kinds: 1/2 are ReadReady/WriteReady's interest codes, 3-5 the
+ * value-yielding forms, 6 the persistent self-pipe watch */
+#define ZT_IO_W 1
+#define ZT_IO_WOUT 2
+#define ZT_IO_RECV 3
+#define ZT_IO_RECV_TO 4
+#define ZT_IO_ACCEPT 5
+#define ZT_IO_DNS 6
+
+typedef struct ZtIOWatch {
+    int fd;
+    int kind;
+    int active;
+    char *buf;               /* recv forms */
+    long long len;
+    long long deadline_ns;   /* recv_to: 0 = none */
+    long long frame, step;
+    long long *outn;         /* recv/accept result slot (frame+32) */
+} ZtIOWatch;
+
+static ZtIOWatch *zt_io_ws;
+static int zt_io_n, zt_io_cap;
+
+static void zt_io_push(int fd, int kind, char *buf, long long len,
+                       long long deadline_ns, long long frame, long long step,
+                       long long *outn) {
+    if (zt_io_n == zt_io_cap) {
+        zt_io_cap = zt_io_cap ? zt_io_cap * 2 : 8;
+        zt_io_ws = realloc(zt_io_ws, (size_t)zt_io_cap * sizeof(*zt_io_ws));
+        if (!zt_io_ws) abort();
+    }
+    ZtIOWatch *w = &zt_io_ws[zt_io_n++];
+    w->fd = fd; w->kind = kind; w->active = 1;
+    w->buf = buf; w->len = len; w->deadline_ns = deadline_ns;
+    w->frame = frame; w->step = step; w->outn = outn;
+}
+
+/* retire a watch and resume its frame; the result lands in the slot the
+ * resume-k reload reads (frame+32, handed to us as outn) */
+static void zt_io_deliver(ZtIOWatch *w, long long result) {
+    w->active = 0;
+    if (w->outn) *w->outn = result;
+    if (zan_co_ready_hook) zan_co_ready_hook(w->frame, w->step);
+}
+
+/* one nonblocking recv: >=0 data/EOF, -2 would-block (park again),
+ * -1 any other error (deliver; callers map negative to the closed shape) */
+static long long zt_recv_try(int fd, char *buf, long long len) {
+    if (len <= 0) return 0;
+    for (;;) {
+        ssize_t n = recv(fd, buf, (size_t)len, 0);
+        if (n >= 0) return (long long)n;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
+        return -1;
+    }
+}
+
+/* zero-timeout readiness probe. EVERY co helper checks this before its
+ * syscall: accepted sockets are often left in blocking mode by callers,
+ * and a blocking recv/accept issued with nothing queued would stall the
+ * whole single-threaded engine instead of parking this coroutine only. */
+static int zt_fd_ready(int fd, short want) {
+    struct pollfd p;
+    p.fd = fd;
+    p.events = want;
+    p.revents = 0;
+    return poll(&p, 1, 0) > 0;
+}
+
+void zan_io_wait_co(intptr_t fd, long long interest, long long frame,
+                    long long step) {
+    /* dead fd: fail fast (oracle io_reject_dead_fd). poll ignores negative
+     * descriptors and a closed fd never fires, so parking would strand the
+     * coroutine forever; readiness probes deliver 0 and resume at once. */
+    if (zan_io_socket_alive(fd) == 0) {
+        if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
+        return;
+    }
+    zt_io_push((int)fd, interest == 2 ? ZT_IO_WOUT : ZT_IO_W,
+               NULL, 0, 0, frame, step, NULL);
+}
+
+void zan_io_recv_co(intptr_t fd, char *buf, long long len, long long frame,
+                    long long step, long long *outn) {
+    long long n = -2;
+    if (zan_io_socket_alive(fd) == 0)
+        n = 0;                           /* dead fd: EOF-shaped delivery */
+    else if (zt_fd_ready((int)fd, POLLRDNORM))
+        n = zt_recv_try((int)fd, buf, len);
+    if (n == -2) {
+        zt_io_push((int)fd, ZT_IO_RECV, buf, len, 0, frame, step, outn);
+        return;
+    }
+    *outn = n;
+    if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
+}
+
+void zan_io_recv_to_co(intptr_t fd, char *buf, long long len, long long tmo,
+                       long long frame, long long step, long long *outn) {
+    long long n = -2;
+    if (zan_io_socket_alive(fd) == 0)
+        n = 0;                           /* dead fd: 0, not the timeout -1 */
+    else if (zt_fd_ready((int)fd, POLLRDNORM))
+        n = zt_recv_try((int)fd, buf, len);
+    if (n == -2) {
+        long long dl = tmo > 0 ? zan_monotonic_ns() + tmo * 1000000LL : 0;
+        zt_io_push((int)fd, ZT_IO_RECV_TO, buf, len, dl, frame, step, outn);
+        return;
+    }
+    *outn = n;
+    if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
+}
+
+void zan_io_accept_co(intptr_t fd, long long frame, long long step,
+                      long long *outfd) {
+    int c = -2;
+    if (zan_io_socket_alive(fd) == 0)
+        c = -1;                          /* dead fd: accept failure shape */
+    else if (zt_fd_ready((int)fd, POLLRDNORM)) {
+        for (;;) {
+            c = accept((int)fd, NULL, NULL);
+            if (c >= 0 || errno != EINTR) break;
+        }
+        if (c < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) c = -2;
+    }
+    if (c == -2) {
+        zt_io_push((int)fd, ZT_IO_ACCEPT, NULL, 0, 0, frame, step, outfd);
+        return;
+    }
+    *outfd = c;
+    if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
+}
+
+/* hostname resolution: zan_io_resolve_sa is synchronous (getaddrinfo), so
+ * it runs on a detached worker that hands the finished job over under a
+ * mutex and signals the self-pipe; the pipe watch drains on the main
+ * thread, so the ready queue is only ever touched by the main thread */
+typedef struct ZtDnsJob {
+    struct ZtDnsJob *next;
+    char *name;
+    int32_t port;
+    char *buf;
+    int32_t cap;
+    long long *outn;
+    long long frame, step;
+    int32_t result;
+    int32_t v4;                          /* plain ipv4 lookup, no sockaddr */
+} ZtDnsJob;
+
+static int zt_dns_pipe[2] = {-1, -1};
+static pthread_mutex_t zt_dns_mu = PTHREAD_MUTEX_INITIALIZER;
+static ZtDnsJob *zt_dns_done;
+
+/* create the self-pipe once. The read end must be non-blocking: the poll
+ * side drains "until it would block", and a blocking read there would
+ * freeze the reactor right after the last byte instead of returning. */
+static int zt_dns_pipe_ensure(void) {
+    if (zt_dns_pipe[0] >= 0) return 1;
+    if (pipe(zt_dns_pipe) != 0) return 0;
+    int fl = fcntl(zt_dns_pipe[0], F_GETFL, 0);
+    if (fl >= 0) fcntl(zt_dns_pipe[0], F_SETFL, fl | O_NONBLOCK);
+    return 1;
+}
+
+static void *zt_dns_worker(void *arg) {
+    ZtDnsJob *j = (ZtDnsJob *)arg;
+    if (j->v4)
+        j->result = zan_io_resolve_ipv4(j->name);
+    else
+        j->result = zan_io_resolve_sa(j->name, j->port, j->buf, j->cap);
+    pthread_mutex_lock(&zt_dns_mu);
+    j->next = zt_dns_done;
+    zt_dns_done = j;
+    pthread_mutex_unlock(&zt_dns_mu);
+    if (write(zt_dns_pipe[1], "x", 1) < 0) { /* main thread gone: nothing to wake */ }
+    return NULL;
+}
+
+void zan_resolve_sa_co(const char *name, long long port, char *buf,
+                       long long cap, long long frame, long long step,
+                       long long *outn) {
+    if (!name || !*name) {
+        *outn = 0;                       /* no worker for the empty name */
+        if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
+        return;
+    }
+    struct in_addr a4;
+    struct in6_addr a6;
+    if (inet_pton(AF_INET, name, &a4) == 1 || inet_pton(AF_INET6, name, &a6) == 1) {
+        /* literal: no DNS, no worker */
+        *outn = zan_io_resolve_sa(name, (int32_t)port, buf, (int32_t)cap);
+        if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
+        return;
+    }
+    if (!zt_dns_pipe_ensure()) {
+        *outn = 0;
+        if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
+        return;
+    }
+    ZtDnsJob *j = calloc(1, sizeof(*j));
+    if (j) j->name = strdup(name);
+    if (!j || !j->name) {
+        free(j);
+        *outn = 0;
+        if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
+        return;
+    }
+    j->port = (int32_t)port; j->buf = buf; j->cap = (int32_t)cap;
+    j->outn = outn; j->frame = frame; j->step = step;
+    int havepipe = 0;
+    for (int i = 0; i < zt_io_n; i++)
+        if (zt_io_ws[i].active && zt_io_ws[i].kind == ZT_IO_DNS) { havepipe = 1; break; }
+    if (!havepipe)
+        zt_io_push(zt_dns_pipe[0], ZT_IO_DNS, NULL, 0, 0, 0, 0, NULL);
+    pthread_t t;
+    if (pthread_create(&t, NULL, zt_dns_worker, j) != 0) {
+        /* no thread: degrade to an inline (blocking) lookup */
+        *outn = zan_io_resolve_sa(j->name, j->port, j->buf, j->cap);
+        free(j->name);
+        free(j);
+        if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
+        return;
+    }
+    pthread_detach(t);
+}
+
+/* plain ipv4 lookup (Socket.ResolveAsync): identical shape to the sockaddr
+ * variant, but the worker delivers zan_io_resolve_ipv4's int, and getaddrinfo
+ * resolves literal dotted quads itself, so no literal fast path is needed. */
+void zan_resolve_ipv4_co(const char *name, long long frame, long long step,
+                         long long *outn) {
+    if (!name || !*name) {
+        *outn = 0;                       /* no worker for the empty name */
+        if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
+        return;
+    }
+    if (!zt_dns_pipe_ensure()) {
+        *outn = 0;
+        if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
+        return;
+    }
+    ZtDnsJob *j = calloc(1, sizeof(*j));
+    if (j) j->name = strdup(name);
+    if (!j || !j->name) {
+        free(j);
+        *outn = 0;
+        if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
+        return;
+    }
+    j->v4 = 1;
+    j->outn = outn; j->frame = frame; j->step = step;
+    int havepipe = 0;
+    for (int i = 0; i < zt_io_n; i++)
+        if (zt_io_ws[i].active && zt_io_ws[i].kind == ZT_IO_DNS) { havepipe = 1; break; }
+    if (!havepipe)
+        zt_io_push(zt_dns_pipe[0], ZT_IO_DNS, NULL, 0, 0, 0, 0, NULL);
+    pthread_t t;
+    if (pthread_create(&t, NULL, zt_dns_worker, j) != 0) {
+        /* no thread: degrade to an inline (blocking) lookup */
+        *outn = zan_io_resolve_ipv4(j->name);
+        free(j->name);
+        free(j);
+        if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
+        return;
+    }
+    pthread_detach(t);
+}
+
+/* the emitted scheduler's pump calls this whenever its ready queue drains:
+ * poll the parked watchers (bounded by the earliest timer deadline), wake
+ * fd-ready ones, expire recv-to deadlines. Returns 1 when watchers exist
+ * (the loop continues), 0 when none (caller falls back to timer sleep). */
+int64_t zan_io_poll(int64_t timer_wait_ns) {
+    int i, k = 0;
+    for (i = 0; i < zt_io_n; i++)
+        if (zt_io_ws[i].active) zt_io_ws[k++] = zt_io_ws[i];
+    zt_io_n = k;
+    if (k == 0) return 0;
+    struct pollfd *fds = calloc((size_t)k, sizeof(*fds));
+    if (!fds) abort();
+    int timeout = -1;                     /* watchers with no timer: block */
+    if (timer_wait_ns >= 0) {
+        long long ms = (timer_wait_ns + 999999) / 1000000;
+        if (ms > 0x7fffffffLL) ms = 0x7fffffffLL;
+        timeout = (int)ms;
+    }
+    for (i = 0; i < k; i++) {
+        fds[i].fd = zt_io_ws[i].fd;
+        fds[i].events = (zt_io_ws[i].kind == ZT_IO_WOUT) ? POLLOUT : POLLIN;
+        fds[i].revents = 0;
+    }
+    int rc;
+    do { rc = poll(fds, (nfds_t)k, timeout); } while (rc < 0 && errno == EINTR);
+    long long now = zan_monotonic_ns();
+    for (i = 0; i < k; i++) {
+        ZtIOWatch *w = &zt_io_ws[i];
+        if (!w->active) continue;
+        short rev = fds[i].revents;
+        if (rev & POLLNVAL) {            /* fd died without a close_notify */
+            zt_io_deliver(w, w->kind == ZT_IO_ACCEPT ? -1 : 0);
+            continue;
+        }
+        if (rev & (POLLIN | POLLOUT | POLLERR | POLLHUP)) {
+            switch (w->kind) {
+            case ZT_IO_W:
+            case ZT_IO_WOUT:
+                zt_io_deliver(w, 0);
+                break;
+            case ZT_IO_RECV: {
+                long long n = zt_recv_try(w->fd, w->buf, w->len);
+                if (n != -2) zt_io_deliver(w, n);  /* spurious: keep watching */
+                break;
+            }
+            case ZT_IO_RECV_TO: {
+                long long n = zt_recv_try(w->fd, w->buf, w->len);
+                if (n == -2) {
+                    if (w->deadline_ns && now >= w->deadline_ns)
+                        zt_io_deliver(w, -1);
+                } else {
+                    zt_io_deliver(w, n);   /* data beats a passing deadline */
+                }
+                break;
+            }
+            case ZT_IO_ACCEPT: {
+                int c;
+                for (;;) {
+                    c = accept(w->fd, NULL, NULL);
+                    if (c >= 0 || errno != EINTR) break;
+                }
+                if (!(c < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)))
+                    zt_io_deliver(w, c);
+                break;
+            }
+            case ZT_IO_DNS: {
+                char drain[64];
+                while (read(zt_dns_pipe[0], drain, sizeof(drain)) > 0) {}
+                pthread_mutex_lock(&zt_dns_mu);
+                ZtDnsJob *list = zt_dns_done;
+                zt_dns_done = NULL;
+                pthread_mutex_unlock(&zt_dns_mu);
+                while (list) {
+                    ZtDnsJob *nx = list->next;
+                    *list->outn = list->result;
+                    if (zan_co_ready_hook) zan_co_ready_hook(list->frame, list->step);
+                    free(list->name);
+                    free(list);
+                    list = nx;
+                }
+                break;
+            }
+            }
+            continue;
+        }
+        if (w->kind == ZT_IO_RECV_TO && w->deadline_ns && now >= w->deadline_ns)
+            zt_io_deliver(w, -1);
+    }
+    free(fds);
+    return 1;
+}
+
+void zan_io_close_notify(intptr_t fd) {
+    /* called BEFORE the actual close (stdlib's Socket.Close): wake every
+     * watcher on this fd so a parked accept/recv fails instead of hanging.
+     * recv/recv_to wake with the closed shape (0 bytes), accept with -1. */
+    int i;
+    for (i = 0; i < zt_io_n; i++) {
+        ZtIOWatch *w = &zt_io_ws[i];
+        if (w->active && w->fd == (int)fd)
+            zt_io_deliver(w, w->kind == ZT_IO_ACCEPT ? -1 : 0);
+    }
+}
 
 int64_t zan_monotonic_us(void) {
     return zan_monotonic_ns() / 1000;

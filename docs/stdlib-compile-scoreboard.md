@@ -1,6 +1,51 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-23 · v14 · 定点见下方 v14 节
+日期：2026-09-23 · v15 · 定点见下方 v15 节
+
+## v15 socket om/em 8 例 reactor 真挂起批（2026-09-23，om 6→3、em 11→6，sweep 307→315，检查点 run.7mjxpH）
+
+v12 基线遗留的 4 个 om 超时 + 4 个 em 超时全部转绿。上一批落好的 C
+reactor（zt_io_ws 观察表 + zan_io_poll + DNS worker + close 唤醒）这次补
+上四处诚实化缺口后真正跑通：
+
+1. **就绪门控**（zt_fd_ready，零超时 pollfd 探测）：recv_co/recv_to_co/
+   accept_co 在发起系统调用前先查就绪。接手的 socket 常被调用方留在阻塞
+   模式，socket_close_wakes 的阻塞 recv 会冻住整个单线程引擎（sample：
+   __recvfrom，Main 永远轮不到 Close）；未就绪一律挂起，不硬试。
+2. **死 fd 快失败**（对齐 oracle io_reject_dead_fd）：fd 不存活时
+   wait_co 立即交付 0、recv 系交付 0、accept_co 交付 -1，绝不入表。
+   关键在 macOS：stdlib 的 CreateTcp6/CreateUdp6 用 Linux 的
+   `socket(10,…)`（Darwin AF_INET6=30）必然失败返回 -1，而 poll() 对负
+   fd 静默忽略——挂起的 W 观察永不触发（lldb：fd=-1 kind=W，无限
+   poll）。ipv6 全程跑在死 fd 上，交付语义逐值对齐后输出与 oracle 完全
+   一致：`FAIL reply= rc=-1 got= peer= salen=16`（oracle 自身 v6 连接
+   缺陷，但其可观察行为就是规格——rc=0、salen=16、四个空串）。
+3. **DNS 自管道 O_NONBLOCK**：poll 侧排水循环"读到不能再读"，阻塞管道
+   在最后一个字节后下一次 read 永久冻结（1 次成功 6 次挂起的竞态假象）；
+   zt_dns_pipe_ensure 给读端加 O_NONBLOCK，EAGAIN 终止排水。
+4. **ResolveAsync 编译器 intrinsic（kind 7 → _zan_resolve_ipv4_co）**：
+   stdlib Socket.ResolveAsync 的方法体是 `return await
+   Socket.ResolveAsync(hostname);` 自递归占位——oracle 把它降为编译器
+   intrinsic（zan_io_resolve_co：空名立即 *out=0，否则 worker 算
+   zan_io_resolve_ipv4 交付）。不识别它 async_dns/async_mt 就在调度器里
+   无限递归。DNS job 结构加 v4 标志共用同一 worker/管道/互斥锁机制。
+
+发射侧配套：_zan_co_sched_run_until 在 timers_due 与定时器睡眠之间插
+BLExtern("_zan_io_poll") 钩子；_zan_co_ready 前奏用函数指针
+zan_co_ready_hook 自注册（弱符号在 macOS ld 静态链接下不可用，见 v12
+注记；ngen_macho ExternSyms 相应收集未定义非 GOT 数据 strRefs）。
+
+**验证**：39/39；crossboot ELF 5/5 + PE-COFF 5/5；正式自举 run.7mjxpH
+stage2.o==stage3.o；qa15（TcpClient 全回显，v10 偏差保持修复）、qa16
+（延迟门控 recv 双形态字节一致）探针复验；定向 8/8（async_asocket_echo/
+async_socket_async_echo/ipv6/accept_after_close/async_concurrent_echo/
+async_dns/async_mt/socket_close_wakes）；全量 sweep 零回归（pass 315 /
+ncf 170 / nlf 0 / om 3 / em 6 / mne 11 /
+rcf 119，total 624）。
+
+**下一批**（按既定顺序）：委托捕获/7 参形状（6 chart 错）→ Html
+Dictionary<Action>（3）→ FindNotAnyOf（2）→ Task.Delay-arg/ToStr-arity
+级联（含 v14 记录的 WriteLine 直参 bool 标签族）→ Interop Com。
 
 ## v14 泛型类构造器逐实例化 spec 批（2026-09-23，hashset_basic em→pass，sweep 306→307，检查点 run.gHqSU9）
 

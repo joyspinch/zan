@@ -591,7 +591,10 @@ partial class Ngen {
     // the IO-reactor / gate suspension intrinsics the compiler lowers
     // itself (irgen_async.zan IsSocketIntrinsic, C host irgen_expr.c
     // 8147-8540): 0 = none, 1 = Gate.Park, 2 = readiness probe,
-    // 3 = RecvOv, 4 = RecvToOv, 5 = AcceptOv, 6 = ResolveSockAddr
+    // 3 = RecvOv, 4 = RecvToOv, 5 = AcceptOv, 6 = ResolveSockAddr,
+    // 7 = ResolveAsync. ResolveAsync matters even though the stdlib body
+    // is one line: that line awaits ITSELF, so without the intrinsic the
+    // body recurses through the scheduler forever (async_dns / async_mt).
     int CoIntrinsicKindNg(Node inner) {
         if (inner == null || inner.kind != AK.Call() || inner.a == null
                 || inner.a.kind != AK.MemberAccess() || inner.a.a == null
@@ -605,6 +608,7 @@ partial class Ngen {
         if (mn == "RecvToOv" && inner.kids.Count == 4) { return 4; }
         if (mn == "AcceptOv" && inner.kids.Count == 1) { return 5; }
         if (mn == "ResolveSockAddr" && inner.kids.Count == 4) { return 6; }
+        if (mn == "ResolveAsync" && inner.kids.Count == 1) { return 7; }
         return 0;
     }
 
@@ -640,12 +644,14 @@ partial class Ngen {
             E4(0xF84107E0);
         } else if (kind == 5) {
             E4(0xF84107E0);                          // fd -> x0
-        } else {                                     // ResolveSockAddr: cap,buf,port,name
+        } else if (kind == 6) {                      // ResolveSockAddr: cap,buf,port,name
             E4(0xF84107E3);
             E4(0xF84107E2);
             E4(0xF84107E1);
             E4(0xF84107E0);                          // name -> x0 (the handle IS
-        }                                            //  the char* on this lane)
+        } else if (kind == 7) {                      //  the char* on this lane)
+            E4(0xF84107E0);                          // ResolveAsync: name -> x0
+        }
         if (kind == 1) {
             LoadLocal(asyncFrameLocal, 1);           // park(g, frame, resume)
             LoadSymRef(asyncResumeSym, 2);
@@ -672,12 +678,18 @@ partial class Ngen {
             LoadLocal(asyncFrameLocal, 3);
             AddImm(3, 3, 32);
             BLExtern("_zan_io_accept_co");
-        } else {
+        } else if (kind == 6) {
             LoadLocal(asyncFrameLocal, 4);           // resolve_sa_co(name, port, buf, cap, frame, resume, &res)
             LoadSymRef(asyncResumeSym, 5);
             LoadLocal(asyncFrameLocal, 6);
             AddImm(6, 6, 32);
             BLExtern("_zan_resolve_sa_co");
+        } else if (kind == 7) {
+            LoadLocal(asyncFrameLocal, 1);           // resolve_ipv4_co(name, frame, resume, &res)
+            LoadSymRef(asyncResumeSym, 2);
+            LoadLocal(asyncFrameLocal, 3);
+            AddImm(3, 3, 32);
+            BLExtern("_zan_resolve_ipv4_co");
         }
         LoadLocal(asyncFrameLocal, 1);
         LoadImm(0, k);
@@ -1686,6 +1698,11 @@ partial class Ngen {
         // _zan_co_ready(i64 frame, i64 step)
         syms.Add(new Sym("_zan_co_ready", txt.Count));
         RtPrologue();
+        // register the callback with the C reactor's io helpers
+        // (zanstubs.c): idempotent self-address store, args untouched
+        LoadSymRef("_zan_co_ready_hook", 9);
+        LoadSymRef("_zan_co_ready", 2);
+        StrU(2, 9, 0);
         int noStep = NL();
         CbzReg(1, noStep);                           // step == 0: nothing
         E4(0xF81F0FE0);                              // push frame
@@ -1765,6 +1782,12 @@ partial class Ngen {
         BLInternal("_zan_co_timers_due");            // x0 = due timers readied
         CbnzReg(0, loopL);
         BLInternal("_zan_co_timer_wait");            // x0 = ns to earliest / -1
+        StrU(0, 31, 8);                              // stash it ([sp+8] scratch)
+        BLExtern("_zan_io_poll");                    // poll the parked io watchers
+                                                     // (bounded by the timer wait):
+                                                     // 1 = watchers exist, loop
+        CbnzReg(0, loopL);
+        LdrU(0, 31, 8);                              // no watchers: timer sleep
         E4(0xEB1F001F);                              // cmp x0, xzr
         EmitBcond(11, outL);                         // no timers: exit
         AddSPImm(32, false);                         // [sp]=req.sec [sp+8]=req.nsec [sp+16]=rem
@@ -2050,123 +2073,14 @@ partial class Ngen {
         Mark(gfOut);
         RtEpilogue();
 
-        // _zan_io_wait_co(fd, interest, frame, step): the native lane has no
-        // kqueue bridge -- the fd is immediately ready (matching the
-        // non-blocking reactor shapes; readiness is re-checked per syscall)
-        syms.Add(new Sym("_zan_io_wait_co", txt.Count));
-        RtPrologue();
-        MovRR(0, 2);
-        MovRR(1, 3);
-        BLInternal("_zan_co_ready");
-        RtEpilogue();
+        // ---- awaited io suspension helpers ----
+        // zan_io_wait_co / _recv_co / _recv_to_co / _accept_co /
+        // _resolve_sa_co moved to the transition runtime
+        // (zanstubs.c): the native lane now has a REAL reactor --
+        // watchers park until zan_io_poll (called from the pump
+        // above) sees the fd ready, a recv-to deadline expires, the
+        // self-pipe signals a finished DNS worker, or close_notify
+        // wakes them. BLExtern resolves them from zanstubs.o.
 
-        // _zan_io_recv_co(fd, buf, len, frame, step, i64* outn): a single
-        // libc recv with no real suspension; the byte count lands in the
-        // frame result slot and the waiter re-readies. A negative
-        // errno-style return propagates (WouldBlock -> callers loop).
-        syms.Add(new Sym("_zan_io_recv_co", txt.Count));
-        RtPrologue();
-        E4(0xF81F0FE3);                              // hold frame
-        E4(0xF81F0FE4);                              // hold step
-        E4(0xF81F0FE5);                              // hold outn
-        LoadImm(3, 0);                               // flags = 0
-        BLExtern("_recv");
-        E4(0xF84107E5);                              // outn -> x5
-        StrU(0, 5, 0);                               // *outn = n
-        E4(0xF84107E4);                              // step -> x4
-        E4(0xF84107E3);                              // frame -> x3
-        MovRR(0, 3);
-        MovRR(1, 4);
-        BLInternal("_zan_co_ready");
-        RtEpilogue();
-
-        // _zan_io_recv_to_co(fd, buf, len, tmo_ms, frame, step, i64* outn):
-        // deadline form -- the timeout is not enforced on the native lane
-        // (documented deviation); the recv is identical to RecvOv's
-        syms.Add(new Sym("_zan_io_recv_to_co", txt.Count));
-        RtPrologue();
-        E4(0xF81F0FE4);                              // hold frame
-        E4(0xF81F0FE5);                              // hold step
-        E4(0xF81F0FE6);                              // hold outn
-        LoadImm(3, 0);                               // flags = 0
-        BLExtern("_recv");
-        E4(0xF84107E6);                              // outn -> x6
-        StrU(0, 6, 0);
-        E4(0xF84107E5);                              // step -> x5
-        E4(0xF84107E4);                              // frame -> x4
-        MovRR(0, 4);
-        MovRR(1, 5);
-        BLInternal("_zan_co_ready");
-        RtEpilogue();
-
-        // _zan_io_accept_co(fd, frame, step, i64* outfd): libc accept with
-        // NULL addr; the new fd lands in the frame result slot
-        syms.Add(new Sym("_zan_io_accept_co", txt.Count));
-        RtPrologue();
-        E4(0xF81F0FE1);                              // hold frame
-        E4(0xF81F0FE2);                              // hold step
-        E4(0xF81F0FE3);                              // hold outfd
-        LoadImm(1, 0);
-        LoadImm(2, 0);
-        BLExtern("_accept");
-        E4(0xF84107E3);                              // outfd -> x3
-        StrU(0, 3, 0);
-        E4(0xF84107E2);                              // step -> x2
-        E4(0xF84107E1);                              // frame -> x1
-        MovRR(0, 1);
-        MovRR(1, 2);
-        BLInternal("_zan_co_ready");
-        RtEpilogue();
-
-        // _zan_resolve_sa_co(name, port, buf, cap, frame, step, i64* outn):
-        // IPv4-literal resolution into a 16-byte darwin sockaddr_in
-        // {len=16, AF_INET, BE16 port, addr, zero pad} (rt_io.c's
-        // zan_resolve_sa_co darwin shape). Hostnames needing DNS are a
-        // documented native gap: *outn = 0.
-        syms.Add(new Sym("_zan_resolve_sa_co", txt.Count));
-        RtPrologue();
-        E4(0xF81F0FE0);                              // hold name
-        E4(0xF81F0FE1);                              // hold port
-        E4(0xF81F0FE2);                              // hold buf
-        E4(0xF81F0FE3);                              // hold cap
-        E4(0xF81F0FE4);                              // hold frame
-        E4(0xF81F0FE5);                              // hold step
-        E4(0xF81F0FE6);                              // hold outn
-        AddSPImm(16, false);                         // 16-byte inet_pton scratch
-        LoadImm(0, 2);                               // AF_INET
-        LdrU(1, 31, 112);                            // name
-        AddImm(2, 31, 0);                            // &scratch ([sp])
-        BLExtern("_inet_pton");
-        int rsFail = NL();
-        int rsDone = NL();
-        EmitCBZ(0, rsFail);                          // not a dotted quad
-        LdrU(1, 31, 64);                             // cap
-        LoadImm(3, 16);
-        E4(0xEB03003F);                              // cmp x1, x3 (cap, 16)
-        EmitBcond(11, rsFail);                       // b.lt: too small
-        LdrU(9, 31, 80);                             // buf
-        LoadImm(1, 16);
-        E4(0x39000121);                              // strb w1, [x9]      sin_len
-        LoadImm(1, 2);
-        E4(0x39000521);                              // strb w1, [x9, #1]  sin_family
-        LdrU(1, 31, 96);                             // port
-        E4(0x5AC00421);                              // rev16 w1, w1       -> BE16
-        E4(0x79000521);                              // strh w1, [x9, #2]  sin_port
-        StrU(31, 9, 8);                              // sin_zero = 0 (xzr store)
-        E4(0xB94003E1);                              // ldr w1, [sp]       parsed addr
-        E4(0xB9001121);                              // str w1, [x9, #4]   sin_addr
-        LdrU(3, 31, 16);                             // outn
-        LoadImm(1, 16);
-        StrU(1, 3, 0);                               // *outn = 16
-        EmitB(rsDone);
-        Mark(rsFail);
-        LdrU(3, 31, 16);
-        StrU(31, 3, 0);                              // *outn = 0
-        Mark(rsDone);
-        LdrU(0, 31, 48);                             // frame
-        LdrU(1, 31, 32);                             // step
-        BLInternal("_zan_co_ready");
-        AddSPImm(128, true);                         // 7 holds + scratch
-        RtEpilogue();
     }
 }
