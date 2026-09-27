@@ -164,6 +164,9 @@ partial class Ngen {
     List<string> locTy;     // declared type name per local ("" for this/params of unknown)
     List<int> locOff;       // frame offset (bytes from sp)
     List<bool> locRef;      // by-ref slots (out/ref params): the slot holds an address
+    List<int> locBoxed;     // lambda-written slots: the slot holds a shared heap
+                            // cell (A33-2b), reads and writes go through it
+    List<string> boxNames;  // names any nested lambda assigns (per method)
     List<int> locOpaq;      // string slot holding an extern-call result: no
                             // length header, no trusted NUL bound (the stdlib
                             // slices readdir's struct dirent* byte by byte)
@@ -806,7 +809,7 @@ partial class Ngen {
                     LoadLocal(li, 1);
                     StrU(0, 1, 0);                       // store through the ref
                 } else {
-                    StoreLocal(li, 0);
+                    StoreLocalVal(li, 0);
                 }
                 return;
             }
@@ -1378,6 +1381,18 @@ partial class Ngen {
         }
         E4(0xA8C17BFD);                                  // ldp x29, x30, [sp], #16
         E4(0xD65F03C0);                                  // ret
+        // ngen_async hook F precondition: the CPS runtime (co_ready /
+        // co_sched_run_until / the gate helpers) must exist before any body
+        // that can root-drive an await -- a sync Main doing `await X()`
+        // inside a try hits EnsureAsyncRuntimeNg mid-body, and the lazy
+        // emission splices the primitives right there: the body continues
+        // after the blob while the pre-blob half falls through into
+        // _zan_co_ready. Emitting it here, after the shim's ret where no
+        // control reaches by fall-through, keeps every later call site a
+        // pure symbol reference. Async-free programs skip the blob: its
+        // co/io primitives would otherwise become undefined references on
+        // the bare ELF runtime (crossboot).
+        if (ProgramCanAwaitNg()) { EnsureAsyncRuntimeNg(); }
     }
 
     // Materialize Main(string[] args), excluding argv[0]. Use the ordinary
@@ -1442,6 +1457,7 @@ partial class Ngen {
             pi = pi + 1;
         }
         ReserveLocals(m.d);
+        BoxLambdaWrittenLocalsNg(m.d);
         curHasTry = HasTry(m.d);
         if (curHasTry) {
             // EH bookkeeping locals: the top mirror, the outermost open
@@ -1588,6 +1604,8 @@ partial class Ngen {
         locOff = new List<int>(); locRef = new List<bool>();
         locDecl = new List<Node>(); locPrev = new List<int>();
         locOpaq = new List<int>();
+        locBoxed = new List<int>();
+        boxNames = new List<string>();
         envNodes = new List<Node>(); envHeads = new List<int>();
         locHead = -1; nloc = 0;
     }
@@ -1598,7 +1616,160 @@ partial class Ngen {
         locName.Add(name); locTy.Add(ty); locOff.Add(16 * nloc);
         locRef.Add(isRef); locDecl.Add(null); locPrev.Add(locHead);
         locOpaq.Add(0);
+        locBoxed.Add(0);
         locHead = nloc; nloc = nloc + 1;
+    }
+
+    // ---- lambda-written locals (A33-2b) ---------------------------------
+    // C# captures variables, not value snapshots: a lambda that assigns an
+    // enclosing local writes *that* local, and the declaring method sees the
+    // write when the delegate returns. Such a local is boxed: its frame slot
+    // holds a shared heap cell, every access on either side goes through the
+    // cell, and the delegate env carries the cell pointer instead of a copy.
+    // The oracle boxes EVERY capture (an outer write between delegate
+    // creation and invocation is the only read-side difference); here only
+    // lambda-written locals box, so the snapshot path every passing lambda
+    // test exercises stays byte-identical.
+    void BoxLambdaWrittenLocalsNg(Node body) {
+        boxNames = new List<string>();
+        BoxWritesNg(body, new List<string>(), false, 0);
+        int li = 0;
+        while (li < locDecl.Count) {
+            Node d = locDecl[li];
+            // plain VarDecl slots only: foreach/catch/for-var decls register
+            // other node kinds (or none) and their per-iteration stores write
+            // the slot directly; params have no decl node at all
+            if (d != null && d.kind == AK.VarDecl() && locRef[li] == false
+                    && DelegateWordNg(locTy[li], false)
+                    && IndexOf(boxNames, locName[li]) >= 0) {
+                locBoxed[li] = 1;
+            }
+            li = li + 1;
+        }
+    }
+
+    // Collect the names any lambda at depth > 0 assigns. Same shadowing
+    // discipline as DelegateCapturesNg: lambda params, block/for/foreach
+    // declarations shadow outer names, so writes to them never box an
+    // outer local. `out`/`ref` arguments are deliberately not treated as
+    // writes: a boxed local's slot holds the cell, and taking its address
+    // would hand the callee the cell pointer instead of storage.
+    void BoxWritesNg(Node n, List<string> bound, bool write, int depth) {
+        if (n == null) { return; }
+        int k = n.kind;
+        if (k == AK.Ident()) {
+            // name match against the WHOLE slot table, not LocalIdx: the
+            // scope chain has been rolled back to the method top by the time
+            // this pre-pass runs, so block-scoped locals are unreachable
+            // through it. Over-matching a same-named local is harmless --
+            // boxing a never-captured local changes no observable behavior.
+            if (depth > 0 && write && IndexOf(bound, n.sval) < 0
+                    && IndexOf(locName, n.sval) >= 0 && IndexOf(boxNames, n.sval) < 0) {
+                boxNames.Add(n.sval);
+            }
+            return;
+        }
+        if (k == AK.ThisExpr()) { return; }
+        if (k == AK.Lambda()) {
+            List<string> inner = DelegateNamesCopyNg(bound); int i = 0;
+            while (i < n.kids.Count) { inner.Add(n.kids[i].sval); i = i + 1; }
+            BoxWritesNg(n.a, inner, false, depth + 1);
+            BoxWritesNg(n.d, inner, false, depth + 1);
+            return;
+        }
+        if (k == AK.Block()) {
+            List<string> inner = DelegateNamesCopyNg(bound); int i = 0;
+            while (i < n.kids.Count) {
+                Node s = n.kids[i]; BoxWritesNg(s, inner, false, depth);
+                // depth 0 walks the METHOD body: its locals are the capture
+                // targets, never shadowing names (adding them made every
+                // lambda treat the enclosing locals as bound)
+                if (depth > 0 && s.kind == AK.VarDecl()) { inner.Add(s.sval); }
+                i = i + 1;
+            }
+            return;
+        }
+        if (k == AK.ForStmt()) {
+            List<string> inner = DelegateNamesCopyNg(bound);
+            BoxWritesNg(n.a, inner, false, depth);
+            if (depth > 0 && n.a != null && n.a.kind == AK.VarDecl()) { inner.Add(n.a.sval); }
+            BoxWritesNg(n.b, inner, false, depth);
+            BoxWritesNg(n.c, inner, false, depth);
+            BoxWritesNg(n.d, inner, false, depth);
+            return;
+        }
+        if (k == AK.ForeachStmt()) {
+            BoxWritesNg(n.b, bound, false, depth);
+            List<string> inner = DelegateNamesCopyNg(bound);
+            if (depth > 0) { inner.Add(n.sval); }
+            BoxWritesNg(n.c, inner, false, depth);
+            return;
+        }
+        if (k == AK.Assignment()) {
+            BoxWritesNg(n.a, bound, true, depth);
+            BoxWritesNg(n.b, bound, false, depth);
+            return;
+        }
+        if (k == AK.PostfixUnary()) {
+            BoxWritesNg(n.a, bound, true, depth);
+            return;
+        }
+        BoxWritesNg(n.a, bound, write, depth);
+        BoxWritesNg(n.b, bound, false, depth);
+        BoxWritesNg(n.c, bound, false, depth);
+        BoxWritesNg(n.d, bound, false, depth);
+        int j = 0;
+        while (j < n.kids.Count) { BoxWritesNg(n.kids[j], bound, false, depth); j = j + 1; }
+    }
+
+    bool LocBoxedNg(int li) {
+        return li >= 0 && li < locBoxed.Count && locBoxed[li] != 0;
+    }
+
+    // the local's VALUE: a boxed slot dereferences its cell
+    void LoadLocalVal(int li, int reg) {
+        LoadLocal(li, reg);
+        if (LocBoxedNg(li)) { LdrU(reg, reg, 0); }
+    }
+
+    // write the local's VALUE: a boxed slot stores through its cell
+    void StoreLocalVal(int li, int reg) {
+        if (LocBoxedNg(li)) {
+            int scr = reg == 9 ? 10 : 9;
+            LoadLocal(li, scr);                      // x_scr = cell
+            StrU(reg, scr, 0);                       // cell->value
+            return;
+        }
+        StoreLocal(li, reg);
+    }
+
+    // a declaration's initializing store: a boxed local allocates its shared
+    // cell here (x0 = value on entry) and keeps the cell pointer in the slot
+    void StoreDeclValNg(Node d) {
+        int li = DeclSlotNg(d);
+        if (LocBoxedNg(li)) {
+            E4(0xF81F0FE0);                          // push value
+            LoadImm(0, 8);
+            LoadImm(1, 0);
+            BLInternal("_zan_rt_alloc");             // x0 = zeroed 8-byte cell
+            E4(0xF84107E1);                          // x1 = value
+            StrU(1, 0, 0);                           // cell->value
+            StoreLocal(li, 0);                       // slot = cell
+            return;
+        }
+        StoreLocal(li, 0);
+    }
+
+    // `T x;` without an initializer: only a boxed local needs anything (its
+    // cell must exist before any lambda can run); _zan_rt_alloc zeroes, so
+    // the cell's value starts at default(T)'s word pattern
+    void StoreDeclZeroCellNg(Node d) {
+        int li = DeclSlotNg(d);
+        if (!LocBoxedNg(li)) { return; }
+        LoadImm(0, 8);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");
+        StoreLocal(li, 0);
     }
 
     // A string slot declared with an extern-call initializer carries a raw
@@ -2010,7 +2181,7 @@ partial class Ngen {
                 string vt = s.type != null ? TypeFullName(s.type) : null;
                 if (vt == null || vt == "") { vt = InferExprTyNg(s.b); }   // silent: ReserveLocals already diagnosed
                 if (!TryGenBindingValue(s.b, vt)) { GenConversionValueNg(s.b, vt); }
-                StoreLocal(DeclSlotNg(s), 0);
+                StoreDeclValNg(s);
             }
             int dsi = 0;
             while (dsi < s.kids.Count) {
@@ -2019,19 +2190,23 @@ partial class Ngen {
                     string dvt = d.type != null ? TypeFullName(d.type) : null;
                     if (dvt == null || dvt == "") { dvt = InferExprTyNg(d.b); }
                     if (!TryGenBindingValue(d.b, dvt)) { GenConversionValueNg(d.b, dvt); }
-                    StoreLocal(DeclSlotNg(d), 0);
+                    StoreDeclValNg(d);
                 }
                 dsi = dsi + 1;
             }
             if (s.b == null) {
                 // `S x;` with S a struct: a fresh zero-filled value (gen0
-                // zero-inits inline storage); other types start unassigned
+                // zero-inits inline storage); a boxed word local still needs
+                // its cell from the declaration point on; other types start
+                // unassigned
                 Cls dc = s.type != null ? FindClass(TypeFullName(s.type)) : null;
                 if (dc != null && dc.isStruct == 1) {
                     LoadImm(0, dc.size + 16);
                     LoadImm(1, 0);
                     BLInternal("_zan_rt_alloc");
                     StoreLocal(DeclSlotNg(s), 0);
+                } else {
+                    StoreDeclZeroCellNg(s);
                 }
             }
         } else if (k == AK.ExprStmt()) {
@@ -2380,7 +2555,7 @@ partial class Ngen {
                 LdrU(0, 1, 0);                               // read through it
                 return;
             }
-            LoadLocal(li, 0);
+            LoadLocalVal(li, 0);
         } else if (k == AK.MemberAccess()) {
             if (e.op == TK.QDot()) {
                 // null-conditional access needs T? tracking (a null member
@@ -3126,7 +3301,7 @@ partial class Ngen {
                     StrU(0, 1, 0);                           // store through it
                     return;
                 }
-                StoreLocal(li, 0);
+                StoreLocalVal(li, 0);
             } else if (e.a != null && e.a.kind == AK.Index() && ArrContainerTy(e.a.a) != null) {
                 // array element set: same bounds rule as the get; the value
                 // and index survive the guard call on the stack
@@ -7099,10 +7274,10 @@ partial class Ngen {
         if (tgt.kind == AK.Ident()) {
             int li = LocalIdx(tgt.sval);
             if (li >= 0 && !locRef[li]) {
-                LoadLocal(li, 0);
+                LoadLocalVal(li, 0);
                 if (!yieldNew) { E4(0xF81F0FE0); }   // save old
                 if (isInc) { AddImm(0, 0, 1); } else { SubImm(0, 0, 1); }
-                StoreLocal(li, 0);
+                StoreLocalVal(li, 0);
                 if (!yieldNew) { E4(0xF84107E0); }   // old -> x0
                 return;
             }
@@ -7186,6 +7361,14 @@ partial class Ngen {
         if (t.kind == AK.Ident()) {
             int li = LocalIdx(t.sval);
             if (li >= 0) {
+                if (LocBoxedNg(li)) {
+                    // the slot holds the shared cell, not storage: handing the
+                    // address out would let the callee overwrite the cell
+                    // pointer itself
+                    diags.Error("ngen: ref/out of a lambda-captured local '" + t.sval + "' is not supported by the native backend", t.line, t.col);
+                    LoadImm(0, 0);
+                    return;
+                }
                 if (locRef[li]) {
                     LoadLocal(li, 0);                    // slot holds the address
                 } else {
@@ -7622,7 +7805,9 @@ partial class Ngen {
     bool KnownParamTy(string pt) {
         if (pt == "int" || pt == "long" || pt == "ulong" || pt == "double"
                 || pt == "bool" || pt == "char" || pt == "string"
-                || pt == "object" || pt == "void") { return true; }
+                || pt == "object" || pt == "void"
+                || pt == "byte" || pt == "sbyte" || pt == "short"
+                || pt == "ushort" || pt == "uint" || pt == "float") { return true; }
         if (pt == "List" || (pt.Length > 5 && pt.Substring(0, 5) == "List<")) { return true; }
         if (IsArrTy(pt)) { return KnownParamTy(pt.Substring(0, pt.Length - 2)); }
         return FindClass(pt) != null;
@@ -7643,13 +7828,27 @@ partial class Ngen {
         if (k == AK.IntLit()) {
             if (pt == "int") { return 8; }
             if (pt == "long" || pt == "ulong") { return 6; }
-            if (pt == "double") { return 4; }
+            if (pt == "double" || pt == "float") { return 4; }
+            // C# implicit constant conversion: an in-range int literal
+            // converts to the narrow integral types (Md5's `wLE(o, 0, a0)`
+            // style calls must not disqualify the only overload)
+            if (pt == "byte" || pt == "sbyte" || pt == "short"
+                    || pt == "ushort" || pt == "uint") { return 5; }
             return -100;
         }
-        if (k == AK.FloatLit()) { return pt == "double" ? 8 : -100; }
+        if (k == AK.FloatLit()) {
+            if (pt == "double" || pt == "float") { return 8; }
+            return -100;
+        }
         if (k == AK.StringLit()) { return pt == "string" ? 8 : -100; }
         if (k == AK.BoolLit()) { return pt == "bool" ? 8 : -100; }
-        if (k == AK.CharLit()) { return pt == "char" ? 8 : (pt == "int" ? 4 : -100); }
+        if (k == AK.CharLit()) {
+            if (pt == "char") { return 8; }
+            if (pt == "int" || pt == "ushort" || pt == "uint") { return 4; }
+            if (pt == "double" || pt == "float" || pt == "long"
+                    || pt == "ulong") { return 3; }
+            return -100;
+        }
         if (k == AK.NullLit()) {
             if (ClassTyOf(pt) != null || pt == "string" || pt == "object"
                     || pt == "List" || pt == "StringBuilder"
