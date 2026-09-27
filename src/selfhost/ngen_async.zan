@@ -1702,6 +1702,36 @@ partial class Ngen {
     // the new head would orphan that later append. Enqueue branches on coq,
     // not on coqt, for the same reason.
     // Native deviation: popped nodes and heap frames are never freed.
+    // does any method in the program reach the CPS runtime? An async method
+    // emits its ramp through EnsureAsyncRuntimeNg; a sync body with an
+    // `await` root-drives through it (TryGenAwaitExprNg). The entry shim
+    // pre-emits the runtime blob only for such programs, so async-free ones
+    // (the crossboot ELF lanes) keep linking without the co/io primitives.
+    bool ProgramCanAwaitNg() {
+        int ci = 0;
+        while (ci < methNodes.Count) {
+            Node m = methNodes[ci];
+            if (m != null) {
+                if (HasMod(m, MOD.Async()) || HasAwaitExprNg(m)) { return true; }
+            }
+            ci = ci + 1;
+        }
+        return false;
+    }
+    bool HasAwaitExprNg(Node n) {
+        if (n == null) { return false; }
+        if (n.kind == AK.AwaitExpr()) { return true; }
+        if (HasAwaitExprNg(n.a) || HasAwaitExprNg(n.b)
+                || HasAwaitExprNg(n.c) || HasAwaitExprNg(n.d)
+                || HasAwaitExprNg(n.type)) { return true; }
+        if (n.kids == null) { return false; }
+        int i = 0;
+        while (i < n.kids.Count) {
+            if (HasAwaitExprNg(n.kids[i])) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
     void EnsureAsyncRuntimeNg() {
         if (asyncRtDone) { return; }
         asyncRtDone = true;
@@ -2037,6 +2067,11 @@ partial class Ngen {
         CbzReg(3, gpEmpty);
         LdrU(4, 0, 8);                               // tail
         StrU(9, 4, 0);                               // tail.next = waiter
+        StrU(9, 0, 8);                               // tail = waiter (rt_io.c 5117:
+                                                     // without this the next park
+                                                     // relinks from the stale tail
+                                                     // and orphans the middle of
+                                                     // the queue)
         EmitB(gpDone);
         Mark(gpEmpty);
         StrU(9, 0, 0);                               // head = waiter
