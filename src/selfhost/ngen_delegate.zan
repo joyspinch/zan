@@ -132,7 +132,18 @@ partial class Ngen {
     }
 
     Node DelegateTypeNodeNg(string ty) {
+        // array ranks ride in the TypeRef's ival (TypeFullName renders them
+        // back); dropping the suffix typed a captured List<string>[] as
+        // List<string> and silently misdispatched every chained access
+        // through the capture
+        int rank = 0;
+        while (ty != null && ty.Length >= 2
+                && ty.Substring(ty.Length - 2, 2) == "[]") {
+            ty = ty.Substring(0, ty.Length - 2);
+            rank = rank + 1;
+        }
         Node n = new Node(AK.TypeRef());
+        n.ival = rank;
         int p = ty.IndexOf("<");
         if (p < 0) { n.sval = ty; return n; }
         n.sval = ty.Substring(0, p);
@@ -418,13 +429,21 @@ partial class Ngen {
             }
             return;
         }
-        if (write || locRef[slot] || !DelegateWordNg(locTy[slot], false)) {
+        // A boxed local (some lambda in this body assigns it) captures as the
+        // shared cell itself: reads and writes on either side land in the one
+        // variable. Writes to unboxed locals stay rejected -- their snapshot
+        // would never propagate (A33-2b).
+        bool boxed = LocBoxedNg(slot);
+        if (locRef[slot] || !DelegateWordNg(locTy[slot], false) || (write && !boxed)) {
             diags.Error("ngen delegate: unsupported captured write, ref/out, or non-word value '" + name + "'", site.line, site.col);
             return;
         }
         int i = 0;
         while (i < caps.kids.Count) { if (caps.kids[i].sval == name) { return; } i = i + 1; }
-        Node cap = new Node(AK.Param()); cap.sval = name; cap.ival = slot;
+        Node cap = new Node(AK.Param()); cap.sval = name;
+        // a negative slot marks a boxed capture: the env holds the cell
+        // pointer, and the thunk's capture local dereferences on access
+        cap.ival = boxed ? -(slot + 1) : slot;
         cap.type = DelegateTypeNodeNg(locTy[slot]); caps.Add(cap);
     }
 
@@ -491,7 +510,11 @@ partial class Ngen {
         int i = 0;
         while (i < nc) {
             if (receiver != null) { GenExpr(receiver); }
-            else { LoadLocal((int)caps.kids[i].ival, 0); }
+            else {
+                int sl = (int)caps.kids[i].ival;
+                if (sl < 0) { sl = -sl - 1; }        // boxed: the slot holds the cell
+                LoadLocal(sl, 0);
+            }
             StrU(0, 31, i * 8);
             i = i + 1;
         }
@@ -730,7 +753,9 @@ partial class Ngen {
                 while (i < m.kids.Count) { AddLoc(m.kids[i].sval, TypeFullName(m.kids[i].type), false); i = i + 1; }
                 int capStart = nloc; i = 0;
                 while (i < m.b.kids.Count) {
-                    Node c = m.b.kids[i]; AddLoc(c.sval, TypeFullName(c.type), false); i = i + 1;
+                    Node c = m.b.kids[i]; AddLoc(c.sval, TypeFullName(c.type), false);
+                    if ((int)c.ival < 0) { locBoxed[nloc - 1] = 1; }  // keep the cell pointer live
+                    i = i + 1;
                 }
                 ReserveLocals(m.d); frame = 16 * nloc;
                 if (frame >= 4096) { diags.Error("ngen delegate: lambda frame exceeds native immediate limit", m.line, m.col); }
@@ -739,6 +764,9 @@ partial class Ngen {
                 while (i <= m.kids.Count) { StoreLocal(i, i); i = i + 1; }
                 i = 0;
                 while (i < m.b.kids.Count) {
+                    // env[i] is the capture's value word; for a boxed capture
+                    // that word IS the shared cell, which the capture slot
+                    // keeps as-is (its reads/writes deref via locBoxed)
                     LoadLocal(0, 1); LdrU(0, 1, i * 8); StoreLocal(capStart + i, 0); i = i + 1;
                 }
                 GenStmt(m.d); LoadImm(0, 0); Epilogue();

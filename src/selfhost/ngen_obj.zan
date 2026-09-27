@@ -1496,9 +1496,12 @@ partial class Ngen {
 
     // ---- Dictionary<K, V>: parallel 8-byte slots, payload size 40 --
     // { i64 count, i64 cap, ptr keys, ptr vals, i64 kinds }.
-    // kinds bit 0: signed int keys; bit 1: signed int values. All other
-    // supported slots retain their full 64-bit value/pointer. Never treat
-    // an unsupported key type or a boxed struct as an integer slot.
+    // kinds bit 0: signed int keys (narrowed to i32 at the set boundary);
+    // bit 1: signed int values; bit 2: full-width integer keys (long/nint,
+    // stored raw and compared as 64-bit, matching the oracle's is_str=0
+    // key equality). All other supported slots retain their full 64-bit
+    // value/pointer. Never treat an unsupported key type or a boxed struct
+    // as an integer slot.
     string DictSlotTy(Node recv, bool key) {
         string ty = StaticTyOf(recv);
         if (recv != null && recv.kind == AK.NewExpr()) { ty = TypeFullName(recv.type); }
@@ -1516,9 +1519,10 @@ partial class Ngen {
         // an open generic body ("Dict<T, int>" inside HashSet<T>) emits
         // under erasure: keys/values travel as words, the int-kind bits
         // stay clear; concrete instantiations go through the spec pipeline
-        if (kt != "string" && kt != "int" && !IsTypeParamErasedNg(kt)) {
+        if (kt != "string" && kt != "int" && kt != "long" && kt != "nint"
+                && !IsTypeParamErasedNg(kt)) {
             diags.Error("ngen: unsupported Dictionary key type '" + kt
-                + "'; supported keys are string and int", curLine, curCol);
+                + "'; supported keys are string, int, long and nint", curLine, curCol);
             return false;
         }
         string valueClass = ClassTyOf(vt);
@@ -1557,13 +1561,23 @@ partial class Ngen {
             diags.Error("ngen: Dictionary string " + (key ? "key" : "value")
                 + " requires a string operand", arg.line, arg.col);
         }
+        if (target == "long" && (arg.kind == AK.NullLit() || IsStrExpr(arg)
+                || (source != null && source != "int" && source != "long"
+                && source != "ulong" && source != "nint" && source != "uint"
+                && source != "short" && source != "ushort" && source != "byte"
+                && source != "sbyte" && source != "char"))) {
+            diags.Error("ngen: cannot convert Dictionary " + (key ? "key" : "value")
+                + " from '" + source + "' to long", arg.line, arg.col);
+        }
     }
 
     // new Dictionary<K, V>(): alloc 40+16, keys/vals calloc'd at cap 4
     void GenDictNew(Node e) {
         if (!DictCheckType(e)) { LoadImm(0, 0); return; }
         int kinds = 0;
-        if (DictSlotTy(e, true) == "int") { kinds = kinds | 1; }
+        string kty = DictSlotTy(e, true);
+        if (kty == "int") { kinds = kinds | 1; }
+        else if (kty == "long" || kty == "nint") { kinds = kinds | 4; }
         if (DictSlotTy(e, false) == "int") { kinds = kinds | 2; }
         // calloc both arrays first, then the object; the arrays survive on
         // the stack while the object allocates
@@ -1806,14 +1820,21 @@ partial class Ngen {
 
     // Compare x0=stored key with x1=query, with d saved at fp-16.
     // Return EQ flags; integer comparisons use their i32 values, never
-    // addresses. String pointer equality also handles two null keys.
+    // addresses. Full-width integer keys (kinds bit 2) compare as raw
+    // 64-bit words; string pointer equality also handles two null keys.
     void RtDictCompareKey() {
         RtLdur(9, 29, -16);
         LdrU(9, 9, 32);
         LoadImm(10, 1);
         E4(0xEA0A013F);                        // tst x9, x10
-        int strings = NL(); int done = NL(); int different = NL();
-        EmitBcond(0, strings);
+        int strings = NL(); int done = NL(); int different = NL(); int notint = NL();
+        EmitBcond(1, notint);                  // bit 0 set: int keys
+        LoadImm(10, 4);
+        E4(0xEA0A013F);                        // tst x9, x10
+        EmitBcond(0, strings);                 // bit 2 clear: string keys
+        E4(0xEB01001F);                        // cmp x0, x1 (64-bit key)
+        EmitB(done);
+        Mark(notint);
         E4(0x6B01001F);                        // cmp w0, w1
         EmitB(done);
         Mark(strings);
@@ -1835,9 +1856,14 @@ partial class Ngen {
         LdrU(9, 0, 32);
         LoadImm(10, 1);
         E4(0xEA0A013F);                        // tst x9, x10
-        int keyDone = NL(); int valDone = NL();
-        EmitBcond(0, keyDone);
+        int keyDone = NL(); int valDone = NL(); int key64 = NL();
+        EmitBcond(0, key64);                   // bit 0 clear: not int keys
         E4(0x93407C21);                        // sxtw x1, w1
+        EmitB(keyDone);
+        Mark(key64);
+        LoadImm(10, 4);
+        E4(0xEA0A013F);                        // tst x9, x10
+        EmitBcond(0, keyDone);                 // bit 2 clear: string keys stay raw
         Mark(keyDone);
         LoadImm(10, 2);
         E4(0xEA0A013F);
