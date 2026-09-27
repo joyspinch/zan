@@ -41,6 +41,15 @@ def main():
             parser.error(f'Missing case: {path}')
     sdk = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True).strip()
     version = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-version'], text=True).strip()
+    # The reference compiler resolves leftover DllImport symbols by probing
+    # homebrew dylibs (libssl/libcrypto among them); mirror that so TLS
+    # stdlib cases link against the same OpenSSL build.
+    homebrew = Path.home() / '.homebrew'
+    extra_libs = []
+    for prefix in (homebrew / 'opt/openssl@3', homebrew / 'opt/openssl', Path('/opt/homebrew/opt/openssl@3')):
+        if (prefix / 'lib/libssl.dylib').exists():
+            extra_libs += ['-L' + str(prefix / 'lib'), '-lssl', '-lcrypto']
+            break
     work = Path(tempfile.mkdtemp(prefix='zan-native-parity-'))
     manifest = {'seed': str(seed), 'seed_sha256': digest(seed), 'reference': str(reference),
                 'reference_sha256': digest(reference), 'sdk': sdk, 'sdk_version': version,
@@ -85,7 +94,16 @@ def main():
                     else:
                         rc, _ = run('native_link', ['/usr/bin/ld', '-arch', 'arm64', '-e', '_main',
                             '-platform_version', 'macos', '11.0', version, '-syslibroot', sdk,
-                            '-L' + sdk + '/usr/lib', '-o', str(exe), str(obj), *map(str, runtime), '-lSystem'])
+                            '-L' + sdk + '/usr/lib',
+                            # DllImport externs the stdlib keeps referenced
+                            # (TLS wrappers) resolve via homebrew OpenSSL, as
+                            # the reference linker does; anything still left
+                            # over defers to dyld, so a called-but-unresolved
+                            # symbol faults exactly where a native library
+                            # would have been required.
+                            '-undefined', 'dynamic_lookup',
+                            *extra_libs,
+                            '-o', str(exe), str(obj), *map(str, runtime), '-lSystem'])
                         if rc != 0:
                             status = 'native_link_failed'
                         else:
