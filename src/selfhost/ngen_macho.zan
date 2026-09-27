@@ -37,15 +37,45 @@ partial class Ngen {
         return off;
     }
 
+    // prefix-sum byte offsets of the string-literal pool: StrOffset is O(n)
+    // per call and the symbol loops call it for every string
+    List<int> StrOffsets() {
+        List<int> offs = new List<int>();
+        offs.Add(0);
+        int i = 0;
+        while (i < strs.Count) { offs.Add(offs[i] + strs[i].Length + 1); i = i + 1; }
+        return offs;
+    }
+
+    // membership index over [syms | strs | dglbs] names: ExternSyms asks
+    // DefinedSym once per string reference and the per-reference linear
+    // scans (with an l_.str.N format per literal) dominated profiles on
+    // large stdlib pull-ins
+    MethIndex BuildDefSymIdx() {
+        MethIndex ix = new MethIndex();
+        int i = 0;
+        while (i < syms.Count) { ix.Add(syms[i].name, 1); i = i + 1; }
+        i = 0;
+        while (i < strs.Count) { ix.Add(StrSym(i), 1); i = i + 1; }
+        i = 0;
+        while (i < dglbs.Count) { ix.Add(DGlobalSym(dglbs[i].name), 1); i = i + 1; }
+        return ix;
+    }
+
+    int DefinedSymIdx(MethIndex ix, string name) {
+        return ix.Get(name) != null ? 1 : 0;
+    }
+
     // undefined extern names in first-reference order
     List<string> ExternSyms() {
         List<string> es = new List<string>();
+        MethIndex defIx = BuildDefSymIdx();
+        MethIndex esIx = new MethIndex();
         int i = 0;
         while (i < fixups.Count) {
             Fixup f = fixups[i];
             if (f.kind == 4) {
-                int at = IndexOf(es, f.sym);
-                if (at < 0) { es.Add(f.sym); }
+                if (esIx.Get(f.sym) == null) { es.Add(f.sym); esIx.Add(f.sym, es.Count - 1); }
             }
             i = i + 1;
         }
@@ -55,9 +85,9 @@ partial class Ngen {
         i = 0;
         while (i < strRefs.Count) {
             StrRef r = strRefs[i];
-            if (DefinedSym(r.sym) == 0 && (r.got != 0 || IndexOf(es, r.sym) < 0)) {
-                int at = IndexOf(es, r.sym);
-                if (at < 0) { es.Add(r.sym); }
+            if (DefinedSymIdx(defIx, r.sym) == 0 && esIx.Get(r.sym) == null) {
+                es.Add(r.sym);
+                esIx.Add(r.sym, es.Count - 1);
             }
             i = i + 1;
         }
@@ -278,13 +308,14 @@ partial class Ngen {
             i = i + 1;
         }
         // string literal symbols (n_sect = __cstring, local)
+        List<int> soffs = StrOffsets();
         i = 0;
         while (i < strs.Count) {
             Put32(img, stro);
             Put8(img, 0x0E);             // N_SECT (local)
             Put8(img, 2);
             Put16(img, 0);
-            Put64(img, cstrOff + StrOffset(i));
+            Put64(img, cstrOff + soffs[i]);
             stro = stro + StrSym(i).Length + 1;
             i = i + 1;
         }
