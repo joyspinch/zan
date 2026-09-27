@@ -1,6 +1,60 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-23 · v16 · 定点见下方 v16 节
+日期：2026-09-27 · v17 · 定点见下方 v17 节
+
+## v17 阶段边界批（2026-09-27，chart 1670→252，sweep 316→380，检查点 run.y2Gm7Q/run.iIz2Mx）
+
+v17b 四项回归清零 + 两项阶段闸门修复。六个根因、六个修复：
+
+1. **nsresolve 镜像按 nsresolve.c 补完**（hashset_basic）：冲突改名改回
+   "按声明顺序单遍扫描"（逐对标记 + 单遍 MangleFull），name_taken 扫描
+   全部 finals 且**不含自身豁免**——dotless 全名（全局 "Button"）与自己的
+   initial simple 相撞时按 oracle 语义跳到 _2；qualified 引用带 arity 校验，
+   静态/点式接收者镜像 resolve_static_receiver/resolve_qualified_receiver，
+   未解析裸名保留 oracle 的歧义报错。
+2. **Directory.ListNames 落到 glob(3)**（dir_watcher）：_zan_host_dir 返回
+   65536 字节换行分隔 BASENAME、已排序、不含点文件，"dir/*" 同时返回文件
+   与目录——watch-ok 场景与 oracle 逐字节一致。
+3. **pull-in 同名空间子目录下沉**（pullin_shadow_same_name）：照 oracle
+   pi_glob_into POSIX 支路——目标目录的一层子目录内 .zan 声明与目标同名
+   空间时并入（Gui/Text/Text.zan、Gui/Text/RichText.zan 等）；配 nsresolve
+   尾部 fallback（用户声明先于 stdlib，倒序扫描把 stdlib 文件里被遮蔽的
+   裸名绑回它书写时对应的声明），以及 stdlib 两处 stray 清理
+   （Gui/Text.zan 截断副本、Gui/QrEncoder.zan）。
+4. **重载贴合补窄整型/数组维度**（crypto_digests rc=139 无限互递归）：
+   Hash(byte[],int) 调用点被判给 Hash(string,int)——KnownParamTy 缺
+   byte/sbyte/short/ushort/uint/float（数组递归判元素），字面量分支按 C#
+   隐式常量转换放宽（IntLit→窄整型 5、→double/float 4；FloatLit→float 8；
+   CharLit→int/ushort/uint 4）。九组已知答案向量与 oracle 输出+rc 全同。
+5. **ELF .strtab 名称偏移与内容偏移解耦**（crossboot ELF 支路全红）：
+   字符串符号拼写是 l_.str.N，st_value 才是字符串池内容偏移——新
+   elfNoffs 前缀和（StrSym 拼写）走 st_name，elfSoffs（StrOffsets 内容）
+   走 st_value，externs 用 extNameBase/extOffsets。恢复 10 PASS。
+6. **stdlib 45 个扁平 Gui 镜像删除**（chart 剖面 1670→16998→252）：下沉
+   让子目录正本成为 provider 候选后，用户树里那套扁平镜像
+   （Gui/App.zan、Control、Event、Theme、StyleBox、Types…）被一并拉入，
+   同全名双副本把 count_simple 翻倍 → 每个 chart 用例 315 个假
+   "ambiguous type"。oracle 树 Gui 顶层**没有任何扁平 .zan**（子目录即正
+   本，Gui/Core/App.zan 是 `partial class App`）→ 扁平镜像是 stray，照
+   QrEncoder 先例删除；同全名重复族 104→10（全部是合法 partial 分片）。
+   剖面 252 的残余（BrkElapsed/gapVal/ChartBreak 族）在**两棵树都不存在**，
+   属 stdlib API 缺口而非编译器缺陷。
+
+验证：39/39；crossboot 10 PASS；定点 run.y2Gm7Q 与 run.iIz2Mx
+（stage2.o==stage3.o 逐字节）；定向 pullin/hashset/crypto/dir/namespace
+8/8 全绿；全量 sweep 316→**380**（ncf 169→100，em 7，om 5，mne 13，
+rcf 119；翻绿 gui_cef_profile，cef_runtime_index ncf→om；v17b 批内
+hashset_basic/pullin_shadow_same_name/dir_watcher/crypto_digests/
+mqtt_lwt_retain/ns_conflict_generic_arity 先后翻绿）。mqtt_lwt_retain
+确认**用例自身竞态**（连跑三次 2×em + 1×pass，与工具链无关）。
+
+**下一批**（按既定顺序）：v18 首项 nsresolve 收集 DelegateDecl
+（oracle is_type_decl_kind 五类；现存实冲突 Gui.Action vs
+Gui.Reactive.Action，Gui/Core/Event.zan:10 vs Gui/Reactive/Events.zan:7，
+当前靠 binder 注册序兜底而非改名重写）；ncf-100 簇（unknown method 23 /
+arity mismatch 13 / async 赋值目标 10 / List 操作 9 / unknown field 8 /
+index target 4 / 表达式 kind 49 ×3 / ...）；cef_runtime_index om 与
+http_client_keepalive 并发 HTTP 池 HttpRequestException 归因。
 
 ## v16 委托捕获/方法组形状批（2026-09-23，chart 2138→1670，sweep 315→316，检查点 run.xwRh1F）
 
