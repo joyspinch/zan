@@ -48,13 +48,14 @@ hashset_basic/pullin_shadow_same_name/dir_watcher/crypto_digests/
 mqtt_lwt_retain/ns_conflict_generic_arity 先后翻绿）。mqtt_lwt_retain
 确认**用例自身竞态**（连跑三次 2×em + 1×pass，与工具链无关）。
 
-**下一批**（按既定顺序）：v18 首项 nsresolve 收集 DelegateDecl
-（oracle is_type_decl_kind 五类；现存实冲突 Gui.Action vs
-Gui.Reactive.Action，Gui/Core/Event.zan:10 vs Gui/Reactive/Events.zan:7，
-当前靠 binder 注册序兜底而非改名重写）；ncf-100 簇（unknown method 23 /
-arity mismatch 13 / async 赋值目标 10 / List 操作 9 / unknown field 8 /
-index target 4 / 表达式 kind 49 ×3 / ...）；cef_runtime_index om 与
-http_client_keepalive 并发 HTTP 池 HttpRequestException 归因。
+**下一批**（按既定顺序）：ncf-100 簇（unknown method 23 / arity mismatch
+13 / async 赋值目标 10 / List 操作 9 / unknown field 8 / index target 4 /
+表达式 kind 49 ×3 / ...）；cef_runtime_index om 与 http_client_keepalive
+并发 HTTP 池 HttpRequestException 归因。（澄清：QualifyTypes 五类
+type-decl 已含 DelegateDecl——Gui.Action 与 Gui.Reactive.Action 的跨空间
+实冲突已按 oracle 语义改名并重写引用；剖析报告里 4 个 "ambiguous
+type 'Action'" 全部来自已删除的扁平 Event.zan 副本把 count_simple 翻倍，
+删除后消失。）
 
 ## v16 委托捕获/方法组形状批（2026-09-23，chart 2138→1670，sweep 315→316，检查点 run.xwRh1F）
 
