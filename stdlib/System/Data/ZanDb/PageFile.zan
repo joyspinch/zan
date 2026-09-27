@@ -53,6 +53,10 @@ class PageFile {
     [DllImport("crt", EntryPoint = "_write")]
     static extern int WriteFd(int fd, nint buf, int count);
 
+    // _chsize_s() 把文件截断/扩展到指定长度（长整型版本）。
+    [DllImport("crt", EntryPoint = "_chsize_s")]
+    static extern int TruncFd(int fd, long size);
+
     // _locking() 从当前文件位置开始锁定一个字节范围；
     // 模式 1（_LK_LOCK）阻塞（约重试 10 秒），2（_LK_NBLCK）快速失败，
     // 0（_LK_UNLCK）释放锁。
@@ -73,6 +77,10 @@ class PageFile {
 
     [DllImport("crt", EntryPoint = "pwrite")]
     static extern int PWriteFd(int fd, nint buf, int count, long offset);
+
+    // ftruncate() 把文件截断/扩展到指定长度。
+    [DllImport("crt", EntryPoint = "ftruncate")]
+    static extern int TruncFd(int fd, long size);
 
     // flock(): 2 = LOCK_EX, 8 = LOCK_UN, 4 = LOCK_NB
     [DllImport("crt", EntryPoint = "flock")]
@@ -177,6 +185,13 @@ class PageFile {
         return SyncFd(this.fd) == 0;
     }
 
+    /// <summary>把文件截断/扩展到 size 字节。日志重放后用
+    /// 它清掉撕裂尾部。</summary>
+    bool Truncate(long size) {
+        if (this.fp == 0) { return false; }
+        return TruncFd(this.fd, size) == 0;
+    }
+
     /// <summary>获取整个文件的独占锁，等待当前
     /// 持有者释放。若进程
     /// 退出，锁由操作系统释放，因此崩溃的写入者不会卡死数据库。</summary>
@@ -194,6 +209,18 @@ class PageFile {
         return false;
         #else
         return FlockFd(this.fd, 2) == 0;
+        #endif
+    }
+
+    /// <summary>非阻塞独占锁：立即返回，抢不到即 false。用于
+    /// 「检测到别的持有者就拒绝打开」而不是排队等待。</summary>
+    bool TryLockExclusive() {
+        if (this.fp == 0) { return false; }
+        #if WINDOWS
+        if (SeekFd(this.fd, 0, 0) < 0) { return false; }
+        return LockFd(this.fd, 2, 1) == 0;                     // _LK_NBLCK
+        #else
+        return FlockFd(this.fd, 6) == 0;                       // LOCK_EX|LOCK_NB
         #endif
     }
 

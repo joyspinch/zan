@@ -1,17 +1,19 @@
-// GenForm.zan -- .zform 设计文档 → 合成 partial class 的代码生成器。
+// GenForm.zan -- 设计文档 → 合成 partial class 的代码生成器。
 // 等价迁移自 src/compiler/formgen.c(输出逐字节一致)。
 //
 // 输入(design 请求的 files[i]):
-//   { "name": "App.zform", "text": "<.zform JSON>", "emitMain": bool }
+//   { "name": "App.html", "text": "<.html 设计稿>", "emitMain": bool }
 // 输出:reply.sources 里追加一段名为 name 的 .zan 源码。
 using System;
 using System.Web;
 
 namespace System.Compiler;
 
-/// <summary>.zform 设计文档到合成 partial class 的代码生成器。
+/// <summary>设计文档到合成 partial class 的代码生成器。
 /// 与 src/compiler/formgen.c 等价(输出逐字节一致);入口是
-/// <see cref="Translate"/>,由 design 请求分派 .zform 文件进来。</summary>
+/// <see cref="Translate"/>,由 design 请求分派 .html 设计稿进来
+/// (.zform JSON 设计文档已删,旧项目先转 .html—— DesignerHtml
+/// FromJsonDoc 是规范转换器)。</summary>
 class GenForm {
     /// 本轮 design 请求携带的用户组件文档（design 请求的
     /// components[i]: { name, text }，来自工程 components/*.zcomp）。
@@ -20,7 +22,7 @@ class GenForm {
     static List<string> compNames;
     static List<JsonValue> compDocs;
 
-    /// 翻译 design 请求里所有 .zform 文件(.zscene 归 GenScene):
+    /// 翻译 design 请求里所有 .html 设计稿(.zscene 归 GenScene):
     /// 逐个解析、校验、合成为 .zan 源码,经 GenCommon.AddSource
     /// 追加进 reply 的 sources;失败时写 reply 的 error 后返回。
     static void Translate(JsonValue req, JsonValue reply) {
@@ -58,22 +60,19 @@ class GenForm {
         for (int i = 0; i < files.Count(); i = i + 1) {
             JsonValue f = files.At(i);
             string fname = f.Str("name", "");
-            /* 只处理 .zform 与 .html 设计稿;.zscene 归 GenScene,
-             * 运行期 HTML UI 文档(无设计标记)归 GenHtml——与 C 端
-             * zan_is_design_path 的按扩展名分派一致。 */
+            /* 只处理 .html 设计稿(.zform 通道已删,.zscene 归
+             * GenScene,运行期 HTML UI 文档(无设计标记)归
+             * GenHtml——与 C 端 zan_is_design_path 的按扩展名分派
+             * 一致)。 */
             string flower = fname.ToLower();
-            bool isZform = fname.EndsWith(".zform");
-            bool isHtmlDoc = (flower.EndsWith(".html") || flower.EndsWith(".htm"))
-                && !isZform;
-            if (!isZform && !isHtmlDoc) { continue; }
+            bool isHtmlDoc = (flower.EndsWith(".html") || flower.EndsWith(".htm"));
+            if (!isHtmlDoc) { continue; }
             string text = f.Str("text", "");
-            if (isHtmlDoc) {
-                /* .html 设计稿(body 带 data-zan-design 标记)走同一
-                 * GenForm 投影:先把 HTML 解回 JSON 文档模型再合成
-                 * partial class。 */
-                if (!DesignerHtml.IsDesignDoc(text)) { continue; }
-                text = DesignerHtml.ToJsonDoc(text);
-            }
+            /* .html 设计稿(body 带 data-zan-design 标记)走同一
+             * GenForm 投影:先把 HTML 解回 JSON 文档模型再合成
+             * partial class。 */
+            if (!DesignerHtml.IsDesignDoc(text)) { continue; }
+            text = DesignerHtml.ToJsonDoc(text);
             bool emitMain = f.Bool("emitMain", false);
             StringBuilder outText = GenForm.TranslateOne(reply, text, fname, emitMain);
             if (outText == null) {
@@ -87,8 +86,9 @@ class GenForm {
         }
     }
 
-    /// 翻译单个 .zform 文档。失败返回 null;具体诊断(非法 kind 等)
-    /// 已写入 reply 的 error,纯解析失败则不设 error(C 端报通用错误)。
+    /// 翻译单个设计文档(JSON 模型,来自 DesignerHtml.ToJsonDoc)。
+    /// 失败返回 null;具体诊断(非法 kind 等)已写入 reply 的 error,
+    /// 纯解析失败则不设 error(C 端报通用错误)。
     static StringBuilder TranslateOne(JsonValue reply, string json,
                                       string file_name, bool emit_main) {
         JsonValue root;
@@ -100,7 +100,7 @@ class GenForm {
 
         string name = GenForm.ObjStr(root, "name");
         if (!GenCommon.IsIdent(name)) {
-            /* fall back to the file's base name (strip dir and .zform) */
+            /* fall back to the file's base name (strip dir and extension) */
             string base0 = file_name;
             if (base0 == null) { base0 = ""; }
             int slash = base0.LastIndexOf("/");
@@ -110,8 +110,7 @@ class GenForm {
             else if (bslash >= 0) { p = bslash + 1; }
             string nm = base0.Substring(p);
             string nml = nm.ToLower();
-            if (nm.EndsWith(".zform")) { nm = nm.Substring(0, nm.Length - 6); }
-            else if (nml.EndsWith(".html")) { nm = nm.Substring(0, nm.Length - 5); }
+            if (nml.EndsWith(".html")) { nm = nm.Substring(0, nm.Length - 5); }
             else if (nml.EndsWith(".htm")) { nm = nm.Substring(0, nm.Length - 4); }
             if (nm.Length > 127) { nm = nm.Substring(0, 127); }
             if (!GenCommon.IsIdent(nm)) { nm = "Form"; }
@@ -142,6 +141,10 @@ class GenForm {
         JsonValue h = root.Get("winH");
         if (h != null && h.IsNumber() && h.AsInt(0) > 0) { win_h = h.AsInt(0); }
         bool free_mode = GenForm.ObjNum(root, "layoutMode", 0) == 1;
+        int form_size = GenForm.ObjNum(root, "formSize", 1);
+        string default_size_class = "";
+        if (form_size == 0) { default_size_class = "large"; }
+        else if (form_size == 2) { default_size_class = "small"; }
         /* role: "control" 生成可嵌入的 `partial class X : Control`(面板、
          * 视图、卡片),缺省或 "window" 生成窗体。控件文档没有窗口,
          * 因此不能充当项目入口。 */
@@ -150,7 +153,7 @@ class GenForm {
         if (fn0 == null) { fn0 = "<design>"; }
         if (ctl && emit_main) {
             GenCommon.Fail(reply, fn0 +
-                ": a .zform with \"role\": \"control\" cannot be the project" +
+                ": a design document with \"role\": \"control\" cannot be the project" +
                 " entry; the entry document must be a window");
             return null;
         }
@@ -165,8 +168,16 @@ class GenForm {
         if (py != null && py.IsNumber()) { pos_y = py.AsInt(0); }
         int win_shape = GenForm.ObjNum(root, "winShape", 0);
         int win_shape_radius = GenForm.ObjNum(root, "winShapeRadius", 0);
-        int win_shadow = GenForm.ObjNum(root, "winShadow", 0);
-        int win_opacity = GenForm.ObjNum(root, "winOpacity", 0);
+        if (win_shape == 1 && win_shape_radius <= 0) { win_shape_radius = 12; }
+        int win_shadow = 0;
+        JsonValue wsd = root.Get("winShadow");
+        if (wsd != null && wsd.IsNumber()) {
+            win_shadow = wsd.AsInt(0);
+        } else if (win_shape != 0 || GenForm.ObjBool(root, "winRound")) {
+            win_shadow = 10;
+        }
+        int win_opacity = GenForm.ObjNum(root, "winOpacity", 100);
+        if (win_opacity <= 0) { win_opacity = 100; }
         bool win_glass = GenForm.ObjBool(root, "winGlass");
         bool win_chrome = true;
         JsonValue wch = root.Get("winChrome");
@@ -209,23 +220,6 @@ class GenForm {
                 Convert.ToString(win_h) + ",0";
         }
 
-        /* winShadow: prepend a type-3 "shadow band" region. */
-        if (win_shadow > 0 && shape_spec.Length > 0) {
-            int max_r = win_shape_radius;
-            if (wshape != null && wshape.IsArray()) {
-                for (int i = 0; i < wshape.Count(); i = i + 1) {
-                    int rr = GenForm.ObjNum(wshape.At(i), "r", 0);
-                    if (rr > max_r) { max_r = rr; }
-                }
-            }
-            int band_r = max_r + win_shadow;
-            if (band_r < 8) { band_r = 8; }
-            if (band_r > 64) { band_r = 64; }
-            string band = "3,0,0," + Convert.ToString(win_w) + "," +
-                Convert.ToString(win_h) + "," + Convert.ToString(band_r) + ";";
-            shape_spec = band + shape_spec;
-        }
-
         StringBuilder decls = new StringBuilder();
         StringBuilder body = new StringBuilder();
         StringBuilder wire = new StringBuilder();
@@ -245,32 +239,40 @@ class GenForm {
             int id = 0;
             string rootParent = self;
             if (!free_mode) {
-                body.Append("        FbFlow __flow = new FbFlow();\n");
-                body.Append("        __flow.Dock(Dock.Top());\n");
+                body.Append("        Gui.Widget.FbFlow __flow = new Gui.Widget.FbFlow();\n");
+                body.Append("        __flow.Dock(Gui.Dock.Top());\n");
                 body.Append("        " + self + ".Add(__flow);\n");
                 rootParent = "__flow";
             }
             for (int i = 0; i < fields.Count(); i = i + 1) {
                 id = GenForm.EmitField(decls, body, wire, valid, fields.At(i),
-                                       rootParent, id, used, free_mode,
-                                       !free_mode, dispatch, ctl, false);
+                                       rootParent, "", id, used, free_mode,
+                                       !free_mode, dispatch, ctl, false,
+                                       default_size_class);
             }
         }
 
         /* ---- assemble the synthetic partial class ---- */
+        /* 重家族 using 按需发射：auto-stdlib 按 using 指令把
+         * stdlib/X/Y/Z 整目录编译进图，无条件发射会让没放图表/
+         * 表格/浏览器的简单设计也背上全家（发布体积治理，见
+         * ControlFactory 的重臂注册制）。先扫设计树的实际 kind。 */
+        bool[] heavy = new bool[4];
+        GenForm.ScanHeavyKinds(root, heavy);
         StringBuilder out0 = new StringBuilder();
         out0.Append("using System;\n");
         out0.Append("using Gui;\n");
         out0.Append("using Gui.Widget;\n");
         out0.Append("using Gui.Hmi;\n");
         out0.Append("using Gui.Component;\n");
-        out0.Append("using Gui.Component.Chart;\n");
-        out0.Append("using Gui.Component.DataTable;\n");
-        out0.Append("using Gui.Component.WebView;\n");
+        if (heavy[0]) { out0.Append("using Gui.Component.Chart;\n"); }
+        if (heavy[1]) { out0.Append("using Gui.Component.DataTable;\n"); }
+        if (heavy[2]) { out0.Append("using Gui.Component.WebView;\n"); }
         /* CefBrowserBox 和 WebViewBox 一样是设计器一等控件
          * （见 ControlFactory.Kinds），设计里放一个浏览器就必须
          * 在生成的布局代码里解析得到它的类型。 */
-        out0.Append("using Gui.Component.CefBrowser;\n\n");
+        if (heavy[3]) { out0.Append("using Gui.Component.CefBrowser;\n"); }
+        out0.Append("\n");
         if (ctl) {
             out0.Append("// <auto-generated> Control layout compiled from ");
         } else {
@@ -281,7 +283,7 @@ class GenForm {
         out0.Append("// Regenerated from the visual design on every build - do not edit.\n");
         out0.Append("// Write your initialization and event logic in " + name + ".zan.\n");
         if (ctl) {
-            out0.Append("partial class " + name + " : Control {\n");
+            out0.Append("partial class " + name + " : Gui.Control {\n");
         } else {
             out0.Append("partial class " + name + " {\n");
         }
@@ -291,7 +293,7 @@ class GenForm {
             out0.Append("    /// control is attached to a window tree (OnHostForm),\n");
             out0.Append("    /// so a host never wires anything by hand; it is null\n");
             out0.Append("    /// while the control lives outside any window.\n");
-            out0.Append("    Form __form;\n");
+            out0.Append("    Gui.Form __form;\n");
         } else {
             out0.Append("    /// The live form, kept for the non-capturing handler\n");
             out0.Append("    /// lambdas (the generator keeps handlers capture-free).\n");
@@ -299,7 +301,7 @@ class GenForm {
             out0.Append("    /// assigned by __BuildForm() and are only valid once\n");
             out0.Append("    /// __CreateWindow() has returned; showing the window\n");
             out0.Append("    /// again rebuilds the tree and overwrites them.\n");
-            out0.Append("    static Form __form;\n");
+            out0.Append("    static Gui.Form __form;\n");
         }
         if (decls.Length > 0) {
             out0.Append(decls.ToString());
@@ -335,9 +337,9 @@ class GenForm {
             out0.Append("\"; }\n\n");
         } else {
             out0.Append("    /// Builds the designed control tree (real, interactive widgets).\n");
-            out0.Append("    static Control __BuildForm() {\n");
-            out0.Append("        Panel root = Panel.Root(\"root\");\n");
-            out0.Append("        root.Dock(Dock.Fill());\n");
+            out0.Append("    static Gui.Control __BuildForm() {\n");
+            out0.Append("        Gui.Widget.Panel root = Gui.Widget.Panel.Root(\"root\");\n");
+            out0.Append("        root.Dock(Gui.Dock.Fill());\n");
             if (free_mode) {
                 // 自由画布：坐标发射逻辑字段（logX/logY/logW/logH），
                 // 应用按当前 dpiScale 重解；不再发射构建期
@@ -367,7 +369,7 @@ class GenForm {
         out0.Append("    /// registry on the form (see Form.On / Form.Handle). Unregistered\n");
         out0.Append("    /// handler names simply never fire.\n");
         if (ctl) {
-            out0.Append("    override void OnHostForm(Form form) {\n");
+            out0.Append("    override void OnHostForm(Gui.Form form) {\n");
             out0.Append("        this.__form = form;\n");
             out0.Append("    }\n\n");
             out0.Append("    /// Routes a designed binding to the host form's handler\n");
@@ -385,7 +387,7 @@ class GenForm {
                 out0.Append("    }\n\n");
             }
         } else {
-            out0.Append("    static void __WireForm(Form form) {\n");
+            out0.Append("    static void __WireForm(Gui.Form form) {\n");
             out0.Append("        __form = form;\n");
             if (wire.Length > 0) { out0.Append(wire.ToString()); }
             out0.Append("    }\n\n");
@@ -394,8 +396,8 @@ class GenForm {
             out0.Append("    /// Builds this designed window: control tree, window\n");
             out0.Append("    /// attributes, OnLoad and the event wiring - everything except\n");
             out0.Append("    /// the event loop, so a caller may still adjust it before Run().\n");
-            out0.Append("    static Form __CreateWindow() {\n");
-            out0.Append("        Form form = Form.Create(\"");
+            out0.Append("    static Gui.Form __CreateWindow() {\n");
+            out0.Append("        Gui.Form form = Gui.Form.Create(\"");
             out0.Append(GenCommon.Esc(title));
             out0.Append("\", " + Convert.ToString(win_w) + ", " +
                         Convert.ToString(win_h) + ");\n");
@@ -441,11 +443,14 @@ class GenForm {
             out0.Append("    /// This is how one window calls another:\n");
             out0.Append("    ///     " + name + ".Show();\n");
             out0.Append("    static void Show() {\n");
-            out0.Append("        Form form = " + name + ".__CreateWindow();\n");
+            out0.Append("        Gui.Form form = " + name + ".__CreateWindow();\n");
             out0.Append("        form.Run();\n");
             out0.Append("    }\n");
             if (emit_main) {
-                out0.Append("\n    static void Main() {\n");
+                // Internal fallback entry: the compiler prefers an explicit
+                // user Main anywhere in the input set and uses this only when
+                // the design document is the whole application.
+                out0.Append("\n    static void __DesignMain() {\n");
                 out0.Append("        " + name + ".Show();\n");
                 out0.Append("    }\n");
             }
@@ -611,19 +616,25 @@ class GenForm {
         for (int i = 0; i < arr.Count(); i = i + 1) {
             JsonValue o = arr.At(i);
             if (o == null || !o.IsObject()) {
-                GenCommon.Fail(reply, f0 + ": .zform field " +
+                GenCommon.Fail(reply, f0 + ": design field " +
                     Convert.ToString(i) + " must be an object");
                 continue;
             }
             string kind = GenForm.KindOf(o);
             if (!GenCommon.IsIdent(kind)) {
-                GenCommon.Fail(reply, f0 + ": .zform field " +
+                GenCommon.Fail(reply, f0 + ": design field " +
                     Convert.ToString(i) +
                     " requires a valid Zan Control kind; use the class name in \"kind\"");
             }
+            if (GenForm.NonConstructibleKinds().Contains(kind)) {
+                GenCommon.Fail(reply, f0 + ": design field " +
+                    Convert.ToString(i) + ": kind '" + kind +
+                    "' is an abstract base and cannot be instantiated; "
+                    + "use a concrete subclass (RadioGroup, CheckboxGroup)");
+            }
             string of = GenForm.ObjStr(o, "of");
             if (of.Length > 0 && !GenForm.ValidTypeArgs(of)) {
-                GenCommon.Fail(reply, f0 + ": .zform field " +
+                GenCommon.Fail(reply, f0 + ": design field " +
                     Convert.ToString(i) +
                     " has an invalid \"of\": type arguments must be Zan type names");
             }
@@ -634,44 +645,76 @@ class GenForm {
         }
     }
 
-    /// 校验 DataGrid 的声明式列:columns 必须是对象数组,每列的
-    /// "field" 是行实体上的字段路径(点分标识符),"type" 只认
-    /// text/num/real/bool/date。带列的网格还必须写 "of"——列访问器
-    /// 读的是 "of" 类型的字段,缺省的 string 上没有它们。
+    /// 校验 DataGrid 的声明式列。列有两个声明面：手写文档的
+    /// columns 对象数组，与设计器列编辑器写出的 options
+    /// "标题:字段" 选项串（设计器以 options 为列序真相，columns
+    /// 条目只是同下标的声明属性跟随表）。任一面声明了带字段的
+    /// 列，"of" 就是必需的——列访问器读的是 "of" 类型的字段，
+    /// 缺省的 string 上没有它们。
     static void ValidateColumns(JsonValue reply, JsonValue o, string f0,
                                 int idx) {
         JsonValue cols = o.Get("columns");
-        if (cols == null) { return; }
-        if (!cols.IsArray()) {
-            GenCommon.Fail(reply, f0 + ": .zform field " +
+        if (cols != null && !cols.IsArray()) {
+            GenCommon.Fail(reply, f0 + ": design field " +
                 Convert.ToString(idx) +
                 ": DataGrid \"columns\" must be an array of column objects");
             return;
         }
-        if (cols.Count() > 0 && GenForm.ObjStr(o, "of").Length == 0) {
-            GenCommon.Fail(reply, f0 + ": .zform field " +
-                Convert.ToString(idx) +
-                ": a DataGrid with \"columns\" requires \"of\" naming the row" +
-                " entity type");
+        JsonValue opts = o.Get("options");
+        bool optField = false;
+        if (opts != null && opts.IsArray()) {
+            for (int j = 0; j < opts.Count(); j = j + 1) {
+                string opt = opts.At(j).AsString("");
+                string fld = GenForm.OptFieldOf(opt);
+                if (fld.Length > 0) {
+                    optField = true;
+                    if (!GenForm.ValidFieldPath(fld)) {
+                        GenCommon.Fail(reply, f0 + ": design field " +
+                            Convert.ToString(idx) + " column option '" +
+                            opt + "' has an invalid field '" + fld +
+                            "'; use dotted identifiers (name, addr.city)");
+                    }
+                }
+            }
         }
+        bool hasCols = cols != null && cols.IsArray() && cols.Count() > 0;
+        if (!hasCols && !optField) { return; }
+        if (GenForm.ObjStr(o, "of").Length == 0) {
+            GenCommon.Fail(reply, f0 + ": design field " +
+                Convert.ToString(idx) +
+                ": a DataGrid with declarative columns (\"columns\" or" +
+                " \"options\" title:field entries) requires \"of\" naming" +
+                " the row entity type");
+        }
+        if (cols == null || !cols.IsArray()) { return; }
         for (int j = 0; j < cols.Count(); j = j + 1) {
             JsonValue c = cols.At(j);
             if (c == null || !c.IsObject()) {
-                GenCommon.Fail(reply, f0 + ": .zform field " +
+                GenCommon.Fail(reply, f0 + ": design field " +
                     Convert.ToString(idx) + " column " + Convert.ToString(j) +
                     " must be an object");
                 continue;
             }
+            /* 条目自己的 field 缺省时，同下标 options 的 "标题:字段"
+             * 供给字段名（设计器的跟随表形态）——两处都没有才报错。 */
             string field = GenForm.ObjStr(c, "field");
-            if (!GenForm.ValidFieldPath(field)) {
-                GenCommon.Fail(reply, f0 + ": .zform field " +
+            if (field.Length == 0) {
+                field = GenForm.OptFieldAt(opts, j);
+            }
+            if (field.Length == 0) {
+                GenCommon.Fail(reply, f0 + ": design field " +
                     Convert.ToString(idx) + " column " + Convert.ToString(j) +
                     " requires \"field\": a field name on the row entity");
+            } else if (!GenForm.ValidFieldPath(field)) {
+                GenCommon.Fail(reply, f0 + ": design field " +
+                    Convert.ToString(idx) + " column " + Convert.ToString(j) +
+                    " has an invalid \"field\" '" + field +
+                    "'; use dotted identifiers (name, addr.city)");
             }
             string t = GenForm.ObjStr(c, "type");
             if (t.Length > 0 && t != "text" && t != "num" && t != "real" &&
                 t != "bool" && t != "date") {
-                GenCommon.Fail(reply, f0 + ": .zform field " +
+                GenCommon.Fail(reply, f0 + ": design field " +
                     Convert.ToString(idx) + " column " + Convert.ToString(j) +
                     " has unknown \"type\" '" + t +
                     "'; use text, num, real, bool or date");
@@ -697,11 +740,44 @@ class GenForm {
         return "";
     }
 
+    /// 设计树重家族 kind 扫描（生成头部按需发射 using 用）：
+    /// flags[0]=Chart（ChartHost）、flags[1]=DataTable（DataGrid/
+    /// Transfer）、flags[2]=WebView（WebViewBox）、flags[3]=Cef
+    /// （CefBrowserBox）。kind 别名与 TypeOf 同步归一
+    /// （Table/DataTable→DataGrid、Chart→ChartHost）。递归数组与
+    /// 对象的 "kids"/"fields" 子树；其余节点忽略。
+    static void ScanHeavyKinds(JsonValue node, bool[] flags) {
+        if (node == null) { return; }
+        if (node.IsArray()) {
+            for (int i = 0; i < node.Count(); i = i + 1) {
+                GenForm.ScanHeavyKinds(node.At(i), flags);
+            }
+            return;
+        }
+        if (!node.IsObject()) { return; }
+        string kind = GenForm.KindOf(node);
+        if (kind == "Table" || kind == "DataTable") { kind = "DataGrid"; }
+        if (kind == "Chart") { kind = "ChartHost"; }
+        if (kind == "ChartHost") { flags[0] = true; }
+        else if (kind == "DataGrid" || kind == "Transfer") { flags[1] = true; }
+        else if (kind == "WebViewBox") { flags[2] = true; }
+        else if (kind == "CefBrowserBox") { flags[3] = true; }
+        JsonValue kids = node.Get("kids");
+        if (kids != null && kids.IsArray()) { GenForm.ScanHeavyKinds(kids, flags); }
+        JsonValue fs = node.Get("fields");
+        if (fs != null && fs.IsArray()) { GenForm.ScanHeavyKinds(fs, flags); }
+    }
+
     /// 字段的 Zan 类型:泛型控件在 "of" 里写类型实参
     /// (`"kind": "ListView", "of": "string"` -> `ListView<string>`),
     /// 多个实参用逗号分隔。非泛型控件就是 kind 本身。
     static string TypeOf(JsonValue o) {
         string kind = GenForm.KindOf(o);
+        // 导出器（Gui.Designer.DesignExport）把裸标签容器（div/span）
+        // 写成 kind="Element" + "tag" 键：它们是 HTML 声明层的通用
+        // 元素，不是 Widget 类。发射 InitElement(tag) 构造的
+        // Gui.Element（见 EmitField）。
+        if (kind == "Element") { return "Gui.Element"; }
         // 旧设计稿把表格字段写成 "Table"/"DataTable"——两者都不是
         // Control（Table 只是设计器画布的静态表头渲染器），统一
         // 归到泛型 DataGrid<T>。
@@ -721,8 +797,73 @@ class GenForm {
         if (kind == "Ribbon") { kind = "ToolStrip"; }
         string of = GenForm.ObjStr(o, "of");
         if (of.Length == 0) { of = GenForm.DefaultTypeArgs(kind); }
-        if (of.Length == 0) { return kind; }
-        return kind + "<" + of + ">";
+        if (of.Length == 0) { return GenForm.QualifyKind(kind); }
+        return GenForm.QualifyKind(kind) + "<" + of + ">";
+    }
+
+    /// 控件 kind → 命名空间限定名（A314）。生成类落在全局命名空间，
+    /// 裸 `Panel`/`Button` 会优先绑定到用户项目的同名全局类（全局
+    /// 声明压过 using import），字段与构造必须发射限定名才能锁住
+    /// stdlib 真身（遮蔽下的限定逃逸，见 A312）。名单与
+    /// ControlFactory.Kinds() 对齐（外加泛型控件 ListView/Dropdown）；
+    /// 名单外的 kind 是用户自定义 Control 派生类，保持裸名让它解析
+    /// 到用户项目自己的类。
+    static string QualifyKind(string kind) {
+        if (kind == "DataGrid") { return "Gui.Component.DataTable.DataGrid"; }
+        if (kind == "WebViewBox") { return "Gui.Component.WebView.WebViewBox"; }
+        if (kind == "CefBrowserBox") { return "Gui.Component.CefBrowser.CefBrowserBox"; }
+        if (kind == "ChartHost") { return "Gui.Component.Chart.ChartHost"; }
+        // 工业与告警件声明在 Gui.Hmi（Hmi/Alarm、Indicator、Gauge、
+        // NumPad、Trend、EquipPanel），不在 Gui.Widget——限定错命名
+        // 空间的名字全靠解析器的简单名回退碰巧编过，用户项目一旦
+        // 出现同名全局类就报 undefined（探针实证），必须锁真身。
+        // 该支路必须在 IsStdWidgetKind 门槛之前：Hmi kind 大多不在
+        // 那张名单里，放在门槛后会先被放行成裸名（遮蔽探针实证）。
+        if (GenForm.IsHmiKind(kind)) { return "Gui.Hmi." + kind; }
+        if (!GenForm.IsStdWidgetKind(kind)) { return kind; }
+        return "Gui.Widget." + kind;
+    }
+
+/// 设计文档里不允许实例化的 kind：抽象基类（ChoiceGroup 是
+/// RadioGroup/CheckboxGroup 的基类，自身无零参构造，GenForm 发射
+/// `new ChoiceGroup()` 会得到 labels/children 为 null 的半初始化实例，
+/// 首帧即空引用——html_gallery 曾因此整卡崩溃）。名单内 kind 一律
+/// 在校验期报错，具体子类不受影响。
+static List<string> NonConstructibleKinds() {
+    List<string> k = new List<string>{
+        "ChoiceGroup"};
+    return k;
+}
+
+    static bool IsStdWidgetKind(string kind) {
+        List<string> k = new List<string>{
+            "Panel", "Label", "Button", "Progress", "Input", "TextArea",
+            "InputOtp", "InputNumber", "Switch", "Checkbox", "Radio",
+            "Slider", "SelectBox",
+            "Rate", "Pagination", "Tabs", "DatePicker", "ColorPicker",
+            "VirtualList", "AlarmBanner", "AlarmList", "SplitPanel",
+            "ToolStrip", "StatusBar", "FloatButton", "RadioGroup",
+            "RadioButtonGroup", "CheckboxGroup", "ScrollColumn", "Divider",
+            "Flex", "Grid", "GridItem", "Image", "Watermark", "Countdown",
+            "QrCode", "Upload", "NumberAnimation", "Marquee", "DynamicTags",
+            "Calendar", "Transfer", "ListView", "Dropdown", "Card",
+            // 展示/反馈/导航族的其余面板 kind——工具箱全量可放置，
+            // 名单缺了它们就会发裸名，用户项目的同名全局类压过
+            // stdlib 真身（A312/A314）。
+            "Tag", "Badge", "Avatar", "Statistic", "Timeline", "TreeView",
+            "Collapse", "Empty", "Result", "Skeleton", "Spin", "Steps",
+            "Breadcrumb", "PageHeader", "Carousel" };
+        return k.Contains(kind);
+    }
+
+    /// 声明在 Gui.Hmi 命名空间的保留控件（工业/告警族，见
+    /// Hmi/Alarm、Indicator、Gauge、NumPad、Trend、EquipPanel）。
+    /// QualifyKind 据此发射 `Gui.Hmi.X` 而不是 `Gui.Widget.X`。
+    static bool IsHmiKind(string kind) {
+        List<string> k = new List<string>{
+            "AlarmBanner", "AlarmList", "Led", "Digital", "Gauge",
+            "Bargraph", "Trend", "NumPad", "DeviceCard", "EquipPanel" };
+        return k.Contains(kind);
     }
 
     /// 泛型控件缺省的类型实参:设计器放置的控件只有 kind,
@@ -801,7 +942,11 @@ class GenForm {
     /// Join options with '|' (mirrors JoinOpts).
     static string JoinOpts(JsonValue o) {
         JsonValue opts = o.Get("options");
-        if (opts == null || !opts.IsArray() || opts.Count() == 0) { return null; }
+        if (opts == null) { return null; }
+        // 字符串形式（"a|b|c"）本身就是 SetProp 的取值形态——
+        // 原生 <select><option> 折进模型的就是它，不必再拼。
+        if (opts.IsString()) { return opts.AsString(""); }
+        if (!opts.IsArray() || opts.Count() == 0) { return null; }
         string out0 = "";
         for (int i = 0; i < opts.Count(); i = i + 1) {
             JsonValue it = opts.At(i);
@@ -811,19 +956,38 @@ class GenForm {
         return out0;
     }
 
+    /// 发射一条字符串 SetProp：值超长（base64 资源等）时拆成
+    /// 多段字面量相加，绕开单字面量 4095 字符的词法上限。
+    static void EmitSetProp(StringBuilder b, string vn, string key,
+                            string v) {
+        b.Append("        " + vn + ".SetProp(\"");
+        b.Append(GenCommon.Esc(key));
+        b.Append("\", ");
+        int at = 0;
+        int n = 0;
+        while (at < v.Length) {
+            int take = v.Length - at;
+            if (take > 3000) { take = 3000; }
+            if (n > 0) { b.Append(" + "); }
+            b.Append("\"");
+            b.Append(GenCommon.Esc(v.Substring(at, take)));
+            b.Append("\"");
+            at = at + take;
+            n = n + 1;
+        }
+        if (n == 0) { b.Append("\"\""); }
+        b.Append(");\n");
+    }
+
     /// 应用 schema 级属性(options/placeholder/required/defOn)。
     static void FieldSetup(StringBuilder b, JsonValue o, string vn) {
         string opts = GenForm.JoinOpts(o);
         if (opts != null && opts.Length > 0) {
-            b.Append("        " + vn + ".SetProp(\"options\", \"");
-            b.Append(GenCommon.Esc(opts));
-            b.Append("\");\n");
+            GenForm.EmitSetProp(b, vn, "options", opts);
         }
         string placeholder = GenForm.ObjStr(o, "placeholder");
         if (placeholder.Length > 0) {
-            b.Append("        " + vn + ".SetProp(\"placeholder\", \"");
-            b.Append(GenCommon.Esc(placeholder));
-            b.Append("\");\n");
+            GenForm.EmitSetProp(b, vn, "placeholder", placeholder);
         }
         if (GenForm.ObjBool(o, "required")) {
             b.Append("        " + vn + ".SetProp(\"required\", \"true\");\n");
@@ -838,9 +1002,29 @@ class GenForm {
     /// ({"field":"name"} -> `__r => __r.name`),不经过任何字符串行
     /// 中间层;字段名或列类型与实体不符时由编译器在生成代码上报错。
     /// 数据本身由 code-behind 用 `grid.Bind(list)` 传入 List<of>。
+    /// 设计器文档的列序真相在 options（"标题:字段" 选项串，列编辑
+    /// 器写的就是它），columns[i] 只是同下标的声明属性跟随表——
+    /// options 非空时按它合成列，两处声明在 EmitColumn 汇合。
     static void EmitColumns(StringBuilder b, JsonValue o, string vn) {
         JsonValue cols = o.Get("columns");
-        if (cols != null && cols.IsArray()) {
+        JsonValue opts = o.Get("options");
+        if (opts != null && opts.IsArray() && opts.Count() > 0) {
+            string of = GenForm.ObjStr(o, "of");
+            for (int i = 0; i < opts.Count(); i = i + 1) {
+                string opt = opts.At(i).AsString("");
+                JsonValue entry = GenForm.ColEntryAt(cols, i);
+                GenForm.EmitOptionColumn(b, vn, opt, entry, of);
+            }
+            /* columns 比 options 长的部分照旧发射（两处声明并存
+             * 时不丢列）。 */
+            if (cols != null && cols.IsArray()) {
+                for (int i = opts.Count(); i < cols.Count(); i = i + 1) {
+                    JsonValue c = cols.At(i);
+                    if (c == null || !c.IsObject()) { continue; }
+                    GenForm.EmitColumn(b, c, vn);
+                }
+            }
+        } else if (cols != null && cols.IsArray()) {
             for (int i = 0; i < cols.Count(); i = i + 1) {
                 JsonValue c = cols.At(i);
                 if (c == null || !c.IsObject()) { continue; }
@@ -856,6 +1040,77 @@ class GenForm {
                          of + "());\n");
             }
         }
+    }
+
+    /// columns 数组第 i 个条目（缺失/非数组/越界/非对象返回 null）。
+    static JsonValue ColEntryAt(JsonValue cols, int i) {
+        if (cols == null || !cols.IsArray()) { return null; }
+        if (i < 0 || i >= cols.Count()) { return null; }
+        JsonValue e = cols.At(i);
+        if (e == null || !e.IsObject()) { return null; }
+        return e;
+    }
+
+    /// 设计器列选项 "标题:字段" 的字段部分（首个冒号之后；没有
+    /// 冒号返回 ""）。与 Designer.ColField 同约定。
+    static string OptFieldOf(string opt) {
+        for (int i = 0; i < opt.Length; i = i + 1) {
+            if (opt.Substring(i, 1) == ":") {
+                return opt.Substring(i + 1, opt.Length - i - 1);
+            }
+        }
+        return "";
+    }
+
+    /// options 数组第 i 项的字段部分（opts 非数组/越界返回 ""）。
+    static string OptFieldAt(JsonValue opts, int i) {
+        if (opts == null || !opts.IsArray()) { return ""; }
+        if (i < 0 || i >= opts.Count()) { return ""; }
+        return GenForm.OptFieldOf(opts.At(i).AsString(""));
+    }
+
+    /// 列选项的标题部分（首个冒号之前；没有冒号是整串）。
+    static string OptTitleOf(string opt) {
+        for (int i = 0; i < opt.Length; i = i + 1) {
+            if (opt.Substring(i, 1) == ":") {
+                return opt.Substring(0, i);
+            }
+        }
+        return opt;
+    }
+
+    /// 把一条 options 列选项（"标题:字段"）连同同下标的 columns
+    /// 声明条目发射成列：field/title 以显式条目优先，缺省从选项串
+    /// 解析，条目的其余声明键（width/type/align/聚合…）原样并入，
+    /// 走与手写 columns 相同的 EmitColumn 通道。只有标题的列在无
+    /// "of"（DataGrid<string>，行即文本）时发射 `__r => __r` 直读
+    /// 行文本；有 "of" 时无法构成访问器，跳过（与手写 columns 缺
+    /// field 的行为一致）。
+    static void EmitOptionColumn(StringBuilder b, string vn,
+                                 string opt, JsonValue entry, string of) {
+        string field = entry != null ? GenForm.ObjStr(entry, "field") : "";
+        string title = entry != null ? GenForm.ObjStr(entry, "title") : "";
+        if (field.Length == 0) { field = GenForm.OptFieldOf(opt); }
+        if (title.Length == 0) { title = GenForm.OptTitleOf(opt); }
+        if (field.Length == 0) {
+            if (opt.Length == 0 || of.Length > 0) { return; }
+            int width = entry != null ? GenForm.ObjNum(entry, "width", 100) : 100;
+            b.Append("        " + vn + ".Col(\"" + GenCommon.Esc(title) +
+                     "\", " + Convert.ToString(width) + ", __r => __r);\n");
+            return;
+        }
+        if (title.Length == 0) { title = field; }
+        JsonValue m = JsonValue.NewObject();
+        m.Put("field", JsonValue.NewStr(field));
+        m.Put("title", JsonValue.NewStr(title));
+        if (entry != null && entry.IsObject()) {
+            for (int k = 0; k < entry.Count(); k = k + 1) {
+                string ek = entry.KeyAt(k);
+                if (ek == "field" || ek == "title") { continue; }
+                m.Put(ek, entry.ValAt(k));
+            }
+        }
+        GenForm.EmitColumn(b, m, vn);
     }
 
     /// 把一列的声明展开成 DataGrid<T> 的链式列构造调用
@@ -970,19 +1225,68 @@ class GenForm {
             wire.Append(GenCommon.Esc(hv));
             wire.Append("\");\n");
         }
+        /* DataGrid 声明式列级点击事件（columns[i].click）脱糖：
+         * 引擎的 CellClick 本就携带命中列，HitField() 把它翻译成
+         * 稳定 field 名；这里生成一条 CellClick 绑定按列名分派到
+         * 各列声明的处理器——列重排/改标题不影响路由，网格级
+         * onCellClick 与列级 click 可共存（两个订阅都在同一队列）。
+         * click 非字符串或列缺 field 时整列跳过。 */
+        JsonValue cols = o.Get("columns");
+        if (cols != null && cols.IsArray()) {
+            StringBuilder cc = new StringBuilder();
+            int nhit = 0;
+            for (int ci = 0; ci < cols.Count(); ci = ci + 1) {
+                JsonValue c = cols.At(ci);
+                if (c == null || !c.IsObject()) { continue; }
+                string fld = GenForm.ObjStr(c, "field");
+                string h = GenForm.ObjStr(c, "click");
+                if (fld.Length == 0 || h.Length == 0) { continue; }
+                nhit = nhit + 1;
+                cc.Append(" if (" + vn + ".HitField() == \""
+                    + GenCommon.Esc(fld) + "\") { " + dispatch + "(\""
+                    + GenCommon.Esc(h) + "\"); }");
+            }
+            if (nhit > 0) {
+                wire.Append("        " + vn + ".BindEvent(\"CellClick\", () => {"
+                    + cc.ToString() + " });\n");
+            }
+        }
     }
 
     /// 子控件归属的容器表达式：设计把它放在容器的某个“位”
     /// 上时（`childTab`：标签页的第几页、分栏的哪个窗格），真正
     /// 的父节点是那个内部容器（见 Control.SlotHost），而不是容器
     /// 自身——直接挂在容器上的子控件会全部重叠在一起或压根
-    /// 就不参与布局。
-    static string ParentExpr(JsonValue o, string parent) {
+    /// 就不参与布局。slot-host 容器（Tabs/SplitPanel）的子级缺
+    /// `childTab` 就是第 0 位：设计器模型里 0 值被 HTML 序列化
+    /// 跳过（data-child-tab="0" 不落盘），按“挂容器本体”处理会让
+    /// 这些子控件运行时整个不可见（Tabs 只渲染页容器），设计里
+    /// 却明明看得到。
+    static string ParentExpr(JsonValue o, string parent,
+                             string parentKind) {
         JsonValue slot = o.Get("childTab");
-        if (slot == null || !slot.IsNumber()) { return parent; }
-        int idx = slot.AsInt(0);
-        if (idx < 0) { idx = 0; }
-        return parent + ".SlotHost(" + Convert.ToString(idx) + ")";
+        if (slot != null && slot.IsNumber()) {
+            int idx = slot.AsInt(0);
+            if (idx < 0) { idx = 0; }
+            return parent + ".SlotHost(" + Convert.ToString(idx) + ")";
+        }
+        if (parentKind == "Tabs" || parentKind == "SplitPanel") {
+            return parent + ".SlotHost(0)";
+        }
+        return parent;
+    }
+
+    /// 是否已经由控件自己声明尺寸档。按空格分词，避免把
+    /// `small-card` 这类普通语义类误判成尺寸覆盖。
+    static bool HasSizeClass(string classes) {
+        List<string> xs = classes.Split(" ");
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            string x = xs[i].Trim();
+            if (x == "tiny" || x == "small" || x == "medium" || x == "large") {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// 直接子控件数:无 "kids" 数组则为 0。自动布局用它估容器高度。
@@ -999,13 +1303,14 @@ class GenForm {
     /// "compAbs" 键折叠进 freeMode(自由组件文档的子树恒走绝对几何)。
     static int EmitField(StringBuilder decls, StringBuilder body,
                          StringBuilder wire, StringBuilder valid,
-                         JsonValue o, string parent, int id,
-                         List<string> used, bool freeMode,
+                         JsonValue o, string parent, string parentKind,
+                         int id, List<string> used, bool freeMode,
                          bool parentIsFlow, string dispatch,
-                         bool instanceFields, bool anon) {
+                         bool instanceFields, bool anon,
+                         string defaultSizeClass) {
         string kind = GenForm.TypeOf(o);
         string fname = GenForm.ObjStr(o, "name");
-        string host = GenForm.ParentExpr(o, parent);
+        string host = GenForm.ParentExpr(o, parent, parentKind);
         int next = id + 1;
         bool req = GenForm.ObjBool(o, "required");
 
@@ -1036,6 +1341,17 @@ class GenForm {
         }
 
         body.Append("        " + vn + " = new " + kind + "();\n");
+        /* Element 是唯一不走缺省构造的 kind：标签名存设计 "tag" 键
+         * （Kind() 返回它，CSS type 选择器因此命中 div/p/span 规则）。 */
+        if (GenForm.KindOf(o) == "Element") {
+            string etag = GenForm.ObjStr(o, "tag");
+            if (etag == "") { etag = "div"; }
+            body.Append("        " + vn + ".InitElement(\"");
+            body.Append(GenCommon.Esc(etag));
+            body.Append("\", \"");
+            body.Append(GenCommon.Esc(fname));
+            body.Append("\");\n");
+        }
         body.Append("        " + vn + ".name = \"");
         body.Append(GenCommon.Esc(fname));
         body.Append("\";\n");
@@ -1043,12 +1359,45 @@ class GenForm {
          * (Label/Button/Checkbox...)取它作为内容,容器忽略。 */
         string dlabel = GenForm.ObjStr(o, "label");
         if (dlabel.Length > 0) {
+            /* SetDesignText 对发布 text 属性的控件写入标题；Label 的
+             * text 规格带 syncName，写入会覆盖 name——设计文档的
+             * 字段名优先，标题写完再把 name 拨回去。 */
             body.Append("        " + vn + ".SetDesignText(\"");
             body.Append(GenCommon.Esc(dlabel));
             body.Append("\");\n");
+            body.Append("        " + vn + ".name = \"");
+            body.Append(GenCommon.Esc(fname));
+            body.Append("\";\n");
         }
-        /* 设计里的 class 就是控件的 CSS 类(皮肤/尺寸变体)。 */
+        /* Element 的文本内容："text" 键（导出器写），落 elText 参与
+         * 块流/行盒排版——SetDesignText 对 Element 是空操作（它不发布
+         * text 属性）。 */
+        if (GenForm.KindOf(o) == "Element") {
+            string dtext = GenForm.ObjStr(o, "text");
+            if (dtext.Length > 0) {
+                body.Append("        " + vn + ".SetText(\"");
+                body.Append(GenCommon.Esc(dtext));
+                body.Append("\");\n");
+            }
+        }
+        /* Element 的 data-for 声明（<template data-for>）：落原始属性
+         * 表，ChildWindow 行克隆展开按它读数组路径。 */
+        if (GenForm.KindOf(o) == "Element") {
+            string dfor = GenForm.ObjStr(o, "for");
+            if (dfor.Length > 0) {
+                body.Append("        " + vn + ".SetAttr(\"data-for\", \"");
+                body.Append(GenCommon.Esc(dfor));
+                body.Append("\");\n");
+            }
+        }
+        /* 表单级 formSize 是未显式定档控件的默认尺寸。控件自己的
+         * tiny/small/medium/large 优先，外观类（text/primary 等）与
+         * 默认尺寸类合并；不能靠 CSS 继承，因为高度/padding 不继承。 */
         string dcls = GenForm.ObjStr(o, "class");
+        if (defaultSizeClass.Length > 0 && !GenForm.HasSizeClass(dcls)) {
+            if (dcls.Length > 0) { dcls = dcls + " "; }
+            dcls = dcls + defaultSizeClass;
+        }
         if (dcls.Length > 0) {
             body.Append("        " + vn + ".Class = \"");
             body.Append(GenCommon.Esc(dcls));
@@ -1058,9 +1407,7 @@ class GenForm {
          * 语义,优先于类规则):SetProp("style") 走 ApplyInline 通道。 */
         string dsty = GenForm.ObjStr(o, "style");
         if (dsty.Length > 0) {
-            body.Append("        " + vn + ".SetProp(\"style\", \"");
-            body.Append(GenCommon.Esc(dsty));
-            body.Append("\");\n");
+            GenForm.EmitSetProp(body, vn, "style", dsty);
         }
         /* 设计里的 props 是控件自有属性的直通表(滑块的 min/max、
          * 单选项的 option ...):键名就是控件 SetProp 认的名字。 */
@@ -1069,11 +1416,61 @@ class GenForm {
             for (int pi = 0; pi < dprops.Count(); pi = pi + 1) {
                 JsonValue pv = dprops.ValAt(pi);
                 if (pv == null) { continue; }
-                body.Append("        " + vn + ".SetProp(\"");
-                body.Append(GenCommon.Esc(dprops.KeyAt(pi)));
-                body.Append("\", \"");
-                body.Append(GenCommon.Esc(pv.AsString("")));
-                body.Append("\");\n");
+                GenForm.EmitSetProp(body, vn, dprops.KeyAt(pi),
+                                    pv.AsString(""));
+            }
+        }
+        /* 建模直通:props 之外的字段级标量键(text/src/min/...)同样
+         * 落成 SetProp——html 的原生语义键(<button>文本 → "text"、
+         * <img src> → "src")与手写键由此等价,不再静默丢弃。上面
+         * 各分支已消费的建模键与事件键(onXxx)不进回退。 */
+        for (int si = 0; si < o.Count(); si = si + 1) {
+            string sk = o.KeyAt(si);
+            JsonValue sv = o.ValAt(si);
+            if (sv == null) { continue; }
+            /* 布尔/数字标量同样直通：原生通道读回的 checked →
+             * defOn、data-show-count="true" 是布尔，min/max 是数字——
+             * 只收字符串会把这些静默丢掉。 */
+            string sval;
+            if (sv.IsString()) {
+                sval = sv.AsString("");
+            } else if (sv.IsBool()) {
+                sval = sv.AsBool(false) ? "true" : "false";
+            } else if (sv.IsNumber()) {
+                sval = Convert.ToString(sv.AsInt(0));
+            } else {
+                continue;
+            }
+            if (sk == "kind" || sk == "name" || sk == "tag"
+                || sk == "class" || sk == "style" || sk == "props"
+                || sk == "kids" || sk == "dock" || sk == "fx"
+                || sk == "fy" || sk == "fw" || sk == "fh"
+                || sk == "bind" || sk == "bindProp" || sk == "if"
+                || sk == "for" || sk == "columns" || sk == "of"
+                || sk == "options" || sk == "orient" || sk == "required"
+                || sk == "defOn" || sk == "placeholder"
+                /* label 已被上方 SetDesignText 分支消费（设计注记，
+                 * 只有发布 text 的控件接受）；再进回退会在没有
+                 * label 属性的控件上退化成样式类（SetProp 兜底
+                 * AddClass），容器 GetProp("class") 便混进标题文案。 */
+                || sk == "label") {
+                continue;
+            }
+            if (sk.Length > 3 && HtmlText.StartsWith(sk, "on")
+                && sk[2] >= 65 && sk[2] <= 90) {
+                continue;   // onClick 等事件键由接线通道消费
+            }
+            GenForm.EmitSetProp(body, vn, sk, sval);
+            /* "text" 是 html 元素内容通道：Label 的 text 规格带 syncName，
+             * 写入会把 name 覆盖成标题文本（FormBuilder 同坑，属性写完
+             * "以设计的字段名为准"），发射完立刻把 name 拨回字段名。
+             * data-x-props 的同步（BatchJobProgress 的 titleText 可按
+             * caption 检索）是设计意图，不在此列——那个通道自带的
+             * syncName 必须保留。 */
+            if (sk == "text" && fname.Length > 0) {
+                body.Append("        " + vn + ".name = \"");
+                body.Append(GenCommon.Esc(fname));
+                body.Append("\";\n");
             }
         }
         /* Tabs 标签条方向:设计器建模键 orient 存选项名,横排是
@@ -1094,6 +1491,14 @@ class GenForm {
                 body.Append(GenCommon.Esc(dbindProp));
                 body.Append("\";\n");
             }
+        }
+        /* data-if 声明：模型路径真值插拔（ChildWindow 每帧消费；
+         * 无模型宿主惰性恒显示）。 */
+        string dif = GenForm.ObjStr(o, "if");
+        if (dif.Length > 0) {
+            body.Append("        " + vn + ".bindIf = \"");
+            body.Append(GenCommon.Esc(dif));
+            body.Append("\";\n");
         }
         GenForm.FieldSetup(body, o, vn);
         if (GenForm.KindOf(o) == "DataGrid") {
@@ -1116,7 +1521,7 @@ class GenForm {
             int fh = GenForm.ObjNum(o, "fh", 0);
             int dk = GenForm.ObjNum(o, "dock", 0);
             if (dk == 1 || dk == 2) {
-                body.Append("        " + vn + ".Dock(Dock.");
+                body.Append("        " + vn + ".Dock(Gui.Dock.");
                 if (dk == 1) { body.Append("Top"); } else { body.Append("Bottom"); }
                 body.Append("());\n");
                 if (fh > 0) {
@@ -1124,7 +1529,7 @@ class GenForm {
                                 Convert.ToString(fh) + ";\n");
                 }
             } else if (dk == 3 || dk == 4) {
-                body.Append("        " + vn + ".Dock(Dock.");
+                body.Append("        " + vn + ".Dock(Gui.Dock.");
                 if (dk == 3) { body.Append("Left"); } else { body.Append("Right"); }
                 body.Append("());\n");
                 if (fw > 0) {
@@ -1132,9 +1537,9 @@ class GenForm {
                                 Convert.ToString(fw) + ";\n");
                 }
             } else if (dk == 5) {
-                body.Append("        " + vn + ".Dock(Dock.Fill());\n");
+                body.Append("        " + vn + ".Dock(Gui.Dock.Fill());\n");
             } else {
-                body.Append("        " + vn + ".Dock(Dock.Manual());\n");
+                body.Append("        " + vn + ".Dock(Gui.Dock.Manual());\n");
                 body.Append("        " + vn + ".logPlaceSet = true;\n");
                 body.Append("        " + vn + ".logX = " +
                             Convert.ToString(fx) + ";\n");
@@ -1167,7 +1572,7 @@ class GenForm {
             }
             body.Append("        " + host + ".Add(" + vn + ");\n");
         } else if (!flowCell) {
-            body.Append("        " + vn + ".Dock(Dock.Top());\n");
+            body.Append("        " + vn + ".Dock(Gui.Dock.Top());\n");
             if (GenForm.IsContainer(o)) {
                 body.Append("        " + vn + ".AddClass(\"designgroup\");\n");
                 body.Append("        " + vn + ".Prefer(0, " +
@@ -1195,14 +1600,23 @@ class GenForm {
         }
         if (!anon) {
             GenForm.EmitHandlers(wire, o, vn, dispatch);
+            // 带参事件声明（设计模型 "arg" 键）：落 handlerArg 字段，
+            // ChildWindow.WireNode 二次接线据此发 WireArg（实参快照）
+            // ——与 GenHtml 的 data-arg 通道同形。
+            string arg = o.Str("arg", "");
+            if (arg != "") {
+                wire.Append("        " + vn + ".handlerArg = \""
+                            + GenCommon.Esc(arg) + "\");\n");
+            }
         }
 
         JsonValue kids = o.Get("kids");
         if (GenForm.IsContainer(o) && kids != null && kids.IsArray()) {
             for (int i = 0; i < kids.Count(); i = i + 1) {
                 next = GenForm.EmitField(decls, body, wire, valid, kids.At(i),
-                                         vn, next, used, fm, false,
-                                         dispatch, instanceFields, anonKids);
+                                         vn, GenForm.KindOf(o), next, used, fm,
+                                         false, dispatch, instanceFields,
+                                         anonKids, defaultSizeClass);
             }
         }
         return next;

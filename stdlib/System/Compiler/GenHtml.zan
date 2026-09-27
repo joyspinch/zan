@@ -21,6 +21,13 @@ namespace System.Compiler;
 /// 调用方：`Control root = UiHtml.Build(handlers);` 之后自行
 /// `app.UseAppCss(UiHtml.Css)`（或并进自己的样式表）再挂树。
 ///
+/// 样式 scoping（Vue <style scoped> 同语义）：多份文档的 Css 合装
+/// 进同一张 app 表时，裸标签/类选择器会跨文档互中。生成期给每个
+/// 元素混入文档作用域类 zs-<基名>，并把文档 CSS 每个复合块补上
+/// 该类——规则只命中本文档的元素（System.Web.HtmlScope）。运行期挂载件
+/// （列表行模板等 Build 之外长出来的控件）不携作用域类，其样式
+/// 放皮肤层（全局通道）——与 Vue 的组件样式不泄漏子组件同一取舍。
+///
 /// 生成依据是 WDoc.nodes 声明记录（tag/父下标/属性/文档序内容）——
 /// 与运行时同一次解析的产物，天然同构。本文件只依赖 System.Web
 /// 纯层（不能 using Gui：生成器 exe 的活名闭包会滤掉 Gui 的
@@ -70,24 +77,43 @@ class GenHtml {
             }
             genCls.Add(g);
         }
-        StringBuilder b = new StringBuilder();
-        GenCommon.Line(b, 0, "// 由 GenHtml 从 " + BaseName(path)
+        // 文档作用域类：元素与 CSS 同源混入（见类注释与 HtmlScope.Styles）。
+        string zs = ScopeClassOf(path);
+        css = HtmlScope.Styles(css, zs);
+        StringBuilder b = new StringBuilder();        GenCommon.Line(b, 0, "// 由 GenHtml 从 " + BaseName(path)
                              + " 生成 -- 编译期产物,勿手改。");
         GenCommon.Line(b, 0, "using System;");
         GenCommon.Line(b, 0, "using Gui;");
         GenCommon.Line(b, 0, "");
         GenCommon.Line(b, 0, "public class " + cls + " {");
-        GenCommon.Line(b, 1, "/// <style>、<link> 与 style 属性收集的 CSS："
+        GenCommon.Line(b, 1, "/// <style>、<link> 与 style 属性收集的 CSS，已按文档"
+                           + "作用域类 " + zs + " 收窄（只命中本文档元素）："
                            + "装载时并进 appCss（UseAppCss）。");
-        GenCommon.Line(b, 1, "public static string Css = \""
-                           + GenCommon.Esc(css) + "\";");
+        // 值超长（整套应用样式随文档走）时拆成多段字面量相加，绕开
+        // 单字面量 4095 字符的词法上限——与 GenForm.EmitSetProp 同一
+        // 配方（超限字面量会让整个字段声明解析失败而 Build 还在，
+        // 表现为“类有 Build 没 Css”的怪象）。
+        string cssLit = "";
+        int cssAt = 0;
+        while (cssAt < css.Length) {
+            int take = css.Length - cssAt;
+            if (take > 3000) { take = 3000; }
+            if (cssAt > 0) { cssLit = cssLit + " + "; }
+            cssLit = cssLit + "\"" + GenCommon.Esc(css.Substring(cssAt, take))
+                + "\"";
+            cssAt = cssAt + take;
+        }
+        // 无样式文档（不带 <style> 的片段）css 为空：必须落合法的
+        // 空字面量，裸 `Css = ;` 整个生成类解析失败。
+        if (cssLit == "") { cssLit = "\"\""; }
+        GenCommon.Line(b, 1, "public static string Css = " + cssLit + ";");
         GenCommon.Line(b, 1, "");
         GenCommon.Line(b, 1, "/// 构建树。handlers：data-on-* 注册表"
                            + "（可 null）。\n"
                            + "    public static Control Build("
                            + "HtmlHandlers handlers) {");
         for (int i = 0; i < wd.nodes.Count; i = i + 1) {
-            EmitDecl(b, wd.nodes[i], i, genCls[i]);
+            EmitDecl(b, wd.nodes[i], i, genCls[i], zs);
         }
         // 内容游走：逐父按 items 文档序发射 AddText / AddChild——
         // 与运行时 Html.Parse 的装配同一顺序，混排行盒靠它同构。
@@ -106,42 +132,53 @@ class GenHtml {
 
     /// 一条记录 = 一个变量的声明 + 属性协议（构造；文本与挂树在
     /// EmitContent 按文档序发射）。
-    static void EmitDecl(StringBuilder b, WNode n, int idx, string genCls) {
+    static void EmitDecl(StringBuilder b, WNode n, int idx, string genCls,
+                         string zs) {
         string v = "v" + idx;
         string tag = n.tag;
         string id = GenCommon.Esc(HtmlText.Attr(n.attrNames, n.attrVals,
                                                 "id"));
         string type = HtmlText.Attr(n.attrNames, n.attrVals,
                                     "type").ToLower();
+        // 生成物里的控件类型一律发射命名空间限定名（A314）：生成类
+        // 落在全局命名空间，裸 `new Button()` 会优先绑定到用户项目的
+        // 同名全局类（全局声明压过 using import），限定名靠 A312 的
+        // 限定逃逸始终解析到 stdlib 真身。
         if (tag == "button") {
-            GenCommon.Line(b, 2, "Button " + v + " = new Button();");
+            GenCommon.Line(b, 2, "Gui.Widget.Button " + v
+                           + " = new Gui.Widget.Button();");
             GenCommon.Line(b, 2, v + ".InitButton(\""
                            + GenCommon.Esc(n.text) + "\");");
         } else if (tag == "textarea") {
-            GenCommon.Line(b, 2, "TextArea " + v + " = new TextArea();");
+            GenCommon.Line(b, 2, "Gui.Widget.TextArea " + v
+                           + " = new Gui.Widget.TextArea();");
             GenCommon.Line(b, 2, v + ".InitTextArea(new SignalString(\""
                            + GenCommon.Esc(n.text) + "\"), \"\");");
         } else if (tag == "input" && type == "checkbox") {
-            GenCommon.Line(b, 2, "Checkbox " + v + " = new Checkbox();");
+            GenCommon.Line(b, 2, "Gui.Widget.Checkbox " + v
+                           + " = new Gui.Widget.Checkbox();");
             GenCommon.Line(b, 2, v + ".InitCheckbox(\"\", "
                            + "new SignalBool(false));");
         } else if (tag == "input") {
             string val = HtmlText.Attr(n.attrNames, n.attrVals, "value");
             string ph = HtmlText.Attr(n.attrNames, n.attrVals,
                                       "placeholder");
-            GenCommon.Line(b, 2, "Input " + v + " = new Input();");
+            GenCommon.Line(b, 2, "Gui.Widget.Input " + v
+                           + " = new Gui.Widget.Input();");
             GenCommon.Line(b, 2, v + ".InitInput(new SignalString(\""
                            + GenCommon.Esc(val) + "\"), \""
                            + GenCommon.Esc(ph) + "\");");
         } else if (tag == "img") {
             string src = HtmlText.Attr(n.attrNames, n.attrVals, "src");
             string alt = HtmlText.Attr(n.attrNames, n.attrVals, "alt");
-            GenCommon.Line(b, 2, "Image " + v + " = new Image();");
+            GenCommon.Line(b, 2, "Gui.Widget.Image " + v
+                           + " = new Gui.Widget.Image();");
             GenCommon.Line(b, 2, v + ".InitImage(\""
                            + GenCommon.Esc(src) + "\", \""
                            + GenCommon.Esc(alt) + "\", \"cover\");");
         } else {
-            GenCommon.Line(b, 2, "Element " + v + " = new Element();");
+            GenCommon.Line(b, 2, "Gui.Element " + v
+                           + " = new Gui.Element();");
             GenCommon.Line(b, 2, v + ".InitElement(\"" + tag + "\", \""
                            + id + "\");");
         }
@@ -157,16 +194,62 @@ class GenHtml {
                                + GenCommon.Esc(cs[c]) + "\");");
             }
         }
+        // 文档作用域类：与 HtmlScope.Styles 改写的选择器配对——生成 CSS
+        // 只命中带此类的元素（即本文档 Build 出的树）。
+        GenCommon.Line(b, 2, v + ".AddClass(\"" + zs + "\");");
         bool isWidget = tag == "button" || tag == "textarea"
             || tag == "input" || tag == "img";
         if (isWidget && id != "") {
             GenCommon.Line(b, 2, v + ".SetProp(\"name\", \"" + id
                            + "\");");
         }
+        /* Element 的原始 data-* 属性 parity 落属性表（运行时
+         * Html.Build 全量进 elAttrs；编译通道至少让 data-for 一类
+         * 动态原语与 CSS 属性选择器同语义生效）。协议消费掉的
+         * data-bind、data-on 系列、data-if 不重复入表；真控件的
+         * 非协议属性仍丢弃（台账）。<a> 另放行 href/target：缺省
+         * 导航（Html.AutoLink，挂载窗口 WireNode 二次接线时绑上）
+         * 读属性表路由。title 直接发 elTitle（悬停提示，与运行时
+         * Build 的消费点同源）。 */
+        if (!isWidget) {
+            for (int a = 0; a < n.attrNames.Count; a = a + 1) {
+                string ak = n.attrNames[a];
+                bool linkKey = tag == "a"
+                    && (ak == "href" || ak == "target");
+                if (!linkKey
+                    && (ak.Length <= 5
+                    || !HtmlText.StartsWith(ak, "data-")
+                    || ak == "data-bind" || ak == "data-if"
+                    || (ak.Length > 8
+                    && HtmlText.StartsWith(ak, "data-on-")))) {
+                    continue;
+                }
+                GenCommon.Line(b, 2, v + ".SetAttr(\""
+                               + GenCommon.Esc(ak) + "\", \""
+                               + GenCommon.Esc(n.attrVals[a]) + "\");");
+            }
+            string ttl = HtmlText.Attr(n.attrNames, n.attrVals, "title");
+            if (ttl != "") {
+                GenCommon.Line(b, 2, v + ".elTitle = \""
+                               + GenCommon.Esc(ttl) + "\";");
+            }
+        }
         string bind = HtmlText.Attr(n.attrNames, n.attrVals, "data-bind");
         if (bind != "") {
             GenCommon.Line(b, 2, v + ".bindPath = \""
                            + GenCommon.Esc(bind) + "\";");
+        }
+        string dif = HtmlText.Attr(n.attrNames, n.attrVals, "data-if");
+        if (dif != "") {
+            GenCommon.Line(b, 2, v + ".bindIf = \""
+                           + GenCommon.Esc(dif) + "\";");
+        }
+        // data-arg 落字段：无参接线照旧，带参处理器经 Html.WireArg
+        // 闭包捕获实参（字段本身供 ChildWindow.WireNode 二次接线）。
+        string darg = HtmlText.Attr(n.attrNames, n.attrVals, "data-arg");
+        if (darg != "") {
+            GenCommon.Line(b, 2, v + ".handlerArg = \""
+                           + GenCommon.Esc(darg) + "\";");
         }
     }
 
@@ -187,8 +270,10 @@ class GenHtml {
         }
     }
 
-    /// data-on-* 接线（树建完统一挂，html 文档序不敏感）。
+    /// data-on-* 接线（树建完统一挂，html 文档序不敏感）。节点声明了
+    /// `data-arg` 时走带参 WireArg（实参闭包捕获）。
     static void EmitWiring(StringBuilder b, WNode n, int idx) {
+        string darg = HtmlText.Attr(n.attrNames, n.attrVals, "data-arg");
         for (int i = 0; i < n.attrNames.Count; i = i + 1) {
             string k = n.attrNames[i];
             if (k.Length <= 8 || !HtmlText.StartsWith(k, "data-on-")) {
@@ -197,9 +282,16 @@ class GenHtml {
             string suffix = k.Substring(8, k.Length - 8);
             string evt = HtmlText.EventKind(suffix);
             if (evt == "") { continue; }
-            GenCommon.Line(b, 2, "Html.Wire(handlers, v" + idx + ", \""
-                           + evt + "\", \""
-                           + GenCommon.Esc(n.attrVals[i]) + "\");");
+            if (darg != "") {
+                GenCommon.Line(b, 2, "Html.WireArg(handlers, v" + idx
+                               + ", \"" + evt + "\", \""
+                               + GenCommon.Esc(n.attrVals[i]) + "\", \""
+                               + GenCommon.Esc(darg) + "\");");
+            } else {
+                GenCommon.Line(b, 2, "Html.Wire(handlers, v" + idx
+                               + ", \"" + evt + "\", \""
+                               + GenCommon.Esc(n.attrVals[i]) + "\");");
+            }
         }
     }
 
@@ -232,5 +324,29 @@ class GenHtml {
         int back = path.LastIndexOf("\\");
         int at = slash > back ? slash : back;
         return at >= 0 ? path.Substring(at + 1) : path;
+    }
+
+    /// 文档路径 → 作用域类：基名去扩展名后小写、非字母数字折 '-'。
+    /// 与生成类名同源（同目录同名文档本来就会撞生成类名），
+    /// 作用域类继承该唯一性。改写本身在 System.Web.HtmlScope 共用。
+    static string ScopeClassOf(string path) {
+        string baseName = BaseName(path);
+        int dot = baseName.LastIndexOf(".");
+        if (dot > 0) { baseName = baseName.Substring(0, dot); }
+        string outp = "zs-";
+        bool dash = true;
+        for (int i = 0; i < baseName.Length; i = i + 1) {
+            int c = baseName[i];
+            bool al = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122);
+            if (al) {
+                outp = outp + baseName.Substring(i, 1).ToLower();
+                dash = false;
+            } else if (!dash) {
+                outp = outp + "-";
+                dash = true;
+            }
+        }
+        return outp;
     }
 }

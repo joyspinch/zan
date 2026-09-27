@@ -5,19 +5,26 @@ using System.Text;
 namespace System.Web;
 
 /// 设计器文档的 HTML 存取编解码器（WEB_GUI_ROADMAP P7）：把设计器
-/// 的 JSON 文档（原 .zform）与 HTML 文本互相转换——HTML 从此是设计器
-/// 的存取格式，.zform 退役。纯字符串层，不依赖 Gui：设计器
+/// 的 JSON 文档模型与 HTML 文本互相转换——HTML 从此是设计器
+/// 的存取格式。纯字符串层，不依赖 Gui：设计器
 /// (Gui.Designer)、编译期生成器 (GenForm/GenHtml) 两端共用。
 ///
 /// 编码规则（全键保真往返）：
 ///   - 文档级键（name/winW/role/...）→ <body> 的 data-<kebab> 属性；
 ///     name 另发 id 便于阅读；body 带 data-zan-design 标记（IsDesignDoc
 ///     据此区分设计稿与普通 HTML UI 文档）。
-///   - 字段对象 → 元素：kind 决定 tag（Panel→div、Label→label、
-///     Button→button、Input→input、TextArea→textarea、Image→img，
-///     其余 div），kind 本身存 data-kind（自定义组件/共享控件的
-///     权威标记）；name → id；class → class；style → style；
-///     kids → 子元素。
+///   - 字段对象 → 元素：kind 决定 tag，能原生就原生（Panel→div、
+///     Label→label、Button→button、Input→input、TextArea→textarea、
+///     Image→img、Divider→hr、Progress→progress、SelectBox→select、
+///     Typography→p、Checkbox/Radio/Slider/ColorPicker/InputNumber/
+///     DatePicker→input+type=…，其余 div），kind 本身存 data-kind
+///     （自定义组件/共享控件的权威标记，读端优先于 tag 兜底）；
+///     name → id；class → class；style → style；kids → 子元素。
+///   - 原生属性/内容直进原生通道：<img src/alt>、<input/textarea
+///     placeholder/value>、表单族 min/max/step、<progress value/max>、
+///     checkbox/radio 的 value(=label)/checked(=defOn)、<select> 的
+///     <option> 子元素（含 selected）、button/label/textarea/p 的
+///     文本内容——与 data-* 通道等价，读端不分来源。
 ///   - 其余标量键 → data-<kebab>="值"（camelCase 键名 kebab 化——
 ///     解析器把属性名整体小写，kebab 保大小写信息；false/""/0 跳过，
 ///     与 HTML 布尔属性同趣，读端有缺省）。
@@ -28,8 +35,10 @@ namespace System.Web;
 ///     字符串值不作数字/布尔嗅探，props 的 "min":"0" 不会漂成数字。
 ///   - options（字符串数组）→ data-options="a|b|c"（与 JoinOpts 同
 ///     分隔，| 内嵌限制相同）。
-///   - 属性值统一实体转义（& < > "）；元素不发裸文本（文本内容全在
-///     属性里），规避 HTML 空白塌缩。
+///   - 属性值统一实体转义（& < > "）；原生语义发原生形态——img 的
+///     src/alt、input/textarea 的 placeholder/value 发真属性，
+///     button/label/textarea 的 text 发元素文本（读端与 data-* 通道
+///     等价），其余键全在属性里，规避 HTML 空白塌缩。
 class DesignerHtml {
     /// 是否设计器文档：body 带 data-zan-design 标记。标记是裸属性
     /// （值为空串），不能用 Attr(...) != "" 判——那样存在与缺失
@@ -109,17 +118,41 @@ class DesignerHtml {
     static void FieldHtml(StringBuilder b, JsonValue o, int depth) {
         string kind = o.Str("kind", "");
         string tag = KindTag(kind);
+        if (kind == "Element") {
+            // Element 的真实标签在 "tag" 键（div/span/template...），
+            // 键本身不入属性循环——它已经是元素名。
+            tag = o.Str("tag", "");
+            if (tag == "") { tag = "div"; }
+        }
         string pad = "";
         for (int i = 0; i < depth; i = i + 1) { pad = pad + "  "; }
         b.Append(pad + "<" + tag);
         string nm = o.Str("name", "");
         if (nm != "") { b.Append(" id=\"" + EscapeAttr(nm) + "\""); }
-        b.Append(" data-kind=\"" + EscapeAttr(kind) + "\"");
+        // kind 可从载体恢复的不发 data-kind：zan-* 自定义元素反解即得，
+        // 裸 div 本就是 Panel 的兜底形态——文档只保留"不标就看不出"的
+        // 标记（如 div 承载的非 Panel kind、span 上的 Element 覆写）。
+        bool kindFromTag = HtmlText.StartsWith(tag, "zan-")
+            || (tag == "div" && kind == "Panel");
+        if (!kindFromTag) {
+            b.Append(" data-kind=\"" + EscapeAttr(kind) + "\"");
+        }
+        // input 变体组件发 type：<input type="checkbox"> 一族读起来
+        // 就是原生表单控件。
+        string ity = DesignerHtml.KindInputType(kind);
+        if (ity != "") { b.Append(" type=\"" + ity + "\""); }
+        // 带参事件声明（data-arg）：与运行时 HTML 协议同键同名。
+        // 发原生 data-arg 属性——.html 设计稿读起来就是真 HTML。
+        string argv = o.Str("arg", "");
+        if (argv != "") {
+            b.Append(" data-arg=\"" + EscapeAttr(argv) + "\"");
+        }
         for (int i = 0; i < o.Count(); i = i + 1) {
             string key = o.KeyAt(i);
             JsonValue v = o.ValAt(i);
             if (v == null) { continue; }
             if (key == "kind" || key == "name") { continue; }
+            if (kind == "Element" && key == "tag") { continue; }
             if (key == "class") {
                 string cv = v.IsString() ? v.AsString("") : "";
                 if (cv != "") { b.Append(" class=\"" + EscapeAttr(cv) + "\""); }
@@ -135,7 +168,103 @@ class DesignerHtml {
             if (key == "kids") {
                 continue;   // 收尾统一发子元素
             }
+            // 原生语义键发原生属性/文本：img 的 src/alt、input/textarea
+            // 的 placeholder/value 发真 HTML 属性；button/label/textarea
+            // 的 text 发元素文本（收尾）——文档读起来就是真 HTML。
+            if (kind == "Image" && (key == "src" || key == "alt")) {
+                string nv = v.IsString() ? v.AsString("") : "";
+                if (nv != "") { b.Append(" " + key + "=\"" + EscapeAttr(nv) + "\""); }
+                continue;
+            }
+            if ((kind == "Input" || kind == "TextArea")
+                && (key == "placeholder" || key == "value")) {
+                string pv = v.IsString() ? v.AsString("") : "";
+                if (pv != "") { b.Append(" " + key + "=\"" + EscapeAttr(pv) + "\""); }
+                continue;
+            }
+            if ((kind == "Button" || kind == "Label" || kind == "TextArea"
+                || kind == "Typography") && key == "text") {
+                continue;   // 收尾发元素文本
+            }
+            // <hr> 是 void 元素没有正文：Divider 的标题走
+            // data-text 通用通道（导入端 PutAttr 原样读回 text 键）。
+            if (kind == "Divider" && key == "text") {
+                string dv = v.IsString() ? v.AsString("") : "";
+                if (dv != "") {
+                    b.Append(" data-text=\"" + EscapeAttr(dv) + "\"");
+                }
+                continue;
+            }
+            // <progress value="72" max="100">：percent 折回原生双属性。
+            if (kind == "Progress" && key == "percent") {
+                int pc = v.IsNumber() ? v.AsInt(0)
+                    : Convert.ToInt32(v.AsString("0"));
+                if (pc < 0) { pc = 0; }
+                if (pc > 100) { pc = 100; }
+                b.Append(" value=\"" + Convert.ToString(pc)
+                         + "\" max=\"100\"");
+                continue;
+            }
+            // <select> 的候选在收尾发 <option> 子元素；value（选中
+            // 下标）折成 selected 标记，不进通用属性。
+            if (kind == "SelectBox"
+                && (key == "options" || key == "value")) {
+                continue;
+            }
+            // checkbox/radio 的原生 value 是可视文案；checked 是
+            // 初始勾选。导入端按同一约定读回。
+            if ((kind == "Checkbox" || kind == "Radio") && key == "label") {
+                string lv = v.IsString() ? v.AsString("") : "";
+                if (lv != "") { b.Append(" value=\"" + EscapeAttr(lv) + "\""); }
+                continue;
+            }
+            if (kind == "Checkbox" && key == "defOn") {
+                if (v.IsBool() && v.AsBool(false)) {
+                    b.Append(" checked=\"true\"");
+                }
+                continue;
+            }
+            // range/number/color/date 的取值与范围就是原生属性。
+            if ((kind == "Slider" || kind == "InputNumber")
+                && (key == "min" || key == "max" || key == "step"
+                    || key == "value")) {
+                string rv = v.IsString() ? v.AsString("")
+                    : (v.IsNumber() ? Convert.ToString(v.AsInt(0)) : "");
+                if (rv != "") { b.Append(" " + key + "=\"" + rv + "\""); }
+                continue;
+            }
+            if ((kind == "ColorPicker" || kind == "DatePicker")
+                && key == "value") {
+                string cvv = v.IsString() ? v.AsString("") : "";
+                if (cvv != "") {
+                    b.Append(" value=\"" + EscapeAttr(cvv) + "\"");
+                }
+                continue;
+            }
+            if (key == "arg") {
+                continue;   // 已在属性头发 data-arg，通用通道跳过
+            }
             AppendKey(b, v, key, 1);
+        }
+        // <select>：候选发 <option> 子元素，value 下标标 selected。
+        if (kind == "SelectBox") {
+            string opts = o.Str("options", "");
+            int selIdx = o.Has("value") ? o.Int("value", -1) : 0 - 1;
+            b.Append(">\n");
+            int oi = 0;
+            int p = 0;
+            while (p < opts.Length) {
+                int q = opts.IndexOf("|", p);
+                string one = q < 0 ? opts.Substring(p) : opts.Substring(p, q - p);
+                b.Append(pad + "  <option");
+                if (oi == selIdx) { b.Append(" selected"); }
+                b.Append(">" + EscapeAttr(one) + "</option>\n");
+                oi = oi + 1;
+                if (q < 0) { break; }
+                p = q + 1;
+            }
+            b.Append(pad + "</select>\n");
+            return;
         }
         JsonValue kids = o.Get("kids");
         if (kids != null && kids.IsArray() && kids.Count() > 0) {
@@ -146,9 +275,17 @@ class DesignerHtml {
             b.Append(pad + "</" + tag + ">\n");
             return;
         }
-        if (tag == "input" || tag == "img") {
+        if (tag == "input" || tag == "img" || tag == "hr") {
             b.Append(" />\n");
             return;
+        }
+        JsonValue tv = o.Get("text");
+        if (tv != null && tv.IsString()) {
+            string ts = tv.AsString("");
+            if (ts != "") {
+                b.Append(">" + EscapeAttr(ts) + "</" + tag + ">\n");
+                return;
+            }
         }
         b.Append("></" + tag + ">\n");
     }
@@ -156,11 +293,23 @@ class DesignerHtml {
     static JsonValue FieldJson(WDoc doc, WNode n) {
         JsonValue o = JsonValue.NewObject();
         string kind = HtmlText.Attr(n.attrNames, n.attrVals, "data-kind");
+        if (kind == "" && n.tag == "template") { kind = "Element"; }
         if (kind == "") { kind = TagKind(n.tag); }
         if (kind == "") { kind = "Panel"; }
+        // <input type=…> 一族：type 细化出 Checkbox/Radio/Slider/…
+        //（data-kind 缺失才兜底，见 InputTypeKind）。
+        if (kind == "Input" && n.tag == "input") {
+            kind = DesignerHtml.InputTypeKind(
+                HtmlText.Attr(n.attrNames, n.attrVals, "type"));
+        }
         o.Put("kind", JsonValue.NewStr(kind));
         string id = HtmlText.Attr(n.attrNames, n.attrVals, "id");
         if (id != "") { o.Put("name", JsonValue.NewStr(id)); }
+        // Element 的真实标签随对象走（FieldHtml 读 "tag" 发元素名）；
+        // "tag" 不在建模键名单里，设计器 extra 原样透传。
+        if (kind == "Element") { o.Put("tag", JsonValue.NewStr(n.tag)); }
+        string pgV = "";
+        string pgM = "";
         for (int i = 0; i < n.attrNames.Count; i = i + 1) {
             string a = n.attrNames[i];
             string v = n.attrVals[i];
@@ -174,10 +323,112 @@ class DesignerHtml {
                 if (v != "") { o.Put("style", JsonValue.NewStr(v)); }
                 continue;
             }
+            // checkbox/radio 的原生 value 是可视文案（label）而非取值；
+            // checked 是初始勾选（= defOn）。写 value="记住我" checked。
+            // （必须先于下面的通用 value 分支。）
+            if ((kind == "Checkbox" || kind == "Radio") && a == "value") {
+                if (v != "") { o.Put("label", JsonValue.NewStr(v)); }
+                continue;
+            }
+            if (kind == "Checkbox" && a == "checked") {
+                if (v == "" || v == "checked" || v == "true") {
+                    o.Put("defOn", JsonValue.NewBool(true));
+                }
+                continue;
+            }
+            // <progress value max>：两属性先截下（不入模型），
+            // 循环后折算成 percent——模型里只留 percent 一个键。
+            if (kind == "Progress" && (a == "value" || a == "max")) {
+                if (a == "value") { pgV = v; }
+                else { pgM = v; }
+                continue;
+            }
+            // 原生 HTML 属性 → 建模键：<img src/alt>、input/textarea
+            // 的 placeholder/value、表单族的 min/max/step。与 data-*
+            // 通道写进同一个键空间（src="x" ≡ data-src="x"），读端
+            // 不分来源。
+            if (a == "src" || a == "alt" || a == "placeholder"
+                || a == "value" || a == "min" || a == "max"
+                || a == "step") {
+                if (v != "") { o.Put(a, JsonValue.NewStr(v)); }
+                continue;
+            }
             if (a.Length > 5 && HtmlText.StartsWith(a, "data-")) {
+                if (a == "data-arg") { continue; }   // 循环后统一折 "arg"
                 PutAttr(o, a.Substring(5), v);
             }
         }
+        // data-arg 是事件通道的键：折成模型 "arg"（FieldHtml 对称发
+        // data-arg 属性）。单点折键，避免通用通道与这里重复 Put。
+        string darg = HtmlText.Attr(n.attrNames, n.attrVals, "data-arg");
+        if (darg != "") { o.Put("arg", JsonValue.NewStr(darg)); }
+        // <progress value max> → percent（原生两属性表达的是同一信息）。
+        if (kind == "Progress" && pgV != "") {
+            int pv = Convert.ToInt32(pgV);
+            int pm = Convert.ToInt32(pgM != "" ? pgM : "100");
+            if (pm <= 0) { pm = 100; }
+            int pct = pv * 100 / pm;
+            if (pct < 0) { pct = 0; }
+            if (pct > 100) { pct = 100; }
+            o.Put("percent", JsonValue.NewNum(Convert.ToString(pct)));
+        }
+        // <select><option>…</option></select>：option 文本即候选
+        // （"a|b|c" 建模键），selected 属性 → 选中下标（value 键）。
+        if (kind == "SelectBox") {
+            string opts = "";
+            int selIdx = 0 - 1;
+            int oi = 0;
+            for (int i = 0; i < n.items.Count; i = i + 1) {
+                WItem it = n.items[i];
+                if (it.kid < 0) { continue; }
+                WNode cn = doc.nodes[it.kid];
+                if (cn.tag != "option") { continue; }
+                string ot = cn.text;
+                if (ot == "") {
+                    for (int k = 0; k < cn.items.Count; k = k + 1) {
+                        WItem cit = cn.items[k];
+                        if (cit.kid >= 0 || cit.text == "") { continue; }
+                        ot = ot + cit.text;
+                    }
+                }
+                ot = ot.Trim();
+                for (int q = 0; q < cn.attrNames.Count; q = q + 1) {
+                    if (cn.attrNames[q] == "selected") { selIdx = oi; }
+                }
+                if (ot != "") {
+                    if (oi > 0) { opts = opts + "|"; }
+                    opts = opts + ot;
+                }
+                oi = oi + 1;
+            }
+            if (opts != "") { o.Put("options", JsonValue.NewStr(opts)); }
+            // 浏览器语义：没有任何 option 带 selected 时显示首项，
+            // 所以选中也落到 0 而不是"未选"。
+            if (selIdx < 0 && opts != "") { selIdx = 0; }
+            if (selIdx >= 0) {
+                o.Put("value", JsonValue.NewNum(Convert.ToString(selIdx)));
+            }
+        }
+        // 原生文本内容 → "text" 键：<button>点我</button>、<label>…</label>
+        // 的可见文字、<textarea> 的初始值、<p> 的段落文字——与 data-text
+        // 等价。button/textarea 是解析器的捕获控件（文本汇总在节点 text
+        // 上），其余标签从文本片拼。
+        string nk = o.Str("kind", "");
+        if (nk == "Button" || nk == "Label" || nk == "TextArea"
+            || nk == "Typography") {
+            string txt = n.text;
+            if (txt == "") {
+                for (int i = 0; i < n.items.Count; i = i + 1) {
+                    WItem it = n.items[i];
+                    if (it.kid >= 0 || it.text == "") { continue; }
+                    txt = txt + it.text;
+                }
+            }
+            txt = txt.Trim();
+            if (txt != "") { o.Put("text", JsonValue.NewStr(txt)); }
+        }
+        // select 的子元素已在上面折成 options，不再当容器 kids 递归。
+        if (kind == "SelectBox") { return o; }
         JsonValue kids = JsonValue.NewArray();
         for (int i = 0; i < n.items.Count; i = i + 1) {
             WItem it = n.items[i];
@@ -226,7 +477,8 @@ class DesignerHtml {
     /// 键值 → 属性写出发射（标量 false/""/0 跳过；复合值走 x- JSON）。
     /// 零值/空串有义的键豁免跳过：几何四键 fx/fy/fw/fh（矩形边界，
     /// FieldJson 无条件写出，丢了会在解码端回落到 32 的缺省高）、
-    /// winZoom（0 = 适应视口，模型缺省 1000）、pad/gap（0 = 显式无
+    /// winZoom（0 = 适应视口，模型缺省 1000）、layoutMode（0 = 吸附/
+    /// 流式布局，丢了读端回落 1 变自由布局）、pad/gap（0 = 显式无
     /// 内边距/间距，压过样式表缺省）、label/placeholder（"" = 显式
     /// 清空，缺了会回落 kind 缺省文案）。其余键 0/"" == 读端缺省，
     /// 跳过保持文档干净；
@@ -242,8 +494,8 @@ class DesignerHtml {
         if (v.IsNumber()) {
             string t = v.ToJson();
             if (t != "0" || key == "fx" || key == "fy" || key == "fw"
-                || key == "fh" || key == "winZoom" || key == "pad"
-                || key == "gap") {
+                || key == "fh" || key == "winZoom" || key == "layoutMode"
+                || key == "pad" || key == "gap") {
                 b.Append(" data-" + KebabKey(key) + "=\"" + t + "\"");
             }
             return;
@@ -330,23 +582,89 @@ class DesignerHtml {
         return outp;
     }
 
-    /// kind → 存储 tag（只为可读性；data-kind 是权威标记）。
+    /// kind → 存储 tag。有 HTML 原生等价物的走原生标签；Panel 走裸
+    /// div（布局兜底形态，kind 由 TagKind("div") 恢复）；其余组件走
+    /// `zan-<kebab>` 自定义元素（HTML5 合法标签名，tokenizer 的
+    /// IsNameChar 收连字符）——组件化写法，不再骑在 div 上打标记。
     static string KindTag(string kind) {
         if (kind == "Label") { return "label"; }
         if (kind == "Button") { return "button"; }
         if (kind == "Input") { return "input"; }
         if (kind == "TextArea") { return "textarea"; }
         if (kind == "Image") { return "img"; }
-        return "div";
+        if (kind == "Divider") { return "hr"; }
+        if (kind == "Progress") { return "progress"; }
+        if (kind == "SelectBox") { return "select"; }
+        if (kind == "Typography") { return "p"; }
+        // input 的 type 变体：HTML 原生表单控件一族。
+        if (kind == "Checkbox") { return "input"; }
+        if (kind == "Radio") { return "input"; }
+        if (kind == "Slider") { return "input"; }
+        if (kind == "ColorPicker") { return "input"; }
+        if (kind == "InputNumber") { return "input"; }
+        if (kind == "DatePicker") { return "input"; }
+        if (kind == "Upload") { return "input"; }
+        if (kind == "Panel") { return "div"; }
+        return "zan-" + KebabKey(kind);
     }
 
-    /// tag → kind（读端兜底；data-kind 缺失时）。
+    /// tag → kind（读端兜底；data-kind 缺失时）。zan-<kebab> 自定义
+    /// 元素反解回 Pascal kind，与 KindTag 的默认分支互逆。
     static string TagKind(string tag) {
+        if (HtmlText.StartsWith(tag, "zan-")) {
+            // 标签名经 tokenizer 全小写，逐段首字母大写复原 Pascal
+            // kind（Unkebab 不动首段，这里不能用）："zan-qr-code" →
+            // "QrCode"，与 KebabKey 互逆。
+            string pascal = "";
+            List<string> ks = tag.Substring(4).Split("-");
+            for (int ki = 0; ki < ks.Count; ki = ki + 1) {
+                string kp = ks[ki];
+                if (kp.Length == 0) { continue; }
+                int c0 = kp[0];
+                if (c0 >= 97 && c0 <= 122) {
+                    pascal = pascal + (char)(c0 - 32) + kp.Substring(1);
+                } else {
+                    pascal = pascal + kp;
+                }
+            }
+            return pascal;
+        }
         if (tag == "label") { return "Label"; }
         if (tag == "button") { return "Button"; }
         if (tag == "input") { return "Input"; }
         if (tag == "textarea") { return "TextArea"; }
         if (tag == "img") { return "Image"; }
+        if (tag == "hr") { return "Divider"; }
+        if (tag == "progress") { return "Progress"; }
+        if (tag == "select") { return "SelectBox"; }
+        if (tag == "p") { return "Typography"; }
         return "Panel";
+    }
+
+    /// input 的 type 属性 → 组件 kind（<input type=checkbox> 是 Checkbox
+    /// 而不是 Input）。只在 data-kind 缺失、kind 从标签兜底而来时细化：
+    /// data-kind 是权威标记，写了就不改写。
+    static string InputTypeKind(string ty) {
+        if (ty == "checkbox") { return "Checkbox"; }
+        if (ty == "radio") { return "Radio"; }
+        if (ty == "range") { return "Slider"; }
+        if (ty == "color") { return "ColorPicker"; }
+        if (ty == "number") { return "InputNumber"; }
+        if (ty == "date" || ty == "month" || ty == "week"
+            || ty == "time") { return "DatePicker"; }
+        if (ty == "file") { return "Upload"; }
+        return "Input";
+    }
+
+    /// input 变体组件导出时发哪个 type 属性。
+    static string KindInputType(string kind) {
+        if (kind == "Checkbox") { return "checkbox"; }
+        if (kind == "Radio") { return "radio"; }
+        if (kind == "Slider") { return "range"; }
+        if (kind == "ColorPicker") { return "color"; }
+        if (kind == "InputNumber") { return "number"; }
+        if (kind == "DatePicker") { return "date"; }
+        if (kind == "Upload") { return "file"; }
+        return "";
     }
 }

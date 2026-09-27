@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using Gui;
 using Gui.Widget;
 using Gui.Backend;
@@ -20,14 +21,23 @@ class CeHlLine {
     bool blockOpen;
 }
 
-/// <summary>一条撤销/重做记录：完整的缓冲区文本及要恢复的
-/// 光标行/列。用单个实体取代并行的文本/行/列栈。</summary>
+/// <summary>一条撤销/重做记录：以行列表深拷贝（引用复制）及光标行/列
+/// 构成的快照，彻底消灭旧实现每次击键 string.Join 全文的巨大开销。</summary>
 class EditSnapshot {
+    List<string> lines;
     string text;
     int line;
     int col;
 
+    EditSnapshot(List<string> lines, int line, int col) {
+        this.lines = lines;
+        this.text = "";
+        this.line = line;
+        this.col = col;
+    }
+
     EditSnapshot(string text, int line, int col) {
+        this.lines = null;
         this.text = text;
         this.line = line;
         this.col = col;
@@ -106,6 +116,24 @@ class ProjType {
     }
 }
 
+/// 外部语义补全项（如 LSP / 智能分析器提供）
+class CodeCompletionItem {
+    string label;
+    string kind;
+    string detail;
+    string doc;
+
+    CodeCompletionItem(string label, string kind, string detail, string doc) {
+        this.label = label;
+        this.kind = kind;
+        this.detail = detail;
+        this.doc = doc;
+    }
+}
+
+delegate List<CodeCompletionItem> CodeCompletionProvider(string path, int line0, int col0);
+delegate string CodeSignatureProvider(string path, int line0, int col0, string callee);
+
 /// 右键菜单的一项：标签、右侧显示的快捷键提示，以及动作编号
 /// （0 = 分隔行，其余由编辑器的菜单执行器解释）。
 class ContextMenuItem {
@@ -141,11 +169,21 @@ partial class CodeEditor {
     int curLine;
     int curCol;
     int scrollLine;
+    int scrollY;
+    int targetScrollY;
+    int maxScrollY;
     // 视图上次自动滚动保持可见的行。"保持光标
     // 在视野内"的钳制只在光标行变化时触发（输入/方向键/点击），
     // 因此单纯的滚轮/滚动条滚动不会被拉回光标行。
     int ensuredCaretLine;
     int lastId;
+
+    /// 当前编辑的文件完整路径（用于 LSP 语义服务）
+    public string documentPath = "";
+    /// 外部智能补全提供者（如 LSP）
+    public CodeCompletionProvider externalCompletion;
+    /// 外部参数签名提示提供者（如 LSP）
+    public CodeSignatureProvider externalSignature;
 
     // ---- 本帧的行布局 ----
     // CodeLens 标注位于其装饰的声明上方独占的一行
@@ -223,6 +261,10 @@ partial class CodeEditor {
     int clickCount;
     // 上次 Render 中完全可见的文本行数（供 Page Up/Down）。
     int pageRows;
+    int textVersion;
+    int lastScrollMs;
+    int wheelAccum;
+    List<string> rowDecl;
 
     // ---- 多光标（次要光标，各在不同行） ----
     List<Caret> carets;
@@ -234,6 +276,10 @@ partial class CodeEditor {
     bool ateCtrlKey;
     List<EditSnapshot> undoStack;
     List<EditSnapshot> redoStack;
+    // 连续键入合并撤销状态：0=无、1=打字、2=退格。
+    int undoEditKind;
+    int undoEditLine;
+    int undoEditCol;
 
     // ---- 错误诊断 ----
     List<Diagnostic> errors;
@@ -353,6 +399,9 @@ partial class CodeEditor {
     DbgVar hoverTip;        // 当前悬停提示条目（无则为 null）
     int hoverTipX;
     int hoverTipY;
+    int lastHoverMoveMs;
+    int lastHoverX;
+    int lastHoverY;
 
     // 右键上下文菜单状态。
     bool ctxOpen;
@@ -460,6 +509,9 @@ partial class CodeEditor {
         this.curLine = 0;
         this.curCol = 0;
         this.scrollLine = 0;
+        this.scrollY = 0;
+        this.targetScrollY = 0;
+        this.maxScrollY = 0;
         this.ensuredCaretLine = -1;
         this.lastId = -1;
         this.rowLine = new List<int>();
@@ -497,10 +549,17 @@ partial class CodeEditor {
         this.lastClickCol = -1;
         this.clickCount = 0;
         this.pageRows = 20;
+        this.textVersion = 1;
+        this.lastScrollMs = 0;
+        this.wheelAccum = 0;
+        this.rowDecl = new List<string>();
         this.carets = new List<Caret>();
         this.clipboard = "";
         this.undoStack = new List<EditSnapshot>();
         this.redoStack = new List<EditSnapshot>();
+        this.undoEditKind = 0;
+        this.undoEditLine = 0 - 1;
+        this.undoEditCol = 0 - 1;
         this.errors = new List<Diagnostic>();
         this.lastDiagLine = -1;
         this.compErrors = new List<Diagnostic>();
@@ -557,15 +616,20 @@ partial class CodeEditor {
         this.hoverTip = null;
         this.hoverTipX = 0;
         this.hoverTipY = 0;
+        this.lastHoverMoveMs = 0;
+        this.lastHoverX = 0;
+        this.lastHoverY = 0;
         this.ctxOpen = false;
         this.ctxX = 0;
         this.ctxY = 0;
         this.ctxCmd = "";
     }
 
-    /// 按 '\n' 把字符串拆分为行（去除 '\r'）。
+    /// 按 '\n' 把字符串拆分为行（去除 '\r'）。实现移至
+    /// TextWrap.SplitLines：输入框/多行框只需文本布局原语，
+    /// 不必拖入整个代码编辑器；此处保留委托以稳住内部调用点。
     static List<string> SplitLines(string s) {
-        return s.Replace("\r", "").Split("\n");
+        return Gui.TextWrap.SplitLines(s);
     }
 
     /// 整体替换缓冲区：保证至少一行，光标与滚动复位到开头，
@@ -576,8 +640,16 @@ partial class CodeEditor {
         curLine = 0;
         curCol = 0;
         scrollLine = 0;
+        scrollY = 0;
+        targetScrollY = 0;
         ensuredCaretLine = -1;
         lastDiagLine = -1;  // 强制对新内容重新计算诊断
+        BumpTextVersion();
+    }
+
+    /// 标记文本已被修改，递增单调版本号。
+    void BumpTextVersion() {
+        textVersion = textVersion + 1;
     }
 
     /// 载入整段文本（SetLines 的字符串版），同时清空 CodeLens、
@@ -598,14 +670,10 @@ partial class CodeEditor {
         return string.Join("\n", lines);
     }
 
-    /// 廉价的内容指纹（行数 + 总字符数）；使宿主
-    /// 无需实例化完整文本即可每帧检测缓冲区变化。
+    /// O(1) 内容版本号：文本实际变更时才递增，
+    /// 彻底消除每帧遍历全文件所有行统计长度的巨大卡顿。
     int TextStamp() {
-        int n = 0;
-        for (int i = 0; i < lines.Count; i = i + 1) {
-            n = n + lines[i].Length;
-        }
-        return n * 131 + lines.Count;
+        return textVersion;
     }
 
     /// 缓冲区行数。
@@ -641,6 +709,18 @@ partial class CodeEditor {
         if (line >= lines.Count) { line = lines.Count - 1; }
         if (line < 0) { line = 0; }
         scrollLine = line;
+        scrollY = 0 - 1; // 标记由下一次 Render 转换为精确像素
+        targetScrollY = 0 - 1;
+    }
+
+    /// 当前视口垂直像素滚动偏移。
+    int ScrollY() { return scrollY; }
+    /// 设置垂直像素滚动偏移。
+    void SetScrollY(int y) {
+        if (y < 0) { y = 0; }
+        if (maxScrollY > 0 && y > maxScrollY) { y = maxScrollY; }
+        scrollY = y;
+        targetScrollY = y;
     }
 
     // ---- 自动化 / 自省访问器（供 Gui.UiDriver 使用） ----
@@ -703,12 +783,17 @@ partial class CodeEditor {
     /// 用上次 Run/Build 针对本文件报告的真实错误
     /// 替换红色下划线 + 提示显示的编译器诊断，并
     /// 把光标跳到第一个错误，使其原因立即可见。
+    /// 当编译成功（diagnostics 为空）时，清空启发式扫描的假阳性错误，保证与编译器一致。
     void SetCompilerDiagnostics(List<Diagnostic> diagnostics) {
         compErrors = diagnostics;
         cErrStamp = BufLen();
         diagStaleFrame = 0 - 1;
         if (compErrors.Count > 0) {
             GoToLine(compErrors[0].line);
+        } else {
+            // 真实编译器验证无任何错误：权威冲刷本地启发式假阳性，消除误导性红线
+            errors = new List<Diagnostic>();
+            fixes = new List<QuickFix>();
         }
     }
 
@@ -971,45 +1056,103 @@ partial class CodeEditor {
         if (curCol < 0) { curCol = 0; }
     }
 
-    /// ---- 撤销 / 重做 ----
-    /// 把当前全文与光标压入撤销栈（上限 50 条，超出丢最旧），
-    /// 并清空重做栈。
-    void SaveUndo() {
-        undoStack.Add(new EditSnapshot(GetText(), curLine, curCol));
+    static List<string> CloneLines(List<string> src) {
+        List<string> copy = new List<string>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            copy.Add(src[i]);
+        }
+        return copy;
+    }
+
+    /// 终结连续输入/退格的合并事务。在回车、选区编辑、粘贴、光标移动时调用。
+    void EndUndoGroup() {
+        this.undoEditKind = 0;
+        this.undoEditLine = 0 - 1;
+        this.undoEditCol = 0 - 1;
+    }
+
+    /// 压入一个完整的撤销快照（浅拷贝行引用列表，零 string.Join 开销）。
+    void PushUndoSnapshot() {
+        undoStack.Add(new EditSnapshot(CodeEditor.CloneLines(lines), curLine, curCol));
         if (undoStack.Count > 50) {
             undoStack.RemoveAt(0);
         }
-        // 新编辑会使重做历史失效。
         redoStack = new List<EditSnapshot>();
+        BumpTextVersion();
+    }
+
+    /// ---- 撤销 / 重做 ----
+    /// 普通离散编辑动作：终结之前的合并事务，压入快照。
+    void SaveUndo() {
+        EndUndoGroup();
+        PushUndoSnapshot();
+    }
+
+    /// 连续单字输入的合并撤销：同一行连续键入时只在输入起始压一次栈，避免每击一键都分配快照。
+    void SaveUndoTyping() {
+        if (undoEditKind == 1 && curLine == undoEditLine && curCol == undoEditCol) {
+            undoEditCol = curCol + 1;
+            redoStack = new List<EditSnapshot>();
+            BumpTextVersion();
+            return;
+        }
+        PushUndoSnapshot();
+        undoEditKind = 1;
+        undoEditLine = curLine;
+        undoEditCol = curCol + 1;
+    }
+
+    /// 连续单字退格的合并撤销：同一行连续退格时合并。
+    void SaveUndoBackspace() {
+        if (undoEditKind == 2 && curLine == undoEditLine && curCol == undoEditCol) {
+            undoEditCol = curCol - 1;
+            redoStack = new List<EditSnapshot>();
+            BumpTextVersion();
+            return;
+        }
+        PushUndoSnapshot();
+        undoEditKind = 2;
+        undoEditLine = curLine;
+        undoEditCol = curCol - 1;
+    }
+
+    void RestoreSnapshot(EditSnapshot s) {
+        if (s.lines != null) {
+            this.lines = CodeEditor.CloneLines(s.lines);
+            if (this.lines.Count == 0) { this.lines.Add(""); }
+            this.extRefDirty = true;
+            this.lastDiagLine = 0 - 1;
+            BumpTextVersion();
+        } else {
+            LoadText(s.text);
+        }
+        this.curLine = s.line;
+        this.curCol = s.col;
+        ClampCol();
+        this.selActive = false;
     }
 
     /// 撤销最近一次编辑：撤销前状态先压入重做栈，恢复后清除选区。
     void Undo() {
+        EndUndoGroup();
         if (undoStack.Count == 0) { return; }
         int last = undoStack.Count - 1;
         EditSnapshot s = undoStack[last];
         undoStack.RemoveAt(last);
         // 记录撤销前的状态，供 Redo 恢复。
-        redoStack.Add(new EditSnapshot(GetText(), curLine, curCol));
-        LoadText(s.text);
-        curLine = s.line;
-        curCol = s.col;
-        ClampCol();
-        selActive = false;
+        redoStack.Add(new EditSnapshot(CodeEditor.CloneLines(lines), curLine, curCol));
+        RestoreSnapshot(s);
     }
 
     /// 重做最近一次被撤销的编辑（对称地更新撤销栈）。
     void Redo() {
+        EndUndoGroup();
         if (redoStack.Count == 0) { return; }
         int last = redoStack.Count - 1;
         EditSnapshot s = redoStack[last];
         redoStack.RemoveAt(last);
-        undoStack.Add(new EditSnapshot(GetText(), curLine, curCol));
-        LoadText(s.text);
-        curLine = s.line;
-        curCol = s.col;
-        ClampCol();
-        selActive = false;
+        undoStack.Add(new EditSnapshot(CodeEditor.CloneLines(lines), curLine, curCol));
+        RestoreSnapshot(s);
     }
 
     /// ---- 选区 ----
@@ -1103,32 +1246,50 @@ partial class CodeEditor {
         }
     }
 
-    /// 布局本帧各行：从 `scrollLine` 起所有能放入
+    /// 布局本帧各行：从 `scrollY` 起所有能放入
     /// `area` 的代码行，声明了成员的代码行前加 lens 行。
-    /// 每帧在行与像素互相换算之前调用一次。
+    /// 逐像素计算首行偏移与位置，并复用表容器消除每帧堆分配。
     void BuildRowLayout(Rect area, int lineH, int lensH) {
-        rowLine = new List<int>();
-        rowTop = new List<int>();
-        rowLensY = new List<int>();
+        if (rowLine == null) {
+            rowLine = new List<int>();
+            rowTop = new List<int>();
+            rowLensY = new List<int>();
+            rowDecl = new List<string>();
+        } else {
+            rowLine.Clear();
+            rowTop.Clear();
+            rowLensY.Clear();
+            rowDecl.Clear();
+        }
         lensRowH = lensH;
-        int y = area.y;
         int bottom = area.y + area.height;
-        int ln = scrollLine;
+        if (lineH < 1) { lineH = 1; }
+        if (scrollY < 0) {
+            scrollY = scrollLine * lineH;
+            targetScrollY = scrollY;
+        }
+        int ln = scrollY / lineH;
         if (ln < 0) { ln = 0; }
-        while (ln < lines.Count && y + lineH <= bottom) {
+        int subOffset = scrollY % lineH;
+        if (subOffset < 0) { subOffset = 0; }
+        int y = area.y - subOffset;
+        while (ln < lines.Count && y < bottom) {
             int ly = 0 - 1;
+            string decl = "";
+            string lnt = lines[ln];
             // lens 行要么完整绘制要么整行丢弃，而不是在顶部或底部边缘半绘，
-            // 因此代码行永远不会被自己的
-            // 注解挤出视野。
-            if (lensH > 0 && ln > scrollLine
-                && CodeEditor.DeclNameAt(lines[ln]).Length > 0
-                && y + lensH + lineH <= bottom) {
-                ly = y;
-                y = y + lensH;
+            // 因此代码行永远不会被自己的注解挤出视野。
+            if (lensH > 0 && ln > scrollLine && CodeEditor.MightBeDecl(lnt)) {
+                decl = CodeEditor.DeclNameAt(lnt);
+                if (decl.Length > 0 && y + lensH + lineH <= bottom) {
+                    ly = y;
+                    y = y + lensH;
+                }
             }
             rowLine.Add(ln);
             rowTop.Add(y);
             rowLensY.Add(ly);
+            rowDecl.Add(decl);
             y = y + lineH;
             ln = ln + 1;
         }
@@ -1175,8 +1336,13 @@ partial class CodeEditor {
         int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
         int clicked = LineAtY(lineH, app.mouseY);
         if (clicked < 0) {
-            if (app.mouseY < area.y) { clicked = scrollLine; }
-            else { clicked = scrollLine + VisibleRowCount() - 1; }
+            if (app.mouseY < area.y) {
+                if (rowLine.Count > 0) { clicked = rowLine[0]; }
+                else { clicked = scrollLine; }
+            } else {
+                if (rowLine.Count > 0) { clicked = rowLine[rowLine.Count - 1]; }
+                else { clicked = scrollLine + VisibleRowCount() - 1; }
+            }
         }
         if (clicked >= lines.Count) { clicked = lines.Count - 1; }
         if (clicked < 0) { clicked = 0; }

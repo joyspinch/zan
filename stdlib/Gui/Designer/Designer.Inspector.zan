@@ -85,6 +85,10 @@ partial class Designer {
         selPrev = f;
         inspKeySeq = inspKeySeq + 1;
         optInput.SetText("");
+        // 表格的行实体（extra["of"]）读进检查器暂存，属性表经
+        // 绑定写 ofEd，渲染后差量写回 extra。
+        ofEd = "";
+        if (f.extra != null) { ofEd = f.extra.Str("of", ""); }
         List<string> evs = f.Events();
         if (evs.Count > 0) { evtEditing = evs[0]; } else { evtEditing = ""; }
         evtInput.SetText(f.GetHandler(evtEditing));
@@ -233,6 +237,18 @@ partial class Designer {
             don.flag = f.defOn;
             ps.Add(don);
         }
+        if (f.ftype == 23 || f.ftype == 41) {
+            // 行实体：声明式列（extra["columns"]）的类型化访问器读
+            // 它的字段（GenForm 生成 `__r => __r.<field>`），列属性
+            // 弹窗里配了列类型/可编辑时必填。
+            PropSpec ofr = PropSpec.Text("of",
+                Designer.T("Row entity (of)", "行实体 (of)"));
+            ofr.str = ofEd;
+            ofr.tip = Designer.T(
+                "Row entity type for declarative columns; column accessors read its fields (required for typed/editable columns).",
+                "声明式列的行实体类型；列访问器读取它的字段（列配了类型/可编辑时必填）。");
+            ps.Add(ofr);
+        }
         return ps;
     }
 
@@ -257,6 +273,17 @@ partial class Designer {
         f.name = f.fname;
         if (f.span < 1) { f.span = 1; }
         if (f.span > 24) { f.span = 24; }
+        // 行实体写回 extra["of"]：空值且原来也没设就不动文档。
+        if (f.ftype == 23 || f.ftype == 41) {
+            string ofCur = f.extra == null ? "" : f.extra.Str("of", "");
+            string ofNew = StyleSheet.Trim(ofEd);
+            if (ofNew != ofCur) {
+                if (f.extra == null) { f.extra = JsonValue.NewObject(); }
+                if (ofNew == "") { Designer.DropKey(f.extra, "of"); }
+                else { f.extra.Put("of", JsonValue.NewStr(ofNew)); }
+                app.RequestRedraw();
+            }
+        }
 
         // STYLE（CSS 声明行）：一行一条声明，与元素 style 属性同一
         // 语义（键: 值）。每帧重组回 f.styleText（空行跳过），画布
@@ -280,9 +307,11 @@ partial class Designer {
         slb.RenderInside(app, new Rect(ix, iy, iw, app.Scale(18)));
         iy = iy + app.Scale(20);
         for (int si = 0; si < styleInputs.Count; ) {
-            styleInputs[si].Render(app, ix, iy, iw - app.Scale(58), app.Scale(28));
+            int btnW = app.Scale(28);
+            int gap = app.Scale(6);
+            styleInputs[si].Render(app, ix, iy, iw - btnW - gap, btnW);
             int rmStyId = SmallIconBtn(app, "close", 5,
-                ix + iw - app.Scale(28), iy, app.Scale(28));
+                ix + iw - btnW, iy, btnW);
             if (Ui.Clicked(app, rmStyId)) {
                 styleInputs.RemoveAt(si);
                 app.RequestRedraw();
@@ -323,32 +352,81 @@ partial class Designer {
                 if (compPropEditFor != browId) {
                     compPropEditFor = browId;
                     compPropInputs = new List<Input>();
+                    compPropSwitches = new List<Switch>();
+                    compPropIsBool = new List<bool>();
                     compPropShadow = new List<string>();
                     for (int bi = 0; bi < brows.Count; bi = bi + 1) {
                         int bar = brows[bi].IndexOf("|");
-                        Input pin = new Input("");
-                        pin.SetText(CompPropValue(f,
-                            brows[bi].Substring(0, bar), ""));
-                        compPropInputs.Add(pin);
-                        compPropShadow.Add(pin.GetText());
+                        string key = brows[bi].Substring(0, bar);
+                        string rawLabel = brows[bi].Substring(bar + 1);
+                        string curVal = CompPropValue(f, key, "");
+                        bool isBool = Designer.IsBoolProp(key, rawLabel, curVal);
+                        compPropIsBool.Add(isBool);
+                        if (isBool) {
+                            Switch sw = new Switch();
+                            sw.Size = "small";
+                            sw.SetOn(PropSpec.IsOn(curVal));
+                            compPropSwitches.Add(sw);
+                            compPropInputs.Add(new Input(""));
+                            compPropShadow.Add(sw.IsOn() ? "true" : "false");
+                        } else {
+                            Input pin = new Input("");
+                            pin.SetText(curVal);
+                            compPropInputs.Add(pin);
+                            compPropSwitches.Add(new Switch());
+                            compPropShadow.Add(pin.GetText());
+                        }
                     }
                 }
                 Label blb = new Label(Designer.T("WIDGET PROPS", "组件属性"));
                 blb.Class = "tertiary small";
-                blb.RenderInside(app, new Rect(ix, iy, iw, app.Scale(18)));
+                blb.RenderInside(app, new Rect(ix, iy, iw - app.Scale(76), app.Scale(18)));
+                int pbigId = SmallBtn(app, Designer.T("Edit…", "编辑…"), 0,
+                    ix + iw - app.Scale(72), iy - app.Scale(2), app.Scale(72));
+                if (Ui.Clicked(app, pbigId)) { this.OpenPropsEditor(app, f); }
                 iy = iy + app.Scale(20);
+
+                int labelW = app.Scale(116);
+                if (labelW > iw * 52 / 100) { labelW = iw * 52 / 100; }
+                if (labelW < app.Scale(80)) { labelW = app.Scale(80); }
+
                 for (int bi = 0; bi < brows.Count; bi = bi + 1) {
                     int bar = brows[bi].IndexOf("|");
-                    Label brl = new Label(brows[bi].Substring(bar + 1));
+                    string key = brows[bi].Substring(0, bar);
+                    string rawLabel = brows[bi].Substring(bar + 1);
+                    string cleanLabel = Designer.CleanPropLabel(rawLabel);
+
+                    int rowH = app.Scale(28);
+                    bool rowHover = InRect(app.mouseX, app.mouseY, ix, iy, iw, rowH);
+                    if (rowHover) {
+                        c.FillRoundRect(ix, iy, iw, rowH, app.Scale(3), t.bgHover);
+                    }
+
+                    Label brl = new Label(cleanLabel);
                     brl.Class = "secondary small";
-                    brl.RenderInside(app, new Rect(ix, iy, app.Scale(84), app.Scale(28)));
-                    compPropInputs[bi].Render(app, ix + app.Scale(84), iy,
-                        iw - app.Scale(84), app.Scale(28));
-                    string bcur = compPropInputs[bi].GetText();
-                    if (bcur != compPropShadow[bi]) {
-                        SetCompPropValue(f, brows[bi].Substring(0, bar), bcur);
-                        compPropShadow[bi] = bcur;
-                        app.RequestRedraw();
+                    brl.RenderInside(app, new Rect(ix, iy, labelW, rowH));
+
+                    if (compPropIsBool[bi]) {
+                        Switch sw = compPropSwitches[bi];
+                        int swH = app.Scale(18);
+                        int swY = iy + (rowH - swH) / 2;
+                        sw.Render(app, ix + labelW + app.Scale(6), swY);
+                        bool isSwOn = sw.IsOn();
+                        string bcur = isSwOn ? "true" : "false";
+                        if (bcur != compPropShadow[bi]) {
+                            SetCompPropValue(f, key, bcur);
+                            compPropShadow[bi] = bcur;
+                            app.RequestRedraw();
+                        }
+                    } else {
+                        compPropInputs[bi].Render(app, ix + labelW, iy,
+                            iw - labelW, rowH);
+                        string bcur = compPropInputs[bi].GetText();
+                        if (bcur != compPropShadow[bi]) {
+                            SetCompPropValue(f, key, bcur);
+                            compPropShadow[bi] = bcur;
+                            app.RequestRedraw();
+                        }
                     }
                     iy = iy + app.Scale(32);
                 }
@@ -369,7 +447,7 @@ partial class Designer {
 
             // 组件声明的对外属性（v1 文本型）：每行一个输入框，
             // 实例值写入 f.extra 的 "props" 直通表——随 SaveJson
-            // 进 .zform，GenForm 展开时落给目标内部控件；画布
+            // 进设计文档，GenForm 展开时落给目标内部控件；画布
             // 预览同步应用。目标名/声明都来自组件文档根。
             this.EnsureCompPropDecls(f.customKind);
             if (compPropKeys.Count > 0) {
@@ -378,30 +456,73 @@ partial class Designer {
                 if (compPropEditFor != rowId) {
                     compPropEditFor = rowId;
                     compPropInputs = new List<Input>();
+                    compPropSwitches = new List<Switch>();
+                    compPropIsBool = new List<bool>();
                     compPropShadow = new List<string>();
                     for (int pi = 0; pi < compPropKeys.Count; pi = pi + 1) {
-                        Input pin = new Input("");
-                        pin.SetText(CompPropValue(f, compPropKeys[pi],
-                            compPropDefs[pi]));
-                        compPropInputs.Add(pin);
-                        compPropShadow.Add(pin.GetText());
+                        string key = compPropKeys[pi];
+                        string lbl = compPropLabels[pi];
+                        string curVal = CompPropValue(f, key, compPropDefs[pi]);
+                        bool isBool = Designer.IsBoolProp(key, lbl, curVal) || compPropDefs[pi] == "true" || compPropDefs[pi] == "false";
+                        compPropIsBool.Add(isBool);
+                        if (isBool) {
+                            Switch sw = new Switch();
+                            sw.Size = "small";
+                            sw.SetOn(PropSpec.IsOn(curVal));
+                            compPropSwitches.Add(sw);
+                            compPropInputs.Add(new Input(""));
+                            compPropShadow.Add(sw.IsOn() ? "true" : "false");
+                        } else {
+                            Input pin = new Input("");
+                            pin.SetText(curVal);
+                            compPropInputs.Add(pin);
+                            compPropSwitches.Add(new Switch());
+                            compPropShadow.Add(pin.GetText());
+                        }
                     }
                 }
                 Label pl = new Label(Designer.T("COMPONENT PROPS", "组件属性"));
                 pl.Class = "tertiary small";
                 pl.RenderInside(app, new Rect(ix, iy, iw, app.Scale(18)));
                 iy = iy + app.Scale(20);
+
+                int labelW = app.Scale(116);
+                if (labelW > iw * 52 / 100) { labelW = iw * 52 / 100; }
+                if (labelW < app.Scale(80)) { labelW = app.Scale(80); }
+
                 for (int pi = 0; pi < compPropKeys.Count; pi = pi + 1) {
-                    Label rl = new Label(compPropLabels[pi]);
+                    string cleanLabel = Designer.CleanPropLabel(compPropLabels[pi]);
+                    int rowH = app.Scale(28);
+                    bool rowHover = InRect(app.mouseX, app.mouseY, ix, iy, iw, rowH);
+                    if (rowHover) {
+                        c.FillRoundRect(ix, iy, iw, rowH, app.Scale(3), t.bgHover);
+                    }
+
+                    Label rl = new Label(cleanLabel);
                     rl.Class = "secondary small";
-                    rl.RenderInside(app, new Rect(ix, iy, app.Scale(84), app.Scale(28)));
-                    compPropInputs[pi].Render(app, ix + app.Scale(84), iy,
-                        iw - app.Scale(84), app.Scale(28));
-                    string cur = compPropInputs[pi].GetText();
-                    if (cur != compPropShadow[pi]) {
-                        SetCompPropValue(f, compPropKeys[pi], cur);
-                        compPropShadow[pi] = cur;
-                        app.RequestRedraw();
+                    rl.RenderInside(app, new Rect(ix, iy, labelW, rowH));
+
+                    if (compPropIsBool[pi]) {
+                        Switch sw = compPropSwitches[pi];
+                        int swH = app.Scale(18);
+                        int swY = iy + (rowH - swH) / 2;
+                        sw.Render(app, ix + labelW + app.Scale(6), swY);
+                        bool isSwOn = sw.IsOn();
+                        string cur = isSwOn ? "true" : "false";
+                        if (cur != compPropShadow[pi]) {
+                            SetCompPropValue(f, compPropKeys[pi], cur);
+                            compPropShadow[pi] = cur;
+                            app.RequestRedraw();
+                        }
+                    } else {
+                        compPropInputs[pi].Render(app, ix + labelW, iy,
+                            iw - labelW, rowH);
+                        string cur = compPropInputs[pi].GetText();
+                        if (cur != compPropShadow[pi]) {
+                            SetCompPropValue(f, compPropKeys[pi], cur);
+                            compPropShadow[pi] = cur;
+                            app.RequestRedraw();
+                        }
                     }
                     iy = iy + app.Scale(32);
                 }
@@ -411,6 +532,9 @@ partial class Designer {
 
         // 双向绑定选择器：从配对的代码文件扫描出的变量。
         if (bindVars.Count > 0) {
+            Label bvl = new Label(Designer.T("BINDING", "数据绑定"));
+            bvl.Class = "tertiary small";
+            bvl.RenderInside(app, new Rect(ix, iy, app.Scale(80), app.Scale(28)));
             string pickLbl = Designer.T("Pick from code ▾", "从代码选择 ▾");
             if (bindPickOpen) { pickLbl = Designer.T("Pick from code ▴", "从代码选择 ▴"); }
             int pkId = SmallBtn(app, pickLbl, 0, ix + app.Scale(84), iy, iw - app.Scale(84));
@@ -443,7 +567,12 @@ partial class Designer {
             if (table) { head = Designer.T("COLUMNS (title · field)", "列（标题 · 字段）"); }
             Label hl = new Label(head);
             hl.Class = "tertiary small";
-            hl.RenderInside(app, new Rect(ix, iy, iw, app.Scale(18)));
+            hl.RenderInside(app, new Rect(ix, iy, iw - app.Scale(76), app.Scale(18)));
+            // 弹窗大编辑器：面板太窄放不下完整表格（工具条还要
+            // 编辑图标/靠右/分隔条），行批量编辑在这里做。
+            int bigId = SmallBtn(app, Designer.T("Edit…", "编辑…"), 0,
+                ix + iw - app.Scale(72), iy - app.Scale(2), app.Scale(72));
+            if (Ui.Clicked(app, bigId)) { this.OpenRowsEditor(app, f); }
             iy = iy + app.Scale(20);
             for (int oi = 0; oi < f.OptionCount(); oi = oi + 1) {
                 string disp = f.OptionAt(oi);
@@ -452,10 +581,12 @@ partial class Designer {
                     string cfd = Designer.ColField(f.OptionAt(oi));
                     if (cfd != "") { disp = disp + "  ·  " + cfd; }
                 }
+                int btnW = app.Scale(28);
+                int gap = app.Scale(6);
                 Label ol = new Label(Convert.ToString(oi + 1) + ".  " + disp);
                 ol.Class = "secondary small";
-                ol.RenderInside(app, new Rect(ix, iy, iw - app.Scale(32), app.Scale(28)));
-                int rmId = SmallIconBtn(app, "close", 5, ix + iw - app.Scale(28), iy, app.Scale(28));
+                ol.RenderInside(app, new Rect(ix, iy, iw - btnW - gap, btnW));
+                int rmId = SmallIconBtn(app, "close", 5, ix + iw - btnW, iy, btnW);
                 if (Ui.Clicked(app, rmId)) {
                     RemoveOptionFixup(f, oi);
                 }
@@ -492,6 +623,8 @@ partial class Designer {
     /// 让 Tabs 容器的活动标签/子标签超出范围）。
     void RemoveOptionFixup(FormField f, int oi) {
         f.RemoveOptionAt(oi);
+        // 列属性条目跟着走（extra["columns"] 与 options 下标对齐）。
+        Designer.RemoveColEntry(f, oi);
         if (f.kind == "Tabs") {
             for (int ki = 0; ki < f.kids.Count; ki = ki + 1) {
                 if (f.kids[ki].childTab == oi) { f.kids[ki].childTab = 0; }
@@ -642,12 +775,21 @@ partial class Designer {
             "窗口轮廓：矩形、圆角、圆形或自定义（在 JSON 抽屉里编辑的区域并集）。");
         ps.Add(sh);
         if (winShape == 1) {
+            if (winShapeRadius <= 0) { winShapeRadius = 12; }
             PropSpec rr = PropSpec.Int("radius", Designer.T("Corner radius", "圆角半径"));
             rr.num = winShapeRadius;
             rr.Step(2, 0, 80);
             rr.tip = Designer.T("Corner radius in pixels for the rounded window shape.",
                 "圆角窗口的圆角半径（像素）。");
             ps.Add(rr);
+        }
+        if (winShape != 0) {
+            PropSpec sd = PropSpec.Int("shadow", Designer.T("Shadow (px)", "阴影大小（像素）"));
+            sd.num = winShadow;
+            sd.Step(2, 0, 40);
+            sd.tip = Designer.T("Window shadow blur extent in pixels (0 for none).",
+                "窗口外围柔和阴影大小（像素，0 为无阴影）。");
+            ps.Add(sd);
         }
         PropSpec ch = PropSpec.Bool("chrome", Designer.T("Title bar", "标题栏"));
         ch.flag = winChrome;
@@ -847,14 +989,22 @@ partial class Designer {
                             c.FillRoundRect(ix - app.Scale(4), iy - app.Scale(2),
                                 iw + app.Scale(8), rowH, app.Scale(4), Style.Part(app, "designer", "panel", "", "", "", Style.SActive()).BgOr(0));
                         }
-                        c.DrawText(ix, iy + app.Scale(5), ev, Style.Part(app, "designer", "value", "", "", "", Style.SNormal()).FgOr(0), fs);
+                        int btnAreaW = app.Scale(86);
+                        int evColW = app.Scale(92);
+                        if (evColW > (iw - btnAreaW) * 2 / 5) { evColW = (iw - btnAreaW) * 2 / 5; }
+                        if (evColW < app.Scale(60)) { evColW = app.Scale(60); }
+                        int handColX = ix + evColW + app.Scale(6);
+                        int handColW = (ix + iw - btnAreaW) - handColX;
+                        if (handColW < app.Scale(24)) { handColW = app.Scale(24); }
+
+                        c.DrawText(ix, iy + app.Scale(5), Ellipsis.Fit(ev, evColW, fs), Style.Part(app, "designer", "value", "", "", "", Style.SNormal()).FgOr(0), fs);
                         string h;
                         if (root) { h = WinGetHandler(ev); } else { h = sel.GetHandler(ev); }
                         string hv = h;
                         int hColor = Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0);
                         if (hv == "") { hv = "—"; } else { hColor = Style.Part(app, "designer", "accent", "", "success", "", Style.SNormal()).BgOr(0); }
-                        c.DrawText(ix + app.Scale(92), iy + app.Scale(5),
-                            Ellipsis.Fit(hv, iw - app.Scale(180), fs), hColor, fs);
+                        c.DrawText(handColX, iy + app.Scale(5),
+                            Ellipsis.Fit(hv, handColW, fs), hColor, fs);
                         int edId = SmallBtn(app, Designer.T("edit", "编辑"), 0, ix + iw - app.Scale(84), iy, app.Scale(40));
                         if (Ui.Clicked(app, edId)) {
                             if (root) { winEvtEditing = ev; evtInput.SetText(WinGetHandler(ev)); }
@@ -1034,6 +1184,7 @@ partial class Designer {
         o.Put("winChrome", JsonValue.NewBool(winChrome));
         o.Put("winGlass", JsonValue.NewBool(winGlass));
         o.Put("winOpacity", JsonValue.NewNum(Convert.ToString(winOpacity)));
+        o.Put("winShadow", JsonValue.NewNum(Convert.ToString(winShadow)));
         JsonValue fieldsArr = JsonValue.NewArray();
         for (int fi = 0; fi < fields.Count; fi = fi + 1) {
             fieldsArr.Append(this.FieldJson(fields[fi]));
@@ -1139,13 +1290,17 @@ partial class Designer {
                 o.Put("on" + evs[e], JsonValue.NewStr(h));
             }
         }
+        // 带参事件声明：FieldFromJson 对称读回 "arg"。
+        if (f.handlerArg != "") {
+            o.Put("arg", JsonValue.NewStr(f.handlerArg));
+        }
         JsonValue opts = JsonValue.NewArray();
         for (int op = 0; op < f.OptionCount(); op = op + 1) {
             opts.Append(JsonValue.NewStr(f.OptionAt(op)));
         }
         o.Put("options", opts);
         // Keep optional class metadata after options: this is the established
-        // order in the existing .zform corpus and preserves its byte order.
+        // order in the existing design-doc corpus and preserves its byte order.
         if (f.Class != "") { o.Put("class", JsonValue.NewStr(f.Class)); }
         // 内联 CSS 声明：与元素 style 属性同键同名（.html 设计稿里
         // 就是元素的 style 属性），解码端按同一属性名读回。
@@ -1270,6 +1425,9 @@ partial class Designer {
         winChrome = root.Bool("winChrome", winChrome);
         winGlass = root.Bool("winGlass", winGlass);
         winOpacity = root.Int("winOpacity", winOpacity);
+        if (winOpacity <= 0) { winOpacity = 100; }
+        winShadow = root.Int("winShadow", 10);
+        if (winShapeRadius <= 0 && winShape == 1) { winShapeRadius = 12; }
         if (layoutMode < 0 || layoutMode > 1) { layoutMode = 0; }
         JsonValue arr = root.Get("fields");
         if (arr != null && arr.IsArray()) {
@@ -1280,7 +1438,7 @@ partial class Designer {
 
     /// 打开/换入一份新文档：恢复模型后清空撤销/重做历史——快照
     /// 是整份设计 JSON，不清理的话，上一个文档的撤销会把别的设计
-    /// 灌进当前画布并在帧末落盘覆盖本文件（IDE 所有 .zform 标签页
+    /// 灌进当前画布并在帧末落盘覆盖本文件（IDE 所有设计稿标签页
     /// 共用一个设计器单例）。JSON 抽屉 Apply 也走这里，行为一致。
     /// 解析失败（loadError）保持历史，与旧行为一致。
     void LoadJson(string s) {
@@ -1290,7 +1448,7 @@ partial class Designer {
 
     /// 载入新文档时清空撤销/重做历史：快照是整份设计 JSON，
     /// 不清理的话，上一个文档的撤销会把别的设计灌进当前画布
-    /// 并在帧末落盘覆盖本文件（IDE 所有 .zform 标签页共用一个
+    /// 并在帧末落盘覆盖本文件（IDE 所有设计稿标签页共用一个
     /// 设计器单例）。JSON 抽屉 Apply 也走这里，行为一致。
     void ResetHistoryLocked() {
         undoStack = new List<string>();
@@ -1329,7 +1487,7 @@ partial class Designer {
     }
 
     /// 把设计文档改到 devW x devH 画布，并把绝对定位的控件夹回
-    /// 新画布内。就地编辑 JSON：.zform 每个字段携带的状态（kind、
+    /// 新画布内。就地编辑 JSON：设计文档每个字段携带的状态（kind、
     /// placeholder、绑定、事件、options、容器 kids）远多于这里要动的
     /// 几何，任何「反序列化到模型再序列化回去」的写法都会静默丢掉
     /// 其余键——控件会全部退化成默认 Input。
@@ -1485,12 +1643,24 @@ partial class Designer {
             if (o.Has(key)) { f.SetHandler(evs[e], o.Str(key, "")); }
         }
         if (o.Has("change")) { f.SetHandler("Change", o.Str("change", "")); }
+        // 带参事件声明（ DesignerHtml data-arg 属性 ↔ "arg" 键）：
+        // 落 handlerArg，GenForm/ChildWindow 二次接线据此发 WireArg。
+        f.handlerArg = o.Str("arg", f.handlerArg);
         JsonValue opts = o.Get("options");
         if (opts != null && opts.IsArray()) {
             f.SetOptionsFrom("");
             for (int k = 0; k < opts.Count(); k = k + 1) {
                 f.AddOption(opts.At(k).AsString(""));
             }
+        }
+        // 列声明（extra["columns"]）顺序对齐 options：设计器以
+        // options 为列序真相，GenForm 先行的设计稿里两者可能不同
+        // 序。条目数可以少于 options（缺 = 全缺省）；对齐后的数组
+        // 写回 o，随 UnmodeledKeys 进 extra，未匹配条目保留尾部。
+        JsonValue cols0 = o.Get("columns");
+        if (opts != null && opts.IsArray() && opts.Count() > 0
+                && cols0 != null && cols0.IsArray()) {
+            o.Set("columns", Designer.NormalizedColumns(f, cols0));
         }
         JsonValue kids = o.Get("kids");
         if (kids != null && kids.IsArray()) {
@@ -1527,7 +1697,7 @@ partial class Designer {
             || k == "fw" || k == "fh" || k == "alt" || k == "locked"
             || k == "defOn" || k == "dock" || k == "childTab"
             || k == "activeTab" || k == "options" || k == "kids"
-            || k == "orient"
+            || k == "orient" || k == "arg"
             || k == "change" || k == "ref" || k == "pvOff";
     }
 

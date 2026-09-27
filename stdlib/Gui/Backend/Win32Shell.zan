@@ -47,6 +47,20 @@ class Win32Shell {
     static extern int DragQueryPoint(nint hdrop, nint pt);
     [DllImport("shell32", EntryPoint = "DragFinish")]
     static extern void DragFinish(nint hdrop);
+    [DllImport("shell32", EntryPoint = "ShellExecuteW")]
+    static extern nint WinShellExecuteW(nint hwnd, nint op, nint file,
+                                        nint args, nint dir, int show);
+
+    /// 用系统关联程序打开 url/文件（`<a target="_blank">` 的系统
+    /// 浏览器通道）。直接调 shell32 的 ShellExecuteW，不经
+    /// cmd.exe——URL 里的 & ? # = 等字符不会被 shell 元字符拆散。
+    static void ShellOpenUrl(string url) {
+        nint wOp = Wide.Of("open");
+        nint wUrl = Wide.Of(url);
+        WinShellExecuteW(0, wOp, wUrl, 0, 0, 1 /* SW_SHOWNORMAL */);
+        Wide.Free(wOp);
+        Wide.Free(wUrl);
+    }
 
     [DllImport("user32", EntryPoint = "CreateWindowExW")]
     static extern nint CreateWindowExW(int exStyle, nint cls, nint title,
@@ -319,6 +333,11 @@ class Win32Shell {
     // 边框的，尺寸手柄全靠 WM_NCHITTEST 给出，所以“不能拉”
     // 就是不再把边缘报成手柄，并挡住双击标题栏 / 最大化。
     static List<nint> fixedHwnd;
+    // 关闭了最大化按钮的窗口。标题按钮画在客户区，外壳看不到
+    // 哪个按钮存在，而双击标题栏与 SC_MAXIMIZE（Win+Up、系统
+    // 菜单）会被 DefWindowProc 兜底成最大化——没有最大化按钮的
+    // 窗口也照放大不误。App 显式登记到这里：不在表内才允许放大。
+    static List<nint> noMaxHwnd;
     static int imeX;
     static int imeY;
 
@@ -333,6 +352,8 @@ class Win32Shell {
     // 没有 DWM 也能工作。所有区域之外的像素点击穿透。
     static int shapeMode;
     static List<int> shapeRegions;
+    static int winOpacityPercent;
+    static bool hasShadowBand;
     // 分层路径缓存的逐像素覆盖掩码（0..255，直通
     // alpha）：仅在窗口或形状列表变化时重建。
     static List<byte> shapeMask;
@@ -441,6 +462,7 @@ class Win32Shell {
         Win32Shell.hitGuardWins = new List<nint>();
         Win32Shell.lastSurface = 0 - 1;
         Win32Shell.bgColor = 0;
+        Win32Shell.winOpacityPercent = 100;
 
         Win32Shell.injectCs = NativeMemory.Alloc(64);
         Win32Shell.InitializeCriticalSection(Win32Shell.injectCs);
@@ -533,6 +555,16 @@ class Win32Shell {
             Win32Shell.postQ[(n - 1) * 6 + 3] = button;
             Win32Shell.postQ[(n - 1) * 6 + 4] = keycode;
             Win32Shell.postQ[(n - 1) * 6 + 5] = mods;
+            return;
+        }
+        // 鼠标滚轮（kind 13）高频到达时：同窗口同修饰键合并累加 delta 并更新位置，
+        // 免得触控板平滑滚动或无级滚轮一瞬间产生几十帧排队重绘导致严重滞后与 CPU 飙满。
+        if (kind == 13 && n > 0 && Win32Shell.postQ[(n - 1) * 6] == 13
+            && Win32Shell.postHwnd[n - 1] == hwnd
+            && Win32Shell.postQ[(n - 1) * 6 + 5] == mods) {
+            Win32Shell.postQ[(n - 1) * 6 + 1] = x;
+            Win32Shell.postQ[(n - 1) * 6 + 2] = y;
+            Win32Shell.postQ[(n - 1) * 6 + 4] = Win32Shell.postQ[(n - 1) * 6 + 4] + keycode;
             return;
         }
         // 应用长时间不取（例如卡在一次很慢的绘制里）时丢最老的，
@@ -755,6 +787,20 @@ class Win32Shell {
             Win32Shell.Post(hwnd, 13, Win32Shell.S32(pt, 0),
                 Win32Shell.S32(pt, 4), 0, delta, Win32Shell.ModsNow());
             return 0;
+        } else if (msg == 526) {                   // WM_MOUSEHWHEEL
+            // 横向滚轮（P6 横滚）：同为 kind 13，delta 走同一键码槽，
+            // 交给渲染期滚动声明者按 shift 语义路由——触控板横扫
+            // （合成 shift+滚轮）与真横滚轮走同一条消费路径。
+            nint pt = Win32Shell.scratchRect;
+            new Span<int>(pt, 1)[0] = Win32Shell.LoWord(lp);
+            new Span<int>(pt + 4, 1)[0] = Win32Shell.HiWord(lp);
+            Win32Shell.ScreenToClient(hwnd, pt);
+            int delta = (((int)wp) >> 16) & 65535;
+            if (delta >= 32768) { delta = delta - 65536; }
+            Win32Shell.Post(hwnd, 13, Win32Shell.S32(pt, 0),
+                Win32Shell.S32(pt, 4), 0, delta,
+                Win32Shell.ModsNow() | 2);
+            return 0;
         } else if (msg == 0x0083) {                // WM_NCCALCSIZE
             if (wp != 0) {
                 if (Win32Shell.IsMaximized(hwnd)) {
@@ -772,13 +818,34 @@ class Win32Shell {
         } else if (msg == 0x0084) {                // WM_NCHITTEST
             return Win32Shell.HitTest(hwnd, Win32Shell.LoWord(lp),
                 Win32Shell.HiWord(lp));
+        } else if (msg == 0x0085) {                // WM_NCPAINT
+            if (Win32Shell.shapeMode != 0) {
+                return 0;                          // 异形分层窗口阻止系统绘制默认方形非客户区边框
+            }
+            return Win32Shell.DefWindowProcW(hwnd, msg, wp, lp);
+        } else if (msg == 0x0086) {                // WM_NCACTIVATE
+            if (Win32Shell.shapeMode != 0) {
+                // 异形分层窗口阻止 DefWindowProc 绘制默认方形激活/非激活边框高亮（消灭点击激活时的方角）
+                return 1;
+            }
+            // 普通无边框窗口：将 lParam 置为 -1 传给 DefWindowProc，
+            // 既通知 DWM 维持窗口投影和状态更新，又阻止绘制默认方形非客户区边框
+            return Win32Shell.DefWindowProcW(hwnd, msg, wp, (nint)(0 - 1));
         } else if (msg == 0x00A3) {                // WM_NCLBUTTONDBLCLK
-            // 双击标题栏默认最大化；固定尺寸的窗口吃掉它。
+            // 双击标题栏默认最大化；固定尺寸的窗口吃掉它，
+            // 关闭了最大化按钮的窗口同样吃掉。已经最大的窗口
+            // 放行，让 DefWindowProc 走 SC_RESTORE 双击还原。
             if (!Win32Shell.ResizableOf(hwnd)) { return 0; }
+            if (!Win32Shell.MaximizableOf(hwnd)
+                && !Win32Shell.IsMaximized(hwnd)) { return 0; }
         } else if (msg == 0x0112) {                // WM_SYSCOMMAND
             int cmd = ((int)wp) & 0xFFF0;
-            if (!Win32Shell.ResizableOf(hwnd) && (cmd == 0xF030 || cmd == 0xF000)) {
-                return 0;                          // SC_MAXIMIZE / SC_SIZE
+            if (!Win32Shell.ResizableOf(hwnd) && cmd == 0xF000) {
+                return 0;                          // SC_SIZE
+            }
+            if (cmd == 0xF030 && (!Win32Shell.ResizableOf(hwnd)
+                || !Win32Shell.MaximizableOf(hwnd))) {
+                return 0;                          // SC_MAXIMIZE
             }
         } else if (msg == 15) {                    // WM_PAINT
             nint ps = NativeMemory.Alloc(72);
@@ -1176,10 +1243,14 @@ class Win32Shell {
         int wh = ph;
         int ox = 0;
         int oy = 0;
+        int wx = 0;
+        int wy = 0;
         nint wrect = NativeMemory.Alloc(16);
         nint cpt = NativeMemory.Alloc(8);
         if (Win32Shell.GetWindowRect(hwnd, wrect) != 0
                 && Win32Shell.ClientToScreen(hwnd, cpt) != 0) {
+            wx = Win32Shell.S32(wrect, 0);
+            wy = Win32Shell.S32(wrect, 4);
             int tw = Win32Shell.S32(wrect, 8) - Win32Shell.S32(wrect, 0);
             int th = Win32Shell.S32(wrect, 12) - Win32Shell.S32(wrect, 4);
             int tx = Win32Shell.S32(cpt, 0) - Win32Shell.S32(wrect, 0);
@@ -1252,7 +1323,18 @@ class Win32Shell {
                     if (mask != null) {
                         int cov = mask[sy * pw + (x - ox)];
                         if (cov <= 0) {
-                            new Span<int>(dstRow + x * 4, 1)[0] = 0;
+                            // 在真实内容轮廓外部：若开启了阴影带，仅允许半透明阴影透出；
+                            // 子控件或背景越界画的不透明方角（a >= 240）在此被直接裁去，
+                            // 确保组件圆角与窗口轮廓完全吻合。
+                            if (Win32Shell.hasShadowBand && a > 0 && a < 240) {
+                                int r0 = ((p >> 16) & 255) * a / 255;
+                                int g0 = ((p >> 8) & 255) * a / 255;
+                                int b0 = (p & 255) * a / 255;
+                                new Span<int>(dstRow + x * 4, 1)[0] =
+                                    (a << 24) | (r0 << 16) | (g0 << 8) | b0;
+                            } else {
+                                new Span<int>(dstRow + x * 4, 1)[0] = 0;
+                            }
                             x = x + 1;
                             continue;
                         }
@@ -1292,11 +1374,18 @@ class Win32Shell {
         nint blend = NativeMemory.Alloc(4);
         new Span<byte>(blend, 1)[0] = 0;         // AC_SRC_OVER
         new Span<byte>(blend + 1, 1)[0] = 0;
-        new Span<byte>(blend + 2, 1)[0] = 255;
+        int constAlpha = (Win32Shell.winOpacityPercent * 255) / 100;
+        if (constAlpha < 0) { constAlpha = 0; }
+        if (constAlpha > 255) { constAlpha = 255; }
+        new Span<byte>(blend + 2, 1)[0] = (byte)constAlpha;
         new Span<byte>(blend + 3, 1)[0] = 1;         // AC_SRC_ALPHA
-        // pptDst = 0：只更新内容，绝不改动系统持有的位置。
-        int ulw = Win32Shell.UpdateLayeredWindow(hwnd, screenDc, 0, size,
+        nint dstPt = NativeMemory.Alloc(8);
+        new Span<int>(dstPt, 1)[0] = wx;
+        new Span<int>(dstPt + 4, 1)[0] = wy;
+        // 传递当前窗口屏幕位置，避免首次进入分层窗口时因 NULL 目标坐标引发系统定位丢失或失败
+        int ulw = Win32Shell.UpdateLayeredWindow(hwnd, screenDc, dstPt, size,
             Win32Shell.lwDc, src, 0, blend, 2);
+        NativeMemory.Free(dstPt);
         NativeMemory.Free(blend);
         NativeMemory.Free(src);
         NativeMemory.Free(size);
@@ -1700,6 +1789,31 @@ class Win32Shell {
         Win32Shell.fixedHwnd = keep;
     }
 
+    /// 窗口是否允许最大化（默认允许）。关闭了最大化按钮的窗口
+    /// 必须登记 false，否则双击标题栏 / SC_MAXIMIZE 照样放大窗口。
+    static bool MaximizableOf(nint hwnd) {
+        if (Win32Shell.noMaxHwnd == null) { return true; }
+        for (int i = 0; i < Win32Shell.noMaxHwnd.Count; i = i + 1) {
+            if (Win32Shell.noMaxHwnd[i] == hwnd) { return false; }
+        }
+        return true;
+    }
+
+    /// 登记窗口是否允许最大化；false 时双击标题栏与
+    /// SC_MAXIMIZE（Win+Up、系统菜单）不再放大窗口，双击
+    /// 已最大的窗口仍可还原。重复设置同值无副作用。
+    static void SetMaximizable(nint hwnd, bool on) {
+        if (Win32Shell.noMaxHwnd == null) {
+            Win32Shell.noMaxHwnd = new List<nint>();
+        }
+        List<nint> keep = new List<nint>();
+        for (int i = 0; i < Win32Shell.noMaxHwnd.Count; i = i + 1) {
+            if (Win32Shell.noMaxHwnd[i] != hwnd) { keep.Add(Win32Shell.noMaxHwnd[i]); }
+        }
+        if (!on) { keep.Add(hwnd); }
+        Win32Shell.noMaxHwnd = keep;
+    }
+
     // 工具窗口（WS_EX_TOOLWINDOW）hwnd 登记表：SetToolWindow 翻转
     // 扩展样式位，IsToolWindow 查登记表（样式位读回来也可靠，但
     // 登记表让查询与重置不依赖 GetWindowLongPtrW 的平台可用性）。
@@ -1752,9 +1866,9 @@ class Win32Shell {
         if (hwnd == 0) { return; }
         nint fn = Interop.Entry("dwmapi.dll", "DwmSetWindowAttribute");
         if (fn == 0) { return; }
-        // DWMWA_WINDOW_CORNER_PREFERENCE = 33; 1 = ROUND, 2 = DONOTROUND
+        // DWMWA_WINDOW_CORNER_PREFERENCE = 33; 1 = DONOTROUND, 2 = ROUND
         nint slot = NativeMemory.Alloc(4);
-        new Span<int>(slot, 1)[0] = on ? 1 : 2;
+        new Span<int>(slot, 1)[0] = on ? 2 : 1;
         DwmSetWindowAttrFn call = (DwmSetWindowAttrFn)fn;
         call(hwnd, 33, slot, 4);
         NativeMemory.Free(slot);
@@ -1959,11 +2073,25 @@ class Win32Shell {
     static void SetOpacity(nint hwnd, int percent) {
         Win32Shell.Init();
         if (hwnd == 0) { return; }
-        // 半透明靠 SetLayeredWindowAttributes，必须分层；分层会连
+        // 半透明靠 SetLayeredWindowAttributes 或 UpdateLayeredWindow，必须分层；分层会连
         // 原生子窗口一起藏掉，宿主窗口只能整窗不透明。
         if (Win32Shell.IsLayerHost(hwnd)) { return; }
         if (percent < 10) { percent = 10; }
         if (percent > 100) { percent = 100; }
+        Win32Shell.winOpacityPercent = percent;
+
+        // 若当前窗口使用异形/圆角或原生玻璃等逐像素分层呈现模式，
+        // 绝不可调用 SetLayeredWindowAttributes，否则会导致与 UpdateLayeredWindow 互斥失败，
+        // 使得渲染管道损坏并将所有组件刷白；亦不可在 percent == 100 时摘掉 WS_EX_LAYERED。
+        // 通过 UpdateLayeredWindow 的 SourceConstantAlpha 完成整窗混合。
+        if (Win32Shell.shapeMode != 0 || Win32Shell.glassOn) {
+            int own = Win32Shell.SurfaceOf(hwnd);
+            if (own >= 0) {
+                Win32Shell.PresentLayered(hwnd, own);
+            }
+            return;
+        }
+
         nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
         if (percent >= 100) {
             if (!Win32Shell.glassOn && (ex & 0x00080000) != 0) {
@@ -2007,6 +2135,7 @@ class Win32Shell {
         }
         if (regs.Count == 0) {
             // 恢复普通不透明窗口：清除所有区域 + 分层样式。
+            Win32Shell.hasShadowBand = false;
             Win32Shell.SetWindowRgn(hwnd, 0, true);
             nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
             if ((ex & 0x00080000) != 0) {
@@ -2020,6 +2149,13 @@ class Win32Shell {
             return;
         }
         Win32Shell.shapeRegions = regs;
+        bool sb = false;
+        int si = 0;
+        while (si + 5 < regs.Count) {
+            if (regs[si] == 3) { sb = true; }
+            si = si + 6;
+        }
+        Win32Shell.hasShadowBand = sb;
         Win32Shell.shapeMask = new List<byte>();
         // 在缩小之前标记异形：FitShapeWindow 的 SetWindowPos
         // 不能被主框架 800x600 的 WM_GETMINMAXINFO 最小值夹紧。
@@ -2034,8 +2170,6 @@ class Win32Shell {
                 Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex | 0x00080000);
             }
             Win32Shell.glassOn = true;                 // 将 Present 路由到 PresentLayered
-            int own = Win32Shell.SurfaceOf(hwnd);
-            if (own >= 0) { Win32Shell.PresentLayered(hwnd, own); }
         } else {
             // 无 DWM（如 Win7 关闭合成）：经典区域
             // 窗口。区域坐标为客户端像素（按物理像素缩放）。
@@ -2126,6 +2260,11 @@ class Win32Shell {
         int i = 0;
         while (i + 5 < regs.Count) {
             int t = regs[i];
+            if (t == 3) {
+                // 类型 3（阴影带）仅用于分层外扩，不属于窗口可交互实体区域
+                i = i + 6;
+                continue;
+            }
             int x = regs[i + 1] * scale / 100;
             int y = regs[i + 2] * scale / 100;
             int w = regs[i + 3] * scale / 100;
@@ -2160,6 +2299,11 @@ class Win32Shell {
         int i = 0;
         while (i + 5 < regs.Count) {
             int t = regs[i];
+            if (t != 1 && t != 2) {
+                // 类型 3（阴影带）仅用于分层表面柔和阴影透出，不计入实体内容轮廓 SDF
+                i = i + 6;
+                continue;
+            }
             long x = (long)(regs[i + 1] * scale / 100) * 16;
             long y = (long)(regs[i + 2] * scale / 100) * 16;
             long w = (long)(regs[i + 3] * scale / 100) * 16;
@@ -2167,14 +2311,26 @@ class Win32Shell {
             long r = (long)(regs[i + 5] * scale / 100) * 16;
             long d = 0;
             if (t == 2) {
-                long cx = x + w / 2;
-                long cy = y + h / 2;
-                long rad = w / 2;
-                if (rad < 1) { rad = 1; }
+                long rx = w / 2;
+                long ry = h / 2;
+                if (rx < 1) { rx = 1; }
+                if (ry < 1) { ry = 1; }
+                long cx = x + rx;
+                long cy = y + ry;
                 long dx = sx - cx;
+                if (dx < 0) { dx = 0 - dx; }
                 long dy = sy - cy;
-                long dist = Win32Shell.ISqrt64(dx * dx + dy * dy);
-                d = dist - rad;
+                if (dy < 0) { dy = 0 - dy; }
+                if (rx == ry) {
+                    long dist = Win32Shell.ISqrt64(dx * dx + dy * dy);
+                    d = dist - rx;
+                } else {
+                    long term1 = dx * ry;
+                    long term2 = dy * rx;
+                    long k = Win32Shell.ISqrt64(term1 * term1 + term2 * term2);
+                    long denom = rx > ry ? rx : ry;
+                    d = (k - rx * ry) / denom;
+                }
             } else {
                 if (r < 0) { r = 0; }
                 if (r * 2 > w) { r = w / 2; }
@@ -2251,33 +2407,6 @@ class Win32Shell {
             }
             int c2 = sum; // 16 samples * 0..16 = 0..256
             if (c2 > 255) { c2 = 255; }
-            if (c2 == 0) {
-                // 类型 3 阴影带区域仅扩展系统表面：
-                // 画布自身的 alpha（PaintShapeShadow 绘制的柔和阴影）
-                // 必须原样合成，因此该带在掩码中不透明。
-                // 阴影未到达的像素因画布 alpha 为 0
-                // 而保持透明。真实轮廓（类型 1/2）的覆盖
-                // 在其非零处优先，因此角落的抗锯齿
-                // 绝不会被该带抹平。
-                int inBand = 0;
-                int rj = 0;
-                while (rj + 5 < Win32Shell.shapeRegions.Count) {
-                    if (Win32Shell.shapeRegions[rj] == 3) {
-                        long bx0 = (long)Win32Shell.shapeRegions[rj + 1] * scale / 100 * 16;
-                        long by0 = (long)Win32Shell.shapeRegions[rj + 2] * scale / 100 * 16;
-                        long bx1 = bx0 + (long)Win32Shell.shapeRegions[rj + 3] * scale / 100 * 16;
-                        long by1 = by0 + (long)Win32Shell.shapeRegions[rj + 4] * scale / 100 * 16;
-                        long sx = (long)px * 16 + 8;
-                        long sy = (long)py * 16 + 8;
-                        if (sx >= bx0 && sx < bx1 && sy >= by0 && sy < by1) {
-                            inBand = 1;
-                            rj = Win32Shell.shapeRegions.Count;
-                        }
-                    }
-                    rj = rj + 6;
-                }
-                if (inBand != 0) { c2 = 255; }
-            }
             mask.Add((byte)c2);
         }
         Win32Shell.shapeMask = mask;
@@ -2442,8 +2571,8 @@ class Win32Shell {
             if (Win32Shell.S32(msg, 8) == 18) { return 0 - 1; }  // WM_QUIT
             Win32Shell.TranslateMessage(msg);
             Win32Shell.DispatchMessageW(msg);
-            if (Win32Shell.DrainPosted()) { return 0; }
         }
+        if (Win32Shell.DrainPosted()) { return 0; }
         return 1;
     }
 
@@ -2478,8 +2607,8 @@ class Win32Shell {
                 if (Win32Shell.S32(msg, 8) == 18) { return 0 - 1; }
                 Win32Shell.TranslateMessage(msg);
                 Win32Shell.DispatchMessageW(msg);
-                if (Win32Shell.DrainPosted()) { return 0; }
             }
+            if (Win32Shell.DrainPosted()) { return 0; }
             int elapsed = Win32Shell.GetTickCount() - start;
             if (elapsed >= ms) { return 1; }
             // QS_ALLINPUT = 0x04FF; WAIT_TIMEOUT = 258

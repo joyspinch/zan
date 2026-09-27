@@ -1,0 +1,1327 @@
+using System;
+using System.IO;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+delegate string StoreUpdater(string current);
+
+/// <summary>扫描回调：按 键序升序 收到每个存活键的最新值；
+/// 返回 false 早停。</summary>
+delegate bool StoreVisit(string key, string val);
+
+/// <summary>裸扫描回调：收到零拷贝扫描行（值按块内偏移/长度/指针
+/// 暴露，Key()/Val() 才物化字符串）；返回 false 早停。</summary>
+delegate bool ScanRowVisit(ScanRow row);
+
+/// <summary>
+/// 扫描行视图：<see cref="ZanStore.ScanRows"/> 回调参数。值默认
+/// 零拷贝——按块内偏移/长度/指针暴露，调用 Key()/Val() 才物化
+/// 字符串（同一行内缓存，推进到下一行自动失效）。多源归并退化
+/// 路径（memtable 有未固化数据）时 <see cref="Block"/> 为 null，
+/// 键值直接以字符串给出。行数据仅在回调返回前有效。
+/// </summary>
+class ScanRow {
+    SegCursor cur;
+    string memKey;
+    string memVal;
+
+    /// 绑定到段游标当前记录（零拷贝模式）。
+    void Bind(SegCursor c) {
+        this.cur = c;
+        this.memKey = "";
+        this.memVal = "";
+    }
+
+    /// 绑定到一对字符串（多源归并退化模式）。
+    void BindMem(string k, string v) {
+        this.cur = null;
+        this.memKey = k;
+        this.memVal = v;
+    }
+
+    /// 当前行的键（惰性物化，行内缓存；退化模式直接给字符串）。
+    string Key() { return this.cur != null ? this.cur.Key() : this.memKey; }
+
+    /// 当前行的值字符串（惰性物化，行内缓存）。
+    string Val() { return this.cur != null ? this.cur.Val() : this.memVal; }
+
+    /// 值所在块缓冲；退化模式下为 null，调用方须走字符串路径。
+    ByteBuffer Block() { return this.cur != null ? this.cur.Block() : null; }
+
+    /// 值在块内的起始偏移（退化模式无意义）。
+    int ValOff() { return this.cur != null ? this.cur.ValOff() : 0; }
+
+    /// 值的字节长度。
+    int ValLen() { return this.cur != null ? this.cur.ValLen() : 0; }
+
+    /// 值字节的裸指针（等于 Block().Raw() + ValOff()）。
+    nint ValPtr() {
+        return this.cur != null ? this.cur.Block().Raw() + this.cur.ValOff() : 0;
+    }
+}
+
+/// <summary>
+/// 聚合内核回调：块级扫描按记录粒度交付（op=1 的存活 put），
+/// 键/值以（缓冲裸指针 + 偏移 + 长度）零拷贝给出——同一缓冲跨
+/// 块复用、回调期间有效。返回 false 早停整个扫描。
+/// </summary>
+delegate bool KernelVisit(nint basePtr, int keyOff, int keyLen, int valOff, int valLen);
+
+/// <summary>覆盖索引内核回调：索引条目键以（缓冲裸指针 + 偏移 +
+/// 长度）零拷贝交付，id 段固定在键尾 6 字节；缓冲跨跨度复用、
+/// 回调期间有效。返回 false 早停。</summary>
+delegate bool KernelKeyVisit(nint basePtr, int keyOff, int keyLen);
+
+/// 段句柄：段文件与其全局段号的配对。
+class SegRef {
+    SegmentFile seg;
+    long id;
+
+    SegRef(SegmentFile seg, long id) {
+        this.seg = seg;
+        this.id = id;
+    }
+}
+
+/// <summary>
+/// 日志式键值存储：memtable + 不可变有序段 + 追加日志 + 双槽清单。
+///
+/// 写路径：追加 CRC 帧日志（组提交）+ 更新 memtable；日志攒到
+/// 阈值（默认 64MB，可调）把 memtable 排序固化为新段、保存
+/// manifest、截断日志。读路径：memtable → 内存索引（键 → 段号）
+/// → 目标段的块（有界块缓存，O(1) 点读）。恢复：逐段顺序扫描
+/// 重建索引（Bitcask 式，纯顺序读）+ 重放日志中 seq ≥ 水位的
+/// 尾部——「manifest 已存、日志未截断」的崩溃窗口由水位跳过。
+///
+/// 内存有界：memtable ≤ 阈值，块缓存有硬上限；常驻索引每键
+/// 只有哈希项 + 4 字节段号。
+///
+/// 记录帧、持久化三档、NUL-free 契约、单进程单写多读模型
+/// 与异步 API 的说明见各类注释（LogFile / Segment / Manifest）。
+/// </summary>
+class ZanStore {
+    /// 每次提交都 fsync。
+    static int DUR_SYNC = 0;
+    /// 分组提交：按次数/字节数窗口 fsync。
+    static int DUR_GROUP = 1;
+    /// 只在 Checkpoint/Close 与缓冲攒满时落盘。
+    static int DUR_NONE = 2;
+
+    /// GROUP 档攒满这么多字节提前 fsync。
+    static int GROUP_FLUSH_BYTES = 524288;
+    /// NONE 档攒满这么多字节强制 flush 进 OS 缓存。
+    static int NONE_FLUSH_BYTES = 1048576;
+    /// 默认 memtable/日志 flush 阈值（字节）。
+    static long DEFAULT_FLUSH_THRESHOLD = 67108864;
+    /// 默认块缓存上限（字节）。
+    static long DEFAULT_CACHE_CAP = 33554432;
+    /// 块级内核的读跨度（字节）：一次 ReadAt 摊掉这么多的逐块
+    /// 系统调用——扫描/聚合路径的 IO 下限由它决定。
+    static int KERNEL_SPAN_BYTES = 262144;
+
+    LogFile log;
+    Dictionary<string, string> memtable;
+    Dictionary<string, long> index;
+    List<SegRef> segs;
+    Manifest man;
+    string basePath;
+    BlockCache cache;
+    AsyncRwLock rw;
+    int durability;
+    int syncEvery;
+    int commitsSinceSync;
+    long seq;
+    long logStartSeq;
+    long nextSegId;
+    long flushThreshold;
+    long recoverSeg;
+    int txDepth;
+    int txMark;
+    Dictionary<string, string> txPut;
+    Dictionary<string, string> txDel;
+    /// <summary>未固化墓碑：删掉的键在旧段里仍有旧版本，固化时
+    /// 必须把 op=2 记录写进新段压住它们，否则恢复扫描会让已删
+    /// 键复活（旧段版本重指索引）。</summary>
+    Dictionary<string, long> tombstones;
+    /// <summary>自动增量归并阈值：固化后段数 ≥ autoMergeAt 时就地
+    /// 归并 autoMergeK 个最老段。0 = 关闭（默认）——归并代价显式
+    /// 交还调用方，自动策略只应被明确开启。</summary>
+    int autoMergeAt;
+    int autoMergeK;
+    string lastError;
+
+    ZanStore() {
+        this.memtable = new Dictionary<string, string>();
+        this.index = new Dictionary<string, long>();
+        this.segs = new List<SegRef>();
+        this.txPut = new Dictionary<string, string>();
+        this.txDel = new Dictionary<string, string>();
+        this.tombstones = new Dictionary<string, long>();
+        this.cache = new BlockCache(ZanStore.DEFAULT_CACHE_CAP);
+        this.rw = new AsyncRwLock();
+        this.durability = ZanStore.DUR_GROUP;
+        this.syncEvery = 32;
+        this.commitsSinceSync = 0;
+        this.seq = 0;
+        this.logStartSeq = 0;
+        this.nextSegId = 0;
+        this.flushThreshold = ZanStore.DEFAULT_FLUSH_THRESHOLD;
+        this.recoverSeg = 0;
+        this.txDepth = 0;
+        this.txMark = 0;
+        this.autoMergeAt = 0;
+        this.autoMergeK = 0;
+        this.basePath = "";
+        this.lastError = "";
+    }
+
+    static string SegPath(string basePath, long id) {
+        return basePath + ".s" + Convert.ToString(id);
+    }
+
+    /// <summary>打开（必要时创建）分组提交档的存储。</summary>
+    static ZanStore Open(string path) {
+        return ZanStore.Open(path, ZanStore.DUR_GROUP);
+    }
+
+    /// <summary>以显式持久化档打开：加载 manifest 与段、重建
+    /// 内存索引、按水位重放日志尾部。</summary>
+    static ZanStore Open(string path, int durability) {
+        ZanStore s = new ZanStore();
+        s.durability = durability;
+        s.basePath = path;
+        s.log = LogFile.Open(path);
+        if (!s.log.IsOpen()) {
+            s.lastError = s.log.GetError();
+            return s;
+        }
+        // 单写模型：别的进程/句柄已持有该路径时直接拒绝打开，
+        // 而不是静默并发写腐坏文件。锁随日志句柄在 Close 释放，
+        // 持有者崩溃时由操作系统兜底。
+        if (!s.log.TryLockExclusive()) {
+            // 锁被占：拒绝打开前必须关掉刚拿到的日志句柄——留着它，
+            // 进程生命周期内该文件在 Windows 上删不掉（测试清理、
+            // 原地重建库都会踩）。
+            s.log.Close();
+            s.lastError = "store is locked by another writer";
+            return s;
+        }
+        s.man = Manifest.Load(path);
+        if (s.man.Exists()) {
+            s.logStartSeq = s.man.LogStartSeq();
+            // 新帧从水位起编号：日志为空（全部已固化）时 seq 若
+            // 从 0 重来，重开的写入帧全部低于水位，下次恢复会被
+            // 当陈旧头整体跳过——插入丢失、删除复活。
+            s.seq = s.logStartSeq;
+            s.nextSegId = s.man.NextSegId();
+            List<long> ids = s.man.SegIds();
+            for (int i = 0; i < ids.Count; i = i + 1) {
+                SegmentFile sf = SegmentFile.Open(ZanStore.SegPath(path, ids[i]));
+                if (sf.GetError() != "") {
+                    s.lastError = "segment " + Convert.ToString(ids[i]) + ": " + sf.GetError();
+                    return s;
+                }
+                s.recoverSeg = ids[i];
+                s.segs.Add(new SegRef(sf, ids[i]));
+                sf.Scan("", s.RecoverRecord);
+            }
+        }
+        s.log.Replay(s.ApplyFrame);
+        return s;
+    }
+
+    /// 恢复扫描回调：段内记录重指索引（段按号升序扫描，
+    /// 后段覆盖前段；墓碑摘除索引，为合并输出预留）。
+    bool RecoverRecord(string key, string val, int op) {
+        if (op == 2) {
+            if (this.index.ContainsKey(key)) { this.index.Remove(key); }
+            return true;
+        }
+        if (this.index.ContainsKey(key)) { this.index.Remove(key); }
+        this.index.Add(key, this.recoverSeg);
+        return true;
+    }
+
+    /// 重放期间应用一帧；水位之下的陈旧头跳过。重放的删除同时
+    /// 进墓碑集——该删除尚未落段，下次固化必须带进新段。
+    void ApplyFrame(ByteBuffer b) {
+        b.SeekRead(0);
+        long fseq = b.ReadU64();
+        if (fseq < this.logStartSeq) { return; }
+        int op = b.ReadU8();
+        string key = b.ReadString();
+        if (op == 1) {
+            string val = b.ReadString();
+            if (this.memtable.ContainsKey(key)) { this.memtable.Remove(key); }
+            if (this.tombstones.ContainsKey(key)) { this.tombstones.Remove(key); }
+            this.memtable.Add(key, val);
+        } else if (op == 2) {
+            this.memtable.Remove(key);
+            if (this.index.ContainsKey(key)) { this.index.Remove(key); }
+            if (!this.tombstones.ContainsKey(key)) { this.tombstones.Add(key, 0); }
+        }
+        this.seq = fseq + 1;
+    }
+
+    /// 是否处于打开状态（打开无错误且底层日志可用）。
+    bool IsOpen() { return this.lastError.Length == 0 && this.log.IsOpen(); }
+
+    /// 最近一次打开失败的错误文本；Open 失败时由它给出原因。
+    string GetError() { return this.lastError; }
+
+    /// <summary>该句柄已应用的记录数：单调递增，可当快照版本用。</summary>
+    long Version() { return this.seq; }
+
+    /// 键值对总数：索引（已落段）+ memtable 中尚未落段的新键。
+    int Count() {
+        int n = this.index.Count;
+        List<string> mk = this.memtable.Keys;
+        for (int i = 0; i < mk.Count; i = i + 1) {
+            if (!this.index.ContainsKey(mk[i])) { n = n + 1; }
+        }
+        return n;
+    }
+
+    /// 已固化段的数量。
+    int SegCount() { return this.segs.Count; }
+
+    /// 日志逻辑大小（字节）：0 表示全部数据已在段里。
+    long LogBytes() { return this.log.Size(); }
+
+    /// 切换持久化档（立即生效）。
+    void SetDurability(int d) { this.durability = d; }
+
+    /// <summary>GROUP 档的 fsync 窗口：N = 每 N 次提交至多
+    /// 一次 fsync（攒满 <see cref="GROUP_FLUSH_BYTES"/> 字节会提前）。</summary>
+    void SetSyncEvery(int n) {
+        if (n >= 1) { this.syncEvery = n; }
+    }
+
+    /// <summary>memtable/日志 flush 阈值（字节）：日志攒到该值
+    /// 即固化新段。默认 64MB；调小是合法配置（=1 即每次提交
+    /// 都固化），只拒绝非正数。</summary>
+    void SetFlushThreshold(long bytes) {
+        if (bytes >= 1) { this.flushThreshold = bytes; }
+    }
+
+    /// <summary>块缓存字节上限。默认 32MB；调小是合法配置
+    /// （缓存退化到直读），只拒绝非正数。</summary>
+    void SetCacheCap(long bytes) {
+        if (bytes >= 1) { this.cache.SetCap(bytes); }
+    }
+
+    /// <summary>开启自动增量归并：每次固化新段后若段数达到
+    /// <paramref name="atSegs"/>，就地归并最老的
+    /// <paramref name="mergeK"/> 个段（同
+    /// <see cref="MergeSomeSegments"/>，有界停顿=写 k 段的耗时）。
+    /// atSegs ≥ max(3, mergeK+1) 才生效——阈值太低会每次固化都
+    /// 归并、得不偿失；atSegs = 0 关闭（默认）。段数稳态在
+    /// [atSegs-mergeK+1, atSegs] 间振荡，不再无界增长。</summary>
+    void SetAutoMerge(int atSegs, int mergeK) {
+        if (atSegs <= 0) { this.autoMergeAt = 0; this.autoMergeK = 0; return; }
+        if (mergeK < 2) { return; }
+        if (atSegs < mergeK + 1) { return; }
+        this.autoMergeAt = atSegs;
+        this.autoMergeK = mergeK;
+    }
+
+    // ===== 同步核心（单所有者，无锁） =====
+
+    /// <summary>返回值；不存在时返回 ""（与「值为空串」不可区分，
+    /// 需要区分时用 <see cref="Contains"/>）。事务内可见未提交的
+    /// 本事务写入。</summary>
+    string Get(string key) {
+        if (this.txDepth > 0) {
+            if (this.txDel.ContainsKey(key)) { return ""; }
+            string tv = "";
+            if (this.txPut.TryGetValue(key, out tv)) { return tv; }
+        }
+        string mv = "";
+        if (this.memtable.TryGetValue(key, out mv)) { return mv; }
+        long segId = 0;
+        if (this.index.TryGetValue(key, out segId)) {
+            SegRef r = this.FindSeg(segId);
+            if (r != null) {
+                string sv = "";
+                int hit = r.seg.Lookup(key, out sv, this.cache, segId);
+                if (hit == 1) { return sv; }
+            }
+        }
+        return "";
+    }
+
+    /// 键是否存在。
+    bool Contains(string key) {
+        if (this.txDepth > 0) {
+            if (this.txDel.ContainsKey(key)) { return false; }
+            if (this.txPut.ContainsKey(key)) { return true; }
+        }
+        if (this.memtable.ContainsKey(key)) { return true; }
+        return this.index.ContainsKey(key);
+    }
+
+    /// <summary>插入或替换一个键。除非处于 Begin()/Commit() 内，
+    /// 否则按当前持久化档立即落盘；日志攒满阈值自动固化新段。
+    /// 事务内只记覆盖层、不落帧——最外层 Commit 时每个键只落
+    /// 最终值一帧（批量写同一键 N 次只写 1 帧，日志写放大大幅
+    /// 下降；帧在提交前从未离开内存，回滚与崩溃语义不变）。</summary>
+    void Put(string key, string val) {
+        if (this.txDepth > 0) {
+            if (this.txDel.ContainsKey(key)) { this.txDel.Remove(key); }
+            if (this.txPut.ContainsKey(key)) { this.txPut.Remove(key); }
+            this.txPut.Add(key, val);
+            return;
+        }
+        this.AppendRec(1, key, val);
+        if (this.memtable.ContainsKey(key)) { this.memtable.Remove(key); }
+        if (this.tombstones.ContainsKey(key)) { this.tombstones.Remove(key); }
+        this.memtable.Add(key, val);
+        this.FinishCommit();
+    }
+
+    /// 删除键；键存在时返回 true。事务内延迟到提交落帧。
+    bool Delete(string key) {
+        if (!this.Contains(key)) { return false; }
+        if (this.txDepth > 0) {
+            if (this.txPut.ContainsKey(key)) { this.txPut.Remove(key); }
+            if (this.txDel.ContainsKey(key)) { this.txDel.Remove(key); }
+            this.txDel.Add(key, "");
+            return true;
+        }
+        this.AppendRec(2, key, "");
+        this.memtable.Remove(key);
+        this.index.Remove(key);
+        if (!this.tombstones.ContainsKey(key)) { this.tombstones.Add(key, 0); }
+        this.FinishCommit();
+        return true;
+    }
+
+    /// <summary>开始一个批次：写入进入内存覆盖层（不落帧），
+    /// 最外层 Commit 时按覆盖层落帧、合并进 memtable 并按持久化档
+    /// 落盘。可嵌套。</summary>
+    void Begin() {
+        if (this.txDepth == 0) { this.txMark = this.log.Mark(); }
+        this.txDepth = this.txDepth + 1;
+    }
+
+    /// <summary>原子地持久化自最外层 Begin() 以来的全部写入。</summary>
+    bool Commit() {
+        if (this.txDepth > 0) { this.txDepth = this.txDepth - 1; }
+        if (this.txDepth > 0) { return true; }
+        this.AppendTxFrames();
+        this.MergeTxOverlay();
+        this.FinishCommit();
+        return true;
+    }
+
+    /// 最外层提交时按覆盖层落帧：每个键一帧、只落最终值。
+    /// 帧只在内存缓冲中追加（磁盘写仍由 FinishCommit 统一做），
+    /// 键集在 txPut/txDel 间互斥，帧序与恢复无关。
+    void AppendTxFrames() {
+        List<string> dk = this.txDel.Keys;
+        for (int i = 0; i < dk.Count; i = i + 1) {
+            this.AppendRec(2, dk[i], "");
+        }
+        List<string> pk = this.txPut.Keys;
+        for (int i = 0; i < pk.Count; i = i + 1) {
+            string v = "";
+            this.txPut.TryGetValue(pk[i], out v);
+            this.AppendRec(1, pk[i], v);
+        }
+    }
+
+    /// <summary>丢弃自最外层 Begin() 以来的全部写入：缓冲中的帧
+    /// 回退到事务起点，覆盖层清空。</summary>
+    void Rollback() {
+        if (this.txDepth == 0) { return; }
+        this.txDepth = 0;
+        this.log.RollbackTo(this.txMark);
+        this.txPut.Clear();
+        this.txDel.Clear();
+    }
+
+    /// 最外层提交时把覆盖层合并进 memtable/索引/墓碑。
+    void MergeTxOverlay() {
+        List<string> dk = this.txDel.Keys;
+        for (int i = 0; i < dk.Count; i = i + 1) {
+            this.memtable.Remove(dk[i]);
+            this.index.Remove(dk[i]);
+            if (!this.tombstones.ContainsKey(dk[i])) { this.tombstones.Add(dk[i], 0); }
+        }
+        this.txDel.Clear();
+        List<string> pk = this.txPut.Keys;
+        for (int i = 0; i < pk.Count; i = i + 1) {
+            string k = pk[i];
+            string v = "";
+            this.txPut.TryGetValue(k, out v);
+            if (this.memtable.ContainsKey(k)) { this.memtable.Remove(k); }
+            if (this.tombstones.ContainsKey(k)) { this.tombstones.Remove(k); }
+            this.memtable.Add(k, v);
+        }
+        this.txPut.Clear();
+    }
+
+    /// 按当前持久化档处理缓冲：flush / 窗口化 fsync；日志攒满
+    /// 阈值时固化新段。
+    void FinishCommit() {
+        if (this.durability == ZanStore.DUR_SYNC) {
+            if (!this.log.Sync()) { this.lastError = this.log.GetError(); }
+        } else if (this.durability == ZanStore.DUR_GROUP) {
+            if (!this.log.Flush()) {
+                this.lastError = this.log.GetError();
+                return;
+            }
+            this.commitsSinceSync = this.commitsSinceSync + 1;
+            if (this.commitsSinceSync >= this.syncEvery
+                    || this.log.PendingBytes() >= ZanStore.GROUP_FLUSH_BYTES) {
+                if (!this.log.Sync()) { this.lastError = this.log.GetError(); }
+                this.commitsSinceSync = 0;
+            }
+        } else {
+            if (this.log.PendingBytes() >= ZanStore.NONE_FLUSH_BYTES) {
+                this.log.Flush();
+            }
+        }
+        if (this.log.Size() >= this.flushThreshold) {
+            this.FlushToSegment();
+        }
+    }
+
+    /// <summary>把 memtable 固化为新段：put 与未固化墓碑按键序
+    /// 合并写段 → fsync → 保存 manifest（水位 = 当前 seq）→ 截断
+    /// 日志。墓碑必须随段持久化：被删键在旧段里仍有旧版本，没有
+    /// 新段墓碑压住，恢复扫描就会把它复活。任一步失败都保持日志
+    /// 兜底（旧 manifest + 完整日志 = 完好状态）；成功后日志归零。
+    /// 须在写侧串行环境调用（同步核心即满足；协程请走
+    /// <see cref="FlushAsync"/>）。</summary>
+    void FlushToSegment() {
+        if (this.memtable.Count == 0 && this.tombstones.Count == 0) {
+            // 空覆盖也能安全轮转：memtable 与墓碑皆空说明未落段
+            // 日志的净效果为零（put 过的键都被删除或已落段）。
+            if (this.log.Size() == 0) { return; }
+            if (!this.man.Save(this.seq, this.nextSegId, this.SegIdList())) {
+                this.lastError = this.man.GetError();
+                return;
+            }
+            this.log.Reset();
+            return;
+        }
+        long segId = this.nextSegId;
+        string segPath = ZanStore.SegPath(this.basePath, segId);
+        // 同号孤儿防御：上次崩溃可能留下未入清单的同名残段。
+        File.Delete(segPath);
+        // 写入集 = memtable put + 墓碑 del；两集合互斥（Put 摘
+        // 墓碑、Delete 摘 memtable），合并后同键至多一条记录。
+        List<string> keys = new List<string>();
+        List<string> src = this.memtable.Keys;
+        for (int i = 0; i < src.Count; i = i + 1) { keys.Add(src[i]); }
+        List<string> tks = this.tombstones.Keys;
+        for (int i = 0; i < tks.Count; i = i + 1) { keys.Add(tks[i]); }
+        ZanStore.SortStrings(keys);
+        SegmentWriter wtr = SegmentWriter.Create(segPath);
+        if (wtr.Failed()) { this.lastError = wtr.GetError(); return; }
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (this.tombstones.ContainsKey(keys[i])) {
+                wtr.Add(keys[i], "", 2);
+            } else {
+                string v = "";
+                this.memtable.TryGetValue(keys[i], out v);
+                wtr.Add(keys[i], v, 1);
+            }
+        }
+        if (!wtr.Finish()) {
+            this.lastError = wtr.GetError();
+            File.Delete(segPath);
+            return;
+        }
+        SegmentFile seg = SegmentFile.Open(segPath);
+        if (seg.GetError() != "") {
+            this.lastError = seg.GetError();
+            File.Delete(segPath);
+            return;
+        }
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (this.tombstones.ContainsKey(keys[i])) {
+                this.index.Remove(keys[i]);
+            } else {
+                if (this.index.ContainsKey(keys[i])) { this.index.Remove(keys[i]); }
+                this.index.Add(keys[i], segId);
+            }
+        }
+        this.memtable.Clear();
+        this.tombstones.Clear();
+        this.segs.Add(new SegRef(seg, segId));
+        this.nextSegId = segId + 1;
+        if (!this.man.Save(this.seq, this.nextSegId, this.SegIdList())) {
+            this.lastError = this.man.GetError();
+            return;
+        }
+        this.log.Reset();
+        this.commitsSinceSync = 0;
+        // 自动增量归并：固化后段数达阈值就归并最老 k 段。固化只在
+        // Commit 尾部触发（txDepth==0），MergeSomeSegments 的守卫
+        // 只是双保险。返回值忽略：归并失败不回滚固化，下次固化
+        // 段数仍达标会再试。
+        if (this.autoMergeAt > 0 && this.segs.Count >= this.autoMergeAt) {
+            this.MergeSomeSegments(this.autoMergeK);
+        }
+    }
+
+    /// <summary>把全部已固化段（≥2 个）归并为一个新段：同键只留
+    /// 最新版本，墓碑直接掉落（归并集=全部段，不存在会复活的更老
+    /// 版本），索引按归并结果重建。须在写侧串行环境调用且不在事务
+    /// 中（协程请走 <see cref="MergeAsync"/>）；期间阻塞写入——
+    /// 在线换段优化留待后续。崩溃窗口两段皆一致：段已写清单未换
+    /// = 孤儿段，下次同号归并覆盖之；清单已换 = 旧段成孤儿（不再
+    /// 被引用，仅占盘）。内存峰值 ≈ 存活键数（重建索引用）。</summary>
+    void MergeSegments() {
+        if (this.segs.Count < 2 || this.txDepth > 0) { return; }
+        long newId = this.nextSegId;
+        string segPath = ZanStore.SegPath(this.basePath, newId);
+        // 同号孤儿防御：上次「段已写、清单未换」的崩溃残留。
+        File.Delete(segPath);
+        SegmentWriter wtr = SegmentWriter.Create(segPath);
+        if (wtr.Failed()) { this.lastError = wtr.GetError(); return; }
+        // 各段游标，段号降序 = 新→旧；每键第一个停住的游标即最新
+        // 版本：put 落入归并段，墓碑让整键消失（旧版本一并作废）。
+        List<SegCursor> cursors = new List<SegCursor>();
+        for (int i = this.segs.Count - 1; i >= 0; i = i - 1) {
+            cursors.Add(SegCursor.Open(this.segs[i].seg, ""));
+        }
+        Dictionary<string, long> mergedIndex = new Dictionary<string, long>();
+        while (true) {
+            string minKey = "";
+            bool has = false;
+            for (int i = 0; i < cursors.Count; i = i + 1) {
+                SegCursor c = cursors[i];
+                if (!c.Valid()) { continue; }
+                if (!has || String.CompareOrdinal(c.Key(), minKey) < 0) {
+                    minKey = c.Key();
+                    has = true;
+                }
+            }
+            if (!has) { break; }
+            // 尚未固化的墓碑同样压住段内旧版本：该键整体跳过、
+            // 不写入归并段——重建的键索引才不会让它复活
+            // （Get/Contains 走 memtable+索引，不查墓碑集）。
+            if (this.tombstones.ContainsKey(minKey)) {
+                for (int i = 0; i < cursors.Count; i = i + 1) {
+                    SegCursor c = cursors[i];
+                    if (c.Valid() && c.Key() == minKey) { c.Next(); }
+                }
+                continue;
+            }
+            // 第一个（=最新段的）停在 minKey 的游标无条件定生死：
+            // put 落入归并段；墓碑让整键消失——绝不能落到更旧段
+            // 的同名 put（否则删除会复活）。
+            bool decided = false;
+            for (int i = 0; i < cursors.Count; i = i + 1) {
+                SegCursor c = cursors[i];
+                if (c.Valid() && c.Key() == minKey) {
+                    if (!decided) {
+                        decided = true;
+                        if (c.Op() == 1) {
+                            wtr.Add(minKey, c.Val(), 1);
+                            if (!mergedIndex.ContainsKey(minKey)) {
+                                mergedIndex.Add(minKey, newId);
+                            }
+                        }
+                    }
+                    c.Next();
+                }
+            }
+        }
+        for (int i = 0; i < cursors.Count; i = i + 1) { cursors[i].Free(); }
+        if (!wtr.Finish()) {
+            this.lastError = wtr.GetError();
+            File.Delete(segPath);
+            return;
+        }
+        SegmentFile seg = SegmentFile.Open(segPath);
+        if (seg.GetError() != "") {
+            this.lastError = seg.GetError();
+            File.Delete(segPath);
+            return;
+        }
+        // 清单先换：此后任何时刻崩溃，磁盘上都只剩一致状态。
+        // 水位保持原值——归并不覆盖任何日志帧（memtable 数据
+        // 仍在日志里），推到当前 seq 会让重开时跳过那些帧、
+        // 丢掉未固化数据。
+        List<long> ids = new List<long>();
+        ids.Add(newId);
+        if (!this.man.Save(this.man.LogStartSeq(), newId + 1, ids)) {
+            this.lastError = this.man.GetError();
+            seg.Close();
+            File.Delete(segPath);
+            return;
+        }
+        this.index = mergedIndex;
+        for (int i = 0; i < this.segs.Count; i = i + 1) {
+            this.segs[i].seg.Close();
+            File.Delete(ZanStore.SegPath(this.basePath, this.segs[i].id));
+        }
+        this.segs.Clear();
+        this.segs.Add(new SegRef(seg, newId));
+        this.nextSegId = newId + 1;
+    }
+
+    /// <summary>独占锁下的 <see cref="MergeSegments"/>。</summary>
+    async void MergeAsync() {
+        await this.rw.EnterWrite();
+        MergeSegments();
+        this.rw.ExitWrite();
+    }
+
+    /// 线性查小列表（归并集段号，k 很小）。
+    static bool IdInList(List<long> ids, long id) {
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (ids[i] == id) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary><see cref="MergeSegments"/> 的增量形式：把最老的
+    /// maxMerge（≥2）个段归并为一个新段，其余较新段原样保留——
+    /// 写阻塞时长被归并集规模封顶，反复调用最终收敛为单段。索引
+    /// 原地改指：只有键索引仍指向归并集的键才重指/摘除；指向未
+    /// 归并新段的键保持原指（更新版本继续赢），且这样的键**不写
+    /// 入新段**——重开恢复按清单序「后扫覆盖前扫」时才不会让旧
+    /// 版本压住未归并段的新版本。归并集内同键由游标新→旧序去重，
+    /// 未固化墓碑压键与崩溃窗口语义同全量归并。返回实际归并的
+    /// 段数（0 = 无事可做：段不足 2 或在事务中）。</summary>
+    int MergeSomeSegments(int maxMerge) {
+        if (maxMerge < 2 || this.segs.Count < 2 || this.txDepth > 0) { return 0; }
+        int k = maxMerge < this.segs.Count ? maxMerge : this.segs.Count;
+        if (k < 2) { return 0; }
+        long newId = this.nextSegId;
+        string segPath = ZanStore.SegPath(this.basePath, newId);
+        // 同号孤儿防御：上次「段已写、清单未换」的崩溃残留。
+        File.Delete(segPath);
+        SegmentWriter wtr = SegmentWriter.Create(segPath);
+        if (wtr.Failed()) { this.lastError = wtr.GetError(); return 0; }
+        // 归并集 = 最老 k 段；游标集内新→旧排列，同键第一个停住的
+        // 即集内最新版本。
+        List<long> chosenIds = new List<long>();
+        for (int i = 0; i < k; i = i + 1) { chosenIds.Add(this.segs[i].id); }
+        List<SegCursor> cursors = new List<SegCursor>();
+        for (int i = k - 1; i >= 0; i = i - 1) {
+            cursors.Add(SegCursor.Open(this.segs[i].seg, ""));
+        }
+        while (true) {
+            string minKey = "";
+            bool has = false;
+            for (int i = 0; i < cursors.Count; i = i + 1) {
+                SegCursor c = cursors[i];
+                if (!c.Valid()) { continue; }
+                if (!has || String.CompareOrdinal(c.Key(), minKey) < 0) {
+                    minKey = c.Key();
+                    has = true;
+                }
+            }
+            if (!has) { break; }
+            // 未固化墓碑压键：整键跳过不写入，索引项一并摘除
+            // （指向归并集才摘——指向未归并段说明有更新版本）。
+            if (this.tombstones.ContainsKey(minKey)) {
+                for (int i = 0; i < cursors.Count; i = i + 1) {
+                    SegCursor c = cursors[i];
+                    if (c.Valid() && c.Key() == minKey) { c.Next(); }
+                }
+                long curSeg;
+                if (this.index.TryGetValue(minKey, out curSeg) && ZanStore.IdInList(chosenIds, curSeg)) {
+                    this.index.Remove(minKey);
+                }
+                continue;
+            }
+            // 集内最新版本定生死：仅当键索引指向归并集时才需要
+            // 落入新段并重指；指向未归并段 = 那里有更新版本，此键
+            // 直接跳过（新段不含它，重开覆盖序才安全）。
+            bool decided = false;
+            bool write = false;
+            string val = "";
+            for (int i = 0; i < cursors.Count; i = i + 1) {
+                SegCursor c = cursors[i];
+                if (c.Valid() && c.Key() == minKey) {
+                    if (!decided) {
+                        decided = true;
+                        long curSeg;
+                        bool mine = this.index.TryGetValue(minKey, out curSeg) && ZanStore.IdInList(chosenIds, curSeg);
+                        if (c.Op() == 1 && mine) {
+                            write = true;
+                            val = c.Val();
+                        }
+                    }
+                    c.Next();
+                }
+            }
+            if (write) {
+                wtr.Add(minKey, val, 1);
+                this.index.Remove(minKey);
+                this.index.Add(minKey, newId);
+            } else if (decided) {
+                // 集内最新是墓碑或键已归属未归并段：前者索引早已摘除；
+                // 后者不动。两情形都无需写新段。
+                long curSeg;
+                if (this.index.TryGetValue(minKey, out curSeg) && ZanStore.IdInList(chosenIds, curSeg)) {
+                    this.index.Remove(minKey);
+                }
+            }
+        }
+        for (int i = 0; i < cursors.Count; i = i + 1) { cursors[i].Free(); }
+        if (!wtr.Finish()) {
+            this.lastError = wtr.GetError();
+            File.Delete(segPath);
+            return 0;
+        }
+        SegmentFile seg = SegmentFile.Open(segPath);
+        if (seg.GetError() != "") {
+            this.lastError = seg.GetError();
+            File.Delete(segPath);
+            return 0;
+        }
+        // 清单先换：段序 = 数据年龄序（新段载最老数据，排最前），
+        // 未归并段保持原相对序在后——恢复「后扫覆盖前扫」与多路
+        // 游标「新→旧」都以这个序为准。崩溃窗口两段皆一致，同
+        // 全量归并。
+        List<long> ids = new List<long>();
+        ids.Add(newId);
+        for (int i = k; i < this.segs.Count; i = i + 1) { ids.Add(this.segs[i].id); }
+        if (!this.man.Save(this.man.LogStartSeq(), newId + 1, ids)) {
+            this.lastError = this.man.GetError();
+            seg.Close();
+            File.Delete(segPath);
+            return 0;
+        }
+        for (int i = 0; i < k; i = i + 1) {
+            this.segs[i].seg.Close();
+            File.Delete(ZanStore.SegPath(this.basePath, this.segs[i].id));
+        }
+        // 段列表按数据年龄序重建：新段（载最老数据）在最前，
+        // 未归并段保持原相对序。
+        List<SegRef> remaining = new List<SegRef>();
+        remaining.Add(new SegRef(seg, newId));
+        for (int i = k; i < this.segs.Count; i = i + 1) { remaining.Add(this.segs[i]); }
+        this.segs = remaining;
+        this.nextSegId = newId + 1;
+        return k;
+    }
+
+    /// 追加一条记录帧并推进 seq。
+    void AppendRec(int op, string key, string val) {
+        ByteBuffer b = ByteBuffer.Alloc(24 + key.Length + val.Length);
+        b.WriteU64(this.seq);
+        b.WriteU8(op);
+        b.WriteString(key);
+        if (op == 1) { b.WriteString(val); }
+        b.SeekRead(0);
+        this.log.AppendFrame(b);
+        b.Free();
+        this.seq = this.seq + 1;
+    }
+
+    /// <summary>按键序（<see cref="String.CompareOrdinal"/> 升序）
+    /// 归并扫描 fromKey（含）起的全部存活键值：memtable 与各段
+    /// 多路归并，同键取最新版本（memtable &gt; 更大段号），墓碑
+    /// 隐藏。visit 返回 false 早停。看到的是已提交视图（不含未
+    /// 提交事务的覆盖层）；memtable 部分每次扫描现排序，段部分
+    /// 顺序流读、不占用块缓存。返回 visit 接受的键数。</summary>
+    int Scan(string fromKey, StoreVisit visit) {
+        return ScanBetween(fromKey, "", visit);
+    }
+
+    /// <summary><see cref="Scan"/> 的有界形式：只访问
+    /// [startKey, endKey] 闭区间内的键，上界在归并循环内判定，
+    /// 调用方无需在回调里逐键比对。返回 visit 接受的键数。</summary>
+    int ScanBetween(string startKey, string endKey, StoreVisit visit) {
+        // 各段游标，段号降序排列 = 新段在前。
+        List<SegCursor> cursors = new List<SegCursor>();
+        for (int i = this.segs.Count - 1; i >= 0; i = i - 1) {
+            cursors.Add(SegCursor.Open(this.segs[i].seg, startKey));
+        }
+        // memtable 中键 ≥ startKey 的部分（每键至多一条，即最新版本），
+        // 先过滤再排序：固化+归并后的常态是 memtable 为空，排序整段跳过。
+        List<string> mk = new List<string>();
+        List<string> src = this.memtable.Keys;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (String.CompareOrdinal(src[i], startKey) >= 0) { mk.Add(src[i]); }
+        }
+        ZanStore.SortStrings(mk);
+        int mi = 0;
+
+        int accepted = 0;
+        bool bounded = endKey.Length > 0;
+        // 墓碑集为空（无未固化删除）时逐键哈希整个跳过：
+        // 扫描态集合的常态。
+        bool hasTombs = this.tombstones.Count > 0;
+
+        // 单一来源快速路径：恰好一个段、memtable 无参与归并的键。
+        // 固化+归并后的常态——无需最小键仲裁与同键裁决，顺序直读。
+        if (cursors.Count == 1 && mk.Count == 0) {
+            SegCursor c = cursors[0];
+            while (c.Valid()) {
+                if (c.Op() == 1) {
+                    string k = c.Key();
+                    if (bounded && String.CompareOrdinal(k, endKey) > 0) { break; }
+                    if (!hasTombs || !this.tombstones.ContainsKey(k)) {
+                        if (!visit(k, c.Val())) { break; }
+                        accepted = accepted + 1;
+                    }
+                }
+                c.Next();
+            }
+            c.Free();
+            return accepted;
+        }
+
+        bool go = true;
+        while (go) {
+            // 1) 各来源当前位置上的最小键；win = 胜出游标下标
+            //    （-1 = memtable 持有当前键或无来源）。cursors 新→旧，
+            //    严格小于才替换，天然让最新段在并列时胜出。
+            string minKey = "";
+            bool has = false;
+            bool memHas = false;
+            int win = -1;
+            if (mi < mk.Count) { minKey = mk[mi]; has = true; memHas = true; }
+            for (int i = 0; i < cursors.Count; i = i + 1) {
+                SegCursor c = cursors[i];
+                if (!c.Valid()) { continue; }
+                if (!has) {
+                    minKey = c.Key(); has = true; win = i;
+                } else {
+                    int cmp = String.CompareOrdinal(c.Key(), minKey);
+                    if (cmp < 0) {
+                        minKey = c.Key(); win = i; memHas = false;
+                    } else if (cmp == 0 && win == -1) {
+                        win = i;    // 与 memtable 同键：值仍取 memtable，游标须推进
+                    }
+                }
+            }
+            if (!has) { break; }
+            if (bounded && String.CompareOrdinal(minKey, endKey) > 0) { break; }
+            // 2) 最新来源定值：memtable 优先；否则胜出游标。
+            bool live = false;
+            string val = "";
+            if (memHas) {
+                string v = "";
+                this.memtable.TryGetValue(minKey, out v);
+                val = v;
+                live = true;
+            } else {
+                SegCursor c = cursors[win];
+                live = c.Op() == 1;
+                val = c.Val();
+            }
+            // 3) 推进停在 minKey 的来源：memtable 与胜出游标必推；
+            //    多段时更旧的段可能同名键，逐个核对一并作废。
+            if (memHas) { mi = mi + 1; }
+            if (win >= 0) { cursors[win].Next(); }
+            for (int i = win + 1; i < cursors.Count; i = i + 1) {
+                SegCursor c = cursors[i];
+                if (c.Valid() && c.Key() == minKey) { c.Next(); }
+            }
+            // 尚未固化的墓碑同样压住旧段版本（点读路径由索引摘除
+            // 保证，扫描路径在这里保证）。
+            if (live && hasTombs && this.tombstones.ContainsKey(minKey)) { live = false; }
+            // 4) 存活键才交给 visit；false 早停。
+            if (live) {
+                if (!visit(minKey, val)) { go = false; }
+                else { accepted = accepted + 1; }
+            }
+        }
+        for (int i = 0; i < cursors.Count; i = i + 1) { cursors[i].Free(); }
+        return accepted;
+    }
+
+    /// <summary><see cref="ScanBetween"/> 的零拷贝形式：交付
+    /// <see cref="ScanRow"/> 而非字符串——单段且 memtable 无未固化
+    /// 数据时值不物化、上界与墓碑判定全走块内指针；memtable 有
+    /// 参与则退化为字符串路径包装。语义与 ScanBetween 完全一致，
+    /// 行数据仅在回调返回前有效。返回 visit 接受的键数。</summary>
+    int ScanRows(string startKey, string endKey, ScanRowVisit visit) {
+        if (this.segs.Count == 1 && this.memtable.Keys.Count == 0) {
+            SegCursor c = SegCursor.Open(this.segs[0].seg, startKey);
+            ScanRow row = new ScanRow();
+            row.Bind(c);
+            bool hasTombs = this.tombstones.Count > 0;
+            bool bounded = endKey.Length > 0;
+            int accepted = 0;
+            while (c.Valid()) {
+                if (c.Op() == 1) {
+                    if (bounded && c.CmpKeyRaw(endKey) > 0) { break; }
+                    if (!hasTombs || !this.tombstones.ContainsKey(c.Key())) {
+                        if (!visit(row)) { break; }
+                        accepted = accepted + 1;
+                    }
+                }
+                c.Next();
+            }
+            c.Free();
+            return accepted;
+        }
+        // 多源归并（未固化数据参与）：退化为字符串路径包装交付。
+        ScanRow mrow = new ScanRow();
+        return ScanBetween(startKey, endKey, delegate(string k, string v) {
+            mrow.BindMem(k, v);
+            return visit(mrow);
+        });
+    }
+
+    /// <summary>统计 [startKey, endKey] 闭区间内的存活键数，
+    /// 不做任何回调：单段且 memtable 无参与时走块级内核直数
+    /// （免游标/回调对象），否则退化为归并扫描。返回键数。</summary>
+    int CountRange(string startKey, string endKey) {
+        List<string> src = this.memtable.Keys;
+        if (this.segs.Count == 1 && src.Count == 0) {
+            return ScanKernel(this.segs[0].seg, startKey, endKey,
+                delegate(nint basePtr, int keyOff, int keyLen, int valOff, int valLen) {
+                    return true;
+                });
+        }
+        return ScanBetween(startKey, endKey, delegate(string k, string v) {
+            return true;
+        });
+    }
+
+    /// <summary><see cref="ScanKernel"/> 的区间形式：仅当处于
+    /// 单段稳态（memtable 空）时走块级内核；多源归并或 memtable
+    /// 有未固化数据时返回 -1（调用方须退回 <see cref="ScanRows"/>
+    /// 字符串路径）。endKey 为空串 = 无上界。</summary>
+    int TryScanKernel(string startKey, string endKey, KernelVisit visit) {
+        List<string> src = this.memtable.Keys;
+        if (this.segs.Count != 1 || src.Count != 0) { return -1; }
+        return ScanKernel(this.segs[0].seg, startKey, endKey, visit);
+    }
+
+    /// <summary>
+    /// 块级聚合内核（单段快速路径）：把块跨度一次读入（每
+    /// <see cref="KERNEL_SPAN_BYTES"/> 一次系统调用，块在段文件里物理
+    /// 连续、记录解析不依赖块边界）后循环裸解析记录，把（基址+偏移+
+    /// 长度）直接交给 visit——不经 SegCursor/ScanRow 对象、不经每行
+    /// delegate 之外的任何抽象；op=2 的段内墓碑由这里跳过（op=2 记
+    /// 录无值）。墓碑集非空时逐键 memcmp 比对（未固化删除极少，比
+    /// 对成本可忽略）；visit 返回 false 早停。返回 visit 接受的行数。
+    ///
+    /// 常态扫描（固化+归并后单段、memtable 空）的聚合与计数走
+    /// 这里——每行成本 = varint 解码 + 一次回调，无对象分配；每
+    /// 跨度成本 = 一次 ReadAt + 逐块 CRC（同会话首遍）。
+    /// </summary>
+    int ScanKernel(SegmentFile seg, string startKey, string endKey, KernelVisit visit) {
+        int blockIdx = seg.BlockFor(startKey);
+        int blockTotal = seg.BlockCount();
+        int accepted = 0;
+        bool bounded = endKey.Length > 0;
+        bool hasTombs = this.tombstones.Count > 0;
+        ByteBuffer buf = null;
+        bool stop = false;
+        while (blockIdx < blockTotal && !stop) {
+            // 跨度终点：够 KERNEL_SPAN_BYTES 或到段尾。单块超长时
+            // 至少覆盖该块。
+            int endBlock = blockIdx + 1;
+            long spanLen = seg.BlockLen(blockIdx);
+            while (endBlock < blockTotal
+                    && spanLen + seg.BlockLen(endBlock) <= ZanStore.KERNEL_SPAN_BYTES) {
+                spanLen = spanLen + seg.BlockLen(endBlock);
+                endBlock = endBlock + 1;
+            }
+            ByteBuffer nb = seg.LoadBlockSpan(blockIdx, endBlock, buf);
+            if (nb == null) { break; }
+            buf = nb;
+            int pos = 0;
+            int len = buf.Length();
+            while (pos < len) {
+                int op = buf.PeekU8(pos);
+                if (op != 1 && op != 2) { break; }
+                int p = pos + 1;
+                long klen = buf.ReadVarIntAt(p, out p);
+                if (klen < 0 || p + (int)klen > len) { break; }
+                int keyOff = p;
+                p = p + (int)klen;
+                // 下界：定位块里可能有 < startKey 的前缀键（稀疏索
+                // 引只保证块首 <= startKey），跳过。
+                if (buf.CmpRangeRaw(keyOff, (int)klen, startKey) < 0) {
+                    if (op == 2) { pos = p; continue; }
+                    long skip = buf.ReadVarIntAt(p, out p);
+                    if (skip < 0 || p + (int)skip > len) { break; }
+                    pos = p + (int)skip;
+                    continue;
+                }
+                if (op == 2) {
+                    // 段内墓碑：无值。单段快速路径下它就是该键的
+                    // 最新版本，直接跳过（键已被固化时索引摘除）。
+                    pos = p;
+                    continue;
+                }
+                long vlen = buf.ReadVarIntAt(p, out p);
+                if (vlen < 0 || p + (int)vlen > len) { break; }
+                int valOff = p;
+                p = p + (int)vlen;
+                // 起始定位之后段内按键序——首条越过上界即整段止步。
+                if (bounded && buf.CmpRangeRaw(keyOff, (int)klen, endKey) > 0) {
+                    stop = true;
+                    break;
+                }
+                if (hasTombs && this.tombstones.ContainsKey(buf.Str(keyOff, (int)klen))) {
+                    pos = p;
+                    continue;
+                }
+                accepted = accepted + 1;
+                if (!visit(buf.Raw(), keyOff, (int)klen, valOff, (int)vlen)) {
+                    stop = true;
+                    break;
+                }
+                pos = p;
+            }
+            blockIdx = endBlock;
+        }
+        if (buf != null) { buf.Free(); }
+        return accepted;
+    }
+
+    /// <summary>共享锁下的 <see cref="Scan"/>；可与并发写入共存。</summary>
+    async int ScanAsync(string fromKey, StoreVisit visit) {
+        await this.rw.EnterRead();
+        int n = Scan(fromKey, visit);
+        this.rw.ExitRead();
+        return n;
+    }
+
+    /// <summary>物化式范围扫描：startKey（含）到 endKey（含，与
+    /// 旧引擎 <c>BTree.Scan</c> 语义一致）按键序收集到 output；
+    /// limit &gt; 0 时至多 limit 条。返回收集的条数。</summary>
+    int ScanRange(string startKey, string endKey, int limit, List<KvEntry> output) {
+        int before = output.Count;
+        Scan(startKey, delegate(string k, string v) {
+            if (endKey.Length > 0 && String.CompareOrdinal(k, endKey) > 0) {
+                return false;
+            }
+            output.Add(new KvEntry(k, v));
+            return limit <= 0 || output.Count - before < limit;
+        });
+        return output.Count - before;
+    }
+
+    /// <summary>前缀扫描：所有以 prefix 开头的键值按键序收集；
+    /// limit &gt; 0 时至多 limit 条。返回收集的条数。</summary>
+    int ScanPrefix(string prefix, int limit, List<KvEntry> output) {
+        int before = output.Count;
+        Scan(prefix, delegate(string k, string v) {
+            if (!k.StartsWith(prefix)) { return false; }
+            output.Add(new KvEntry(k, v));
+            return limit <= 0 || output.Count - before < limit;
+        });
+        return output.Count - before;
+    }
+
+    /// <summary><see cref="ScanKernel"/> 的键只读形式：不解析值、
+    /// 只把（基址+键偏移+键长）交给 visit，供覆盖索引路径
+    /// （索引条目键自带 id/值段，零文档读也零字符串物化）使用。
+    /// 单段稳态前提与 <see cref="TryScanKernel"/> 相同，否则返回 -1。
+    /// 返回 visit 接受的键数。</summary>
+    int TryScanKeyKernel(string startKey, string endKey, KernelKeyVisit visit) {
+        List<string> src = this.memtable.Keys;
+        if (this.segs.Count != 1 || src.Count != 0) { return -1; }
+        return ScanKeyKernel(this.segs[0].seg, startKey, endKey, visit);
+    }
+
+    /// <summary><see cref="ScanKernel"/> 的键只读内档：与行版同
+    /// 跨度整读与上界/墓碑逻辑，只是不读值、交付键区间。</summary>
+    int ScanKeyKernel(SegmentFile seg, string startKey, string endKey, KernelKeyVisit visit) {
+        int blockIdx = seg.BlockFor(startKey);
+        int blockTotal = seg.BlockCount();
+        int accepted = 0;
+        bool bounded = endKey.Length > 0;
+        bool hasTombs = this.tombstones.Count > 0;
+        ByteBuffer buf = null;
+        bool stop = false;
+        while (blockIdx < blockTotal && !stop) {
+            int endBlock = blockIdx + 1;
+            long spanLen = seg.BlockLen(blockIdx);
+            while (endBlock < blockTotal
+                    && spanLen + seg.BlockLen(endBlock) <= ZanStore.KERNEL_SPAN_BYTES) {
+                spanLen = spanLen + seg.BlockLen(endBlock);
+                endBlock = endBlock + 1;
+            }
+            ByteBuffer nb = seg.LoadBlockSpan(blockIdx, endBlock, buf);
+            if (nb == null) { break; }
+            buf = nb;
+            int pos = 0;
+            int len = buf.Length();
+            while (pos < len) {
+                int op = buf.PeekU8(pos);
+                if (op != 1 && op != 2) { break; }
+                int p = pos + 1;
+                long klen = buf.ReadVarIntAt(p, out p);
+                if (klen < 0 || p + (int)klen > len) { break; }
+                int keyOff = p;
+                p = p + (int)klen;
+                // 下界：定位块里可能有 < startKey 的前缀键（稀疏索
+                // 引只保证块首 <= startKey），跳过。
+                if (buf.CmpRangeRaw(keyOff, (int)klen, startKey) < 0) {
+                    if (op == 2) { pos = p; continue; }
+                    long skip = buf.ReadVarIntAt(p, out p);
+                    if (skip < 0 || p + (int)skip > len) { break; }
+                    pos = p + (int)skip;
+                    continue;
+                }
+                if (op == 2) {
+                    if (bounded && buf.CmpRangeRaw(keyOff, (int)klen, endKey) > 0) {
+                        stop = true;
+                        break;
+                    }
+                    pos = p;
+                    continue;
+                }
+                long vlen = buf.ReadVarIntAt(p, out p);
+                if (vlen < 0 || p + (int)vlen > len) { break; }
+                p = p + (int)vlen;
+                if (bounded && buf.CmpRangeRaw(keyOff, (int)klen, endKey) > 0) {
+                    stop = true;
+                    break;
+                }
+                if (hasTombs && this.tombstones.ContainsKey(buf.Str(keyOff, (int)klen))) {
+                    pos = p;
+                    continue;
+                }
+                accepted = accepted + 1;
+                if (!visit(buf.Raw(), keyOff, (int)klen)) {
+                    stop = true;
+                    break;
+                }
+                pos = p;
+            }
+            blockIdx = endBlock;
+        }
+        if (buf != null) { buf.Free(); }
+        return accepted;
+    }
+
+    /// <summary>将缓冲与 OS 缓存全部强制落盘。</summary>
+    void Checkpoint() {
+        if (!this.log.Sync()) { this.lastError = this.log.GetError(); }
+    }
+
+    /// 当前全部段号列表。
+    List<long> SegIdList() {
+        List<long> ids = new List<long>();
+        for (int i = 0; i < this.segs.Count; i = i + 1) {
+            ids.Add(this.segs[i].id);
+        }
+        return ids;
+    }
+
+    /// 按段号找段句柄。
+    SegRef FindSeg(long id) {
+        for (int i = 0; i < this.segs.Count; i = i + 1) {
+            if (this.segs[i].id == id) { return this.segs[i]; }
+        }
+        return null;
+    }
+
+    /// 落盘并关闭日志、段、缓存与进程内读写锁。
+    void Close() {
+        this.log.Close();
+        for (int i = 0; i < this.segs.Count; i = i + 1) {
+            this.segs[i].seg.Close();
+        }
+        this.cache.Close();
+        this.rw.Close();
+    }
+
+    // ===== 排序（键序固化段用）：中位数三选快速排序 =====
+
+    static void SortStrings(List<string> a) {
+        ZanStore.SortRange(a, 0, a.Count - 1);
+    }
+
+    static void SortRange(List<string> a, int lo, int hi) {
+        while (lo < hi) {
+            if (hi - lo < 12) {
+                for (int i = lo + 1; i <= hi; i = i + 1) {
+                    string k = a[i];
+                    int j = i - 1;
+                    while (j >= lo && String.CompareOrdinal(a[j], k) > 0) {
+                        a[j + 1] = a[j];
+                        j = j - 1;
+                    }
+                    a[j + 1] = k;
+                }
+                return;
+            }
+            int mid = (lo + hi) / 2;
+            if (String.CompareOrdinal(a[lo], a[mid]) > 0) { ZanStore.Swap(a, lo, mid); }
+            if (String.CompareOrdinal(a[lo], a[hi]) > 0) { ZanStore.Swap(a, lo, hi); }
+            if (String.CompareOrdinal(a[mid], a[hi]) > 0) { ZanStore.Swap(a, mid, hi); }
+            string pivot = a[mid];
+            int l = lo;
+            int r = hi;
+            while (l <= r) {
+                while (String.CompareOrdinal(a[l], pivot) < 0) { l = l + 1; }
+                while (String.CompareOrdinal(a[r], pivot) > 0) { r = r - 1; }
+                if (l <= r) {
+                    ZanStore.Swap(a, l, r);
+                    l = l + 1;
+                    r = r - 1;
+                }
+            }
+            if (r - lo < hi - l) {
+                ZanStore.SortRange(a, lo, r);
+                lo = l;
+            } else {
+                ZanStore.SortRange(a, l, hi);
+                hi = r;
+            }
+        }
+    }
+
+    static void Swap(List<string> a, int i, int j) {
+        string t = a[i];
+        a[i] = a[j];
+        a[j] = t;
+    }
+
+    // ===== 协程安全的异步 API =====
+
+    /// <summary>共享锁读取；可安全地与并发写入共存。</summary>
+    async string GetAsync(string key) {
+        await this.rw.EnterRead();
+        string v = Get(key);
+        this.rw.ExitRead();
+        return v;
+    }
+
+    /// <summary>独占锁写入并按当前持久化档落盘。</summary>
+    async void PutAsync(string key, string val) {
+        await this.rw.EnterWrite();
+        Put(key, val);
+        this.rw.ExitWrite();
+    }
+
+    /// 独占锁删除一个键；返回键此前是否存在。
+    async bool DeleteAsync(string key) {
+        await this.rw.EnterWrite();
+        bool existed = Delete(key);
+        this.rw.ExitWrite();
+        return existed;
+    }
+
+    /// <summary>独占锁下把 memtable 固化为新段。</summary>
+    async void FlushAsync() {
+        await this.rw.EnterWrite();
+        FlushToSegment();
+        this.rw.ExitWrite();
+    }
+
+    /// <summary>原子读改写：fn 在写临界区内看到最新已提交值
+    /// （不存在时为 ""），因此同一键上的并发 UpdateAtomic
+    /// 不会丢失更新。返回最终存储的结果。</summary>
+    async string UpdateAtomic(string key, StoreUpdater fn) {
+        await this.rw.EnterWrite();
+        Begin();
+        string next = fn(Get(key));
+        Put(key, next);
+        Commit();
+        this.rw.ExitWrite();
+        return next;
+    }
+}

@@ -1,0 +1,573 @@
+using System;
+
+namespace Gui;
+
+/// 带动画的窗口背景效果（"活皮肤"）。每个内置皮肤可携带
+/// 标志性的动态层（Theme.fx），由 App.RenderBackground 在节流的动画帧上
+/// 绘制在静态壁纸快照之上：
+/// 星场漂移（Dark）、极光浮动（Liquid Glass）、
+/// 下落的霓虹光束（Neon）、水墨飘丝（Chinese）、落花
+/// （Peach Blossom）与数字雨（Matrix）。
+///
+/// 所有效果都是无状态的：每个粒子的位置是
+/// 时钟和粒子哈希的纯函数，因此节流/不规则的帧
+/// 节奏不会使动画失步，也无需保留逐帧积分状态。
+/// 渲染只用廉价的 Canvas 原语（小填充、单字形
+/// 文本），软件渲染器在 ~15-25fps 的效果刷新下也能保持流畅。
+class BackdropFx {
+    // 脏区追踪：Render 期间绘制的每个粒子都把它的像素
+    // 矩形（x,y,w,h 四边形，裁剪到效果区域）追加到这里。纯效果
+    // 刷新时只从帧快照修复这些矩形，而不用
+    // 回拷整个帧（见 App.FxPresent），这正是大窗口下
+    // 空闲效果刷新保持廉价的原因。
+    static List<int> damage;
+    static int clipX;
+    static int clipY;
+    static int clipR;
+    static int clipB;
+
+    /// 取走并清空脏区列表：x0,y0,w0,h0,x1,y1,w1,h1… 扁平 int 序列，
+    /// 供 App.FxPresent 只修复被画过的矩形。
+    static List<int> TakeDamage() {
+        List<int> d = BackdropFx.damage;
+        /* 首帧先于任何 Mark 到来时 damage 还是 null（wasm 的首帧
+         * FxPresent 早于第一笔带记录的绘制），调用方直接 .Count 会
+         * 空引用——"取走并清空"的契约是空列表，不是 null。 */
+        if (d == null) { d = new List<int>(); }
+        BackdropFx.damage = new List<int>();
+        return d;
+    }
+
+    /// 记录一个脏矩形，裁剪到当前效果区域。
+    static void Mark(int x, int y, int w, int h) {
+        int x0 = x;
+        int y0 = y;
+        int x1 = x + w;
+        int y1 = y + h;
+        if (x0 < BackdropFx.clipX) { x0 = BackdropFx.clipX; }
+        if (y0 < BackdropFx.clipY) { y0 = BackdropFx.clipY; }
+        if (x1 > BackdropFx.clipR) { x1 = BackdropFx.clipR; }
+        if (y1 > BackdropFx.clipB) { y1 = BackdropFx.clipB; }
+        if (x1 <= x0 || y1 <= y0) { return; }
+        BackdropFx.damage.Add(x0);
+        BackdropFx.damage.Add(y0);
+        BackdropFx.damage.Add(x1 - x0);
+        BackdropFx.damage.Add(y1 - y0);
+    }
+
+    // 带记录的绘制辅助：转发给画布并记录像素矩形。
+    /// 填充矩形并记录脏区。
+    static void FR(Canvas c, int x, int y, int w, int h, int color) {
+        BackdropFx.Mark(x, y, w, h);
+        c.FillRect(x, y, w, h, color);
+    }
+
+    /// 填充圆并记录脏区（外扩 1px 容差）。
+    static void FC(Canvas c, int cx, int cy, int r, int color) {
+        BackdropFx.Mark(cx - r - 1, cy - r - 1, r * 2 + 2, r * 2 + 2);
+        c.FillCircle(cx, cy, r, color);
+    }
+
+    /// 绘制文本并按字号估算记录脏区。
+    static void DT(Canvas c, int x, int y, string s, int color, int fs) {
+        BackdropFx.Mark(x - 1, y - 1, fs + 4, fs * 3 / 2 + 4);
+        c.DrawText(x, y, s, color, fs);
+    }
+
+    // Theme.fx 中保存的效果种类（0 = 静态皮肤，无动画）。
+    /// 星场漂移（Dark，1）。
+    static int KindStars()     { return 1; }
+    /// 极光浮动（Liquid Glass，2）。
+    static int KindAurora()    { return 2; }
+    /// 下落霓虹光束（Neon，3）。
+    static int KindLightfall() { return 3; }
+    /// 水墨飘丝（Chinese，4）。
+    static int KindInk()       { return 4; }
+    /// 桃花瓣（Peach Blossom，5）。
+    static int KindPetals()    { return 5; }
+    /// 数字雨（Matrix，6）。
+    static int KindRain()      { return 6; }
+    /// 失焦光球上浮（Sunset，7）。
+    static int KindBokeh()     { return 7; }
+    /// 发光线框网格（Nebula，8）。
+    static int KindMesh()      { return 8; }
+    // 皮肤包装饰：归属于某个皮肤的招牌动画，作为环境层绘制
+    // （Fortune 是漂移的云和旋转的金币，Dark Gold 是上升的
+    // 余烬与金色细纹，Dreamy 是闪光与蝴蝶），
+    // 让皮肤包一眼可辨，而不只是换了个配色。
+    /// 新春装饰：漂云 + 翻滚金币（Fortune，9）。
+    static int KindFortune()   { return 9; }
+    /// 余烬上升 + 熔金光泽（Dark Gold，10）。
+    static int KindDarkGold()  { return 10; }
+    /// 碎光闪烁 + 蝴蝶（Dreamy，11）。
+    static int KindDreamy()    { return 11; }
+
+    /// 某种类的重绘节奏（动画帧间隔毫秒）。慢速环境
+    /// 效果懒刷新；快速效果（光瀑、雨）略快一些。
+    static int IntervalMs(int kind) {
+        if (kind == BackdropFx.KindLightfall()) { return 80; }
+        if (kind == BackdropFx.KindRain())      { return 100; }
+        if (kind == BackdropFx.KindPetals())    { return 100; }
+        if (kind == BackdropFx.KindAurora())    { return 150; }
+        if (kind == BackdropFx.KindInk())       { return 200; }
+        if (kind == BackdropFx.KindBokeh())     { return 160; }
+        if (kind == BackdropFx.KindFortune())   { return 110; }
+        if (kind == BackdropFx.KindDarkGold())  { return 110; }
+        if (kind == BackdropFx.KindDreamy())    { return 100; }
+        if (kind == BackdropFx.KindMesh())      { return 160; }
+        return 140;
+    }
+
+    // ---- 确定性的逐粒子随机性 ------------------------------
+
+    /// 小型整数哈希：由 (i, salt) 得到可复现的伪随机值，
+    /// 始终非负。
+    static int Hash(int i, int salt) {
+        int h = i * 374761393 + salt * 668265263;
+        h = (h / 8192 + h) % 2147483647;
+        if (h < 0) { h = -h; }
+        return h;
+    }
+
+    /// 通过粗略整数表计算 sin(deg) * 1000（10 度步长，线性
+    /// 插值）。对环境摆动足够用；避免在整个整数
+    /// GUI 栈中使用浮点运算。
+    static int Sin1000(int deg) {
+        int d = deg % 360;
+        if (d < 0) { d = d + 360; }
+        int sign = 1;
+        if (d >= 180) { d = d - 180; sign = -1; }
+        if (d > 90) { d = 180 - d; }
+        // 10 度步长的四分之一波表：sin(0..90)*1000
+        List<int> q = new List<int>{
+            0, 174, 342, 500, 643,
+            766, 866, 940, 985, 1000 };
+        int idx = d / 10;
+        int frac = d % 10;
+        int a = q[idx];
+        int b = 1000;
+        if (idx < 9) { b = q[idx + 1]; }
+        return sign * (a + (b - a) * frac / 10);
+    }
+
+    /// 渲染一种效果到 [x,y,w,h]，帧内所有粒子矩形记入脏区
+    ///（Render 开头重置）。kind 取 KindXxx() 常量；dpi 为 App 的
+    /// 缩放百分比，用于粒子尺寸。颜色取自 "effects" 样式部件。
+    static void Render(App app, Canvas c, int kind, int x, int y, int w, int h,
+                       int now, Theme t, int dpi) {
+        if (w <= 0 || h <= 0) { return; }
+        BackdropFx.damage = new List<int>();
+        BackdropFx.clipX = x;
+        BackdropFx.clipY = y;
+        BackdropFx.clipR = x + w;
+        BackdropFx.clipB = y + h;
+        c.PushClip(x, y, w, h);
+        if (kind == BackdropFx.KindStars()) {
+            int star = Style.Part(app, "effects", "star", "", "", "",
+                                  Style.SNormal()).FgOr(0);
+            BackdropFx.Stars(c, x, y, w, h, now, star, dpi);
+        }
+        if (kind == BackdropFx.KindAurora())    { BackdropFx.Aurora(c, x, y, w, h, now, dpi); }
+        if (kind == BackdropFx.KindLightfall()) {
+            int particleA = Style.Part(app, "effects", "particle", "", "a", "",
+                                       Style.SNormal()).FgOr(0);
+            int particleB = Style.Part(app, "effects", "particle", "", "b", "",
+                                       Style.SNormal()).FgOr(0);
+            int particleC = Style.Part(app, "effects", "particle", "", "c", "",
+                                       Style.SNormal()).FgOr(0);
+            BackdropFx.Lightfall(c, x, y, w, h, now, particleA, particleB,
+                                 particleC, dpi);
+        }
+        if (kind == BackdropFx.KindInk())       { BackdropFx.Ink(c, x, y, w, h, now, dpi); }
+        if (kind == BackdropFx.KindPetals())    { BackdropFx.Petals(c, x, y, w, h, now, t, dpi); }
+        if (kind == BackdropFx.KindFortune())   { BackdropFx.Fortune(c, x, y, w, h, now, dpi); }
+        if (kind == BackdropFx.KindDarkGold())  { BackdropFx.DarkGold(c, x, y, w, h, now, dpi); }
+        if (kind == BackdropFx.KindDreamy())    { BackdropFx.Dreamy(c, x, y, w, h, now, dpi); }
+        if (kind == BackdropFx.KindRain())      { BackdropFx.Rain(c, x, y, w, h, now, t, dpi); }
+        if (kind == BackdropFx.KindBokeh()) {
+            int bokehA = Style.Part(app, "effects", "bokeh", "", "a", "",
+                                    Style.SNormal()).FgOr(0);
+            int bokehB = Style.Part(app, "effects", "bokeh", "", "b", "",
+                                    Style.SNormal()).FgOr(0);
+            int bokehC = Style.Part(app, "effects", "bokeh", "", "c", "",
+                                    Style.SNormal()).FgOr(0);
+            BackdropFx.Bokeh(c, x, y, w, h, now, bokehA, bokehB, bokehC, dpi);
+        }
+        if (kind == BackdropFx.KindMesh()) {
+            int meshA = Style.Part(app, "effects", "mesh", "", "a", "",
+                                   Style.SNormal()).FgOr(0);
+            int meshB = Style.Part(app, "effects", "mesh", "", "b", "",
+                                   Style.SNormal()).FgOr(0);
+            BackdropFx.Mesh(c, x, y, w, h, now, meshA, meshB, dpi);
+        }
+        c.PopClip();
+    }
+
+    /// 按 DPI 百分比缩放尺寸，结果至少为 1px。
+    static int Px(int v, int dpi) {
+        int r = v * dpi / 100;
+        if (r < 1) { r = 1; }
+        return r;
+    }
+
+    // ---- Stars（Dark）：漂移闪烁的星场 -----------------------
+    /// 约 70 颗星缓慢斜向漂移（区域内环绕）、按各自相位闪烁，
+    /// 少数较大的星带一圈淡光晕。
+    static void Stars(Canvas c, int x, int y, int w, int h, int now,
+                      int color, int dpi) {
+        int n = 70;
+        for (int i = 0; i < n; i = i + 1) {
+            int hx = BackdropFx.Hash(i, 11);
+            int hy = BackdropFx.Hash(i, 23);
+            // 缓慢的斜向漂移，在区域内环绕。
+            int spd = 4 + hx % 7;                       // 向下 px/s
+            int px = x + (hx + now / 400) % w;          // 横向约 2.5 px/s
+            int py = y + (hy + now * spd / 1000) % h;
+            // 闪烁：alpha 按每颗星的相位振荡。
+            int tw = BackdropFx.Sin1000(now / 12 + hx % 360);
+            int alpha = 90 + tw * 70 / 1000;
+            int size = 1 + hy % 2;
+            if (dpi > 140) { size = size + 1; }
+            int hi = color % 16777216;
+            if (hi < 0) { hi = hi + 16777216; }
+            BackdropFx.FR(c, px, py, size, size, alpha * 16777216 + hi);
+            // 少数较大的星带一圈淡光晕。
+            if (i % 9 == 0) {
+                BackdropFx.FC(c, px, py, size + 2, 18 * 16777216 + hi);
+            }
+        }
+    }
+
+    // ---- Aurora（Liquid Glass）：缓慢轨道上的柔光球 ---------------
+    /// 一个柔光球：径向渐变圆盘（颜色按 r/g/b 分量给出）。
+    static void AuroraGlow(Canvas c, int cx, int cy, int r,
+                           int cr, int cg, int cb) {
+        BackdropFx.Mark(cx - r - 1, cy - r - 1, r * 2 + 2, r * 2 + 2);
+        // 逐像素径向渐变：一叠半透明圆盘，边缘
+        // 聚成可见的同心圆环。
+        c.FillRadial(cx, cy, r, Theme.Rgb(cr, cg, cb), 80);
+    }
+
+    /// 三个不同色的柔光球各绕锚点沿 Lissajous 式轨道缓慢游移。
+    static void Aurora(Canvas c, int x, int y, int w, int h, int now, int dpi) {
+        int r = BackdropFx.Px(130, dpi);
+        for (int i = 0; i < 3; i = i + 1) {
+            // 绕每个光球锚点的 Lissajous 式轨道。
+            int ax = x + w * (22 + i * 28) / 100;
+            int ay = y + h * (30 + (i * 37) % 45) / 100;
+            int sp = 20 + i * 7;   // 每个光球的相位更慢
+            int ox = BackdropFx.Sin1000(now / sp + i * 120) * (w / 9) / 1000;
+            int oy = BackdropFx.Sin1000(now / (sp + 9) + 90 + i * 80) * (h / 8) / 1000;
+            if (i == 0) { BackdropFx.AuroraGlow(c, ax + ox, ay + oy, r, 120, 150, 255); }
+            if (i == 1) { BackdropFx.AuroraGlow(c, ax + ox, ay + oy, r, 245, 110, 190); }
+            if (i == 2) { BackdropFx.AuroraGlow(c, ax + ox, ay + oy, r, 90, 225, 205); }
+        }
+    }
+
+    // ---- Lightfall（Neon）：下落的光束（reactbits 风格） ---------
+    /// 14 束霓虹光束下落：向尾部渐隐的光带，加明亮的微光头部；
+    /// 三色轮换。
+    static void Lightfall(Canvas c, int x, int y, int w, int h, int now,
+                          int colorA, int colorB, int colorC, int dpi) {
+        int n = 14;
+        for (int i = 0; i < n; i = i + 1) {
+            int hx = BackdropFx.Hash(i, 41);
+            int hy = BackdropFx.Hash(i, 57);
+            int bx = x + hx % w;
+            int len = BackdropFx.Px(90 + hy % 150, dpi);
+            int spd = 120 + hx % 160;                   // 下落速度 px/s
+            int span = h + len;
+            int head = y + (hy + now * spd / 1000) % span - len;
+            int color = colorA;
+            if (i % 3 == 1) { color = colorB; }
+            if (i % 3 == 2) { color = colorC; }
+            int rgb = color % 16777216;
+            if (rgb < 0) { rgb = rgb + 16777216; }
+            int bw = BackdropFx.Px(2, dpi);
+            // 光束：逐段堆叠、向尾部渐隐。
+            int segs = 10;
+            for (int k = 0; k < segs; k = k + 1) {
+                int sy = head - len * (k + 1) / segs;
+                int sh = len / segs + 1;
+                int alpha = 80 - k * 8;
+                BackdropFx.FR(c, bx, sy, bw, sh, alpha * 16777216 + rgb);
+            }
+            // 带微光的明亮头部。
+            BackdropFx.FC(c, bx + bw / 2, head, bw + 2, 60 * 16777216 + rgb);
+            BackdropFx.FR(c, bx, head - BackdropFx.Px(10, dpi), bw,
+                          BackdropFx.Px(10, dpi), 150 * 16777216 + rgb);
+        }
+    }
+
+    // ---- Ink（Chinese）：漂移的水墨墨迹 ------------------------------
+    /// 四团水墨墨迹横向漂移、上下轻摆（半透明径向渐变）。
+    static void Ink(Canvas c, int x, int y, int w, int h, int now, int dpi) {
+        int r = BackdropFx.Px(120, dpi);
+        int n = 4;
+        for (int i = 0; i < n; i = i + 1) {
+            int hx = BackdropFx.Hash(i, 71);
+            int span = w + r * 2;
+            int cx = x + (hx + now * (6 + i * 3) / 1000) % span - r;
+            int cy = y + h * (18 + i * 22) / 100
+                   + BackdropFx.Sin1000(now / 40 + i * 90) * BackdropFx.Px(12, dpi) / 1000;
+            BackdropFx.Mark(cx - r - 1, cy - r - 1, r * 2 + 2, r * 2 + 2);
+            c.FillRadial(cx, cy, r, Theme.Rgb(70, 62, 52), 34);
+        }
+    }
+
+    // ---- Petals（Peach Blossom）：漂移的桃花瓣 ---------------
+    /// 26 片桃花瓣下落、左右摇摆；每片由两枚错位圆盘构成，
+    /// 错位量随相位振荡，呈翻滚感。
+    static void Petals(Canvas c, int x, int y, int w, int h, int now,
+                       Theme t, int dpi) {
+        int n = 26;
+        for (int i = 0; i < n; i = i + 1) {
+            int hx = BackdropFx.Hash(i, 83);
+            int hy = BackdropFx.Hash(i, 97);
+            int spd = 28 + hx % 34;                     // 下落速度 px/s
+            int margin = BackdropFx.Px(24, dpi);
+            int span = h + margin * 2;
+            int py = y + (hy + now * spd / 1000) % span - margin;
+            int sway = BackdropFx.Sin1000(now / 9 + hx % 360)
+                     * BackdropFx.Px(16, dpi) / 1000;
+            int px = x + hx % w + sway;
+            int r = BackdropFx.Px(3, dpi) + hy % 4;
+            // 两个错位的圆盘构成翻滚的花瓣；偏移随每片花瓣的
+            // 相位呼吸变化，让形状看起来在旋转。
+            int spin = BackdropFx.Sin1000(now / 6 + hy % 360) * r / 1000;
+            BackdropFx.FC(c, px, py, r, Theme.Rgba(238, 140, 170, 170));
+            BackdropFx.FC(c, px + spin + 1, py + 1, r - 1, Theme.Rgba(252, 190, 208, 190));
+        }
+    }
+
+    // ---- Bokeh（Sunset）：失焦光球上浮 -----------------
+    /// 一个失焦光球：同心淡圆盘，边缘最亮，这样它
+    /// 读起来像失焦的高光而非实心球。
+    static void BokehOrb(Canvas c, int cx, int cy, int r, int color, int alpha) {
+        BackdropFx.Mark(cx - r - 1, cy - r - 1, r * 2 + 2, r * 2 + 2);
+        int rgb = color % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+        // 平滑的失焦衰减，而不是六个堆叠圆盘（其边缘会
+        // 显出圆环）：柔和的主体加上略亮的边缘。
+        c.FillRadial(cx, cy, r, rgb, alpha * 3);
+        c.DrawCircle(cx, cy, r * 92 / 100, alpha * 16777216 + rgb, 2);
+    }
+
+    /// 16 个失焦光球上浮（三色轮换），各带摆动相位避免轨迹重合。
+    static void Bokeh(Canvas c, int x, int y, int w, int h, int now,
+                      int colorA, int colorB, int colorC, int dpi) {
+        int n = 16;
+        for (int i = 0; i < n; i = i + 1) {
+            int hx = BackdropFx.Hash(i, 151);
+            int hy = BackdropFx.Hash(i, 167);
+            int r = BackdropFx.Px(10, dpi) + hy % BackdropFx.Px(34, dpi);
+            int spd = 6 + hx % 12;                      // 上升 px/s
+            int span = h + r * 2;
+            // 上浮：从跨度中减去，让光球向上漂移；每个光球
+            // 有各自的摆动相位，避免两条相同轨迹。
+            int py = y + h + r - (hy + now * spd / 1000) % span;
+            int sway = BackdropFx.Sin1000(now / 22 + hx % 360)
+                     * BackdropFx.Px(20, dpi) / 1000;
+            int px = x + hx % w + sway;
+            int color = colorA;
+            if (i % 3 == 1) { color = colorB; }
+            if (i % 3 == 2) { color = colorC; }
+            BackdropFx.BokehOrb(c, px, py, r, color, 7);
+        }
+    }
+
+    // ---- Mesh（Nebula）：带发光节点的漂移线框网格 ---------------
+    /// 线框晶格整体沿对角滑动一格并环绕，少量节点在交叉处脉动发光。
+    static void Mesh(Canvas c, int x, int y, int w, int h, int now,
+                     int colorA, int colorB, int dpi) {
+        int cell = BackdropFx.Px(72, dpi);
+        int lw = 1;
+        // 整个晶格沿对角滑动一格并环绕，这样
+        // 运动不会累积状态或漂出区域。
+        int offx = (now / 90) % cell;
+        int offy = (now / 140) % cell;
+        int rgbP = colorA % 16777216;
+        if (rgbP < 0) { rgbP = rgbP + 16777216; }
+        int rgbI = colorB % 16777216;
+        if (rgbI < 0) { rgbI = rgbI + 16777216; }
+        int cols = w / cell + 2;
+        int rows = h / cell + 2;
+        for (int ci = 0; ci < cols; ci = ci + 1) {
+            int gx = x + ci * cell - cell + offx;
+            if (gx >= x && gx < x + w) {
+                BackdropFx.FR(c, gx, y, lw, h, 12 * 16777216 + rgbP);
+            }
+        }
+        for (int ri = 0; ri < rows; ri = ri + 1) {
+            int gy = y + ri * cell - cell + offy;
+            if (gy >= y && gy < y + h) {
+                BackdropFx.FR(c, x, gy, w, lw, 12 * 16777216 + rgbP);
+            }
+        }
+        // 少量节点在晶格交叉处脉动。
+        for (int i = 0; i < 18; i = i + 1) {
+            int hc = BackdropFx.Hash(i, 181);
+            int nx = x + (hc % cols) * cell - cell + offx;
+            int ny = y + ((hc / 7) % rows) * cell - cell + offy;
+            if (nx >= x && nx < x + w && ny >= y && ny < y + h) {
+                int pulse = BackdropFx.Sin1000(now / 9 + hc % 360);
+                int alpha = 40 + pulse * 35 / 1000;
+                if (alpha < 6) { alpha = 6; }
+                int rgb = rgbP;
+                if (i % 2 == 1) { rgb = rgbI; }
+                BackdropFx.FC(c, nx, ny, BackdropFx.Px(2, dpi) + 1,
+                              alpha * 16777216 + rgb);
+            }
+        }
+    }
+
+    // ---- Rain（Matrix）：数字字符雨 -----------------------------------
+    /// 数字字符雨：约 2/3 的稀疏字符列下落，头部亮、8 格尾迹渐隐。
+    static void Rain(Canvas c, int x, int y, int w, int h, int now,
+                     Theme t, int dpi) {
+        List<string> glyphs = new List<string>{
+            "0", "1", "7", "2",
+            "X", "Z", "$", "#",
+            "K", "R", "+", "=",
+            "<", ">", "|", "*" };
+        int colw = BackdropFx.Px(18, dpi);
+        int rowh = BackdropFx.Px(16, dpi);
+        int cols = w / colw;
+        if (cols < 1) { cols = 1; }
+        int rows = h / rowh + 1;
+        int trail = 8;
+        int fs = BackdropFx.Px(12, dpi);
+        for (int col = 0; col < cols; col = col + 1) {
+            int hc = BackdropFx.Hash(col, 113);
+            // 只绘制约 2/3 的列，让雨显得稀疏。
+            if (hc % 3 != 0) {
+                int spd = 5 + hc % 8;                   // 行/秒
+                int cycle = rows + trail;
+                int head = (hc + now * spd / 1000) % cycle;
+                for (int k = 0; k < trail; k = k + 1) {
+                    int row = head - k;
+                    if (row >= 0 && row < rows) {
+                        int gi = BackdropFx.Hash(col * 131 + row, 127) % glyphs.Count;
+                        int alpha = 150;
+                        if (k > 0) { alpha = 80 - k * 9; }
+                        BackdropFx.DT(c, x + col * colw, y + row * rowh,
+                                      glyphs[gi], Theme.Rgba(57, 255, 90, alpha), fs);
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- 皮肤包装饰 ---------------------------------------------
+    // 每个皮肤包拥有一个招牌环境层。它们是程序化生成的（无精灵表），
+    // 可随 dpi 缩放，每帧只耗费少量图形，
+    // 并与其他效果在同一节流节奏下动画，
+    // 。
+
+    /// Fortune（中国新年包）：祥云横向漂移、
+    /// 金币翻滚落下，以及元宝碎光缓缓闪烁。
+    static void Fortune(Canvas c, int x, int y, int w, int h, int now, int dpi) {
+        // 云：每朵云由三个堆叠圆盘构成，向右滑动并环绕。
+        int n = 7;
+        for (int i = 0; i < n; i = i + 1) {
+            int hx = BackdropFx.Hash(i, 211);
+            int hy = BackdropFx.Hash(i, 233);
+            int r = BackdropFx.Px(16, dpi) + hy % BackdropFx.Px(14, dpi);
+            int span = w + r * 8;
+            int spd = 8 + hx % 10;
+            int px = x - r * 4 + (hx + now * spd / 1000) % span;
+            int py = y + BackdropFx.Px(30, dpi) + hy % (h * 2 / 3);
+            int tint = Theme.Rgba(255, 226, 168, 34);
+            BackdropFx.FC(c, px, py, r, tint);
+            BackdropFx.FC(c, px + r, py + r / 3, r * 3 / 4, tint);
+            BackdropFx.FC(c, px - r, py + r / 3, r * 2 / 3, tint);
+        }
+        // 金币：金色圆环下落，带压扁周期，看起来在旋转。
+        int m = 14;
+        for (int j = 0; j < m; j = j + 1) {
+            int hx = BackdropFx.Hash(j, 307);
+            int hy = BackdropFx.Hash(j, 331);
+            int r = BackdropFx.Px(4, dpi) + hy % 4;
+            int spd = 34 + hx % 40;
+            int margin = BackdropFx.Px(20, dpi);
+            int span = h + margin * 2;
+            int py = y + (hy + now * spd / 1000) % span - margin;
+            int px = x + hx % w
+                   + BackdropFx.Sin1000(now / 10 + hx % 360) * BackdropFx.Px(10, dpi) / 1000;
+            int squash = BackdropFx.Sin1000(now / 4 + hy % 360);
+            int rr = r * (400 + squash * 6 / 10) / 1000;
+            if (rr < 1) { rr = 1; }
+            BackdropFx.FC(c, px, py, r, Theme.Rgba(224, 164, 32, 120));
+            BackdropFx.FC(c, px, py, rr, Theme.Rgba(255, 226, 130, 170));
+        }
+    }
+
+    /// Dark Gold（神话包）：余烬穿过烟雾上升，底部边缘
+    /// 有熔金般的光泽汇聚。
+    static void DarkGold(Canvas c, int x, int y, int w, int h, int now, int dpi) {
+        int glowH = BackdropFx.Px(70, dpi);
+        for (int band = 0; band < 6; band = band + 1) {
+            int bh = glowH / 6;
+            int by = y + h - bh * (band + 1);
+            BackdropFx.FR(c, x, by, w, bh, Theme.Rgba(190, 120, 20, 8 + band * 2));
+        }
+        int n = 30;
+        for (int i = 0; i < n; i = i + 1) {
+            int hx = BackdropFx.Hash(i, 419);
+            int hy = BackdropFx.Hash(i, 431);
+            int spd = 26 + hx % 46;
+            int margin = BackdropFx.Px(16, dpi);
+            int span = h + margin * 2;
+            int py = y + h + margin - (hy + now * spd / 1000) % span;
+            int drift = BackdropFx.Sin1000(now / 13 + hx % 360)
+                      * BackdropFx.Px(14, dpi) / 1000;
+            int px = x + hx % w + drift;
+            int r = BackdropFx.Px(2, dpi) + hy % 3;
+            // 余烬上升时渐隐：alpha 跟随剩余高度。
+            int life = (py - y) * 100 / h;
+            int alpha = 40 + life * 130 / 100;
+            BackdropFx.FC(c, px, py, r + 1, Theme.Rgba(150, 70, 10, alpha / 3));
+            BackdropFx.FC(c, px, py, r, Theme.Rgba(255, 190, 90, alpha));
+        }
+    }
+
+    /// Dreamy（星光包）：闪烁的碎光加上几只蝴蝶
+    /// 沿缓慢的正弦路径飞行。
+    static void Dreamy(Canvas c, int x, int y, int w, int h, int now, int dpi) {
+        int n = 40;
+        for (int i = 0; i < n; i = i + 1) {
+            int hx = BackdropFx.Hash(i, 521);
+            int hy = BackdropFx.Hash(i, 541);
+            int px = x + hx % w;
+            int py = y + hy % h;
+            // 闪烁：每个碎光的相位同时驱动尺寸和 alpha。
+            int ph = BackdropFx.Sin1000(now / 5 + (hx + hy) % 360);
+            if (ph < 0) { ph = 0; }
+            int r = BackdropFx.Px(1, dpi) + ph * BackdropFx.Px(3, dpi) / 1000;
+            int alpha = 40 + ph * 150 / 1000;
+            BackdropFx.FC(c, px, py, r, Theme.Rgba(255, 255, 255, alpha));
+            if (i % 7 == 0) {
+                int arm = r * 3;
+                BackdropFx.FR(c, px - arm, py, arm * 2, 1, Theme.Rgba(220, 210, 255, alpha / 2));
+                BackdropFx.FR(c, px, py - arm, 1, arm * 2, Theme.Rgba(220, 210, 255, alpha / 2));
+            }
+        }
+        for (int b = 0; b < 5; b = b + 1) {
+            int hx = BackdropFx.Hash(b, 601);
+            int hy = BackdropFx.Hash(b, 613);
+            int spd = 18 + hx % 16;
+            int span = w + BackdropFx.Px(60, dpi);
+            int px = x - BackdropFx.Px(30, dpi) + (hx + now * spd / 1000) % span;
+            int py = y + hy % (h - BackdropFx.Px(40, dpi))
+                   + BackdropFx.Sin1000(now / 7 + hy % 360) * BackdropFx.Px(22, dpi) / 1000;
+            // 翅膀：两个圆盘，其张开程度随同一时钟扇动。
+            int wr = BackdropFx.Px(4, dpi) + hy % 3;
+            int flap = BackdropFx.Sin1000(now / 2 + hx % 360);
+            int off = wr * (300 + flap * 7 / 10) / 1000;
+            if (off < 1) { off = 1; }
+            BackdropFx.FC(c, px - off, py, wr, Theme.Rgba(198, 170, 255, 120));
+            BackdropFx.FC(c, px + off, py, wr, Theme.Rgba(168, 214, 255, 120));
+            BackdropFx.FR(c, px, py - wr / 2, 1, wr, Theme.Rgba(240, 236, 255, 150));
+        }
+    }
+}

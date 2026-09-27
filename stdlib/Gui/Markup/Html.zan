@@ -1,0 +1,459 @@
+using System;
+using System.Diagnostics;
+using System.Web;
+// 控件映射用的是裸 Button/TextArea/Checkbox/Input/Image——这些类型在
+// Gui.Widget 命名空间里，必须显式 import；不写的话只靠 binder 的全局
+// 唯一简单名兜底才能编过，一旦用户项目定义了同名全局类（如 class
+// TextArea）这里就会炸。同 A314。
+using Gui.Widget;
+// 链接的系统浏览器回落通道（ShellOpenUrl）在 Gui.Backend。
+using Gui.Backend;
+
+namespace Gui;
+
+/// WEB_GUI_ROADMAP P5：HTML 声明层的 Gui 侧——把 System.Web.HtmlParser
+/// 的声明记录构建成控件树。解析/空白/实体/记录全在纯层（生成器
+/// GenHtml 也吃同一份记录，运行时与编译期同构）；本文件只负责
+/// tag→控件映射与属性协议（事件接线、绑定路径、样式类）。
+///
+/// tag 映射：容器 tag → Element（UA 样式表给 web 缺省语义），
+/// button → Button、input → Input/Checkbox、textarea → TextArea、
+/// img → Image；select 等未映射 tag 落 Element 占位。
+///
+/// 属性协议：id → 选择器名（nodeName），class → AddClass，
+/// style → 合成 .zgen-N 规则（复用整套级联与 !important 机制），
+/// data-on-<evt>="名" 经 HtmlHandlers 注册表接 BindEvent，
+/// data-bind → bindPath，data-if → bindIf。其余属性（Element 进
+/// 原始属性表；真控件忽略）。
+///
+/// 与 App 的解耦（auto-stdlib 按需拉取，活名才入编译图）：契约类型
+/// HtmlDoc/HtmlHandlers 在 Gui.HtmlApi（App.LoadHtml 的签名只背它们），
+/// 装载实现在本文件，经 <see cref="Install"/> 注册进 App 的装载槽。
+/// 只经 `app.LoadHtml(...)` 用 HTML 的宿主需在启动时调用一次 Install；
+/// 拼写了任何 Html.* 构建入口的程序会被自动安装。不安装的程序
+/// App 编译图不背解析器/渲染器/System.Web。
+class Html {
+    static bool loaderInstalled;
+
+    /// 向 App 注册 HTML 装载与链接扫描实现（App.LoadHtmlWith 的
+    /// 后端、ChildWindow.WireNode 的扫描通道），并补齐 Element 的
+    /// title 提示、模板行克隆与远端图片三个通道。
+    static void Install() {
+        if (loaderInstalled) { return; }
+        loaderInstalled = true;
+        App.SetHtmlLoader(LoadForApp);
+        App.SetLinkScanner(AutoLinkTree);
+        Element.SetTipPainter(Html.PaintTip);
+        App.SetCloneTree(Html.Clone);
+        ImageHttp.Install();
+    }
+
+    static Control LoadForApp(App app, string html, HtmlHandlers handlers,
+                              string baseDir) {
+        HtmlDoc doc = Html.Parse(html, baseDir, handlers);
+        string zs = app.NextLoadScope();
+        string scoped = doc.css == "" ? "" : HtmlScope.Styles(doc.css, zs);
+        app.ApplyScopedTree(doc.root, scoped, zs);
+        App.AutoLinkTree(doc.root, app);
+        return doc.root;
+    }
+
+    /// 解析 `html`（整文档或片段）并建树。`baseDir` 是 `<link>`
+    /// 相对路径的基目录（空 = 不解析 link）。`handlers` 可为 null。
+    static HtmlDoc Parse(string html, string baseDir, HtmlHandlers handlers) {
+        Install();
+        WDoc wd = HtmlParser.Parse(html, baseDir);
+        HtmlDoc doc = new HtmlDoc();
+        doc.css = wd.css;
+        doc.gen = 0;
+        List<Control> built = new List<Control>();
+        for (int i = 0; i < wd.nodes.Count; i = i + 1) {
+            built.Add(Html.Build(wd, wd.nodes[i], doc, handlers));
+        }
+        // 装配：逐父按 items 文档序走一遍——AddText 与 AddChild 的
+        // 交错顺序就是 HTML 的行内内容顺序（混排行盒依赖）。
+        for (int i = 0; i < wd.nodes.Count; i = i + 1) {
+            WNode n = wd.nodes[i];
+            Control c = built[i];
+            for (int k = 0; k < n.items.Count; k = k + 1) {
+                WItem it = n.items[k];
+                if (it.kid < 0) {
+                    // 真控件下的游离文本无处安放（映射控件的文本走
+                    // 自己的协议——button 吃捕获文本）
+                    if (c is Element) { ((Element)c).AddText(it.text); }
+                } else {
+                    Html.AddChild(c, built[it.kid]);
+                }
+            }
+        }
+        doc.root = built.Count > 0 ? built[0] : null;
+        return doc;
+    }
+
+    /// 一条记录 → 一个控件（构造 + 属性协议）。容器自己的文本不在这
+    /// 里加——装配阶段按 items 文档序与子控件交错加入。
+    static Control Build(WDoc wd, WNode n, HtmlDoc doc, HtmlHandlers handlers) {
+        Install();
+        string tag = n.tag;
+        string id = HtmlText.Attr(n.attrNames, n.attrVals, "id");
+        string type = HtmlText.Attr(n.attrNames, n.attrVals,
+                                    "type").ToLower();
+        Control c = null;
+        if (tag == "button") {
+            Button b = new Button();
+            b.InitButton(n.text);
+            c = b;
+        } else if (tag == "textarea") {
+            TextArea ta = new TextArea();
+            ta.InitTextArea(new SignalString(n.text), "");
+            c = ta;
+        } else if (tag == "input" && type == "checkbox") {
+            Checkbox cb = new Checkbox();
+            cb.InitCheckbox("", new SignalBool(false));
+            c = cb;
+        } else if (tag == "input") {
+            Input inp = new Input();
+            inp.InitInput(
+                new SignalString(HtmlText.Attr(n.attrNames, n.attrVals,
+                                               "value")),
+                HtmlText.Attr(n.attrNames, n.attrVals, "placeholder"));
+            c = inp;
+        } else if (tag == "img") {
+            Image img = new Image();
+            img.InitImage(HtmlText.Attr(n.attrNames, n.attrVals, "src"),
+                          HtmlText.Attr(n.attrNames, n.attrVals, "alt"),
+                          "cover");
+            c = img;
+        } else if (tag == "select") {
+            // 浏览器语义：<option> 文本即候选，selected 属性标选中项，
+            // 无任何 selected 时显示首项——与设计稿通道（DesignerHtml
+            // 折 "a|b|c" options + value 下标）同一折叠规则，运行时
+            // 与生成器在 <select> 上产出同形控件。
+            SelectBox sb = new SelectBox();
+            string opts = "";
+            int selIdx = 0 - 1;
+            int oi = 0;
+            for (int i = 0; i < n.items.Count; i = i + 1) {
+                WItem it = n.items[i];
+                if (it.kid < 0) { continue; }
+                WNode cn = wd.nodes[it.kid];
+                if (cn.tag != "option") { continue; }
+                string ot = cn.text;
+                if (ot == "") {
+                    for (int k = 0; k < cn.items.Count; k = k + 1) {
+                        WItem cit = cn.items[k];
+                        if (cit.kid >= 0 || cit.text == "") { continue; }
+                        ot = ot + cit.text;
+                    }
+                }
+                ot = ot.Trim();
+                for (int q = 0; q < cn.attrNames.Count; q = q + 1) {
+                    if (cn.attrNames[q] == "selected") { selIdx = oi; }
+                }
+                if (ot != "") {
+                    if (oi > 0) { opts = opts + "|"; }
+                    opts = opts + ot;
+                }
+                oi = oi + 1;
+            }
+            if (opts != "") { sb.SetProp("options", opts); }
+            if (selIdx < 0 && opts != "") { selIdx = 0; }
+            // value 是 PropSpec 常量槽（写它不动 selected），选中走
+            // Select（-1 清除、程序化赋值不触发 Change）。
+            if (selIdx >= 0) { sb.Select(selIdx); }
+            c = sb;
+        } else {
+            Element el = new Element();
+            el.InitElement(tag, id);
+            // 真实属性表：全部原始属性进表（class/style/data-* 与
+            // 构造消费的 id/src 等都存原文），CSS 属性选择器与
+            // content:attr() 的取值源。布尔属性值为空串也照存——
+            // 存在性走 CssHasAttr，不看值。
+            for (int i = 0; i < n.attrNames.Count; i = i + 1) {
+                el.SetAttr(n.attrNames[i], n.attrVals[i]);
+            }
+            c = el;
+        }
+        // 真控件的 id 不进 nodeName（那是 Element 的），走选择器名
+        if (id != "" && !(c is Element)) { c.SetProp("name", id); }
+        // data-arg 预扫：属性顺序不保证（data-arg 可写在 data-on-*
+        // 之后），先取出来供本节点全部事件共用；同时落 handlerArg
+        // 字段，ChildWindow.WireNode 的二次接线同源。
+        string darg = HtmlText.Attr(n.attrNames, n.attrVals, "data-arg");
+        if (darg != "") { c.handlerArg = darg; }
+        // 属性协议（与 GenHtml 生成的建树代码同一套语义）
+        for (int i = 0; i < n.attrNames.Count; i = i + 1) {
+            string k = n.attrNames[i];
+            string v = n.attrVals[i];
+            if (k == "id" || k == "type" || k == "value"
+                || k == "placeholder" || k == "src" || k == "alt") {
+                continue;   // 构造时已用
+            }
+            if (k == "class") {
+                List<string> cs = HtmlText.SplitClass(v);
+                for (int j = 0; j < cs.Count; j = j + 1) {
+                    c.AddClass(cs[j]);
+                }
+                continue;
+            }
+            if (k == "style") {
+                // 行内样式合成专属类规则，复用整套级联/!important 机制
+                string gen = "zgen-" + Convert.ToString(doc.gen);
+                doc.gen = doc.gen + 1;
+                c.AddClass(gen);
+                doc.css = doc.css + "." + gen + " { " + v + " }\n";
+                continue;
+            }
+            if (k == "data-bind") {
+                c.bindPath = v;
+                continue;
+            }
+            if (k == "data-if") {
+                c.bindIf = v;
+                continue;
+            }
+            if (k.Length > 8 && HtmlText.StartsWith(k, "data-on-")) {
+                string suffix = k.Substring(8, k.Length - 8);
+                string evt = HtmlText.EventKind(suffix);
+                if (evt != "") {
+                    // Wire/WireArg 负责落名（SetHandler）+ 接线，见上。
+                    if (darg != "") {
+                        Html.WireArg(handlers, c, evt, v, darg);
+                    } else {
+                        Html.Wire(handlers, c, evt, v);
+                    }
+                } else {
+                    // 未知后缀 = 拼错的事件名（如 data-on-clic），此前
+                    // 静默不接线、表现为“点了没反应”。控制台一行警告
+                    // 把它变成可发现的事实（对照 EventKind 支持表）。
+                    Console.WriteLine("HTML_WIRE_WARN unknown event '"
+                        + suffix + "' on <" + n.tag + (id != ""
+                            ? " id=" + id : "") + ">");
+                }
+                continue;
+            }
+            if (k == "title") {
+                // 原生悬停提示（tooltip）语义：指针在元素上停稳
+                // Tooltip.DefaultDelayMs 后浮出气泡。Element 记
+                // elTitle、绘制期由 Html.PaintTip 轮询（悬停计时在
+                // focus.hoverStartMs，目标一变即重置）；真控件不吃
+                // 这条（title 不进控件属性面，见 HTML_UI 台账）。
+                if (c is Element) { ((Element)c).elTitle = v; }
+                continue;
+            }
+            // 其余属性（href 已由 AutoLink 消费；disabled/...）忽略
+            // （台账）
+        }
+        return c;
+    }
+
+    /// title 属性的渲染期轮询（Element.OnPaint 每帧调用）：本元素
+    /// 正被悬停且停稳达 DefaultDelayMs 时，向帧末提示队列登记
+    /// （Request 幂等，重复登记无害）。指针挪走/悬停目标一变即
+    /// 失效——气泡生命周期与浏览器一致。命中矩形来自 FireCommon
+    /// （链接/带事件的元素）或宿主注册；纯展示容器无人监听时没有
+    /// 命中区，也就无提示（不给静态内容开指针）。App 从静态
+    /// FrameApp 取（渲染帧内即当前 App；无帧体的探针直接跳过）。
+    static void PaintTip(Control c, string tip) {
+        App app = App.FrameApp();
+        if (app == null) { return; }
+        if (!app.focus.IsHovered(c.CommonId())) { return; }
+        if (app.focus.HoveredMs() < Tooltip.DefaultDelayMs()) {
+            app.RequestWakeFrameIn(80);
+            return;
+        }
+        Tooltip.RequestBox(app, c.bx, c.by, c.bw, c.bh, tip,
+            Tooltip.Bottom(), app.Scale(260));
+    }
+
+    /// 挂子节点：Element 父走 AddKid（与 AddText 的文档序交错，
+    /// 行盒混排依赖），控件父走普通 Add。
+    static void AddChild(Control parent, Control c) {
+        if (parent is Element) {
+            ((Element)parent).AddKid(c);
+            return;
+        }
+        parent.Add(c);
+    }
+
+    /// 深拷贝一棵控件树（`<template data-for>` 行展开用）。Element
+    /// 走同构克隆——Props() 没有覆写、Serialize 无法往返，标签/文本/
+    /// 原始属性表必须特判搬运；Class 原样带上（行内 style 的 zgen-N
+    /// 规则已在应用样式表里，克隆件挂同名类即生效）。其余控件按注册
+    /// kind 重建（未注册返回 null，调用侧跳过不占位），Props 声明槽
+    /// 与事件名照搬；几何与绑定声明逐项复制，子树递归。
+    static Control Clone(Control c) {
+        Install();
+        if (c is Element) {
+            Element src = (Element)c;
+            Element el = new Element();
+            el.InitElement(src.Kind(), src.name);
+            el.CopyAttrsFrom(src);
+            el.SetText(src.Text());
+            el.Class = src.Class;
+            el.dock = src.dock;
+            el.padL = src.padL;
+            el.padT = src.padT;
+            el.padR = src.padR;
+            el.padB = src.padB;
+            el.gap = src.gap;
+            el.mx = src.mx;
+            el.my = src.my;
+            el.prefW = src.prefW;
+            el.prefH = src.prefH;
+            el.logW = src.logW;
+            el.logH = src.logH;
+            el.logX = src.logX;
+            el.logY = src.logY;
+            el.logGap = src.logGap;
+            el.logPad = src.logPad;
+            el.logPlaceSet = src.logPlaceSet;
+            el.bindPath = src.bindPath;
+            el.bindProp = src.bindProp;
+            el.bindIf = src.bindIf;
+            el.handlerArg = src.handlerArg;
+            for (int ei = 0; ei < src.events.Count; ei = ei + 1) {
+                el.SetHandler(src.events[ei].key, src.events[ei].val);
+            }
+            // 文档序重放（AddText/AddKid 交错是行盒混排的依据）
+            if (src.elOrder != null) {
+                for (int i = 0; i < src.elOrder.Count; i = i + 1) {
+                    FlowEntry o = src.elOrder[i];
+                    if (o.kid != null) {
+                        Control kid = Html.Clone(o.kid);
+                        if (kid != null) { el.AddKid(kid); }
+                    } else {
+                        el.AddText(o.text);
+                    }
+                }
+            } else {
+                List<Control> kids = src.children;
+                for (int i = 0; i < kids.Count; i = i + 1) {
+                    Control kid = Html.Clone(kids[i]);
+                    if (kid != null) { el.AddKid(kid); }
+                }
+            }
+            return el;
+        }
+        Control n = ControlFactory.Create(c.Kind());
+        if (n == null) { return null; }
+        n.name = c.name;
+        n.Class = c.Class;
+        n.dock = c.dock;
+        n.padL = c.padL;
+        n.padT = c.padT;
+        n.padR = c.padR;
+        n.padB = c.padB;
+        n.gap = c.gap;
+        n.mx = c.mx;
+        n.my = c.my;
+        n.prefW = c.prefW;
+        n.prefH = c.prefH;
+        n.logW = c.logW;
+        n.logH = c.logH;
+        n.logX = c.logX;
+        n.logY = c.logY;
+        n.logGap = c.logGap;
+        n.logPad = c.logPad;
+        n.logPlaceSet = c.logPlaceSet;
+        n.bindPath = c.bindPath;
+        n.bindProp = c.bindProp;
+        n.bindIf = c.bindIf;
+        n.handlerArg = c.handlerArg;
+        List<PropSpec> ps = c.Props();
+        for (int i = 0; i < ps.Count; i = i + 1) {
+            n.SetProp(ps[i].key, c.GetProp(ps[i].key));
+        }
+        for (int ei = 0; ei < c.events.Count; ei = ei + 1) {
+            n.SetHandler(c.events[ei].key, c.events[ei].val);
+        }
+        for (int i = 0; i < c.children.Count; i = i + 1) {
+            Control kid = Html.Clone(c.children[i]);
+            if (kid != null) { n.Add(kid); }
+        }
+        return n;
+    }
+
+    /// data-on-* 接线的公开钩子：生成的/手写的建树代码统一走这里，
+    /// 由它消化"名字 → 注册表 Action → BindEvent"与 Button 等控件
+    /// 把事件路由到专属槽位的差异（BindEvent 多态分派）。名字无论
+    /// 有没有注册表都落控件（SetHandler）——与 GenForm 生成的建树
+    /// 代码同一契约，ChildWindow.Wire 等宿主才能二次解析。
+    static void Wire(HtmlHandlers handlers, Control c, string evt,
+                     string name) {
+        if (evt == "") { return; }
+        c.SetHandler(evt, name);
+        if (handlers == null) { return; }
+        Action a = handlers.Find(name);
+        if (a != null) { c.BindEvent(evt, a); }
+        else {
+            // 名字没注册 = 处理器漏写/拼错（宿主侧）——同一“点了没
+            // 反应”家族，同样一行警告点名。注册表晚于装载补充的
+            // 二次接线（ChildWindow.WireNode）不受影响：名字已落
+            // 控件，那路命中照样接。
+            Console.WriteLine("HTML_WIRE_WARN handler '" + name
+                + "' not registered (" + evt + " on " + c.name + ")");
+        }
+    }
+
+    /// 带参接线（`data-arg`）：按名查带参槽，把实参闭包进无参
+    /// Action 再 BindEvent（实参是只读捕获的局部——创建时值快照，
+    /// 语义即"这个控件永远带着它的参数"）。名字照落控件；带参槽
+    /// 未命中时静默不接（与 Wire 同一契约）。
+    static void WireArg(HtmlHandlers handlers, Control c, string evt,
+                        string name, string arg) {
+        if (evt == "") { return; }
+        c.SetHandler(evt, name);
+        if (handlers == null) { return; }
+        Action<string> a = handlers.FindArg(name);
+        if (a == null) { return; }
+        string captured = arg;
+        c.BindEvent(evt, () => { a(captured); });
+    }
+
+    // ---- <a> 链接导航（P5 链接语义） --------------------------------
+    //
+    // 桌面映射：<a href="http..."> 缺省路由到 App.linkNavigator（
+    // WebView 家族经 WebViewBootstrap.Install 注册：宿主经
+    // WebViewBootstrap.UseAsLinkTarget 登记的就地图优先，没有就
+    // App 级链接窗口；未安装 WebView 家族的程序直开系统浏览器），
+    // target="_blank"（新弹窗）直接弹系统浏览器。三个入口共用
+    // AutoLink：LoadHtmlWith 装载扫描、ChildWindow.WireNode 二次
+    // 接线（模板行克隆等）、宿主对手搭/生成树的 AutoLinkTree。
+
+    /// 给一个元素接上缺省导航。已有 Click 监听（data-on-click 或
+    /// 宿主程序化 OnClick）即宿主接管，不再叠加；app 为 null 不接
+    /// （编译期生成的树没有 App 上下文，由挂载它的窗口 WireNode
+    /// 或宿主 AutoLinkTree 补）。幂等：已接 Click 的元素跳过。
+    static void AutoLink(Control c, App app) {
+        if (app == null) { return; }
+        if (!(c is Element)) { return; }
+        if (c.On.Click.Count() > 0) { return; }
+        string href = c.CssAttr("href");
+        if (!Html.Navigable(href)) { return; }
+        bool blank = c.CssAttr("target") == "_blank";
+        c.BindEvent("Click", () => { app.OpenLink(href, blank); });
+    }
+
+    /// 对一棵树做链接扫描（LoadHtmlWith / 宿主自挂的手搭或生成树）。
+    static void AutoLinkTree(Control root, App app) {
+        Install();
+        if (root == null) { return; }
+        Html.AutoLink(root, app);
+        for (int i = 0; i < root.children.Count; i = i + 1) {
+            Html.AutoLinkTree(root.children[i], app);
+        }
+    }
+
+    /// href 可路由：仅 http/https（大小写不敏感）。相对路径没有
+    /// base 可解析；# 锚在保留树上无滚动目标；javascript:/mailto:
+    /// 等其它 scheme 涉及脚本执行或 shell 关联程序——本版一律
+    /// 不路由（宁缺毋滥，AI 生成的 UI 不至于误触系统处理器）。
+    static bool Navigable(string href) {
+        if (href == "") { return false; }
+        string low = href.ToLower();
+        return HtmlText.StartsWith(low, "http://")
+            || HtmlText.StartsWith(low, "https://");
+    }
+}
+

@@ -1,0 +1,539 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.WebSocket;
+using System.Text;
+using System.Threading;
+
+namespace System.Net;
+
+/// <summary>
+/// WebSocket 协议分片（A332 肥边③）：握手/帧循环/连接注册表/Push 的实现，
+/// 从 Worker.zan 外迁为独立类。Worker 核心只经静态槽分发（Worker.wsEntry），
+/// 应用调用一次 WorkerWs.Install() 本文件才进编译图——纯 HTTP 服务不背
+/// ws 编解码（约 870 行），正如不背 SSE/MQTT。槽反转与独立类（不写
+/// partial Worker）的理由见 Worker.ProtoEntryFn 的文档。
+/// </summary>
+class WorkerWs {
+    [DllImport("crt")]
+    static extern long strlen(string str);
+
+    /// <summary>Installs the WebSocket shard into the Worker entry slot.
+    /// Call once before Worker.RunAll(); a worker-process copy re-runs it
+    /// through its own Main.</summary>
+    static void Install() {
+        Worker.wsEntry = WorkerWs.HandleWebSocket;
+        WorkerWs.EnableSharedBus("zan_ws_worker_bus");
+    }
+
+    // ---- 跨进程消息总线与频道/房间管理 ----
+    static WsSharedBus sharedBus = null;
+    static WorkerWsConsumer busConsumer = null;
+    static Dict<string, List<Connection>> channels = new Dict<string, List<Connection>>();
+    static nint chanLock = 0;
+
+    static void ChanInit() {
+        if (WorkerWs.chanLock == 0) { WorkerWs.chanLock = Mutex.Create(); }
+    }
+
+    /// <summary>启用基于 SharedTable 共享内存的跨 Worker 进程 WebSocket 消息总线。</summary>
+    static void EnableSharedBus(string busName) {
+        if (WorkerWs.sharedBus != null) { return; }
+        WorkerWs.sharedBus = new WsSharedBus(busName, 128);
+        if (WorkerWs.sharedBus.IsAvailable()) {
+            WorkerWs.busConsumer = new WorkerWsConsumer();
+            WorkerWs.sharedBus.StartPolling(WorkerWs.busConsumer);
+        }
+    }
+
+    /// <summary>订阅者加入频道/房间。</summary>
+    static void Join(string channel, Connection conn) {
+        if (conn == null || channel == "") { return; }
+        WorkerWs.ChanInit();
+        Mutex.Lock(WorkerWs.chanLock);
+        List<Connection> list = null;
+        if (WorkerWs.channels.ContainsKey(channel)) {
+            list = WorkerWs.channels[channel];
+        } else {
+            list = new List<Connection>();
+            WorkerWs.channels.Add(channel, list);
+        }
+        int id = conn.GetId();
+        bool exists = false;
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i].GetId() == id) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            list.Add(conn);
+        }
+        Mutex.Unlock(WorkerWs.chanLock);
+    }
+
+    /// <summary>订阅者离开频道/房间。</summary>
+    static void Leave(string channel, Connection conn) {
+        if (conn == null || channel == "") { return; }
+        WorkerWs.ChanInit();
+        Mutex.Lock(WorkerWs.chanLock);
+        if (WorkerWs.channels.ContainsKey(channel)) {
+            List<Connection> list = WorkerWs.channels[channel];
+            int id = conn.GetId();
+            for (int i = 0; i < list.Count; i = i + 1) {
+                if (list[i].GetId() == id) {
+                    list.RemoveAt(i);
+                    break;
+                }
+            }
+            if (list.Count == 0) {
+                WorkerWs.channels.Remove(channel);
+            }
+        }
+        Mutex.Unlock(WorkerWs.chanLock);
+    }
+
+    /// <summary>断开时从所有频道中自动清理该连接。</summary>
+    static void LeaveAllChannels(Connection conn) {
+        if (conn == null) { return; }
+        WorkerWs.ChanInit();
+        Mutex.Lock(WorkerWs.chanLock);
+        int id = conn.GetId();
+        List<string> keys = WorkerWs.channels.Keys;
+        for (int k = 0; k < keys.Count; k = k + 1) {
+            string ch = keys[k];
+            List<Connection> list = WorkerWs.channels[ch];
+            for (int i = 0; i < list.Count; i = i + 1) {
+                if (list[i].GetId() == id) {
+                    list.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+        Mutex.Unlock(WorkerWs.chanLock);
+    }
+
+    // ---- 连接注册表（对标 workerman $server->connections）----
+
+    // Upgrade 成功时登记，连接结束/回调关闭后移除。
+    // 使用 Dict<int, WsLink> 确保高并发长连接增删查与反查均为严格 O(1)。
+    // 多 worker 进程时注册表是进程内的——跨进程广播经 WsSharedBus 分发。
+    static Dict<int, WsLink> conns = new Dict<int, WsLink>();
+    // 同步段进出 WS 连接协程用的互斥（--async-workers 下连接协程跑在
+    // 不同线程，Dict 本身不是线程安全）。
+    static nint regLock = 0;
+
+    /// 惰性创建注册表用的互斥锁。
+    static void RegInit() {
+        if (WorkerWs.regLock == 0) { WorkerWs.regLock = Mutex.Create(); }
+    }
+
+    /// Upgrade 成功后由 HandleWebSocket 调用（单线程 accept 路径）：
+    /// 出站 writer/client 挂到连接的注册项上，Push/Broadcast 经 id 找回。
+    static void Attach(Connection conn, WsWriter writer, TcpClient client) {
+        WorkerWs.RegInit();
+        Mutex.Lock(WorkerWs.regLock);
+        WsLink link = new WsLink();
+        link.conn = conn;
+        link.writer = writer;
+        link.client = client;
+        int id = conn.GetId();
+        if (WorkerWs.conns.ContainsKey(id)) {
+            WorkerWs.conns.Remove(id);
+        }
+        WorkerWs.conns.Add(id, link);
+        Mutex.Unlock(WorkerWs.regLock);
+        if (WorkerWs.sharedBus != null) {
+            WorkerWs.sharedBus.OnConnChange(1);
+        }
+    }
+
+    /// 连接结束后由 HandleWebSocket 调用（O(1) 删除）。
+    static void ConnRemove(Connection conn) {
+        WorkerWs.RegInit();
+        Mutex.Lock(WorkerWs.regLock);
+        int id = conn.GetId();
+        if (WorkerWs.conns.ContainsKey(id)) {
+            WorkerWs.conns.Remove(id);
+        }
+        Mutex.Unlock(WorkerWs.regLock);
+        WorkerWs.LeaveAllChannels(conn);
+        if (WorkerWs.sharedBus != null) {
+            WorkerWs.sharedBus.OnConnChange(-1);
+        }
+    }
+
+    /// 按连接 id 找注册项；不存在（已断开）返回 null（O(1) 哈希查找）。
+    static WsLink LinkOf(int id) {
+        WorkerWs.RegInit();
+        Mutex.Lock(WorkerWs.regLock);
+        WsLink found = null;
+        if (WorkerWs.conns.ContainsKey(id)) {
+            found = WorkerWs.conns[id];
+        }
+        Mutex.Unlock(WorkerWs.regLock);
+        return found;
+    }
+
+    /// <summary>本进程当前在线 WebSocket 连接数。</summary>
+    static int ConnCount() {
+        WorkerWs.RegInit();
+        Mutex.Lock(WorkerWs.regLock);
+        int n = WorkerWs.conns.Count;
+        Mutex.Unlock(WorkerWs.regLock);
+        return n;
+    }
+
+    /// <summary>获取集群跨 Worker 实时在线 WebSocket 连接总数。</summary>
+    static int ClusterConnCount() {
+        if (WorkerWs.sharedBus != null && WorkerWs.sharedBus.IsAvailable()) {
+            return WorkerWs.sharedBus.GetTotalConnCount();
+        }
+        return WorkerWs.ConnCount();
+    }
+
+    /// <summary>按连接 id 取在线连接；不存在（已断开）返回 null。
+    /// 用于定时器等无引用上下文里找回连接后 WorkerWs.Push(conn, ...)。</summary>
+    static Connection ConnById(int id) {
+        WsLink link = WorkerWs.LinkOf(id);
+        if (link == null) { return null; }
+        return link.conn;
+    }
+
+    /// <summary>向本进程内所有在线 WebSocket 连接广播一条 Text 帧，返回成功投递数。</summary>
+    static async int BroadcastLocal(string data) {
+        WorkerWs.RegInit();
+        Mutex.Lock(WorkerWs.regLock);
+        List<WsLink> snap = WorkerWs.conns.Values;
+        Mutex.Unlock(WorkerWs.regLock);
+        int sent = 0;
+        int j = 0;
+        while (j < snap.Count) {
+            bool ok = await WorkerWs.Push(snap[j].conn, data);
+            if (ok) { sent = sent + 1; }
+            j = j + 1;
+        }
+        return sent;
+    }
+
+    /// <summary>向所有 Worker 进程的所有在线 WebSocket 连接全局广播一条 Text 帧。
+    /// 本进程连接立即本地推送，其他 Worker 进程经 SharedTable 环形总线接收后推送。</summary>
+    static async int Broadcast(string data) {
+        int sent = await WorkerWs.BroadcastLocal(data);
+        if (WorkerWs.sharedBus != null && WorkerWs.sharedBus.IsAvailable()) {
+            WorkerWs.sharedBus.PublishBroadcast(data, data.Length);
+        }
+        return sent;
+    }
+
+    /// <summary>向本进程内加入指定频道/房间的所有连接广播一条 Text 帧。</summary>
+    static async int BroadcastToLocal(string channel, string data) {
+        WorkerWs.ChanInit();
+        Mutex.Lock(WorkerWs.chanLock);
+        List<Connection> snap = new List<Connection>();
+        if (WorkerWs.channels.ContainsKey(channel)) {
+            List<Connection> list = WorkerWs.channels[channel];
+            for (int i = 0; i < list.Count; i = i + 1) {
+                snap.Add(list[i]);
+            }
+        }
+        Mutex.Unlock(WorkerWs.chanLock);
+        int sent = 0;
+        int j = 0;
+        while (j < snap.Count) {
+            bool ok = await WorkerWs.Push(snap[j], data);
+            if (ok) { sent = sent + 1; }
+            j = j + 1;
+        }
+        return sent;
+    }
+
+    /// <summary>跨 Worker 向加入指定频道/房间的所有在线连接广播 Text 帧。</summary>
+    static async int BroadcastTo(string channel, string data) {
+        int sent = await WorkerWs.BroadcastToLocal(channel, data);
+        if (WorkerWs.sharedBus != null && WorkerWs.sharedBus.IsAvailable()) {
+            WorkerWs.sharedBus.PublishChannel(channel, data, data.Length);
+        }
+        return sent;
+    }
+
+    /// <summary>精准向指定连接 ID 发送消息。若该连接在本进程则立即发送；
+    /// 若在集群其他 Worker 进程，则经 SharedTable 路由至目标进程发送。</summary>
+    static async bool PushTo(int connId, string data) {
+        Connection localConn = WorkerWs.ConnById(connId);
+        if (localConn != null) {
+            return await WorkerWs.Push(localConn, data);
+        }
+        if (WorkerWs.sharedBus != null && WorkerWs.sharedBus.IsAvailable()) {
+            WorkerWs.sharedBus.PublishDirect(connId, data, data.Length);
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>接收来自其他 Worker 进程发来的跨进程共享总线消息。</summary>
+    public static async void OnSharedMessage(int targetType, string channel, int targetId, string payload, int payloadLen) {
+        if (targetType == 0) {
+            await WorkerWs.BroadcastLocal(payload);
+        } else if (targetType == 1) {
+            await WorkerWs.BroadcastToLocal(channel, payload);
+        } else if (targetType == 2) {
+            Connection c = WorkerWs.ConnById(targetId);
+            if (c != null) {
+                await WorkerWs.Push(c, payload);
+            }
+        }
+    }
+
+    /// <summary>WebSocket push：把一条 Text 帧排进该连接的出站缓冲并立即
+    /// 写出（服务端帧不掩码）。可从任何回调上下文调用——包括 onOpen 里
+    /// 主动欢迎、定时器里广播等没有入站消息先行的场景，这正是与"从
+    /// onMessage 返回应答"的区别。连接已关或未升级返回 false。
+    /// 帧序与帧循环共用同一缓冲，Append 到 Flush 之间不让出，天然一致。</summary>
+    static async bool Push(Connection c, string data) {
+        WsLink link = WorkerWs.LinkOf(c.GetId());
+        if (link == null || c.IsClosed()) { return false; }
+        int len = (int)strlen(data);
+        WsFrame frame = WsFrame.RawFrame(WsOpcode.Text, data, len);
+        byte[] encoded = frame.Encode();
+        link.writer.Append(encoded, WsFrame.HeaderLen(len) + len);
+        int n = await link.writer.Flush(link.client);
+        if (n < 0) {
+            c.Close();
+            return false;
+        }
+        Worker.BumpSent();
+        return true;
+    }
+
+    /// <summary>WebSocket 二进制 push：`data` 可含 NUL，`len` 为精确
+    /// 字节数（绝不 strlen）。语义同 Push。</summary>
+    static async bool PushBinary(Connection c, string data, int len) {
+        WsLink link = WorkerWs.LinkOf(c.GetId());
+        if (link == null || c.IsClosed()) { return false; }
+        WsFrame frame = WsFrame.RawFrame(WsOpcode.Binary, data, len);
+        byte[] encoded = frame.Encode();
+        link.writer.Append(encoded, WsFrame.HeaderLen(len) + len);
+        int n = await link.writer.Flush(link.client);
+        if (n < 0) {
+            c.Close();
+            return false;
+        }
+        Worker.BumpSent();
+        return true;
+    }
+
+    // ---- 帧循环 ----
+
+    /// A WebSocket port is an HTTP port until the client asks to upgrade, so the
+    /// request head is read and parsed first: an Upgrade request becomes a frame
+    /// loop, anything else is served as HTTP (swoole's WebSocket\Server does the
+    /// same). The bytes consumed here are handed to whichever path takes over.
+    static async void HandleWebSocket(Worker w, nint clientSock) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
+
+        // The head is read with the shared HTTP framer, so the bytes that
+        // arrive with it (an HTTP body, pipelined WebSocket frames) keep their
+        // exact count instead of being length-counted with strlen.
+        // 握手读取与明文 HTTP 一样受 requestTimeout 约束（慢速客户端
+        // 每秒滴一个字节就能永久钉住协程与 64KB 复用缓冲）；WS 循环
+        // 的空闲不设限，与 HTTP keep-alive 的请求间空闲一致。
+        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, w.requestTimeout);
+        HttpFramer framer = HttpFramer.Create(clientSock);
+        int headerEnd = 0;
+        try {
+            headerEnd = await framer.ReadHead(w.maxHeaderBytes);
+            HttpDeadline.Disarm(watch);
+            watch = null;
+        } finally {
+            // ReadHead 半途抛出时 deadline 槽位必须释放（幂等）。
+            HttpDeadline.Disarm(watch);
+        }
+        if (headerEnd <= 0) {
+            framer.Dispose();
+            client.Close();
+            w.DropConn();
+            return;
+        }
+        HttpRequest req = HttpRequest.Parse(framer.Head(headerEnd), headerEnd);
+        string wsKey = req.GetHeader("Sec-WebSocket-Key");
+
+        if (wsKey.Length == 0) {
+            // Plain HTTP on the same port. The framer already holds the head
+            // (and whatever followed it), so it is handed to the HTTP loop
+            // as-is rather than re-read or converted back to a string.
+            await HttpServer.ServeFramed(clientSock, w.RequestHandler(), framer,
+                w.maxHeaderBytes, w.maxRequestBytes, w.requestTimeout);
+            w.DropConn();
+            return;
+        }
+        // 之后的路径全部收口到帧循环末尾的统一清理；本函数内不再
+        // 有提前 return。
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
+        sb.Append("Upgrade: websocket\r\n");
+        sb.Append("Connection: Upgrade\r\n");
+        sb.Append("Sec-WebSocket-Accept: ");
+        sb.Append(Encoding.WebSocketAccept(wsKey));
+        sb.Append("\r\n\r\n");
+        int _hs = await client.SendAsync(sb.ToString());
+
+        Connection conn = w.NewConnection(clientSock);
+
+        // Reassemble whole frames via WsReader (handles partial and coalesced
+        // frames), rather than assuming one recv == one frame.
+        WsReader reader = new WsReader(clientSock);
+        int afterHead = framer.Pending() - headerEnd;
+        if (afterHead > 0) {
+            // The client pipelined frames behind the handshake. Frame bytes are
+            // binary, so they are sliced out of the framer by exact count.
+            reader.Prime(framer.Slice(headerEnd, afterHead), afterHead);
+        }
+        framer.Dispose();
+        WsWriter writer = new WsWriter();
+        // 连接级出站能力：WorkerWs.Push/Broadcast 与帧循环共用这个 writer，
+        // 回调里（onOpen 欢迎、定时器广播）无需入站消息先行即可推帧。
+        WorkerWs.Attach(conn, writer, client);
+        // onOpen 必须在 writer 挂载并登记之后触发：回调里的
+        // WorkerWs.Push 依赖注册项非空（否则静默返回 false，
+        // 欢迎帧丢失且无任何错误迹象）。
+        // WS 帧循环的收尾清理在 finally 中：onOpen/onFrameData 抛出时
+        // Close/ConnRemove/DropConn 一个都不能少——连接留在广播表里
+        // 会对死 socket 持续推送，计数漂移则自我拒绝服务。
+        ConnectionHandler onUp = w.OpenHandler();
+        try {
+        if (onUp != null) { await onUp(conn); }
+        WsAssembler asm = new WsAssembler(reader.MaxLen());
+        MessageHandler onFrameData = w.MessageHandlerOf();
+        bool active = true;
+        while (active && !conn.IsClosed()) {
+            int total = reader.FrameSize();
+            while (total < 0) {
+                if (total == -2 || total == -3) {
+                    // -2 = 帧长编码违规（1002）；-3 = 消息过大（1009）。
+                    // 无上限时对端声明一个 2GB 的帧就能把缓冲撑到 OOM。
+                    byte[] enc = WsFrame.CloseFrameWithCode(total == -3 ? 1009 : 1002).Encode();
+                    writer.Append(enc, 4);
+                    int _v = await writer.Flush(client);
+                    active = false;
+                    break;
+                }
+                // Nothing more to answer from this batch: put the replies on the
+                // wire before parking on the reactor.
+                if (writer.Pending()) { int _f = await writer.Flush(client); }
+                int got = await reader.FillMore();
+                if (got == 0) {
+                    active = false;
+                    break;
+                }
+                total = reader.FrameSize();
+            }
+            if (!active) { break; }
+
+            WsFrame frame = reader.TakeFrame(total);
+
+            // RFC 6455 入站帧门禁：§5.2 保留 opcode（3-7 数据、11-15
+            // 控制）、§5.5 控制帧载荷 ≤125、§5.1 客户端帧必须掩码。
+            // 此前非法 opcode 落进数据帧路径被原样回显给对端。
+            bool protoErr = frame.opcode >= 3 && frame.opcode <= 7
+                || frame.opcode >= 11 && frame.opcode <= 15
+                || frame.opcode >= 8 && frame.payloadLen > 125
+                || !frame.masked;
+            if (protoErr) {
+                byte[] enc = WsFrame.CloseFrameWithCode(1002).Encode();
+                writer.Append(enc, 4);
+                int _b = await writer.Flush(client);
+                active = false;
+                break;
+            }
+            if (frame.opcode == WsOpcode.Ping) {
+                // §5.5.3：Pong 必须原样带回 Ping 的应用数据——空 Pong
+                // 会让按载荷配对的心跳客户端断连。
+                WsFrame pong = WsFrame.RawFrame(WsOpcode.Pong, frame.payload, frame.payloadLen);
+                byte[] encoded = pong.Encode();
+                writer.Append(encoded, WsFrame.HeaderLen(frame.payloadLen) + frame.payloadLen);
+                continue;
+            }
+            if (frame.opcode == WsOpcode.Pong) { continue; }
+            if (frame.opcode == WsOpcode.Close) {
+                WsFrame closeResp = WsFrame.CloseFrame();
+                byte[] enc2 = closeResp.Encode();
+                writer.Append(enc2, 2);
+                int _c = await writer.Flush(client);
+                active = false;
+                break;
+            }
+            // 数据帧（Text/Binary/Continuation）：分片消息在 fin 时
+            // 整条交付——此前 continuation 帧被静默丢弃。
+            int feed = asm.Feed(frame);
+            if (feed < 0) {
+                byte[] enc = WsFrame.CloseFrameWithCode(feed == -2 ? 1009 : 1002).Encode();
+                writer.Append(enc, 4);
+                int _r = await writer.Flush(client);
+                active = false;
+                break;
+            }
+            if (feed == 0) { continue; }
+
+            int msgOpcode = asm.MessageOpcode();
+            string message = asm.Complete();
+
+            Worker.BumpStat();
+            string response = "";
+            if (onFrameData != null) {
+                // 同 HandleTcp：用户帧回调抛出只丢弃本条消息，
+                // 连接与循环存活。
+                try {
+                    response = await onFrameData(conn, message);
+                    if (response == null) { response = ""; }
+                } catch (Exception e) {
+                    Console.WriteLine("[ws] onMessage exception: " + e.Message);
+                    response = "";
+                }
+            } else {
+                response = message;   // default: echo
+            }
+            // One length drives both the frame header and the Append count.
+            // Reading .Length twice around the handler call is not safe: a
+            // cross-unit call can invalidate the cached length of a writable
+            // string (compiler stamps strlen back into the header), so the
+            // two reads can disagree for payloads containing NUL bytes and
+            // the frame goes out with a header larger than its body. strlen
+            // is stable across calls and matches the truncation contract the
+            // old server had (a NUL-payload echo re-delivers up to the NUL).
+            int respLen = (int)strlen(response);
+            if (respLen > 0) {
+                WsFrame respFrame = WsFrame.RawFrame(msgOpcode, response, respLen);
+                byte[] encoded = respFrame.Encode();
+                writer.Append(encoded, WsFrame.HeaderLen(respLen) + respLen);
+                Worker.BumpSent();
+            }
+        }   // while (active && !conn.IsClosed())
+        } finally {
+            client.Close();
+            conn.Close();
+            WorkerWs.ConnRemove(conn);   // Push 之后拒绝写已关闭的 socket
+            w.DropConn();
+            ConnectionCloseHandler onDown = w.onClose;
+            if (onDown != null) { await onDown(conn); }
+        }
+    }
+}
+
+/// 一条在线 WebSocket 连接的注册项：连接对象 + 出站 writer + 底层
+/// socket。原先是 Connection 上的 wsWriter/wsClient 字段——字段类型
+/// 引用 ws 家族会把编解码拖回核心文件，故随分片外迁、按连接 id 关联。
+class WsLink {
+    Connection conn;
+    WsWriter writer;
+    TcpClient client;
+}
+
+class WorkerWsConsumer : IWsSharedBusConsumer {
+    public void OnSharedBusMessage(int targetType, string channel, int targetId, string payload, int payloadLen) {
+        WorkerWs.OnSharedMessage(targetType, channel, targetId, payload, payloadLen);
+    }
+}
+

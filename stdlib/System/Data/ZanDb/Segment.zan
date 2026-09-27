@@ -1,0 +1,738 @@
+using System;
+using System.IO;
+
+namespace System.Data.ZanDb;
+
+/// <summary>扫描回调：op 1=put、2=del（del 是段内墓碑，
+/// 合并时用于压掉旧段同名键）。返回 false 停止扫描。</summary>
+delegate bool SegVisit(string key, string val, int op);
+
+/// <summary>
+/// 不可变有序段文件的写入端：调用方按
+/// <see cref="String.CompareOrdinal"/> 升序逐条 <see cref="Add"/>，
+/// <see cref="Finish"/> 时回读校验并落稀疏索引。
+///
+/// 文件布局（小端）：
+///   头部   "ZSEG" + u32 version + u64 记录数          （16 字节）
+///   记录   u8 op（1=put 2=del）+ varint 键 + [varint 值]
+///          （键按 CompareOrdinal 升序，由写入方保证）
+///   索引   u32 项数 + 每项 { u64 块偏移 + varint 块首键
+///          + u32 块 CRC }
+///   尾部   u64 索引偏移 + "ZSEG"                      （12 字节）
+///
+/// 索引项覆盖的块 = 本项偏移到下一项偏移（末项到索引区起点）。
+/// CRC 在 Finish 时回读整段算出——「创建即校验」：之后每次
+/// 块读取都能凭它发现磁盘腐坏。
+/// </summary>
+class SegmentWriter {
+    /// 段文件魔数（头尾各一次）。
+    static string MAGIC = "ZSEG";
+    static int VERSION = 1;
+    /// 每 N 条记录落一个稀疏索引项（第 0 条必落）。
+    static int SPARSE_EVERY = 16;
+    /// 记录缓冲达到该字节数就刷盘。
+    static int WRITE_BUF = 262144;
+
+    PageFile file;
+    ByteBuffer buf;
+    long fileLen;
+    long recCount;
+    List<long> sparseOff;
+    List<string> sparseKey;
+    bool failed;
+    string lastError;
+
+    SegmentWriter() {
+        this.buf = ByteBuffer.Alloc(SegmentWriter.WRITE_BUF);
+        this.sparseOff = new List<long>();
+        this.sparseKey = new List<string>();
+        this.fileLen = 0;
+        this.recCount = 0;
+        this.failed = false;
+        this.lastError = "";
+    }
+
+    /// <summary>创建段文件并写入头部占位（记录数在
+    /// <see cref="Finish"/> 时回填）。</summary>
+    static SegmentWriter Create(string path) {
+        SegmentWriter w = new SegmentWriter();
+        w.file = PageFile.Open(path);
+        if (!w.file.IsOpen()) {
+            w.failed = true;
+            w.lastError = w.file.GetError();
+            return w;
+        }
+        ByteBuffer h = ByteBuffer.Alloc(16);
+        h.WriteRaw(SegmentWriter.MAGIC, 4);
+        h.WriteU32(SegmentWriter.VERSION);
+        h.WriteU64(0);
+        if (w.file.WriteAt(0, h.Raw(), 16) != 16) {
+            w.failed = true;
+            w.lastError = "segment header write failed";
+        }
+        h.Free();
+        w.fileLen = 16;
+        return w;
+    }
+
+    /// 写入是否已失败。
+    bool Failed() { return this.failed; }
+
+    /// 最近一次错误描述。
+    string GetError() { return this.lastError; }
+
+    /// <summary>追加一条记录；键必须严格升序（由调用方保证，
+    /// 内存排序的结果天然满足）。op 1=put、2=del（del 不带值）。</summary>
+    void Add(string key, string val, int op) {
+        if (this.failed) { return; }
+        if (this.recCount % SegmentWriter.SPARSE_EVERY == 0) {
+            this.sparseOff.Add(this.fileLen + this.buf.Length());
+            this.sparseKey.Add(key);
+        }
+        this.buf.WriteU8(op);
+        this.buf.WriteString(key);
+        if (op == 1) { this.buf.WriteString(val); }
+        this.recCount = this.recCount + 1;
+        if (this.buf.Length() >= SegmentWriter.WRITE_BUF) { this.FlushBuf(); }
+    }
+
+    /// 缓冲刷到文件当前末尾。
+    void FlushBuf() {
+        if (this.failed || this.buf.Length() == 0) { return; }
+        int n = this.file.WriteAt(this.fileLen, this.buf.Raw(), this.buf.Length());
+        if (n != this.buf.Length()) {
+            this.failed = true;
+            this.lastError = "segment write failed";
+            return;
+        }
+        this.fileLen = this.fileLen + n;
+        this.buf.Clear();
+    }
+
+    /// <summary>完成段：刷记录 → 回读逐块算 CRC 写索引 →
+    /// 写尾部 → 回填头部记录数 → fsync。成功后调用方应立刻
+    /// 丢弃本写入端（段不可变）。</summary>
+    bool Finish() {
+        if (this.failed) { return false; }
+        this.FlushBuf();
+        if (this.failed) { return false; }
+        long indexStart = this.fileLen;
+        // 索引块以条目数开头，与 SegmentFile.Open 的解析对齐。
+        this.buf.WriteU32(this.sparseOff.Count);
+
+        ByteBuffer block = ByteBuffer.Alloc(256);
+        int n = this.sparseOff.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            long end = indexStart;
+            if (i + 1 < n) { end = this.sparseOff[i + 1]; }
+            int len = (int)(end - this.sparseOff[i]);
+            long crc = 0;
+            if (len > 0) {
+                block.EnsureCapacity(len);
+                int got = this.file.ReadAt(this.sparseOff[i], block, len);
+                if (got == len) { crc = block.Crc32(len); }
+                else {
+                    this.failed = true;
+                    this.lastError = "segment verify read failed";
+                    break;
+                }
+            }
+            this.buf.EnsureRoom(24 + this.sparseKey[i].Length);
+            this.buf.WriteU64(this.sparseOff[i]);
+            this.buf.WriteString(this.sparseKey[i]);
+            this.buf.WriteU32(crc);
+        }
+        block.Free();
+        if (this.failed) { return false; }
+        this.FlushBuf();
+        if (this.failed) { return false; }
+
+        ByteBuffer foot = ByteBuffer.Alloc(12);
+        foot.WriteU64(indexStart);
+        foot.WriteRaw(SegmentWriter.MAGIC, 4);
+        if (this.file.WriteAt(this.fileLen, foot.Raw(), 12) != 12) {
+            this.failed = true;
+            this.lastError = "segment footer write failed";
+        }
+        foot.Free();
+        if (this.failed) { return false; }
+        this.fileLen = this.fileLen + 12;
+
+        ByteBuffer h = ByteBuffer.Alloc(16);
+        h.WriteRaw(SegmentWriter.MAGIC, 4);
+        h.WriteU32(SegmentWriter.VERSION);
+        h.WriteU64(this.recCount);
+        if (this.file.WriteAt(0, h.Raw(), 16) != 16) {
+            this.failed = true;
+            this.lastError = "segment header rewrite failed";
+        }
+        h.Free();
+        if (this.failed) { return false; }
+
+        if (!this.file.Sync()) {
+            this.lastError = "segment sync failed";
+            return false;
+        }
+        this.file.Close();
+        return true;
+    }
+}
+
+/// <summary>
+/// 不可变有序段文件的读取端：稀疏索引二分定位块（一次块读 +
+/// CRC 校验），块内顺序解析。点查与范围扫描共用同一套块读取。
+/// </summary>
+class SegmentFile {
+    static string MAGIC = "ZSEG";
+
+    PageFile file;
+    string path;
+    List<long> sparseOff;
+    List<string> sparseKey;
+    List<long> sparseCrc;
+    List<int> blockVerified;
+    long indexStart;
+    long recordCount;
+    string lastError;
+
+    SegmentFile() {
+        this.path = "";
+        this.indexStart = 0;
+        this.recordCount = 0;
+        this.lastError = "";
+        this.sparseOff = new List<long>();
+        this.sparseKey = new List<string>();
+        this.sparseCrc = new List<long>();
+        this.blockVerified = new List<int>();
+    }
+
+    /// <summary>打开并校验一个已完成的段：读尾部定位索引区，
+    /// 加载稀疏索引与块 CRC。头部/尾部/索引损坏时报错，
+    /// 记录区损坏在读块时才发现。</summary>
+    static SegmentFile Open(string segPath) {
+        SegmentFile sf = new SegmentFile();
+        sf.path = segPath;
+        // 段只读打开；PageFile.Open 有「不存在即创建」的副作用，
+        // 会把拼错/缺失的段名变成空文件，这里先挡掉。
+        if (!File.Exists(segPath)) {
+            sf.lastError = "segment missing: " + segPath;
+            return sf;
+        }
+        sf.file = PageFile.Open(segPath);
+        if (!sf.file.IsOpen()) {
+            sf.lastError = sf.file.GetError();
+            return sf;
+        }
+        long size = sf.file.Size();
+        if (size < 28) {
+            sf.lastError = "segment too short";
+            return sf;
+        }
+        ByteBuffer tail = ByteBuffer.Alloc(12);
+        sf.file.ReadAt(size - 12, tail, 12);
+        tail.SeekRead(0);
+        long indexOff = tail.ReadU64();
+        string magic = tail.Str(8, 4);
+        tail.Free();
+        if (magic != SegmentFile.MAGIC || indexOff < 16 || indexOff >= size - 12) {
+            sf.lastError = "segment footer corrupt";
+            return sf;
+        }
+        ByteBuffer head = ByteBuffer.Alloc(16);
+        sf.file.ReadAt(0, head, 16);
+        head.SeekRead(0);
+        string hmagic = head.Str(0, 4);
+        // Str 是绝对切片、不移动读游标：版本号要从偏移 4 读起。
+        head.SeekRead(4);
+        long ver = head.ReadU32();
+        long count = head.ReadU64();
+        head.Free();
+        if (hmagic != SegmentFile.MAGIC || ver != SegmentWriter.VERSION) {
+            sf.lastError = "segment header corrupt";
+            return sf;
+        }
+        sf.recordCount = count;
+        sf.indexStart = indexOff;
+
+        ByteBuffer idx = ByteBuffer.Alloc(256);
+        int idxLen = (int)(size - 12 - (indexOff + 4));
+        if (idxLen < 0) {
+            sf.lastError = "segment index corrupt";
+            idx.Free();
+            return sf;
+        }
+        idx.EnsureCapacity(idxLen);
+        int got = sf.file.ReadAt(indexOff + 4, idx, idxLen);
+        if (got != idxLen) {
+            sf.lastError = "segment index short read";
+            idx.Free();
+            return sf;
+        }
+        idx.SeekRead(0);
+        ByteBuffer cnt = ByteBuffer.Alloc(4);
+        sf.file.ReadAt(indexOff, cnt, 4);
+        cnt.SeekRead(0);
+        int n = (int)cnt.ReadU32();
+        cnt.Free();
+        for (int i = 0; i < n; i = i + 1) {
+            if (!idx.CanRead(10)) {
+                sf.lastError = "segment index truncated";
+                idx.Free();
+                return sf;
+            }
+            long off = idx.ReadU64();
+            string key = idx.ReadString();
+            long crc = idx.ReadU32();
+            sf.sparseOff.Add(off);
+            sf.sparseKey.Add(key);
+            sf.sparseCrc.Add(crc);
+            sf.blockVerified.Add(0);
+        }
+        idx.Free();
+        return sf;
+    }
+
+    /// 段文件路径。
+    string Path() { return this.path; }
+
+    /// 段内记录数。
+    long Count() { return this.recordCount; }
+
+    /// 最近一次错误描述（块 CRC 不符也记在这里）。
+    string GetError() { return this.lastError; }
+
+    /// <summary>定位 key 所在或其插入位置的块号：最后一个
+    /// 块首键 &lt;= key 的块；key 小于所有块首键时返回 0。</summary>
+    int BlockFor(string key) {
+        int lo = 0;
+        int hi = this.sparseKey.Count - 1;
+        int ans = 0;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (String.CompareOrdinal(this.sparseKey[mid], key) <= 0) {
+                ans = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return ans;
+    }
+
+    /// 稀疏索引覆盖的块数（0 = 空段）。
+    int BlockCount() { return this.sparseOff.Count; }
+
+    /// <summary>块跨度整读：把块 [fromBlock, toBlock) 的文件区间
+    /// 一次 ReadAt 读入（块在段文件里物理连续），供块级内核跨块
+    /// 连续解析——把每块一次的系统调用摊成每跨度一次。 CRC 逐块
+    /// 校验（块边界在缓冲内偏移已知；用 NativeMemory.Crc32 直接
+    /// 对缓冲内子区间算，不复制）。未固化校验的块标记为已验。
+    /// 失败返回 null 并在 GetError 留痕；缓冲归调用方 Free。</summary>
+    ByteBuffer LoadBlockSpan(int fromBlock, int toBlock, ByteBuffer reuse) {
+        if (fromBlock < 0 || toBlock > this.sparseOff.Count || fromBlock >= toBlock) {
+            this.lastError = "segment block span out of range";
+            return null;
+        }
+        long start = this.sparseOff[fromBlock];
+        long end = this.indexStart;
+        if (toBlock < this.sparseOff.Count) { end = this.sparseOff[toBlock]; }
+        int len = (int)(end - start);
+        if (len <= 0) {
+            this.lastError = "segment block span empty";
+            return null;
+        }
+        ByteBuffer b = reuse;
+        if (b == null) { b = ByteBuffer.Alloc(len); }
+        int got = this.file.ReadAt(start, b, len);
+        if (got != len) {
+            this.lastError = "segment block span short read";
+            if (reuse == null) { b.Free(); }
+            return null;
+        }
+        for (int i = fromBlock; i < toBlock; i = i + 1) {
+            if (this.blockVerified[i] == 0) {
+                long bend = this.indexStart;
+                if (i + 1 < this.sparseOff.Count) { bend = this.sparseOff[i + 1]; }
+                int blen = (int)(bend - this.sparseOff[i]);
+                int boff = (int)(this.sparseOff[i] - start);
+                if (NativeMemory.Crc32(b.Raw() + boff, blen) != this.sparseCrc[i]) {
+                    this.lastError = "segment block corrupt";
+                    if (reuse == null) { b.Free(); }
+                    return null;
+                }
+                this.blockVerified[i] = 1;
+            }
+        }
+        b.SeekRead(0);
+        return b;
+    }
+
+    /// 块 i 的文件偏移（块跨度整读用）。
+    long BlockFileOff(int i) { return this.sparseOff[i]; }
+
+    /// 块 i 的字节长度（块跨度整读用）。
+    int BlockLen(int i) {
+        long end = this.indexStart;
+        if (i + 1 < this.sparseOff.Count) { end = this.sparseOff[i + 1]; }
+        return (int)(end - this.sparseOff[i]);
+    }
+
+    /// <summary>加载块 i 并校验 CRC；失败（越界/腐坏/短读）返回 null
+    /// 并在 <see cref="GetError"/> 留痕。缓冲区归调用方 Free。</summary>
+    ByteBuffer LoadBlock(int i) {
+        ByteBuffer b = this.LoadBlockReuse(i, null);
+        return b;
+    }
+
+    /// <summary><see cref="LoadBlock"/> 的复用形式：给定非 null 的
+    /// reuse 缓冲时原地扩容读入（容量足够则零分配），消除每块的
+    /// Alloc/Free。段不可变——CRC 每块只在首次加载时校验一次，
+    /// 之后同一打开会话内的重复读取免 CRC（读时不算派生数）。</summary>
+    ByteBuffer LoadBlockReuse(int i, ByteBuffer reuse) {
+        if (i < 0 || i >= this.sparseOff.Count) {
+            // 空段（0 条记录）或越界：返回「未命中」而不是索引崩。
+            this.lastError = "segment block out of range";
+            return null;
+        }
+        long end = this.indexStart;
+        if (i + 1 < this.sparseOff.Count) { end = this.sparseOff[i + 1]; }
+        int len = (int)(end - this.sparseOff[i]);
+        if (len <= 0) {
+            this.lastError = "segment block empty";
+            return null;
+        }
+        ByteBuffer b = reuse;
+        if (b == null) { b = ByteBuffer.Alloc(len); }
+        int got = this.file.ReadAt(this.sparseOff[i], b, len);
+        if (got != len) {
+            this.lastError = "segment block short read";
+            if (reuse == null) { b.Free(); }
+            return null;
+        }
+        if (this.blockVerified[i] == 0) {
+            if (b.Crc32(len) != this.sparseCrc[i]) {
+                this.lastError = "segment block corrupt";
+                if (reuse == null) { b.Free(); }
+                return null;
+            }
+            this.blockVerified[i] = 1;
+        }
+        b.SeekRead(0);
+        return b;
+    }
+
+    /// <summary>块内顺序解析下一条记录到 key/val/op；
+    /// 缓冲耗尽返回 false。读位置推进到下一条记录。</summary>
+    static bool NextRecord(ByteBuffer b, out string key, out string val, out int op) {
+        key = "";
+        val = "";
+        op = 0;
+        if (!b.CanRead(1)) { return false; }
+        op = b.ReadU8();
+        if (op != 1 && op != 2) { return false; }
+        if (!b.CanRead(1)) { return false; }
+        long klen = b.ReadVarInt();
+        if (klen < 0 || !b.CanRead((int)klen)) { return false; }
+        int kp = b.ReadPos();
+        b.SeekRead(kp + (int)klen);
+        key = b.Str(kp, (int)klen);
+        if (op == 2) { return true; }
+        if (!b.CanRead(1)) { return false; }
+        long vlen = b.ReadVarInt();
+        if (vlen < 0 || !b.CanRead((int)vlen)) { return false; }
+        int vp = b.ReadPos();
+        b.SeekRead(vp + (int)vlen);
+        val = b.Str(vp, (int)vlen);
+        return true;
+    }
+
+    /// <summary>裸解析块内下一条记录：不物化任何字符串，只输出
+    /// 键/值在块内的绝对偏移与长度（读游标推进到记录尾）。
+    /// 块耗尽或腐坏返回 false。</summary>
+    static bool NextRecordRaw(ByteBuffer b, out int keyOff, out int keyLen,
+                              out int valOff, out int valLen, out int op) {
+        keyOff = 0;
+        keyLen = 0;
+        valOff = 0;
+        valLen = 0;
+        op = 0;
+        if (!b.CanRead(1)) { return false; }
+        op = b.ReadU8();
+        if (op != 1 && op != 2) { return false; }
+        if (!b.CanRead(1)) { return false; }
+        long klen = b.ReadVarInt();
+        if (klen < 0 || !b.CanRead((int)klen)) { return false; }
+        keyOff = b.ReadPos();
+        keyLen = (int)klen;
+        b.SeekRead(keyOff + keyLen);
+        if (op == 2) { return true; }
+        if (!b.CanRead(1)) { return false; }
+        long vlen = b.ReadVarInt();
+        if (vlen < 0 || !b.CanRead((int)vlen)) { return false; }
+        valOff = b.ReadPos();
+        valLen = (int)vlen;
+        b.SeekRead(valOff + valLen);
+        return true;
+    }
+
+    /// <summary>块内顺序查找 key：1=命中（val 为值）、2=墓碑、
+    /// 0=不存在（含越过 key 的位置）。读完即止，不做全块解析。</summary>
+    static int ScanBlock(ByteBuffer b, string key, out string val) {
+        val = "";
+        while (true) {
+            string rk;
+            string rv;
+            int rop;
+            if (!SegmentFile.NextRecord(b, out rk, out rv, out rop)) { break; }
+            int cmp = String.CompareOrdinal(rk, key);
+            if (cmp == 0) {
+                if (rop == 2) { return 2; }
+                val = rv;
+                return 1;
+            }
+            if (cmp > 0) { return 0; }
+        }
+        return 0;
+    }
+
+    /// <summary>点查：0=不存在，1=命中（val 为值），
+    /// 2=墓碑（键在本段被删，查找到此为止）。块腐坏按不存在
+    /// 处理并留错误痕迹。</summary>
+    int Lookup(string key, out string val) {
+        val = "";
+        int bi = this.BlockFor(key);
+        ByteBuffer b = this.LoadBlock(bi);
+        if (b == null) { return 0; }
+        int r = SegmentFile.ScanBlock(b, key, out val);
+        b.Free();
+        return r;
+    }
+
+    /// <summary>点查（带块缓存）：先借缓存 pin，未命中则加载
+    /// 块并入库。val 是字符串拷贝，pin 释放后仍然有效。
+    /// segNo 是本段的全局段号，用于跨段区分缓存键。</summary>
+    int Lookup(string key, out string val, BlockCache cache, long segNo) {
+        if (cache == null) { return this.Lookup(key, out val); }
+        val = "";
+        int bi = this.BlockFor(key);
+        long ck = segNo * 4294967296 + bi;
+        CachePin pin = cache.Acquire(ck);
+        if (pin == null) {
+            ByteBuffer nb = this.LoadBlock(bi);
+            if (nb == null) { return 0; }
+            pin = cache.Insert(ck, nb);
+        }
+        // 缓存块会被反复扫描：ScanBlock 依赖读游标，必须先归零。
+        pin.buf.SeekRead(0);
+        int r = SegmentFile.ScanBlock(pin.buf, key, out val);
+        cache.Release(pin);
+        return r;
+    }
+
+    /// <summary>从 fromKey（含）起顺序扫描全部记录，逐条交给
+    /// visit（返回 false 早停，该条不计入）。跨块推进，直到
+    /// 记录区终点。返回 visit 接受的记录数。</summary>
+    int Scan(string fromKey, SegVisit visit) {
+        int bi = this.BlockFor(fromKey);
+        int added = 0;
+        while (bi < this.sparseOff.Count) {
+            ByteBuffer b = this.LoadBlock(bi);
+            if (b == null) { return added; }
+            while (true) {
+                string rk;
+                string rv;
+                int rop;
+                if (!SegmentFile.NextRecord(b, out rk, out rv, out rop)) { break; }
+                if (String.CompareOrdinal(rk, fromKey) < 0) { continue; }
+                if (!visit(rk, rv, rop)) {
+                    b.Free();
+                    return added;
+                }
+                added = added + 1;
+            }
+            b.Free();
+            bi = bi + 1;
+        }
+        return added;
+    }
+
+    /// 关闭底层文件句柄。
+    void Close() {
+        this.file.Close();
+    }
+}
+
+/// <summary>
+/// 段内拉式游标：定位 fromKey（含）起顺序推进，块读完自动换块。
+/// 供 <see cref="ZanStore"/> 的多路归并扫描使用；扫描走顺序流读、
+/// 不经过块缓存（点读才占缓存，顺序扫不污染它）。键/值字符串
+/// **惰性物化**——裸扫描路径只走偏移/长度与块内指针，命中行才
+/// 调用 Key()/Val() 分配。用完必须 <see cref="Free"/>。
+/// </summary>
+class SegCursor {
+    [DllImport("crt", EntryPoint = "memcmp")]
+    static extern int MemCmp(nint a, string b, long n);
+
+    SegmentFile seg;
+    ByteBuffer buf;
+    int blockIdx;
+    bool valid;
+    string curKey;
+    bool keyMat;
+    string curVal;
+    bool valMat;
+    int curOp;
+    int curKeyOff;
+    int curKeyLen;
+    int curValOff;
+    int curValLen;
+
+    SegCursor(SegmentFile seg) {
+        this.seg = seg;
+        this.buf = null;
+        this.blockIdx = 0;
+        this.valid = false;
+        this.curKey = "";
+        this.keyMat = false;
+        this.curVal = "";
+        this.valMat = false;
+        this.curOp = 0;
+        this.curKeyOff = 0;
+        this.curKeyLen = 0;
+        this.curValOff = 0;
+        this.curValLen = 0;
+    }
+
+    /// 当前记录的键（Valid() 为假时无意义）。首次调用物化并缓存。
+    string Key() {
+        if (!this.keyMat) {
+            this.curKey = this.buf.Str(this.curKeyOff, this.curKeyLen);
+            this.keyMat = true;
+        }
+        return this.curKey;
+    }
+
+    /// 当前记录的值（墓碑时为空串）。首次调用物化并缓存。
+    string Val() {
+        if (!this.valMat) {
+            this.curVal = this.curValLen > 0
+                ? this.buf.Str(this.curValOff, this.curValLen) : "";
+            this.valMat = true;
+        }
+        return this.curVal;
+    }
+
+    /// 当前记录类型：1=put、2=墓碑。
+    int Op() { return this.curOp; }
+
+    /// 是否还有未消费的记录。
+    bool Valid() { return this.valid; }
+
+    /// 当前键在块内的起始偏移（Valid() 为假时无意义）。
+    int KeyOff() { return this.curKeyOff; }
+
+    /// 当前键的字节长度。
+    int KeyLen() { return this.curKeyLen; }
+
+    /// 当前值在块内的起始偏移（墓碑时无意义）。
+    int ValOff() { return this.curValOff; }
+
+    /// 当前值的字节长度（墓碑为 0）。
+    int ValLen() { return this.curValLen; }
+
+    /// 当前块缓冲（键/值偏移基于它；回调期间可随机读）。
+    ByteBuffer Block() { return this.buf; }
+
+    /// <summary>当前键与 other 的序数比较：块内指针 memcmp 前缀、
+    /// 长度定序——与 String.CompareOrdinal 同序（本层键为字节串，
+    /// 每字符一字节），零分配。</summary>
+    int CmpKeyRaw(string other) {
+        int n = this.curKeyLen < other.Length ? this.curKeyLen : other.Length;
+        if (n > 0) {
+            nint kp = this.buf.Raw() + this.curKeyOff;
+            int r = MemCmp(kp, other, n);
+            if (r != 0) { return r; }
+        }
+        return this.curKeyLen - other.Length;
+    }
+
+    /// <summary>打开游标并定位到第一个 key ≥ fromKey 的记录；
+    /// 段为空或全部记录都小于 fromKey 时 Valid() 为假。</summary>
+    static SegCursor Open(SegmentFile seg, string fromKey) {
+        SegCursor c = new SegCursor(seg);
+        c.blockIdx = seg.BlockFor(fromKey);
+        c.LoadCur();
+        while (c.valid && c.CmpKeyRaw(fromKey) < 0) {
+            c.Next();
+        }
+        return c;
+    }
+
+    /// 加载 blockIdx 块并裸解析其首条记录；越界/腐坏/空块置 invalid。
+    /// 块缓冲跨块复用（段不可变，重读只走 IO 不再分配）。
+    bool LoadCur() {
+        this.valid = false;
+        this.curKey = "";
+        this.keyMat = false;
+        this.curVal = "";
+        this.valMat = false;
+        this.curOp = 0;
+        if (this.blockIdx >= this.seg.sparseOff.Count) { return false; }
+        ByteBuffer b;
+        if (this.buf != null) {
+            // 复用现有缓冲：LoadBlockReuse 失败时不动调用方缓冲，
+            // 所有权仍在游标手里，Free() 时统一释放。
+            b = this.seg.LoadBlockReuse(this.blockIdx, this.buf);
+        } else {
+            b = this.seg.LoadBlock(this.blockIdx);
+        }
+        if (b == null) { return false; }
+        this.buf = b;
+        int ko;
+        int kl;
+        int vo;
+        int vl;
+        int rop;
+        if (!SegmentFile.NextRecordRaw(b, out ko, out kl, out vo, out vl, out rop)) {
+            // 空块（良构段不应出现）：按段耗尽处理。
+            this.buf.Free();
+            this.buf = null;
+            return false;
+        }
+        this.curKeyOff = ko;
+        this.curKeyLen = kl;
+        this.curValOff = vo;
+        this.curValLen = vl;
+        this.curOp = rop;
+        this.valid = true;
+        return true;
+    }
+
+    /// 推进到下一条记录（惰性缓存一并失效）；段耗尽后 Valid() 变假。
+    void Next() {
+        if (!this.valid) { return; }
+        int ko;
+        int kl;
+        int vo;
+        int vl;
+        int rop;
+        if (SegmentFile.NextRecordRaw(this.buf, out ko, out kl, out vo, out vl, out rop)) {
+            this.curKeyOff = ko;
+            this.curKeyLen = kl;
+            this.curValOff = vo;
+            this.curValLen = vl;
+            this.curOp = rop;
+            this.keyMat = false;
+            this.valMat = false;
+            return;
+        }
+        this.blockIdx = this.blockIdx + 1;
+        this.LoadCur();
+    }
+
+    /// 释放当前块缓冲；之后 Valid() 恒为假。
+    void Free() {
+        if (this.buf != null) { this.buf.Free(); this.buf = null; }
+        this.valid = false;
+    }
+}

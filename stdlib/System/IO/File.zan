@@ -73,13 +73,8 @@ class File {
     /// "./config/app.json" 与 "config\\app.json" 都指向
     /// "config/app.json"。</summary>
     static string EmbedName(string path) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < path.Length; i = i + 1) {
-            string ch = path.Substring(i, 1);
-            if (ch == "\\") { ch = "/"; }
-            sb.Append(ch);
-        }
-        string s = sb.ToString();
+        if (path == null) { return ""; }
+        string s = path.Replace("\\", "/");
         while (s.Length >= 2 && s.Substring(0, 2) == "./") {
             s = s.Substring(2, s.Length - 2);
         }
@@ -141,8 +136,8 @@ class File {
         return File.StripBom(sb.ToString());
     }
 
-    /// <summary>读取文件内容（ReadAllText 的包装）。</summary>
-    static string ReadAllTextAsync(string path) {
+    /// <summary>异步读取文件内容（完全对齐 C# .NET 异步 TAP 契约）。</summary>
+    static async string ReadAllTextAsync(string path) {
         string result = ReadAllText(path);
         return result;
     }
@@ -169,8 +164,8 @@ class File {
         fclose(fp);
     }
 
-    /// <summary>写入文件内容（WriteAllText 的包装）。</summary>
-    static void WriteAllTextAsync(string path, string content) {
+    /// <summary>异步写入文件内容（完全对齐 C# .NET 异步 TAP 契约）。</summary>
+    static async void WriteAllTextAsync(string path, string content) {
         WriteAllText(path, content);
     }
 
@@ -454,6 +449,11 @@ class File {
             }
             throw new FileNotFoundException("Could not open file: " + path);
         }
+        // 这里的 fp 只用来证明盘上文件可打开；真正的读取在下面
+        // GetSize/ReadBytes 各自开合。不关掉它，句柄就漏到进程退出——
+        // Windows 上被读过的文件会一直处于打开状态，锁死后续的改名/删除
+        // （WebApp 静态资产服务每个资产漏一个，问题在那里最先显形）。
+        fclose(fp);
         int size = File.GetSize(path);
         if (size < 0) {
             throw new FileNotFoundException("Could not open file: " + path);
@@ -528,5 +528,71 @@ class File {
         if (written != (long)data.Length) {
             throw new IOException("Could not append complete data to file: " + path);
         }
+    }
+
+    [DllImport("crt")]
+    static extern long zan_file_set_time(string path, int which, long unixSec);
+
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "CreateHardLinkW")]
+    static extern int CreateHardLinkW(nint link, nint target, nint secAttrs);
+
+    [DllImport("kernel32", EntryPoint = "GetFileAttributesW")]
+    static extern int GetFileAttributesW(nint path);
+    #endif
+
+    #if !WINDOWS
+    [DllImport("crt")]
+    static extern int link(string existing, string newLink);
+    #endif
+
+    /// <summary>将最后写入时间设置为 Unix 时间戳（秒）。
+    /// 文件不存在或平台无法设置时返回 false。</summary>
+    static bool SetLastWriteTime(string path, long unixSec) {
+        return File.zan_file_set_time(path, 0, unixSec) == 1;
+    }
+
+    /// <summary>将最后访问时间设置为 Unix 时间戳（秒）。</summary>
+    static bool SetLastAccessTime(string path, long unixSec) {
+        return File.zan_file_set_time(path, 2, unixSec) == 1;
+    }
+
+    /// <summary>设置创建时间（仅 Windows；其他平台返回 false）。</summary>
+    static bool SetCreationTime(string path, long unixSec) {
+        return File.zan_file_set_time(path, 1, unixSec) == 1;
+    }
+
+    /// <summary>在 link 创建指向已有文件 target 的硬链接。
+    /// 链接创建失败时返回 false（目标不存在、跨卷、权限不足）。</summary>
+    static bool CreateHardLink(string link, string target) {
+        #if WINDOWS
+        nint wlink = Wide.Of(link);
+        nint wtarget = Wide.Of(target);
+        int ok = File.CreateHardLinkW(wlink, wtarget, 0);
+        Wide.Free(wlink);
+        Wide.Free(wtarget);
+        return ok != 0;
+        #else
+        return File.link(target, link) == 0;
+        #endif
+    }
+
+    /// <summary>当 path 是 reparse point（目录 junction、符号链接或 OneDrive 占位文件）时返回 true。
+    /// 仅 Windows；其他平台返回 false。</summary>
+    static bool IsReparsePoint(string path) {
+        #if WINDOWS
+        nint wpath = Wide.Of(path);
+        int attrs = File.GetFileAttributesW(wpath);
+        Wide.Free(wpath);
+        if (attrs == -1) { return false; }
+        return (attrs & 0x400) != 0;
+        #else
+        return false;
+        #endif
+    }
+
+    /// <summary>根据文件扩展名（转小写）猜测 MIME 类型。未知扩展名回退为 application/octet-stream。</summary>
+    static string GetMimeType(string path) {
+        return FileInfoEx.Mime(path);
     }
 }

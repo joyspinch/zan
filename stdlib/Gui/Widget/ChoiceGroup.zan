@@ -92,7 +92,7 @@ class ChoiceGroup : Panel {
         return null;
     }
 
-    /// 选项以 `a|b|c` 字符串表示（设计器 / .zform 属性往返）；
+    /// 选项以 `a|b|c` 字符串表示（设计器 / 设计文档属性往返）；
     /// 子类可扩展语法（RadioGroup 的 `!` 后缀 = 禁用位）。
     virtual string OptionsText() {
         string outp = "";
@@ -160,20 +160,6 @@ class ChoiceGroup : Panel {
             return;
         }
         base.SetProp(key, val);
-    }
-
-    /// 设计器读取 `options`（"A|B|C" 文本）；其余键返回 ""。
-    override string GetExtra(string key) {
-        if (key == "options") { return this.OptionsText(); }
-        return "";
-    }
-
-    /// 设计器写入 `options`（"A|B|C" 逐项追加）；其他键返回 false
-    /// 交给基类。
-    override bool SetExtra(string key, string val) {
-        if (key != "options") { return false; }
-        this.SetOptionsText(val);
-        return true;
     }
 
     /// 覆写：返回设计器属性清单（columns/rowHeight）。
@@ -624,10 +610,8 @@ class RadioGroup : ChoiceGroup {
             return;
         }
         buttonGroup = new RadioButtonGroup(this.model);
-        buttonGroup.Change.Add(() => {
-            this.PushValue();
-            this.Change.Raise();
-        });
+        // 段切换的组级联动经 OnChildEvent 冒泡（见下），不再挂捕获
+        // 组的闭包——组→段→事件表→闭包→组是 ARC 不回收的引用环。
         for (int i = 0; i < this.labels.Count; i = i + 1) {
             buttonGroup.AddOption(this.labels[i], this.valueAt(i));
         }
@@ -659,8 +643,18 @@ class RadioGroup : ChoiceGroup {
         }
         Radio r = new Radio(this.model, this.optionValues[index], text);
         r.Disabled = this.optionDisabled[index];
-        r.Change.Add(() => { this.PushValue(); this.Change.Raise(); });
+        // 组级联动经 OnChildEvent 冒泡（见下），不再挂捕获组的闭包
+        // ——组→子→事件表→闭包→组是 ARC 不回收的引用环。
         return r;
+    }
+
+    /// 子项用户切换冒泡（Control.OnChildEvent）：先同步组级绑定，
+    /// 再触发组 Change——与旧闭包接线同序。
+    override void OnChildEvent(Control child, string evt) {
+        if (evt == "Change") {
+            this.PushValue();
+            this.Change.Raise();
+        }
     }
 
     /// 覆写：先同步组状态；按钮形态量按钮段加内边距，圆点形态走基类。
@@ -707,7 +701,6 @@ class RadioGroup : ChoiceGroup {
             }
             return true;
         }
-        if (key == "size") { this.Size.Set(val); return true; }
         return base.SetExtra(key, val);
     }
 
@@ -718,7 +711,6 @@ class RadioGroup : ChoiceGroup {
             if (this.Buttons.Get()) { return "button"; }
             return "";
         }
-        if (key == "size") { return this.Size.Get(); }
         return base.GetExtra(key);
     }
 
@@ -806,11 +798,16 @@ class CheckboxGroup : ChoiceGroup {
         this.Change = new UiEvent();
     }
 
-    /// 覆写：为选项造一个真实 Checkbox，其切换冒泡为组级 Change。
+    /// 覆写：为选项造一个真实 Checkbox，其切换经 OnChildEvent 冒泡为
+    /// 组级 Change（不挂捕获组的闭包——引用环，逐项泄漏）。
     override Control MakeItem(int index, string text) {
         Checkbox cb = new Checkbox(text);
-        cb.Change.Add(() => { this.Change.Raise(); });
         return cb;
+    }
+
+    /// 子复选框用户切换冒泡（Control.OnChildEvent）：触发组级 Change。
+    override void OnChildEvent(Control child, string evt) {
+        if (evt == "Change") { this.Change.Raise(); }
     }
 
     /// 第 index 个选项的勾选状态；越界或该项不是复选框时返回 false。
@@ -871,7 +868,7 @@ class CheckboxGroup : ChoiceGroup {
 /// 后绘制并向左右各外扩 1px 盖住接缝，强调色描边压在中性色上。
 ///
 /// 段一般不单独使用：RadioGroup 的按钮形态或 RadioButtonGroup 直接
-/// 挂一排段。独立保留模式（.zform / 注册表）也可用：自持信号、
+/// 挂一排段。独立保留模式（注册表 / 直接挂载）也可用：自持信号、
 /// 整段独立成胶囊。
 class RadioButton : Control {
     /// 所属组共享的选中信号（值为选中选项的 value）。
@@ -969,12 +966,13 @@ class RadioButton : Control {
         app.hitTester.RegisterRect(wid, x, y, w, h, 2);
     }
 
-    /// 选中本项（静默判重）：写 model 并触发段事件；组的冒泡由
-    /// 订阅方（RadioGroup/RadioButtonGroup）接线。
+    /// 选中本项（静默判重）：写 model 并触发段事件，再经 weak parent
+    /// 向容器冒泡（RadioButtonGroup.OnChildEvent）。
     void Select() {
         if (model.Get() == optionValue) { return; }
         model.Set(optionValue);
         Change.Raise();
+        if (parent != null) { parent.OnChildEvent(this, "Change"); }
     }
 
     /// 控件类型标识（序列化/设计器用）。
@@ -1009,7 +1007,7 @@ class RadioButton : Control {
         On.AddByName(evt, a);
     }
 
-    /// 独立保留模式（.zform / 直接挂载）：自绘整段 + 点击。
+    /// 独立保留模式（注册表 / 直接挂载）：自绘整段 + 点击。
     override void OnMeasure(App app) {
         this.Measure(app);
         prefW = mw;
@@ -1096,13 +1094,25 @@ class RadioButtonGroup : Control {
     RadioButton AddOption(string label) {
         return this.AddOption(label, this.items.Count);
     }
-    /// 追加选项（显式 value），段事件冒泡为组级 Change。
+    /// 追加选项（显式 value）：段经 weak parent 冒泡到本组的
+    /// OnChildEvent（不挂捕获组的闭包——引用环，逐段泄漏）。
+    /// 注意段不进 children（组自行调度绘制），只指 parent 供冒泡与
+    /// 禁用链上行。
     RadioButton AddOption(string label, int value) {
         if (label == "") { return null; }
         RadioButton b = new RadioButton(this.model, value, label);
-        b.Change.Add(() => { this.Change.Raise(); });
+        b.parent = this;
         this.items.Add(b);
         return b;
+    }
+
+    /// 段的用户切换冒泡：先触发本组 Change，再向自己的容器继续冒泡
+    /// （挂载在 RadioGroup 按钮形态下时即组级联动）。
+    override void OnChildEvent(Control child, string evt) {
+        if (evt == "Change") {
+            this.Change.Raise();
+            if (parent != null) { parent.OnChildEvent(this, "Change"); }
+        }
     }
 
     /// 清空全部段。
@@ -1278,7 +1288,6 @@ class RadioButtonGroup : Control {
             }
             return outp;
         }
-        if (key == "size") { return this.Size.Get(); }
         return "";
     }
 
@@ -1299,7 +1308,6 @@ class RadioButtonGroup : Control {
             }
             return true;
         }
-        if (key == "size") { this.Size.Set(val); return true; }
         return false;
     }
 
