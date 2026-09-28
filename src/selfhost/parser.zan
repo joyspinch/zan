@@ -2604,24 +2604,82 @@ class Parser {
         return false;
     }
 
-    // LINQ query: `from x in src [where c]... select e`. `from` is contextual,
-    // committed only once `in` follows the range variable.
+    // Query-clause chain helpers: `from x in src where W` becomes
+    // src.Where(x => W) over the Enumerable shaped generic extensions, the
+    // same machinery ordinary .Where()/.Select() chains already exercise.
+    Node QLambda(string qv, Node body) {
+        Node lam = new Node(AK.Lambda());
+        Node p = new Node(AK.Param());
+        p.type = MkTypeRef("var");
+        p.sval = qv;
+        lam.Add(p);
+        lam.a = body;
+        lam.line = body.line; lam.col = body.col;
+        return lam;
+    }
+
+    Node QCall(Node recv, string name, Node arg) {
+        Node ma = new Node(AK.MemberAccess());
+        ma.a = recv;
+        ma.sval = name;
+        ma.line = recv.line; ma.col = recv.col;
+        Node c = new Node(AK.Call());
+        c.a = ma;
+        c.Add(arg);
+        c.line = recv.line; c.col = recv.col;
+        return c;
+    }
+
+    // LINQ query: `from x in src [where c]... [orderby k [descending], ...]
+    // select e`. `from` is contextual, committed only once `in` follows the
+    // range variable. Lowered at parse time to the extension chain
+    // src.Where(x => c)...OrderBy...Select(x => e); multi-key orderby emits
+    // one single-key sort per key in reverse order -- the Enumerable sorts
+    // are stable, so that reproduces C#'s major-to-minor mixed ordering.
     Node ParseQuery() {
         int save = pos;
         Next(); // from
         string qv = Next().text; // range var
         if (!At(TK.In())) { pos = save; return null; }
         Next(); // in
-        Node q = new Node(AK.QueryExpr());
-        q.sval = qv;
-        q.a = ParseExpr();
-        while (At(TK.Ident()) && Cur().text == "where") {
+        Node q = ParseExpr();
+        while (At(TK.Ident()) && (Cur().text == "where" || Cur().text == "orderby")) {
+            bool isOrderby = Cur().text == "orderby";
             Next();
-            q.Add(ParseExpr());
+            if (!isOrderby) {
+                q = QCall(q, "Where", QLambda(qv, ParseExpr()));
+                continue;
+            }
+            // keys parse left-to-right but emit right-to-left for the
+            // stable-sort trick
+            List<Node> keys = new List<Node>();
+            List<bool> descs = new List<bool>();
+            while (true) {
+                keys.Add(ParseExpr());
+                bool desc = false;
+                if (At(TK.Ident()) && (Cur().text == "ascending"
+                        || Cur().text == "descending")) {
+                    desc = Cur().text == "descending";
+                    Next();
+                }
+                descs.Add(desc);
+                if (At(TK.Comma())) { Next(); continue; }
+                break;
+            }
+            int ki = keys.Count;
+            while (ki > 0) {
+                ki = ki - 1;
+                q = QCall(q, descs[ki] ? "OrderByDescending" : "OrderBy",
+                          QLambda(qv, keys[ki]));
+            }
         }
         if (At(TK.Ident()) && Cur().text == "select") {
             Next();
-            q.b = ParseExpr();
+            Node e = ParseExpr();
+            // identity projection needs no Select (and no R inference)
+            if (!(e.kind == AK.Ident() && e.sval == qv)) {
+                q = QCall(q, "Select", QLambda(qv, e));
+            }
         } else {
             diags.Error("expected 'select' in query expression", Cur().line, Cur().col);
         }
