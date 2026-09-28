@@ -16,6 +16,17 @@ class Parser {
     public bool attrJsonIgnore; // last ParseAttrs saw [JsonIgnore]
     public bool attrLayoutExplicit;
     public int attrFieldOffset = -1;
+    // dbgen attribute surface captured by the last ParseAttrs: [Table]
+    // presence + explicit name, [Index(Name=,Fields=,IsUnique=)] lines, and
+    // the [Column(...)] flags of the field being declared (-1 = unset bool).
+    public bool attrHasTable;
+    public string attrTableName;
+    public List<string> attrIndexes;
+    public string attrColName;
+    public int attrColPrimary;
+    public int attrColIdentity;
+    public int attrColNullable;
+    public int attrColStrLen;
     public Node curClsNode;   // class being parsed: local functions hoist here
     public int synthUsing;    // counter for `using (expr)` temp names
     public int chkMode;       // 0 default, 1 checked, 2 unchecked (for + - *)
@@ -26,8 +37,11 @@ class Parser {
     public int curFile;       // index into fileStarts of the current file
     public List<int> fileStarts; // first source line of each input file
     public List<string> curFileUsings; // usings of the current file
+    // dbgen's generated ORM text when this unit triggered ORM codegen; main
+    // seeds its post-codegen pull-in round from it (null when none)
+    public string genDbSrc;
 
-    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; attrJsonIgnore = false; curClsNode = null; synthUsing = 0; curNs = ""; curFile = -1; fileStarts = null; curFileUsings = new List<string>(); }
+    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; attrJsonIgnore = false; curClsNode = null; synthUsing = 0; curNs = ""; curFile = -1; fileStarts = null; curFileUsings = new List<string>(); genDbSrc = null; }
 
     // main.zan knows where each input file starts in the concatenated source
     // (1-based line numbers); with it the parser can give every declaration
@@ -72,6 +86,14 @@ class Parser {
         attrJsonIgnore = false;
         attrLayoutExplicit = false;
         attrFieldOffset = -1;
+        attrHasTable = false;
+        attrTableName = "";
+        attrIndexes = null;
+        attrColName = "";
+        attrColPrimary = -1;
+        attrColIdentity = -1;
+        attrColNullable = -1;
+        attrColStrLen = 0;
         while (At(TK.LBracket())) {
             Next(); // [
             if (At(TK.Ident()) && Cur().text == "DllImport") {
@@ -115,6 +137,70 @@ class Parser {
                     while (!At(TK.RParen()) && !At(TK.Eof())) { Next(); }
                     Expect(TK.RParen());
                 }
+            } else if (At(TK.Ident()) && Cur().text == "Table") {
+                // [Table] | [Table("phys_name")] | [Table(Name = "phys_name")]
+                Next();
+                attrHasTable = true;
+                if (Eat(TK.LParen())) {
+                    if (At(TK.StringLit())) { attrTableName = Next().text; }
+                    // first argument may itself be a named one, so scan
+                    // flat to the closing paren
+                    while (!At(TK.RParen()) && !At(TK.Eof())) {
+                        if (At(TK.Ident()) && Cur().text == "Name" && K1() == TK.Eq()) {
+                            Next(); Next();
+                            if (At(TK.StringLit())) { attrTableName = Next().text; }
+                        } else { Next(); }
+                    }
+                    Expect(TK.RParen());
+                }
+            } else if (At(TK.Ident()) && Cur().text == "Column") {
+                // [Column(Name=, IsPrimary=, IsIdentity=, IsNullable=,
+                //  StringLength=)] on an entity field
+                Next();
+                attrColName = "";
+                attrColPrimary = -1;
+                attrColIdentity = -1;
+                attrColNullable = -1;
+                attrColStrLen = 0;
+                if (Eat(TK.LParen())) {
+                    if (At(TK.StringLit())) { attrColName = Next().text; }
+                    while (!At(TK.RParen()) && !At(TK.Eof())) {
+                        if (At(TK.Ident()) && K1() == TK.Eq()) {
+                            string an = Next().text;
+                            Next();
+                            if (an == "Name" && At(TK.StringLit())) { attrColName = Next().text; }
+                            else if (an == "IsPrimary" && (At(TK.True()) || At(TK.False()))) { attrColPrimary = At(TK.True()) ? 1 : 0; Next(); }
+                            else if (an == "IsIdentity" && (At(TK.True()) || At(TK.False()))) { attrColIdentity = At(TK.True()) ? 1 : 0; Next(); }
+                            else if (an == "IsNullable" && (At(TK.True()) || At(TK.False()))) { attrColNullable = At(TK.True()) ? 1 : 0; Next(); }
+                            else if (an == "StringLength" && At(TK.IntLit())) { attrColStrLen = (int)Next().intVal; }
+                            else { Next(); }
+                        } else { Next(); }
+                    }
+                    Expect(TK.RParen());
+                }
+            } else if (At(TK.Ident()) && Cur().text == "Index") {
+                // [Index("ix_name", Fields = "a,b", IsUnique = true)] on an
+                // entity class; multiple allowed, declaration order kept
+                Next();
+                string inm = "";
+                string ifields = "";
+                int iuniq = 0;
+                if (Eat(TK.LParen())) {
+                    if (At(TK.StringLit())) { inm = Next().text; }
+                    while (!At(TK.RParen()) && !At(TK.Eof())) {
+                        if (At(TK.Ident()) && K1() == TK.Eq()) {
+                            string an = Next().text;
+                            Next();
+                            if (an == "Name" && At(TK.StringLit())) { inm = Next().text; }
+                            else if (an == "Fields" && At(TK.StringLit())) { ifields = Next().text; }
+                            else if (an == "IsUnique" && (At(TK.True()) || At(TK.False()))) { iuniq = At(TK.True()) ? 1 : 0; Next(); }
+                            else { Next(); }
+                        } else { Next(); }
+                    }
+                    Expect(TK.RParen());
+                }
+                if (attrIndexes == null) { attrIndexes = new List<string>(); }
+                attrIndexes.Add(inm + "|" + ifields + "|" + (iuniq == 1 ? "true" : "false"));
             } else {
                 while (!At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
             }
@@ -426,14 +512,22 @@ class Parser {
         }
         FlattenNested(unit);
         MergePartials(unit);
-        QualifyTypes(unit);
-        DesugarEvents(unit);
-        DesugarDispatchRt(unit);
-        DesugarIterators(unit);
+        // codegen before nsresolve: the generated classes must join
+        // QualifyTypes's conflict table and take the same reference-
+        // rewriting walk as user declarations (their unqualified
+        // OrmMeta/IOrmRows references only resolve there). Their rewrites
+        // of user bodies see pre-desugar AST, which the chain matcher is
+        // written against; StripTypeArgs still runs last so the rewrites'
+        // __typeargs probes see explicit type arguments.
         Jsongen jg = new Jsongen();
         jg.Run(unit, diags);
         Dbgen dbg = new Dbgen();
         dbg.Run(unit, diags);
+        genDbSrc = dbg.dbSrc;
+        QualifyTypes(unit);
+        DesugarEvents(unit);
+        DesugarDispatchRt(unit);
+        DesugarIterators(unit);
         StripTypeArgs(unit);
         return unit;
     }
@@ -1540,11 +1634,17 @@ class Parser {
 
     Node ParseClass(int mods, int kw) {
         bool explicitLayout = attrLayoutExplicit;
+        bool clsHasTable = attrHasTable;
+        string clsTable = attrTableName;
+        List<string> clsIndexes = attrIndexes;
         Next(); // class/struct
         Node cls = new Node(AK.ClassDecl());
         cls.layoutExplicit = explicitLayout;
         if (kw == TK.Struct()) { cls.kind = AK.StructDecl(); }
         cls.mods = mods;
+        cls.attrHasTable = clsHasTable;
+        cls.attrTable = clsTable;
+        cls.attrIndexes = clsIndexes;
         if (At(TK.Ident())) { cls.sval = Next().text; }
         // generic params <T, ...> recorded as TypeParam children
         if (At(TK.Less())) {
@@ -1709,6 +1809,15 @@ class Parser {
         member.mods = mods;
         member.type = type;
         member.fieldOffset = fieldOffset;
+        // [Column(...)] capture for dbgen: name|primary|identity|nullable|len
+        // with -1 standing for an unset bool flag ("" when no [Column]).
+        if (attrColName.Length > 0 || attrColPrimary >= 0 || attrColIdentity >= 0
+                || attrColNullable >= 0 || attrColStrLen > 0) {
+            member.attrCol = attrColName + "|" + Convert.ToString(attrColPrimary)
+                + "|" + Convert.ToString(attrColIdentity)
+                + "|" + Convert.ToString(attrColNullable)
+                + "|" + Convert.ToString(attrColStrLen);
+        }
         // Stamp the member name's position so jsongen's unsupported-field
         // diagnostics point at the offending field (defaults to 0:0).
         member.line = Cur().line; member.col = Cur().col;
@@ -3104,6 +3213,14 @@ class Parser {
     Node ParseNew() {
         Next(); // new
         Node n = new Node(AK.NewExpr());
+        // anonymous new: `new { a, b = expr, ... }`. The members are plain
+        // expressions / assignments; only the database codegen consumes
+        // them (query lambdas), so the node carries no type.
+        if (At(TK.LBrace())) {
+            n.ival = 2;
+            ParseBraceItems(n);
+            return n;
+        }
         n.type = ParseTypeNoArray();
         if (At(TK.LBracket())) {
             Next();

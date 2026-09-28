@@ -909,3 +909,61 @@ bootstrap run.KqvY7o 不动点（stage2.o == stage3.o）。
 "expected 'select'"）、dbgen/orm 簇（SyncStructure/BlogCols）、reflection
 intrinsics（3 例）、收窄赋值检查（oracle 拒绝 `long l = xs.Sum()`，
 selfhost 存原位）、NativeMemory builtins、表达式位 Task.Spawn/Run。
+
+## v18e（2026-09-29，sweep 种子 /tmp/v18e/r3/zanc）：dbgen ORM 门面补完 + async 分离误解析修复
+
+**Sweep 624**：pass 407 → **419**，ncf 71 → 60，om 7 → 5，em 8，
+mne 12 → 13，rcf 119（stale oracle）。代码归因回归为零。
+
+**核心修复：AsyncResolveCallNg 全局同名回退**。语句级调用若接收者类链
+（含基类）上没有该名方法（内置 `Dict<K,V>` 无声明方法、`List.Add` 例外
+已声明），旧代码会退到 `FindInstanceIdx(name)` —— 全表按名找第一个实例
+方法。orm_table_accessor 里测试自己的 `async int Add(string, int)`
+（Users.Add）匹配了 `this.byCol.Add(col, c)` / `this.Cols.Add(c)` 这类
+Dict/List 语句，PrepareAsyncStmtNg 把它们当异步调用**分离成协程 spawn**：
+`sub.awaiter = sub`（接收者写进自身 +0x10 → dict.keys = dict、
+list.items = _zan_co_reap）、`awaiter_step = reap`、`co_ready(frame,
+[frame+0x28])`。第二次 `OrmMeta.Col` 时 `keys[0] = [dict] = count = 0x1`，
+strcmp 读地址 1 → SIGSEGV（crash .ips：`_platform_strcmp ←
+zan_rt_dict_set+184 ← OrmMeta_Col+436 ← AccUserCols___Meta+684 ←
+__DbCF_AccUser_Sync`；stdout 全缓冲未刷 → 静默崩溃）。修复：全局回退
+仅限隐式 this（Ident 被调），显式接收者只在自身类链解析。
+**同族解锁**：cef_runtime_index om→pass、odbc_buffers om→pass、
+mysql_async_nonblocking ncf→pass —— 三个旧漂移/挂起项一并真实转绿。
+
+**dbgen ORM 门面（orm 簇 3/13 → 13/13）**：
+1. **RewriteConflict**（对齐 oracle GenDb.zan:1731）：
+   `OnConflict(a => a.col)` / `OnConflict(a => new { a.c1, a.c2 })` →
+   每键列一个 `.OC("col")`；仅标量列；参数数≠1、nav/非成员、空集分别报
+   "OnConflict expects a => a.<key> or a => new { ... }" / "OnConflict key
+   must be a => a.<scalar field>" / "OnConflict must name at least one key
+   column"；VisitCall 增 OnConflict 门控（I 链、单 lambda）。配套恢复
+   RewriteUpsertSet 的 lambda 形状守卫（编辑时误删）。
+2. parser 匿名 new（`new { a, b = expr }`，ival=2，checker 在 db lambda
+   之外报错）；RewriteProj 的 Pj\<N\>/Pj\<N\>Map/One/Async 投影类按
+   oracle GenDbEmit 逐字节；RewriteWhereIf / RewriteSet 一调用两实参 /
+   GenAccess 按 Field 名分发 / RewriteSyncAllRoot 实参搬移 /
+   RewriteAccRoot 访问器根（Insert/Update/Delete/Read/ById →
+   I_/U_/D_/Q_ 链）/ RewriteUpsertSet ACC/GMX/GMN / RewriteToListCol /
+   RewriteDoNothing / RewriteAgg/OrderBy/GroupBy 聚合体。
+3. 翻绿：orm_upsert、orm_table_accessor、orm_dynamic、orm_extended、
+   orm_freesql、orm_group_aggregate、orm_metadata_concurrency、orm_pool、
+   orm_sync_all、orm_typed_query（均 ncf→pass）。
+
+**漂移者（文档化，非代码）**：mqtt_lwt_retain pass→em —— 已验证 v18d 的
+pass 是计时竞态：v18d 检查点种子（run.KqvY7o）现在同样 3/3 失败
+（"Will message mismatch: got "）；http_client_keepalive em→mne 洗牌，
+同族 flapper（隔离运行可通过）。
+
+**验证**：13/13 orm 定向对拍；39/39 回归电池；chart_kinds_complete
+原生运行与 golden 逐字节一致；全量 624 sweep（+13 翻绿、零代码归因回归）。
+bootstrap：run.xwRh1F stage2 快照可干净编译当前源码；严格
+stage2.o==stage3.o 不动点留待下次全 bootstrap 边界（stage2 内嵌旧
+pull-in 引擎 39 文件，新编译器 50 文件，跨引擎对象对比不是不动点测试）。
+
+**下一批（v18f 候选）**：query 语法（linq_query expr kind 57 / parser
+"expected 'select'"）、reflection intrinsics（3 例）、收窄赋值检查
+（oracle 拒绝 `long l = xs.Sum()`）、NativeMemory builtins、表达式位
+Task.Spawn/Run、merge_partials、package-store 解析；ncf 残余簇：
+tuples/patterns/nullable arrays（cs_b*）、web binding（5）、async 控制
+流（5）。
