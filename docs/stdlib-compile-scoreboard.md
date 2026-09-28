@@ -861,3 +861,51 @@ linq_csharp_overloads 同时踩中两者（byname=carol ≠ alice）。其余 nc
 不变：dbgen/orm（SyncStructure/BlogCols）、LINQ（6）、tuples/patterns/
 nullable arrays（cs_b*）、reflection（3）、web binding（5）、async 控制
 流（5）。
+
+## v18d（2026-09-29，run.KqvY7o）：泛型重载集合排序 + 推断
+
+**Sweep 624**：pass 400 → **407**，ncf 76 → 71，om 10 → 7，em 8，
+mne 11 → 12，rcf 119（stale oracle）。零代码归因回归。
+
+**解明**：
+1. **spec 名去歧义**（SpecRegister）：同名泛型重载计数
+   `GenericOverloadCountNg(name) > 1` 时，spec 名追加 `_o` +
+   `TySymTagNg(SubstTy(参数类型名, DeclTps, 类型实参))` —— OrderBy 的
+   KeySelector/StrKeySelector/NumKeySelector 三个重载注册成三个不同 body，
+   不再先注册者赢走所有调用点（linq_csharp_overloads byname=carol ≠ alice
+   的根因之一）。
+2. **重载集合整体排序**（TryPlanInferenceSpecNg）：先收集同名泛型候选集
+   （接收者链优先，其次全局），逐候选推断绑定并按
+   InferCandScoreNg 打分（实参精确类型 +8 / 方法组贴合 +4 /
+   lambda 返回族贴合 +4），最优绑定胜出；全绑定（所有 tp KnownTyName）
+   才进入 SpecRegister。非泛型重载先经 NonGenericOverloadFits
+   （含 DeclParamsMatchArgs 参数类型核对）短路。
+3. **oracle 位置式 unify**（UnifyMethodTp / UnifyTps，对齐 irgen_expr.c）：
+   位置对位置合并类型实参，**不比较泛型头名** —— Selector<T,R> 对
+   Conv<int,int> 直接绑 T=int, R=int；裸 tp 先到先得。
+4. **lambda 第二遍**（LambdaBindNg）：按裸名查委托（对部分绑定做整体
+   SubstTy 会渲染出 `Pick<User,>` —— 未绑定 tp 变空串的教训），要求
+   参数个数一致，lambda 参数按"替换后的委托参数文本或显式注解"定型入
+   临时作用域，再对表达式体 StaticTyOf 与委托返回类型 unify；
+   LambdaBodyTyNg 在扫描点 push/pop 形参（扫描点没有 lambda 形参在
+   作用域内）。字面量证据 ArgNaturalTyNg（int/double/string/char/bool）。
+5. **调用形态正确的人口过滤**（OwnedGenericDeclArityNg）：实例形态扩展
+   调用 `xs.M<T>(a)` 接收者是声明参数（argc+1）；类限定 `Cls.M<T>(a)` /
+   裸静态全部参数 1:1（argc）；实例方法接收者是 this（argc）。中途
+   filter 过紧曾造成 generic_instance_method（`_Pool_Describe`）与
+   generic_class_instance_generic_method（`_Pool_Echo`）回归，桶 diff
+   当批抓住并修回。
+
+**Unlocks**：linq_csharp_overloads om→pass；linq_chained / linq_equality /
+linq_extended / generics_linq / generics_uniform_repr ncf→pass。
+**漂移者（文档化，非代码）**：mqtt_lwt_retain em→pass（计时竞态），
+http_client_keepalive mne→em，fileinfoex_mmap + mmap_owner om→mne
+（oracle 漂移，native==golden）。
+
+**验证**：39/39 回归电池；chart_kinds_complete golden 逐字节一致；
+bootstrap run.KqvY7o 不动点（stage2.o == stage3.o）。
+
+**下一批（v18e 候选）**：query 语法（linq_query expr kind 57 / parser
+"expected 'select'"）、dbgen/orm 簇（SyncStructure/BlogCols）、reflection
+intrinsics（3 例）、收窄赋值检查（oracle 拒绝 `long l = xs.Sum()`，
+selfhost 存原位）、NativeMemory builtins、表达式位 Task.Spawn/Run。

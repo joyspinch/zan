@@ -4479,6 +4479,27 @@ partial class Ngen {
     // to instantiate, scoped by the caller (the receiver's own chain, or
     // the global bare-name rule for extension methods) so a same-named
     // method in an unrelated class is never hijacked.
+    // how many same-name GENERIC declarations exist: an overload family
+    // whose members differ only in parameter types (KeySelector vs
+    // StrKeySelector selectors) needs distinct spec symbols
+    int GenericOverloadCountNg(string name) {
+        List<int> cs = MethCandsName(name);
+        if (cs == null) { return 0; }
+        int n = 0;
+        int i = 0;
+        while (i < cs.Count) {
+            if (methStat[cs[i]] != 2 && methStat[cs[i]] != 3 && HasTypeParams(methNodes[cs[i]])) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // symbol-safe tag of a (substituted) type text for spec-name suffixes
+    string TySymTagNg(string t) {
+        if (t == null) { return ""; }
+        return t.Replace("<", ".").Replace(">", "").Replace(",", ".").Replace(" ", "");
+    }
+
     void SpecRegister(string name, List<string> args, Node callNode, int di) {
         bool open = false;
         int oi = 0;
@@ -4487,6 +4508,7 @@ partial class Ngen {
             oi = oi + 1;
         }
         if (open || di < 0) { return; }
+        Node decl = methNodes[di];
         string mangled = name + "$";
         int mj = 0;
         while (mj < args.Count) {
@@ -4494,7 +4516,22 @@ partial class Ngen {
             mangled = mangled + args[mj];
             mj = mj + 1;
         }
-        Node decl = methNodes[di];
+        // same-named generic overloads must not share one spec symbol:
+        // the first registered body would win every call site regardless
+        // of which overload each site resolved to
+        if (GenericOverloadCountNg(name) > 1) {
+            mangled = mangled + "_o";
+            List<string> dtps = DeclTps(decl);
+            int pk = 0;
+            while (pk < decl.kids.Count) {
+                Node pp = decl.kids[pk];
+                if (pp.kind == AK.Param() && pp.type != null) {
+                    string ptx = TypeFullName(pp.type);
+                    if (ptx != null) { mangled = mangled + TySymTagNg(SubstTy(ptx, dtps, args)); }
+                }
+                pk = pk + 1;
+            }
+        }
         if (IndexOfStrNg(specMeth, mangled) < 0) {
             List<string> tps = DeclTps(decl);
             Node spec = CloneNode(decl);
@@ -4718,16 +4755,48 @@ partial class Ngen {
         return false;
     }
 
+    // the receiver-scoped generic decl of `name` whose parameter count
+    // accepts the call's written arguments. Same-name generic OVERLOADS
+    // differ in arity -- Enumerable.Contains<T> has (this, T) and
+    // (this, T, EqualityComparer<T>) -- and the first match must not win
+    // blindly. The extension's `this` slot counts ONLY in instance form
+    // (`xs.Contains<T>(x)`): class-qualified (`Enumerable.Contains<T>(xs, x)`)
+    // and bare calls pass every parameter 1:1.
+    int OwnedGenericDeclArityNg(Node n, string name, int argc) {
+        bool extForm = n.a != null && n.a.kind == AK.MemberAccess()
+            && !(n.a.a != null && n.a.a.kind == AK.Ident() && FindClass(n.a.a.sval) != null);
+        string rc = SpecRecvClsNg(n);
+        while (rc != null) {
+            List<int> cs = MethCandsClsName(rc, name);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    int mi = cs[i];
+                    if (methStat[mi] != 2 && methStat[mi] != 3 && HasTypeParams(methNodes[mi])) {
+                        int extra = extForm && methNodes[mi].ival == 1 && methStat[mi] == 1 ? 1 : 0;
+                        if (ParamCount(methNodes[mi]) == argc + extra) { return mi; }
+                    }
+                    i = i + 1;
+                }
+            }
+            Cls oc = FindClass(rc);
+            rc = oc != null ? oc.baseName : null;
+        }
+        return -1;
+    }
+
     int inferDi;       // planned decl for the next inference registration
-    string inferArgTy; // planned inferred type argument
+    List<string> inferArgs; // planned inferred type arguments (per decl tp)
 
     string uniTp;    // the single type parameter being inferred
     string uniBind;  // its first binding, or null
 
     // one structural unification step against the inferred type parameter
     // (gen0's unify_method_tp): a bare type parameter binds (first binding
-    // wins); matching generic heads recurse into their type arguments, and
-    // array/nullable shapes unwrap before comparing
+    // wins); array/nullable shapes unwrap, then type arguments unify
+    // POSITIONALLY -- gen0 never compares generic head names, so a
+    // delegate-typed argument (`Conv<int,int>` for a `Selector<T,R>`
+    // parameter) binds through its argument list
     void UnifyMethodTp(string dp, string at) {
         if (dp == null || at == null || uniBind != null) { return; }
         if (dp == uniTp) { uniBind = at; return; }
@@ -4744,11 +4813,11 @@ partial class Ngen {
             at = at.Substring(0, at.Length - 1);
         }
         int lt = dp.IndexOf("<");
-        if (lt <= 0 || at.Length < lt + 2) { return; }
-        if (at.Substring(0, lt) != dp.Substring(0, lt)) { return; }
+        int la = at.IndexOf("<");
+        if (lt <= 0 || la <= 0) { return; }
         if (at.Substring(at.Length - 1, 1) != ">") { return; }
         List<string> dargs = SplitTyArgs(dp.Substring(lt + 1, dp.Length - lt - 2));
-        List<string> aargs = SplitTyArgs(at.Substring(lt + 1, at.Length - lt - 2));
+        List<string> aargs = SplitTyArgs(at.Substring(la + 1, at.Length - la - 2));
         int i = 0;
         while (i < dargs.Count && i < aargs.Count) {
             UnifyMethodTp(dargs[i], aargs[i]);
@@ -4808,8 +4877,9 @@ partial class Ngen {
     }
 
     // multi-type-parameter unification (gen0's unify_method_tp): a bare
-    // type parameter binds its argument (first binding wins); matching
-    // generic heads and array/nullable shapes recurse
+    // type parameter binds its argument (first binding wins); array/nullable
+    // shapes unwrap, then type arguments unify positionally (head names are
+    // never compared)
     void UnifyTps(string dp, string at, List<string> tps, List<string> bind) {
         if (dp == null || at == null) { return; }
         int ix = IndexOfStrNg(tps, dp);
@@ -4830,11 +4900,11 @@ partial class Ngen {
             at = at.Substring(0, at.Length - 1);
         }
         int lt = dp.IndexOf("<");
-        if (lt <= 0 || at.Length < lt + 2) { return; }
-        if (at.Substring(0, lt) != dp.Substring(0, lt)) { return; }
+        int la = at.IndexOf("<");
+        if (lt <= 0 || la <= 0) { return; }
         if (at.Substring(at.Length - 1, 1) != ">") { return; }
         List<string> dargs = SplitTyArgs(dp.Substring(lt + 1, dp.Length - lt - 2));
-        List<string> aargs = SplitTyArgs(at.Substring(lt + 1, at.Length - lt - 2));
+        List<string> aargs = SplitTyArgs(at.Substring(la + 1, at.Length - la - 2));
         int i = 0;
         while (i < dargs.Count && i < aargs.Count) {
             UnifyTps(dargs[i], aargs[i], tps, bind);
@@ -4860,6 +4930,67 @@ partial class Ngen {
                 || rt == "short" || rt == "ushort" || rt == "byte"
                 || rt == "sbyte" || rt == "char" || rt == "bool" || rt == "nint") { return 1; }
         return 0;
+    }
+
+    // lambda body's static type with the parameter typed from the
+    // candidate delegate's first parameter (`u => u.name` reads string
+    // only once `u` is User): push a temp local for the parameter, probe,
+    // pop it. Neither scan site has the lambda's parameter in scope -- the
+    // spec pre-pass walks bodies with a light locals table and call
+    // resolution runs before GenLambda registers anything.
+    string LambdaBodyTyNg(Node ae, string p0ty) {
+        Node body = ae.a;
+        if (body == null || ae.d != null || p0ty == null || p0ty == "") { return null; }
+        Node p = null;
+        int i = 0;
+        while (i < ae.kids.Count) {
+            if (ae.kids[i].kind == AK.Param()) { p = ae.kids[i]; }
+            i = i + 1;
+        }
+        if (p == null || p.sval == null) { return null; }
+        int savedN = nloc;
+        int savedHead = locHead;
+        AddLoc(p.sval, p0ty, false);
+        string ty = StaticTyOf(body);
+        nloc = savedN;
+        locHead = savedHead;
+        locName.RemoveAt(locName.Count - 1);
+        locTy.RemoveAt(locTy.Count - 1);
+        locOff.RemoveAt(locOff.Count - 1);
+        locRef.RemoveAt(locRef.Count - 1);
+        locDecl.RemoveAt(locDecl.Count - 1);
+        locPrev.RemoveAt(locPrev.Count - 1);
+        locOpaq.RemoveAt(locOpaq.Count - 1);
+        locBoxed.RemoveAt(locBoxed.Count - 1);
+        return ty;
+    }
+
+    int LamFamForNg(Node ae, string dlgTy) {
+        List<string> ps = DelegateArgsNg(dlgTy);
+        string p0 = ps != null && ps.Count > 0 ? ps[0] : null;
+        string ty = LambdaBodyTyNg(ae, p0);
+        if (ty != null) { return RetFamNg(ty); }
+        return LamFamNg(ae.a);
+    }
+
+    // does the method-group argument `ae` (a bare identifier naming a
+    // static method) fit delegate type sj: same parameter count and
+    // matching return family -- loose ranking evidence, not a binding
+    bool MethodGroupFitNg(Node ae, string sj) {
+        if (ae == null || ae.kind != AK.Ident() || ae.sval == null) { return false; }
+        List<int> cs = MethCandsName(ae.sval);
+        if (cs == null) { return false; }
+        List<string> dps = DelegateArgsNg(sj);
+        int want = dps != null ? dps.Count : 0;
+        int rf = RetFamNg(DelegateRetNg(sj));
+        int i = 0;
+        while (i < cs.Count) {
+            int mi = cs[i];
+            if (methStat[mi] == 1 && ParamCount(methNodes[mi]) == want
+                    && RetFamNg(TypeFullName(methNodes[mi].type)) == rf) { return true; }
+            i = i + 1;
+        }
+        return false;
     }
 
     int shapeMi;          // best shaped-extension candidate of the last scan
@@ -4900,11 +5031,20 @@ partial class Ngen {
                             Node ae = args[ai];
                             string at2 = null;
                             if (ae != null && ae.kind != AK.Lambda()) { at2 = StaticTyOf(ae); }
-                            if (at2 != null) {
-                                string dp2 = null;
-                                Node pp = ParamAt(m, j);
-                                if (pp != null && pp.type != null) { dp2 = TypeFullName(pp.type); }
-                                if (dp2 != null) { UnifyTps(dp2, at2, tps, bind); }
+                            if (at2 == null) { at2 = ArgNaturalTyNg(ae); }
+                            string dp2 = null;
+                            Node pp = ParamAt(m, j);
+                            if (pp != null && pp.type != null) { dp2 = TypeFullName(pp.type); }
+                            if (dp2 != null) {
+                                if (at2 != null) {
+                                    UnifyTps(dp2, at2, tps, bind);
+                                } else if (ae != null && ae.kind == AK.Lambda()) {
+                                    // a lambda pins the delegate's parameter
+                                    // positions from its explicit annotations
+                                    // and the return position from its typed
+                                    // body (Select<T,R>: R = body type)
+                                    LambdaBindNg(ae, dp2, tps, bind);
+                                }
                             }
                         }
                         j = j + 1;
@@ -4928,12 +5068,13 @@ partial class Ngen {
                                     if (ae2.kind == AK.Lambda()) {
                                         int rf = RetFamNg(DelegateRetNg(sj));
                                         if (rf != 0 && ae2.d == null && ae2.a != null
-                                                && rf == LamFamNg(ae2.a)) {
+                                                && rf == LamFamForNg(ae2, sj)) {
                                             score = score + 4;
                                         }
                                     } else {
                                         string atj = StaticTyOf(ae2);
                                         if (atj != null && atj == sj) { score = score + 8; }
+                                        else if (MethodGroupFitNg(ae2, sj)) { score = score + 4; }
                                     }
                                 }
                             }
@@ -5012,6 +5153,24 @@ partial class Ngen {
     // whole overload set before inferring type args, so `SumNum(src)` picks
     // the non-generic `SumNum(this List<double>)` over inferring the generic
     // one (whose extra key-selector parameter then arity-mismatches)
+    // does decl m's parameter types agree with the call's written argument
+    // types wherever an argument's static type is known (a known type that
+    // disagrees disqualifies the overload; unknown types prove nothing)
+    bool DeclParamsMatchArgs(Node m, Node call) {
+        int k = 0;
+        while (k < call.kids.Count && k < ParamCount(m)) {
+            string at = StaticTyOf(call.kids[k]);
+            if (at == null) { at = ExtRecvTy(call.kids[k]); }
+            Node pp = ParamAt(m, k);
+            if (at != null && pp != null && pp.type != null) {
+                string dp = TypeFullName(pp.type);
+                if (dp != null && dp != at && dp != "object") { return false; }
+            }
+            k = k + 1;
+        }
+        return true;
+    }
+
     bool NonGenericOverloadFits(Node n, bool owned) {
         List<int> cands = new List<int>();
         if (owned) {
@@ -5045,7 +5204,7 @@ partial class Ngen {
         int i2 = 0;
         while (i2 < cands.Count) {
             Node m = methNodes[cands[i2]];
-            if (ParamCount(m) == want) { return true; }
+            if (ParamCount(m) == want && DeclParamsMatchArgs(m, n)) { return true; }
             i2 = i2 + 1;
         }
         // instance-form extension: the receiver occupies the first slot, so
@@ -5081,17 +5240,112 @@ partial class Ngen {
     // extensions are left to the dispatchers below). Returns false when
     // nothing can be registered, so the caller's else-if chain keeps
     // falling through to the instantiated-class branches.
-    bool TryPlanInferenceSpecNg(Node n) {
-        int udi = OwnedGenericDeclNg(n, n.a.sval);
-        bool owned = udi >= 0;
-        if (!owned && n.a.kind == AK.MemberAccess() && !ReceiverHasNameNg(n, n.a.sval)) {
-            udi = FindGenericDecl(n.a.sval);
+    // gen0's lambda second pass: the delegate parameter `dp`
+    // ("Selector<T,R>") pins its PARAMETER positions from the lambda's
+    // explicit annotations and its RETURN position from the typed body
+    // (the lambda's parameters are temporarily in scope for the probe).
+    // `tps`/`bind` are the method's type parameters and partial bindings.
+    void LambdaBindNg(Node ae, string dp, List<string> tps, List<string> bind) {
+        if (ae == null || ae.kind != AK.Lambda() || ae.a == null || ae.d != null
+                || dp == null || dp.IndexOf("<") <= 0) { return; }
+        int lt = dp.IndexOf("<");
+        Node dd = layoutBinder.FindDelegate(dp.Substring(0, lt));
+        if (dd == null || dd.type == null) { return; }
+        List<string> dtps = DeclTps(dd);
+        List<string> dargs = SplitTyArgs(dp.Substring(lt + 1, dp.Length - lt - 2));
+        List<string> dpt = new List<string>();
+        int kd = 0;
+        while (kd < dd.kids.Count) {
+            if (dd.kids[kd].kind == AK.Param() && dd.kids[kd].type != null) {
+                dpt.Add(TypeFullName(dd.kids[kd].type));
+            }
+            kd = kd + 1;
         }
-        if (udi < 0) { return false; }
-        Node gd = methNodes[udi];
-        List<string> tps0 = DeclTps(gd);
-        if (tps0.Count != 1) { return false; }
-        if (NonGenericOverloadFits(n, owned)) { return false; }
+        if (dpt.Count == 0) { return; }
+        List<Node> lps = new List<Node>();
+        int li = 0;
+        while (li < ae.kids.Count) {
+            if (ae.kids[li].kind == AK.Param()) { lps.Add(ae.kids[li]); }
+            li = li + 1;
+        }
+        if (lps.Count != dpt.Count) { return; }
+        int savedN = nloc;
+        int savedHead = locHead;
+        bool known = true;
+        int pi = 0;
+        while (pi < lps.Count) {
+            Node lp = lps[pi];
+            string conc = SubstTy(SubstTy(dpt[pi], dtps, dargs), tps, bind);
+            if (lp.type != null && lp.type.sval != null && lp.type.sval != "var") {
+                string ann = TypeFullName(lp.type);
+                if (ann != null) {
+                    UnifyTps(dpt[pi], ann, tps, bind);
+                    conc = ann;
+                }
+            }
+            if (conc == null || !KnownTyName(conc)) { known = false; }
+            if (lp.sval != null) { AddLoc(lp.sval, conc, false); }
+            pi = pi + 1;
+        }
+        if (known) {
+            string bt = StaticTyOf(ae.a);
+            if (bt != null && KnownTyName(bt)) {
+                string rt2 = TypeFullName(dd.type);
+                if (rt2 != null) { UnifyTps(rt2, bt, tps, bind); }
+            }
+        }
+        int pop = lps.Count;
+        nloc = savedN;
+        locHead = savedHead;
+        while (pop > 0) {
+            locName.RemoveAt(locName.Count - 1);
+            locTy.RemoveAt(locTy.Count - 1);
+            locOff.RemoveAt(locOff.Count - 1);
+            locRef.RemoveAt(locRef.Count - 1);
+            locDecl.RemoveAt(locDecl.Count - 1);
+            locPrev.RemoveAt(locPrev.Count - 1);
+            locOpaq.RemoveAt(locOpaq.Count - 1);
+            locBoxed.RemoveAt(locBoxed.Count - 1);
+            pop = pop - 1;
+        }
+    }
+
+    bool TryPlanInferenceSpecNg(Node n) {
+        // the same-name generic overload set, receiver chain first. The
+        // oracle ranks the whole set before inferring; taking the first
+        // same-name generic hijacks delegate-typed overload families
+        List<int> cands = new List<int>();
+        string rc = SpecRecvClsNg(n);
+        bool inScope = false;
+        while (rc != null) {
+            List<int> cs = MethCandsClsName(rc, n.a.sval);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    int mi = cs[i];
+                    if (methStat[mi] != 2 && methStat[mi] != 3 && HasTypeParams(methNodes[mi])) {
+                        cands.Add(mi);
+                        inScope = true;
+                    }
+                    i = i + 1;
+                }
+            }
+            Cls oc = FindClass(rc);
+            rc = oc != null ? oc.baseName : null;
+        }
+        if (!inScope && n.a.kind == AK.MemberAccess() && !ReceiverHasNameNg(n, n.a.sval)) {
+            List<int> gs = MethCandsName(n.a.sval);
+            if (gs != null) {
+                int i = 0;
+                while (i < gs.Count) {
+                    int mi = gs[i];
+                    if (methStat[mi] != 2 && methStat[mi] != 3 && HasTypeParams(methNodes[mi])) { cands.Add(mi); }
+                    i = i + 1;
+                }
+            }
+        }
+        if (cands.Count == 0) { return false; }
+        if (NonGenericOverloadFits(n, inScope)) { return false; }
         // class-qualified statics (`Enumerable.SumNum(src)`) pass every
         // written argument to declared parameters 1:1. A genuine
         // instance-form extension (`xs.Sum()`) must not register here: the
@@ -5100,30 +5354,101 @@ partial class Ngen {
         // arity-mismatch against its own shaped `this` parameter
         bool classQual = n.a.kind == AK.MemberAccess() && n.a.a != null
             && n.a.a.kind == AK.Ident() && FindClass(n.a.a.sval) != null;
-        if (gd.ival == 1 && n.a.kind == AK.MemberAccess() && !classQual) { return false; }
-        uniTp = tps0[0];
-        uniBind = null;
+        int bestDi = -1;
+        List<string> bestBind = null;
+        int bestScore = -1;
+        int ci = 0;
+        while (ci < cands.Count) {
+            int udi = cands[ci];
+            Node gd = methNodes[udi];
+            List<string> tps0 = DeclTps(gd);
+            if (tps0.Count >= 1) {
+                bool instExt = gd.ival == 1 && n.a.kind == AK.MemberAccess() && !classQual;
+                if (!instExt) {
+                    List<string> bind = new List<string>();
+                    int bi = 0;
+                    while (bi < tps0.Count) { bind.Add(null); bi = bi + 1; }
+                    int pc = ParamCount(gd);
+                    int j = 0;
+                    while (j < pc) {
+                        Node ae = null;
+                        if (j < n.kids.Count) { ae = n.kids[j]; }
+                        if (ae != null) {
+                            string at = StaticTyOf(ae);
+                            if (at == null) { at = ExtRecvTy(ae); }
+                            if (at == null) { at = ArgNaturalTyNg(ae); }
+                            string dp = null;
+                            Node pp = ParamAt(gd, j);
+                            if (pp != null && pp.type != null) { dp = TypeFullName(pp.type); }
+                            if (dp != null) {
+                                if (at != null) {
+                                    UnifyTps(dp, at, tps0, bind);
+                                } else {
+                                    LambdaBindNg(ae, dp, tps0, bind);
+                                }
+                            }
+                        }
+                        j = j + 1;
+                    }
+                    bool full = true;
+                    int fi = 0;
+                    while (fi < bind.Count) {
+                        if (bind[fi] == null || !KnownTyName(bind[fi])) { full = false; }
+                        fi = fi + 1;
+                    }
+                    if (full) {
+                        int score = InferCandScoreNg(n, gd, bind);
+                        if (score > bestScore) { bestScore = score; bestDi = udi; bestBind = bind; }
+                    }
+                }
+            }
+            ci = ci + 1;
+        }
+        if (bestDi < 0) { return false; }
+        inferDi = bestDi;
+        inferArgs = bestBind;
+        return true;
+    }
+
+    // natural type of an argument the light scan cannot type: literals
+    // carry their C# natural type (Aggregate's `100` seed pins A=int)
+    string ArgNaturalTyNg(Node ae) {
+        if (ae == null) { return null; }
+        if (ae.kind == AK.IntLit()) { return "int"; }
+        if (ae.kind == AK.FloatLit()) { return "double"; }
+        if (ae.kind == AK.StringLit()) { return "string"; }
+        if (ae.kind == AK.CharLit()) { return "char"; }
+        if (ae.kind == AK.BoolLit()) { return "bool"; }
+        return null;
+    }
+
+    // substitution quality of a fully-bound inference candidate: exact
+    // argument/parameter matches dominate, lambda delegate-return family
+    // matches break ties (gen0 prefers the selector whose return type the
+    // lambda body actually produces)
+    int InferCandScoreNg(Node n, Node gd, List<string> bind) {
+        int score = 0;
+        List<string> tps = DeclTps(gd);
         int pc = ParamCount(gd);
         int j = 0;
         while (j < pc) {
             Node ae = null;
             if (j < n.kids.Count) { ae = n.kids[j]; }
-            if (ae != null) {
-                string at = StaticTyOf(ae);
-                if (at == null) { at = ExtRecvTy(ae); }
-                if (at != null) {
-                    string dp = null;
-                    Node pp = ParamAt(gd, j);
-                    if (pp != null && pp.type != null) { dp = TypeFullName(pp.type); }
-                    if (dp != null) { UnifyMethodTp(dp, at); }
+            Node pp = ParamAt(gd, j);
+            if (ae != null && pp != null && pp.type != null) {
+                string sj = SubstTy(TypeFullName(pp.type), tps, bind);
+                if (ae.kind == AK.Lambda()) {
+                    int rf = RetFamNg(DelegateRetNg(sj));
+                    if (rf != 0 && ae.d == null && ae.a != null && rf == LamFamForNg(ae, sj)) { score = score + 4; }
+                } else {
+                    string atj = StaticTyOf(ae);
+                    if (atj != null && atj == sj) { score = score + 8; }
+                    else if (MethodGroupFitNg(ae, sj)) { score = score + 4; }
                 }
             }
             j = j + 1;
         }
-        if (uniBind == null || !KnownTyName(uniBind)) { return false; }
-        inferDi = udi;
-        inferArgTy = uniBind;
-        return true;
+        return score;
     }
 
     void CollectSpecs(Node n) {
@@ -5164,24 +5489,37 @@ partial class Ngen {
             // methods: db.Query<T> lives in another class) -- a same-named
             // method in an unrelated class (Com.Get vs Control.Get<T>) must
             // never be hijacked by the bare-name match.
-            int odi = OwnedGenericDeclNg(n, name);
-            if (odi < 0 && !ReceiverHasNameNg(n, name)) { odi = FindGenericDecl(name); }
+            int odi = OwnedGenericDeclArityNg(n, name, n.kids.Count);
+            if (odi < 0 && !ReceiverHasNameNg(n, name)) {
+                bool extForm2 = n.a != null && n.a.kind == AK.MemberAccess()
+                    && !(n.a.a != null && n.a.a.kind == AK.Ident()
+                        && FindClass(n.a.a.sval) != null);
+                List<int> gcs = MethCandsName(name);
+                if (gcs != null) {
+                    int gi = 0;
+                    while (gi < gcs.Count) {
+                        int gmi = gcs[gi];
+                        if (methStat[gmi] != 2 && methStat[gmi] != 3 && HasTypeParams(methNodes[gmi])) {
+                            int extra = extForm2 && methNodes[gmi].ival == 1 && methStat[gmi] == 1 ? 1 : 0;
+                            if (ParamCount(methNodes[gmi]) == n.kids.Count + extra) { odi = gmi; break; }
+                        }
+                        gi = gi + 1;
+                    }
+                }
+            }
             SpecRegister(name, args, n, odi);
         } else if (n.kind == AK.Call() && n.a != null
                 && (n.a.kind == AK.Ident() || n.a.kind == AK.MemberAccess())
                 && (n.sval2 == null || n.sval2 == "")
                 && n.kids.Count > 0
                 && TryPlanInferenceSpecNg(n)) {
-            // un-annotated call: infer the single type parameter from the
-            // first argument (gen0's inference) -- but only when the
-            // receiver's own scope declares a single-type-param generic of
-            // that name; a same-named non-generic (JsonValue.Get(key),
-            // Com.Get) resolves normally, and calls that infer nothing must
-            // FALL THROUGH to the instantiated-class branches below (the
-            // old FindGenericDecl gate doubled as that filter).
-            List<string> iargs = new List<string>();
-            iargs.Add(inferArgTy);
-            SpecRegister(n.a.sval, iargs, n, inferDi);
+            // un-annotated call: infer the type parameters from the
+            // arguments (gen0's inference) -- but only when the receiver's
+            // own scope declares a generic of that name; a same-named
+            // non-generic (JsonValue.Get(key), Com.Get) resolves normally,
+            // and calls that infer nothing must FALL THROUGH to the
+            // instantiated-class branches below.
+            SpecRegister(n.a.sval, inferArgs, n, inferDi);
         } else if (n.a != null && n.a.kind == AK.MemberAccess() && n.a.a != null
                 && n.a.a.kind == AK.Ident() && n.a.sval2 != null && n.a.sval2 != "") {
             // qualified static call on an instantiated generic class:
