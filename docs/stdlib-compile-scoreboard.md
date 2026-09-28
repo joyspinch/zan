@@ -967,3 +967,38 @@ pull-in 引擎 39 文件，新编译器 50 文件，跨引擎对象对比不是�
 Task.Spawn/Run、merge_partials、package-store 解析；ncf 残余簇：
 tuples/patterns/nullable arrays（cs_b*）、web binding（5）、async 控制
 流（5）。
+
+## v18f（2026-09-29）— query 语法进 native 后端（419→420）
+
+**根因与修复**（commit 97c8192）：
+1. parser.zan：ParseQuery 不再产出 ngen 从未处理的 AK.QueryExpr(57) 节点，
+   改为解析期脱糖到 Enumerable 扩展链
+   （`from/where/orderby[ascending|descending,多键]/select` →
+   `.Where/.OrderBy*/.Select`；多键 orderby 按逆序逐键发射单键稳定排序，
+   复现 C# 主次序混合排序；恒等 select 省略 .Select，免去 R 推断）。
+2. main.zan：demand pull-in 镜像两类"文本里没有 Enumerable 类型名"的写法
+   —— 查询文本本身（`from X in`）与扩展形式的 DISTINCTIVE Enumerable
+   成员调用（PiLinqExtMethod：Where/Select/OrderBy... → reach
+   System/Linq + flag Enumerable）。超通用名（Count/All/Skip/
+   Contains...）刻意不镜像：kernel11 证明 pull 进 Enumerable 会追加同名
+   重载、挪移重载决议（`List<string>.Contains` 从 0/1 翻成 true/false，
+   对拍失败）。
+3. ngen.zan：InferExprTyNg 给关系/等值/逻辑运算命名 bool，LambdaBindNg
+   对 lambda 体回退到它 —— 无类型 lambda 体 `n * 2` 终于能绑定
+   Selector<T,R> 的 R（此前一切无类型 `.Select` 都是 unknown method；
+   只有带注解 lambda 或成员/索引/调用体走得到返回位）。
+
+**翻绿**：linq_query（ncf→pass，全量 sweep 419→420，零回归）。
+**验证**：linq 六例 + orm x3 定向全 pass；39/39 回归电池（中途真回归
+kernel11 被电池抓住并以上述镜像名单收敛修复）；全量 624 sweep。
+
+**已探明的 ngen 开放缺口**（linq_query_clauses 相关，本批未修）：
+lambda 内嵌套扩展调用、receiver 为外层 lambda 参数时解析失败
+（`unknown method 'Select'`，repro row4）；receiver 换成捕获局部变量则
+解析通过但 thunk 代码 SIGSEGV（repro row5）。clauses 批次因此改为
+脱糖到扁平 stdlib 扩展（With/JoinPairs/JoinInto/GroupBySel + QPair
+行类型），全程不产生嵌套 lambda。
+
+**下一批（v18g 候选）**：linq_query_clauses（let/join/group 脱糖 + 上述
+扁平扩展）、reflection intrinsics（3 例）、收窄赋值检查、NativeMemory
+builtins、表达式位 Task.Spawn/Run、merge_partials、package-store 解析。
