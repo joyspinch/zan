@@ -42,6 +42,24 @@ class Grouping<T> {
 }
 
 /// <summary>
+/// 查询表达式脱糖（let/join/join..into）的内部二元行载体：
+/// first 携带进入该子句的（或连接左侧的）元素，second 携带
+/// let 值（或连接右侧元素 / into 分组）。所有子句都落在扁平的
+/// 扩展链上，不产生嵌套 lambda。
+/// </summary>
+class QPair<A, B> {
+    /// <summary>左侧（或前序）元素。</summary>
+    public A first;
+    /// <summary>右侧元素 / let 值 / into 分组。</summary>
+    public B second;
+
+    public QPair(A a, B b) {
+        first = a;
+        second = b;
+    }
+}
+
+/// <summary>
 /// 对 List&lt;T&gt; 的类型化、即时求值的 LINQ 风格查询操作符。
 ///
 /// 操作符是扩展方法（`this List&lt;T&gt;` 接收者），可像 C# 一样链式调用；
@@ -849,6 +867,74 @@ class Enumerable {
             g.Items.Add(items[i]);
         }
         return groups;
+    }
+
+    /// <summary>let 子句的扁平脱糖：把每个元素和它的投影值
+    /// 组成一行（row.first = 元素，row.second = 值）。C# 的
+    /// let 是透明标识符，查询脱糖用 QPair 行承载它。</summary>
+    static List<QPair<T, V>> With<T, V>(this List<T> src, Selector<T, V> val) {
+        List<QPair<T, V>> rows = new List<QPair<T, V>>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            rows.Add(new QPair<T, V>(src[i], val(src[i])));
+        }
+        return rows;
+    }
+
+    /// <summary>join 子句的扁平脱糖：嵌套循环连接，外序优先、
+    /// 组内保持内序（与 C# Join 的枚举顺序一致）。键为整数。</summary>
+    static List<QPair<TO, TI>> JoinPairs<TO, TI>(this List<TO> outer, List<TI> inner,
+            KeySelector<TO> okey, KeySelector<TI> ikey) {
+        List<QPair<TO, TI>> rows = new List<QPair<TO, TI>>();
+        for (int i = 0; i < outer.Count; i = i + 1) {
+            for (int j = 0; j < inner.Count; j = j + 1) {
+                if (okey(outer[i]) == ikey(inner[j])) {
+                    rows.Add(new QPair<TO, TI>(outer[i], inner[j]));
+                }
+            }
+        }
+        return rows;
+    }
+
+    /// <summary>join .. into 子句的扁平脱糖：每个外层元素一行，
+    /// second 是匹配的内层元素组（空组也保留，与 C# 一致）。
+    /// 键为整数。</summary>
+    static List<QPair<TO, List<TI>>> JoinInto<TO, TI>(this List<TO> outer, List<TI> inner,
+            KeySelector<TO> okey, KeySelector<TI> ikey) {
+        List<QPair<TO, List<TI>>> rows = new List<QPair<TO, List<TI>>>();
+        for (int i = 0; i < outer.Count; i = i + 1) {
+            List<TI> grp = new List<TI>();
+            for (int j = 0; j < inner.Count; j = j + 1) {
+                if (okey(outer[i]) == ikey(inner[j])) { grp.Add(inner[j]); }
+            }
+            rows.Add(new QPair<TO, List<TI>>(outer[i], grp));
+        }
+        return rows;
+    }
+
+    /// <summary>group .. by 的投影分组（GroupByKeysInt 的
+    /// 选择器形式）：IntKey/Key 存整数键及其字符串形式，
+    /// Items 存投影元素，组按首次出现排序。</summary>
+    static List<Grouping<R>> GroupBySel<T, R>(this List<T> src, KeySelector<T> key,
+            Selector<T, R> elem) {
+        List<int> keys = new List<int>();
+        List<R> items = new List<R>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            keys.Add(key(src[i]));
+            items.Add(elem(src[i]));
+        }
+        return Enumerable.GroupByKeysInt<T, R>(src, keys, items);
+    }
+
+    /// <summary>group .. by 的投影分组（字符串键）。</summary>
+    static List<Grouping<R>> GroupBySelStr<T, R>(this List<T> src, StrKeySelector<T> key,
+            Selector<T, R> elem) {
+        List<string> keys = new List<string>();
+        List<R> items = new List<R>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            keys.Add(key(src[i]));
+            items.Add(elem(src[i]));
+        }
+        return Enumerable.GroupByKeysStr<T, R>(src, keys, items);
     }
 
     /// <summary>从 seed 开始把序列折叠进累加器。</summary>

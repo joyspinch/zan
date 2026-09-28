@@ -1002,3 +1002,37 @@ lambda 内嵌套扩展调用、receiver 为外层 lambda 参数时解析失败
 **下一批（v18g 候选）**：linq_query_clauses（let/join/group 脱糖 + 上述
 扁平扩展）、reflection intrinsics（3 例）、收窄赋值检查、NativeMemory
 builtins、表达式位 Task.Spawn/Run、merge_partials、package-store 解析。
+
+## v18g（2026-09-29）— query 子句补全（420→421）
+
+**设计**：linq_query_clauses 的 let/join/join..into/group..by 走"扁平
+脱糖"——全程不产生嵌套 lambda / 捕获（嵌套 lambda 的两个 ngen 缺口
+见 v18f 节，仍开放）。脱糖落在新增的 stdlib 扁平扩展上：
+1. stdlib Enumerable.zan：`QPair<A,B>`（first/second 行载体）+
+   `With`（let：元素+投影值成行）、`JoinPairs`（join：嵌套循环连接，
+   外序优先、组内保持内序，与 C# Join 枚举顺序一致）、`JoinInto`
+   （join..into：空组也保留）、`GroupBySel/GroupBySelStr`
+   （group..by：投影分组，复用 GroupByKeysInt/Str）。键为整数
+   （KeySelector 族）。
+2. parser.zan：ParseQuery 补全子句循环——`let d = e` → `.With(v => e)`
+   （行映射：旧名读 row.first、d 读 row.second；`QSubstVar` 先把旧访问
+   改写到新行变量上再包 .first——直接包旧访问会造出自引用行，join 后
+   的 `p.name` 因此报 unknown field）；`join y in inner on l equals r
+   [into g]` → `.JoinPairs/.JoinInto`；`group e by k [into g]` →
+   `.GroupBySel`（终结或 into 后接 select）；select 恒等省略不变；
+   QRewrite 把行映射代入后续子句体（嵌套 lambda 参数遮蔽映射名）。
+3. ngen.zan：LambdaBindNg 返回位绑定先经委托实参映射——`Selector<T,V>`
+   中委托自身返回型参 R 要先换成方法侧的 V 再统一；参数侧早有这层
+   替换，返回侧没有，凡委托型参与方法型参不同名的扩展都永远绑不满。
+4. main.zan：PiLinqExtMethod 增补五个行扩展名。
+
+**翻绿**：linq_query_clauses（ncf→pass，输出与 golden 逐字节一致，
+sweep 420→421）。**漂移**：http_client_keepalive mne→om —— 已归档的
+mqtt_lwt_retain 计时 flapper 家族（双侧计时敏感，非代码回归）。
+**验证**：39/39 回归电池；linq x7 + orm x3 定向全 pass；全量 624 sweep。
+
+**下一批候选**：reflection intrinsics（reflect_typeinfo/
+reflect_members/reflect_object_payload，3 例，需编译器发射类型记录——
+独立大批次）、收窄赋值检查、NativeMemory builtins、表达式位
+Task.Spawn/Run；ncf 残余簇：tuples/patterns/nullable（cs_b*）、
+web binding（6）、async 控制流（6）。
