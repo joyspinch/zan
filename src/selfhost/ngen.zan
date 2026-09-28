@@ -902,7 +902,21 @@ partial class Ngen {
         return s;
     }
 
-    // virtual-slot names of cls, base classes first; a derived
+    // vtable slot key of a method declaration: name + parameter type tags.
+    // Overloads occupy distinct slots (C# matches overrides by signature),
+    // so a virtual dispatch through one overload can never land in another
+    string SlotKeyNg(Node m) {
+        string s = m.sval;
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { s = s + "_" + TypeTagNg(p.type); }
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // virtual-slot keys of cls, base classes first; a derived
     // re-declaration of an inherited virtual keeps the base slot
     void CollectVSlotsNg(string cls, List<string> slots) {
         Cls c = FindClass(cls);
@@ -913,17 +927,17 @@ partial class Ngen {
         while (i < mine.Count) {
             int mi = mine[i];
             if (methStat[mi] == 0 && IsSlotMod(methNodes[mi])
-                    && IndexOfStrNg(slots, methNodes[mi].sval) < 0) { slots.Add(methNodes[mi].sval); }
+                    && IndexOfStrNg(slots, SlotKeyNg(methNodes[mi])) < 0) { slots.Add(SlotKeyNg(methNodes[mi])); }
             i = i + 1;
         }
     }
 
-    // slot index of `name` in the receiver's static class's vtable, or -1
-    // when the call is not virtual
-    int VSlotOf(string rc, string name) {
+    // slot index of method decl m in the receiver's static class's vtable,
+    // or -1 when the call is not virtual
+    int VSlotOf(string rc, Node m) {
         List<string> slots = new List<string>();
         CollectVSlotsNg(rc, slots);
-        return IndexOfStrNg(slots, name);
+        return IndexOfStrNg(slots, SlotKeyNg(m));
     }
 
     // instance-method candidates for a call on receiver class rc, derived
@@ -1079,16 +1093,17 @@ partial class Ngen {
         return best;
     }
 
-    string VSlotImplCls(string cls, string name) {
+    string VSlotImplCls(string cls, string key) {
         string cur = cls;
         while (cur != null) {
-            List<int> cs = MethCandsClsName(cur, name);
+            List<int> cs = MethCandsCls(cur);
             if (cs != null) {
                 int i = 0;
                 while (i < cs.Count) {
                     // an abstract declaration does not implement its own slot;
                     // the search continues down the chain to the concrete body
-                    if (methStat[cs[i]] == 0 && !HasMod(methNodes[cs[i]], MOD.Abstract())) { return cur; }
+                    if (methStat[cs[i]] == 0 && SlotKeyNg(methNodes[cs[i]]) == key
+                            && !HasMod(methNodes[cs[i]], MOD.Abstract())) { return cur; }
                     i = i + 1;
                 }
             }
@@ -1104,6 +1119,18 @@ partial class Ngen {
         int i = 0;
         while (i < cs.Count) {
             if (methStat[cs[i]] == 0) { return methNodes[cs[i]]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // the concrete instance declaration occupying a signature-keyed slot
+    Node FindInstanceInClsKey(string cls, string key) {
+        List<int> cs = MethCandsCls(cls);
+        if (cs == null) { return null; }
+        int i = 0;
+        while (i < cs.Count) {
+            if (methStat[cs[i]] == 0 && SlotKeyNg(methNodes[cs[i]]) == key) { return methNodes[cs[i]]; }
             i = i + 1;
         }
         return null;
@@ -4694,25 +4721,408 @@ partial class Ngen {
     int inferDi;       // planned decl for the next inference registration
     string inferArgTy; // planned inferred type argument
 
+    string uniTp;    // the single type parameter being inferred
+    string uniBind;  // its first binding, or null
+
+    // one structural unification step against the inferred type parameter
+    // (gen0's unify_method_tp): a bare type parameter binds (first binding
+    // wins); matching generic heads recurse into their type arguments, and
+    // array/nullable shapes unwrap before comparing
+    void UnifyMethodTp(string dp, string at) {
+        if (dp == null || at == null || uniBind != null) { return; }
+        if (dp == uniTp) { uniBind = at; return; }
+        while (dp.Length > 2 && at.Length > 2
+                && dp.Substring(dp.Length - 2, 2) == "[]"
+                && at.Substring(at.Length - 2, 2) == "[]") {
+            dp = dp.Substring(0, dp.Length - 2);
+            at = at.Substring(0, at.Length - 2);
+        }
+        if (dp.Length > 1 && at.Length > 1
+                && dp.Substring(dp.Length - 1, 1) == "?"
+                && at.Substring(at.Length - 1, 1) == "?") {
+            dp = dp.Substring(0, dp.Length - 1);
+            at = at.Substring(0, at.Length - 1);
+        }
+        int lt = dp.IndexOf("<");
+        if (lt <= 0 || at.Length < lt + 2) { return; }
+        if (at.Substring(0, lt) != dp.Substring(0, lt)) { return; }
+        if (at.Substring(at.Length - 1, 1) != ">") { return; }
+        List<string> dargs = SplitTyArgs(dp.Substring(lt + 1, dp.Length - lt - 2));
+        List<string> aargs = SplitTyArgs(at.Substring(lt + 1, at.Length - lt - 2));
+        int i = 0;
+        while (i < dargs.Count && i < aargs.Count) {
+            UnifyMethodTp(dargs[i], aargs[i]);
+            i = i + 1;
+        }
+    }
+
+    // the inline List<T> ops: names + arities the runtime helpers cover;
+    // everything else on a List receiver falls through to extension and
+    // spec dispatch
+    bool ListOpKnown(string name, int argc) {
+        if (name == "Insert") { return argc == 2; }
+        if (name == "Add" || name == "Contains" || name == "Remove"
+                || name == "RemoveAt" || name == "IndexOf" || name == "AddRange") { return argc == 1; }
+        if (name == "Clear" || name == "Reverse" || name == "ToArray") { return argc == 0; }
+        return false;
+    }
+
+    // the inline Dictionary ops
+    bool DictOpKnown(string name, int argc) {
+        if (name == "Add" || name == "TryGetValue") { return argc == 2; }
+        if (name == "ContainsKey" || name == "Remove") { return argc == 1; }
+        if (name == "Clear") { return argc == 0; }
+        return false;
+    }
+
+    // does ty (after unwrapping array/nullable shells) name tp, possibly
+    // nested inside type arguments?
+    bool TyMentionsTp(string ty, string tp) {
+        if (ty == null) { return false; }
+        while (ty.Length > 2 && ty.Substring(ty.Length - 2, 2) == "[]") {
+            ty = ty.Substring(0, ty.Length - 2);
+        }
+        if (ty.Length > 1 && ty.Substring(ty.Length - 1, 1) == "?") {
+            ty = ty.Substring(0, ty.Length - 1);
+        }
+        if (ty == tp) { return true; }
+        int lt = ty.IndexOf("<");
+        if (lt <= 0) { return false; }
+        List<string> args = SplitTyArgs(ty.Substring(lt + 1, ty.Length - lt - 2));
+        int i = 0;
+        while (i < args.Count) {
+            if (TyMentionsTp(args[i], tp)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    bool TyMentionsAnyTp(string ty, List<string> tps) {
+        if (ty == null) { return false; }
+        int i = 0;
+        while (i < tps.Count) {
+            if (TyMentionsTp(ty, tps[i])) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // multi-type-parameter unification (gen0's unify_method_tp): a bare
+    // type parameter binds its argument (first binding wins); matching
+    // generic heads and array/nullable shapes recurse
+    void UnifyTps(string dp, string at, List<string> tps, List<string> bind) {
+        if (dp == null || at == null) { return; }
+        int ix = IndexOfStrNg(tps, dp);
+        if (ix >= 0) {
+            if (bind[ix] == null) { bind[ix] = at; }
+            return;
+        }
+        while (dp.Length > 2 && at.Length > 2
+                && dp.Substring(dp.Length - 2, 2) == "[]"
+                && at.Substring(at.Length - 2, 2) == "[]") {
+            dp = dp.Substring(0, dp.Length - 2);
+            at = at.Substring(0, at.Length - 2);
+        }
+        if (dp.Length > 1 && at.Length > 1
+                && dp.Substring(dp.Length - 1, 1) == "?"
+                && at.Substring(at.Length - 1, 1) == "?") {
+            dp = dp.Substring(0, dp.Length - 1);
+            at = at.Substring(0, at.Length - 1);
+        }
+        int lt = dp.IndexOf("<");
+        if (lt <= 0 || at.Length < lt + 2) { return; }
+        if (at.Substring(0, lt) != dp.Substring(0, lt)) { return; }
+        if (at.Substring(at.Length - 1, 1) != ">") { return; }
+        List<string> dargs = SplitTyArgs(dp.Substring(lt + 1, dp.Length - lt - 2));
+        List<string> aargs = SplitTyArgs(at.Substring(lt + 1, at.Length - lt - 2));
+        int i = 0;
+        while (i < dargs.Count && i < aargs.Count) {
+            UnifyTps(dargs[i], aargs[i], tps, bind);
+            i = i + 1;
+        }
+    }
+
+    // rough expression families for lambda-arg overload scoring: gen0
+    // prefers the delegate whose return type matches the lambda body
+    // exactly over one needing a conversion (int selector vs double)
+    int LamFamNg(Node body) {
+        if (body == null) { return 0; }
+        if (IsStrExpr(body)) { return 2; }
+        if (IsDblExpr(body)) { return 3; }
+        return 1;
+    }
+
+    int RetFamNg(string rt) {
+        if (rt == null) { return 0; }
+        if (rt == "string") { return 2; }
+        if (rt == "double" || rt == "float") { return 3; }
+        if (rt == "int" || rt == "long" || rt == "ulong" || rt == "uint"
+                || rt == "short" || rt == "ushort" || rt == "byte"
+                || rt == "sbyte" || rt == "char" || rt == "bool" || rt == "nint") { return 1; }
+        return 0;
+    }
+
+    int shapeMi;          // best shaped-extension candidate of the last scan
+    List<string> shapeBind;
+    int shapeScore;
+
+    // scan same-name `this`-receiver generic statics for one whose shaped
+    // receiver (`this List<T>`) unifies with rt and whose type parameters
+    // bind completely from the receiver and the written arguments; the
+    // best-scoring candidate lands in shapeMi/shapeBind/shapeScore. No
+    // mutation -- both the dispatch rewrite and the ret-type lookup read
+    // the same scan.
+    void ScanShapedExtNg(string rt, string name, List<Node> args) {
+        shapeMi = -1;
+        shapeBind = null;
+        shapeScore = -1;
+        List<int> cs = MethCandsName(name);
+        if (cs == null) { return; }
+        int i = 0;
+        while (i < cs.Count) {
+            int mi = cs[i];
+            Node m = methNodes[mi];
+            List<string> tps = DeclTps(m);
+            if (methStat[mi] == 1 && m.ival == 1 && tps.Count > 0 && m.kids.Count > 0) {
+                Node p0 = ParamAt(m, 0);
+                string pt = p0 != null && p0.type != null ? TypeFullName(p0.type) : null;
+                // bare `this T` receivers belong to the plain extension path
+                if (pt != null && IndexOfStrNg(tps, pt) < 0 && TyMentionsAnyTp(pt, tps)) {
+                    List<string> bind = new List<string>();
+                    int bi = 0;
+                    while (bi < tps.Count) { bind.Add(null); bi = bi + 1; }
+                    UnifyTps(pt, rt, tps, bind);
+                    int pc = ParamCount(m);
+                    int j = 1;
+                    while (j < pc) {
+                        int ai = j - 1;
+                        if (ai < args.Count) {
+                            Node ae = args[ai];
+                            string at2 = null;
+                            if (ae != null && ae.kind != AK.Lambda()) { at2 = StaticTyOf(ae); }
+                            if (at2 != null) {
+                                string dp2 = null;
+                                Node pp = ParamAt(m, j);
+                                if (pp != null && pp.type != null) { dp2 = TypeFullName(pp.type); }
+                                if (dp2 != null) { UnifyTps(dp2, at2, tps, bind); }
+                            }
+                        }
+                        j = j + 1;
+                    }
+                    bool full = true;
+                    int bi2 = 0;
+                    while (bi2 < bind.Count) {
+                        if (bind[bi2] == null || !KnownTyName(bind[bi2])) { full = false; }
+                        bi2 = bi2 + 1;
+                    }
+                    if (full) {
+                        int score = SubstTy(pt, tps, bind) == rt ? 8 : 0;
+                        int j2 = 1;
+                        while (j2 < pc) {
+                            int ai2 = j2 - 1;
+                            if (ai2 < args.Count) {
+                                Node ae2 = args[ai2];
+                                Node pp2 = ParamAt(m, j2);
+                                if (ae2 != null && pp2 != null && pp2.type != null) {
+                                    string sj = SubstTy(TypeFullName(pp2.type), tps, bind);
+                                    if (ae2.kind == AK.Lambda()) {
+                                        int rf = RetFamNg(DelegateRetNg(sj));
+                                        if (rf != 0 && ae2.d == null && ae2.a != null
+                                                && rf == LamFamNg(ae2.a)) {
+                                            score = score + 4;
+                                        }
+                                    } else {
+                                        string atj = StaticTyOf(ae2);
+                                        if (atj != null && atj == sj) { score = score + 8; }
+                                    }
+                                }
+                            }
+                            j2 = j2 + 1;
+                        }
+                        if (score > shapeScore) {
+                            shapeScore = score;
+                            shapeMi = mi;
+                            shapeBind = bind;
+                        }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    // return type of an instance-form extension call (`xs.Sum()`) without
+    // mutating the call node: the receiver's static type against same-name
+    // `this` statics -- exact receiver-type fit first, then shaped generic
+    // receivers unified (the receiver binds declared parameter 0)
+    string ExtRetTyNg(Node e) {
+        if (e == null || e.a == null || e.a.kind != AK.MemberAccess()
+                || e.a.a == null) { return null; }
+        string rt = ExtRecvTy(e.a.a);
+        if (rt == null) { return null; }
+        string name = e.a.sval;
+        List<int> cs = MethCandsName(name);
+        if (cs != null) {
+            int i = 0;
+            while (i < cs.Count) {
+                int mi = cs[i];
+                Node m = methNodes[mi];
+                if (methStat[mi] == 1 && m.ival == 1 && m.kids.Count > 0
+                        && ParamCount(m) == e.kids.Count + 1) {
+                    Node p0 = ParamAt(m, 0);
+                    string pt = p0 != null && p0.type != null ? TypeFullName(p0.type) : null;
+                    if (pt != null && pt == rt) { return TypeFullName(m.type); }
+                }
+                i = i + 1;
+            }
+        }
+        ScanShapedExtNg(rt, name, e.kids);
+        if (shapeMi >= 0) {
+            Node m = methNodes[shapeMi];
+            return SubstTy(TypeFullName(m.type), DeclTps(m), shapeBind);
+        }
+        return null;
+    }
+
+    // dispatch twin of the scan: register the best shaped candidate, insert
+    // the receiver into the argument list and rewrite the callee
+    int ResolveShapedExtNg(Node recv, string name, Node callNode) {
+        string rt = ExtRecvTy(recv);
+        if (rt == null) { return -1; }
+        ScanShapedExtNg(rt, name, callNode.kids);
+        if (shapeMi < 0) { return -1; }
+        callNode.kids.Insert(0, recv);
+        SpecRegister(name, shapeBind, callNode, shapeMi);
+        Node ci = new Node(AK.Ident());
+        ci.sval = methCls[shapeMi];
+        ci.line = callNode.line;
+        ci.col = callNode.col;
+        Node ma2 = new Node(AK.MemberAccess());
+        ma2.a = ci;
+        ma2.sval = callNode.a.sval;      // mangled by SpecRegister
+        ma2.line = callNode.line;
+        ma2.col = callNode.col;
+        callNode.a = ma2;
+        int spx = FindMethByNameNg(ma2.sval);
+        return spx >= 0 ? spx : shapeMi;
+    }
+
+    // does a same-name NON-generic overload that fits the written argument
+    // count live in the scope the inference would draw from? gen0 ranks the
+    // whole overload set before inferring type args, so `SumNum(src)` picks
+    // the non-generic `SumNum(this List<double>)` over inferring the generic
+    // one (whose extra key-selector parameter then arity-mismatches)
+    bool NonGenericOverloadFits(Node n, bool owned) {
+        List<int> cands = new List<int>();
+        if (owned) {
+            string rc = SpecRecvClsNg(n);
+            while (rc != null) {
+                List<int> cs = MethCandsClsName(rc, n.a.sval);
+                if (cs != null) {
+                    int i = 0;
+                    while (i < cs.Count) {
+                        if (methStat[cs[i]] != 2 && methStat[cs[i]] != 3
+                                && !HasTypeParams(methNodes[cs[i]])) { cands.Add(cs[i]); }
+                        i = i + 1;
+                    }
+                }
+                Cls oc = FindClass(rc);
+                rc = oc != null ? oc.baseName : null;
+            }
+        } else {
+            List<int> gs = MethCandsName(n.a.sval);
+            if (gs != null) {
+                int i = 0;
+                while (i < gs.Count) {
+                    if (methStat[gs[i]] != 2 && methStat[gs[i]] != 3
+                            && !HasTypeParams(methNodes[gs[i]])) { cands.Add(gs[i]); }
+                    i = i + 1;
+                }
+            }
+        }
+        if (cands.Count == 0) { return false; }
+        int want = n.kids.Count;
+        int i2 = 0;
+        while (i2 < cands.Count) {
+            Node m = methNodes[cands[i2]];
+            if (ParamCount(m) == want) { return true; }
+            i2 = i2 + 1;
+        }
+        // instance-form extension: the receiver occupies the first slot, so
+        // a `this T` static with one more parameter than written arguments
+        // fits when its receiver type matches (ResolveExtNg's filter)
+        if (!owned && n.a.kind == AK.MemberAccess() && n.a.a != null
+                && !(n.a.a.kind == AK.Ident() && FindClass(n.a.a.sval) != null)) {
+            string rt = ExtRecvTy(n.a.a);
+            if (rt != null) {
+                int i3 = 0;
+                while (i3 < cands.Count) {
+                    Node m2 = methNodes[cands[i3]];
+                    if (methStat[cands[i3]] == 1 && m2.ival == 1
+                            && ParamCount(m2) == want + 1) {
+                        Node p0 = ParamAt(m2, 0);
+                        string pt = p0 != null && p0.type != null ? TypeFullName(p0.type) : null;
+                        if (pt == rt) { return true; }
+                    }
+                    i3 = i3 + 1;
+                }
+            }
+        }
+        return false;
+    }
+
     // plan an un-annotated generic call: the receiver's own scope must
     // declare a single-type-param generic of that name (extension
     // inference keeps the global rule when the chain names nothing) and
-    // the first argument's concrete type fills the parameter. Returns
-    // false when nothing can be registered, so the caller's else-if
-    // chain keeps falling through to the instantiated-class branches.
+    // the type parameters bind by unifying each declared parameter type
+    // against its actual argument type (gen0's infer_method_tp_bindings
+    // would bind an extension's receiver as parameter 0, but a pre-pass
+    // registration has no way to pass the receiver -- instance-form
+    // extensions are left to the dispatchers below). Returns false when
+    // nothing can be registered, so the caller's else-if chain keeps
+    // falling through to the instantiated-class branches.
     bool TryPlanInferenceSpecNg(Node n) {
         int udi = OwnedGenericDeclNg(n, n.a.sval);
-        if (udi < 0 && n.a.kind == AK.MemberAccess() && !ReceiverHasNameNg(n, n.a.sval)) {
+        bool owned = udi >= 0;
+        if (!owned && n.a.kind == AK.MemberAccess() && !ReceiverHasNameNg(n, n.a.sval)) {
             udi = FindGenericDecl(n.a.sval);
         }
         if (udi < 0) { return false; }
-        List<string> tps0 = DeclTps(methNodes[udi]);
+        Node gd = methNodes[udi];
+        List<string> tps0 = DeclTps(gd);
         if (tps0.Count != 1) { return false; }
-        string st = StaticTyOf(n.kids[0]);
-        if (st == null) { st = ExtRecvTy(n.kids[0]); }
-        if (st == null || !KnownTyName(st)) { return false; }
+        if (NonGenericOverloadFits(n, owned)) { return false; }
+        // class-qualified statics (`Enumerable.SumNum(src)`) pass every
+        // written argument to declared parameters 1:1. A genuine
+        // instance-form extension (`xs.Sum()`) must not register here: the
+        // dispatch's extension path inserts the receiver into the argument
+        // list, a pre-pass registration cannot, so the spec would
+        // arity-mismatch against its own shaped `this` parameter
+        bool classQual = n.a.kind == AK.MemberAccess() && n.a.a != null
+            && n.a.a.kind == AK.Ident() && FindClass(n.a.a.sval) != null;
+        if (gd.ival == 1 && n.a.kind == AK.MemberAccess() && !classQual) { return false; }
+        uniTp = tps0[0];
+        uniBind = null;
+        int pc = ParamCount(gd);
+        int j = 0;
+        while (j < pc) {
+            Node ae = null;
+            if (j < n.kids.Count) { ae = n.kids[j]; }
+            if (ae != null) {
+                string at = StaticTyOf(ae);
+                if (at == null) { at = ExtRecvTy(ae); }
+                if (at != null) {
+                    string dp = null;
+                    Node pp = ParamAt(gd, j);
+                    if (pp != null && pp.type != null) { dp = TypeFullName(pp.type); }
+                    if (dp != null) { UnifyMethodTp(dp, at); }
+                }
+            }
+            j = j + 1;
+        }
+        if (uniBind == null || !KnownTyName(uniBind)) { return false; }
         inferDi = udi;
-        inferArgTy = st;
+        inferArgTy = uniBind;
         return true;
     }
 
@@ -5788,10 +6198,12 @@ partial class Ngen {
                     && (e.a.a.sval == "string" || e.a.a.sval == "String")) {
                 return false;
             }
-            // gen0 lowers string/List Contains to a 0/1 int probe, so
-            // WriteLine renders it numerically (log_rolling_file golden
-            // prints 0/1, not true/false)
-            if (e.a.kind == AK.MemberAccess() && e.a.sval != null) {
+            // gen0 lowers STRING Contains to a 0/1 int probe, so WriteLine
+            // renders it numerically (log_rolling_file golden prints 0/1,
+            // not true/false); List.Contains keeps its declared bool and
+            // renders true/false
+            if (e.a.kind == AK.MemberAccess() && e.a.sval != null
+                    && e.a.a != null && IsStrExpr(e.a.a)) {
                 string cn9 = e.a.sval;
                 int d9 = cn9.IndexOf("$");
                 if (d9 > 0) { cn9 = cn9.Substring(0, d9); }
@@ -5938,6 +6350,14 @@ partial class Ngen {
                 int pick9 = ic.Count == 1 ? ic[0] : (ic.Count > 1 ? FitPickIdx(ic, e) : -1);
                 if (pick9 >= 0) { rty = TypeFullName(methNodes[pick9].type); }
             }
+        }
+        if (rty == null || rty == "") {
+            // instance-form extension calls (`xs.Sum()`) resolve through the
+            // extension machinery, not the receiver's (builtin) member table
+            // or the global name fallback -- gen0 types them from the
+            // resolved overload's declared return type
+            string ert = ExtRetTyNg(e);
+            if (ert != null && ert != "") { rty = ert; }
         }
         if (rty == null || rty == "") { rty = MethRetTy(e.a != null ? e.a.sval : null); }
         if (rty == null || rty == "") { return rty; }
@@ -6177,6 +6597,14 @@ partial class Ngen {
     }
 
     void GenCall(Node e) {
+        // the pre-pass scans original bodies only; a call inside a
+        // specialization body (the template's `SumNum<T>` after T bound to
+        // int) would otherwise resolve to the OPEN generic template, whose
+        // symbol is never emitted. The pre-pass's specMeth dedup makes the
+        // second pass safe on original bodies.
+        if (e.a != null && (e.a.kind == AK.Ident() || e.a.kind == AK.MemberAccess())) {
+            CollectSpecsInEnvNg(e);
+        }
         if (TryGenDelegateCall(e)) { return; }
         if (TryGenPackedSlice(e)) { return; }
         if (TryGenHostCall(e)) { return; }
@@ -6737,13 +7165,17 @@ partial class Ngen {
             // generic-spec registration rewrites the callee to its mangled
             // spec name ("Remove$string"); the inline List/Dict lowering
             // recognizes bare operation names, so strip the instantiation
-            // suffix before the dispatches below
+            // suffix ONLY for ops the inline lowering covers -- anything
+            // else keeps its spec name for the spec/extension dispatchers
             if (recv != null && callee.sval != null) {
                 int dlr = callee.sval.IndexOf("$");
                 if (dlr > 0) {
                     string lcls = ExprCls(recv);
-                    if (lcls == "List" || lcls == "Dict") {
-                        callee.sval = callee.sval.Substring(0, dlr);
+                    string bare = callee.sval.Substring(0, dlr);
+                    if (lcls == "List" && ListOpKnown(bare, e.kids.Count)) {
+                        callee.sval = bare;
+                    } else if (lcls == "Dict" && DictOpKnown(bare, e.kids.Count)) {
+                        callee.sval = bare;
                     }
                 }
             }
@@ -6814,12 +7246,16 @@ partial class Ngen {
                         ? "_zan_rt_list_toarray_f32" : "_zan_rt_list_toarray");
                     return;
                 }
-                diags.Error("ngen: unsupported List operation '" + callee.sval + "'", e.line, e.col);
-                return;
+                // not an inline List op: fall through to the host, spec and
+                // extension dispatchers (Enumerable.Sum(this List<double>)
+                // resolves by receiver fit; gen0's member lookup answers the
+                // same way)
             }
             // Dictionary<string, T> built-ins on a dict receiver: set/add,
-            // contains/remove/query/clear route to the runtime helpers
-            if (ExprCls(recv) == "Dict") {
+            // contains/remove/query/clear route to the runtime helpers.
+            // Unknown operations fall through to the extension dispatchers,
+            // so the gate checks the op name before any emission
+            if (ExprCls(recv) == "Dict" && DictOpKnown(callee.sval, e.kids.Count)) {
                 if (!DictCheckType(recv)) { return; }
                 if (e.kids.Count > 0) { DictCheckOperand(recv, e.kids[0], true); }
                 if (callee.sval == "Add" && e.kids.Count == 2) {
@@ -7007,7 +7443,19 @@ partial class Ngen {
             // instance path -- their receiver is passed separately.
             if (IndexOfStrNg(specMeth, callee.sval) >= 0) {
                 int prespec = FindMethByNameNg(callee.sval);
-                if (prespec >= 0 && methStat[prespec] == 1) { CallStaticNg(prespec, e); return; }
+                if (prespec >= 0 && methStat[prespec] == 1) {
+                    // an extension spec called in instance form takes the
+                    // receiver as its first argument -- the pre-pass cannot
+                    // insert it (class-qualified statics pass args 1:1)
+                    Node psd = methNodes[prespec];
+                    if (psd.ival == 1 && e.a != null && e.a.kind == AK.MemberAccess()
+                            && e.a.a != null
+                            && !(e.a.a.kind == AK.Ident() && FindClass(e.a.a.sval) != null)) {
+                        e.kids.Insert(0, e.a.a);
+                    }
+                    CallStaticNg(prespec, e);
+                    return;
+                }
             }
             // static call through the class name: Cls.Method(args) -- the
             // receiver names a user class and the member is one of its
@@ -7087,10 +7535,15 @@ partial class Ngen {
                     CallStaticNg(xi, e);
                     return;
                 }
+                // no exact-fit extension: a shaped generic extension
+                // (`Sum<T>(this List<T>, KeySelector<T>)`) may still bind by
+                // unifying the receiver against its declared `this` type
+                xi = ResolveShapedExtNg(recv, callee.sval, e);
+                if (xi >= 0) { CallStaticNg(xi, e); return; }
                 diags.Error("ngen: unknown method '" + callee.sval + "'", e.line, e.col);
                 return;
             }
-            int vslot = rc != null ? VSlotOf(rc, callee.sval) : -1;
+            int vslot = rc != null ? VSlotOf(rc, methNodes[mi]) : -1;
             GenExpr(recv);
             E4(0xF81F0FE0);                              // str x0, [sp, #-16]! (receiver)
             int pushed = PushCallArgs(methNodes[mi], e);

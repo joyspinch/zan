@@ -21,6 +21,56 @@ def normalized(data):
     return b'\n'.join(line.rstrip() for line in data.splitlines())
 
 
+def reference_dylibs(refexe):
+    """Dylibs the reference binary bound plus its rpath search dirs.
+
+    The reference resolves [DllImport] driver externs by linking the
+    stdlib's bundled driver dylibs (@rpath/... + LC_RPATH) and Homebrew
+    system deps. The native link must resolve the same externs the same
+    way -- dyld's dynamic_lookup only defers them to a fault at call
+    time. Returns (absolute dylib paths, LC_RPATH dirs); the link passes
+    the dylib paths (ld binds them by their @rpath install name) together
+    with -rpath flags so dyld can find them.
+    """
+    try:
+        out = subprocess.check_output(['otool', '-L', str(refexe)], text=True)
+        rp = subprocess.check_output(['otool', '-l', str(refexe)], text=True)
+    except (subprocess.CalledProcessError, OSError):
+        return [], []
+    rpaths = []
+    libs = []
+    lines = rp.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == 'cmd LC_RPATH':
+            # otool prints cmdsize (and sometimes more) before the path
+            for j in (i + 1, i + 2, i + 3):
+                if j >= len(lines):
+                    break
+                nxt = lines[j].strip()
+                if nxt.startswith('path '):
+                    rpaths.append(nxt[5:].split(' (')[0])
+                    break
+    for line in out.splitlines()[1:]:
+        name = line.strip().split(' (')[0].strip()
+        if not name or 'libSystem' in name:
+            continue
+        if name.startswith('@rpath/'):
+            rel = name[len('@rpath/'):]
+            for r in rpaths:
+                cand = Path(r) / rel
+                if cand.exists():
+                    libs.append(str(cand))
+                    break
+        elif name.startswith('/'):
+            libs.append(name)
+    seen, uniq = set(), []
+    for lib in libs:
+        if lib not in seen:
+            seen.add(lib)
+            uniq.append(lib)
+    return uniq, rpaths
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seed', required=True, type=Path)
@@ -92,18 +142,26 @@ def main():
                     if rc != 0:
                         status = 'native_compile_failed'
                     else:
+                        reflibs, refrpaths = reference_dylibs(refexe)
+                        rpath_args = [x for r in refrpaths for x in ('-rpath', r)]
                         rc, _ = run('native_link', ['/usr/bin/ld', '-arch', 'arm64', '-e', '_main',
-                            '-platform_version', 'macos', '11.0', version, '-syslibroot', sdk,
-                            '-L' + sdk + '/usr/lib',
-                            # DllImport externs the stdlib keeps referenced
-                            # (TLS wrappers) resolve via homebrew OpenSSL, as
-                            # the reference linker does; anything still left
-                            # over defers to dyld, so a called-but-unresolved
-                            # symbol faults exactly where a native library
-                            # would have been required.
-                            '-undefined', 'dynamic_lookup',
-                            *extra_libs,
-                            '-o', str(exe), str(obj), *map(str, runtime), '-lSystem'])
+                        '-platform_version', 'macos', '11.0', version, '-syslibroot', sdk,
+                        '-L' + sdk + '/usr/lib',
+                        # DllImport externs the stdlib keeps referenced
+                        # (TLS wrappers) resolve via homebrew OpenSSL, as
+                        # the reference linker does; anything still left
+                        # over defers to dyld, so a called-but-unresolved
+                        # symbol faults exactly where a native library
+                        # would have been required.
+                        '-undefined', 'dynamic_lookup',
+                        *extra_libs,
+                        # the reference's own DllImport driver dylibs
+                        # (@rpath/... resolved via its LC_RPATH) -- the
+                        # native object's identical externs must bind the
+                        # same dylibs instead of faulting in dyld
+                        *reflibs,
+                        *rpath_args,
+                        '-o', str(exe), str(obj), *map(str, runtime), '-lSystem'])
                         if rc != 0:
                             status = 'native_link_failed'
                         else:

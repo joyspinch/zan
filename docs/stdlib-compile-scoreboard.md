@@ -813,3 +813,51 @@ find stdlib -name '*.zan' | xargs -P 8 -n 1 /tmp/scoreboard/score7.sh > results.
 
 注意：bootstrap run 目录冻结创建时的 stdlib/ 拷贝，exe_dir/stdlib 优先于 cwd——
 用旧 run 目录验证 stdlib 行为会静默拉到旧库。
+
+## v18 批（2026-09-29）：gen0 对齐推断/扩展路由 + 重载虚表签名键
+
+**Sweep 380 → 400 pass**（ncf 100 → 76，零回归），formal bootstrap `run.dNvZTP`
+stage2.o == stage3.o 逐字节定点。三项修复：
+
+1. **AsyncStoreNg 赋值目标**（ngen_async.zan）：await 赋值的实例字段目标
+   放开为任意接收者表达式（StaticTyOf/FieldOf 解析，含 ThisExpr）；新增
+   Index 目标（数组元素写，沿用非 await 臂的越界守卫
+   `_zan_rt_guard_fail3`，按 esz 发 strb/strh/str/str）。
+2. **gen0 对齐的泛型推断与扩展路由**（ngen.zan，规范 =
+   irgen_expr.c:10954 unify_method_tp）：UnifyMethodTp 结构统一（先绑先赢）；
+   NonGenericOverloadFits 门槛（有贴合的非泛型重载时不做泛型推断——oracle
+   先排全集合再推断）；TryPlanInferenceSpecNg 重写（接收者作用域内的 owned
+   decl、实例化扩展跳过、类限定守卫、逐参数统一）；$-strip 仅对 List/Dict
+   接收者且操作名已知时生效，未知 List 操作落回扩展解析；GenCall 入口钩子
+   重扫 spec（spec 体内的 `Enumerable.SumNum<int>` 不再解析到开放泛型）；
+   ScanShapedExtNg/ResolveShapedExtNg（形变泛型扩展 Sum<T>(this List<T>,
+   KeySelector<T>) 按接收者统一 + 候选打分：接收者文本 +8 / 实参文本 +8 /
+   lambda 委托返回族 +4），ExtRetTyNg 供 CallRetTy（`Console.WriteLine(xs.Sum())`
+   正确按 double 渲染）；IsBoolExpr 的 Contains 豁免收窄到 string 接收者
+   （List.Contains 渲染 true/false，string.Contains 保持 0/1）。probe5 与
+   oracle 逐字节一致。
+3. **虚表槽按签名 key**（ngen.zan + ngen_obj.zan）：SlotKeyNg = 方法名 +
+   逐参数 TypeTagNg，CollectVSlotsNg / VSlotOf（改传贴合选中的 decl）/
+   VSlotImplCls / FindInstanceInClsKey / EmitVtInit 五处一致。**根因**：
+   SqliteConnection.Query(string) 与 Query(string, DbParams) 同名共享槽 0，
+   单参体里的 `Query(sql, new DbParams())`（IDbConnection 来源的虚调用）
+   经槽 0 派回自身，每层帧 alloc 一个 DbParams 直至栈溢出（崩溃报告：
+   SqliteConnection_Query___string ×N → DbParams_ctor → zan_rt_alloc）。
+   同时修掉"非虚重载共享虚名时被误虚分派"的潜在错误。
+
+**Harness**：native_parity.py 的 reference_dylibs() 用 otool -L + LC_RPATH
+镜像 oracle 的 DllImport 驱动绑定（@rpath dylib + -rpath），db/tls 驱动
+extern 在链接期与 reference 同方式落位。
+
+**chart_kinds_complete 全绿**：1670 错误（v16 基线）→ 0 错误，原生运行与
+golden 逐字节一致（ Gui 驱动 dylib 链接；双方 dylib 都缺的 15 个
+zan_gui_*/zan_dispatch_* extern 按.oracle 的 -undefined dynamic_lookup 延迟）。
+
+**新暴露簇（下一批目标）**：泛型重载集合排序 + spec 名去歧义 —— 仅委托
+类型不同的三个同名泛型重载（OrderBy<T> × KeySelector/StrKeySelector/
+NumKeySelector）都注册成 `OrderBy$User`（先注册者赢走所有调用点），且
+pre-pass 推断取第一个同名泛型而不按 lambda 返回族对集合打分；
+linq_csharp_overloads 同时踩中两者（byname=carol ≠ alice）。其余 ncf 簇
+不变：dbgen/orm（SyncStructure/BlogCols）、LINQ（6）、tuples/patterns/
+nullable arrays（cs_b*）、reflection（3）、web binding（5）、async 控制
+流（5）。

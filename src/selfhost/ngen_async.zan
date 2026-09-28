@@ -566,6 +566,12 @@ partial class Ngen {
                 StrU(0, 1, 0);
                 return;
             }
+        }
+        if (tgt.kind == AK.MemberAccess() && tgt.a != null) {
+            // instance field store, receiver any expression: `this.tls`,
+            // `conn.buf`, chains. StaticTyOf knows ThisExpr (the current
+            // class, instantiation via curMeth.sval2) so FieldOf resolves
+            // the same field the non-await assignment arm would.
             Fld f = FieldOf(tgt);
             if (f != null) {
                 E4(0xF81F0FE0);                      // push value
@@ -574,6 +580,50 @@ partial class Ngen {
                 StoreFieldNg(1, 0, f);
                 return;
             }
+        }
+        if (tgt.kind == AK.Index() && tgt.a != null && ArrContainerTy(tgt.a) != null) {
+            // array element store: same bounds rule and evaluation order as
+            // the non-await arm -- the await result is on the stack while
+            // container and index re-evaluate from reloaded slots
+            int esz = ArrElemSize(ArrContainerTy(tgt.a));
+            E4(0xF81F0FE0);                          // push value
+            GenExpr(tgt.a);
+            E4(0xF81F0FE0);                          // push arr
+            GenExpr(tgt.b);                          // x0 = idx
+            E4(0xF84107E1);                          // pop arr -> x1
+            E4(0xF84107E2);                          // pop value -> x2
+            E4(0xF85F0023);                          // ldur x3, [x1, #-16] (len)
+            int bad = NL();
+            int cont = NL();
+            E4(0xEB03001F);                          // cmp x0, x3
+            EmitBcond(10, bad);                      // b.ge bad
+            E4(0xEB1F001F);                          // cmp x0, xzr
+            EmitBcond(11, bad);                      // b.lt bad
+            EmitB(cont);
+            Mark(bad);
+            E4(0xF81F0FE1);                          // keep arr (guard clobbers x1)
+            E4(0xF81F0FE0);                          // keep idx
+            E4(0xF81F0FE2);                          // keep value
+            LoadSymRef("l_.str." + guardFileIdx, 0);
+            LoadImm(1, asg.line);
+            LoadImm(2, asg.col);
+            LoadSymRef("l_.str." + guardArrIdx, 3);
+            BLInternal("_zan_rt_guard_fail3");
+            E4(0xF84107E2);                          // pop value
+            E4(0xF84107E0);                          // pop idx
+            E4(0xF84107E1);                          // pop arr
+            LoadImm(0, 0);
+            Mark(cont);
+            if (esz == 1) {
+                E4(0x38206822);                      // strb w2, [x1, x0]
+            } else if (esz == 2) {
+                E4(0x78206822);                      // strh w2, [x1, x0]
+            } else if (esz == 4) {
+                E4(0xB8207822);                      // str w2, [x1, x0, lsl #2]
+            } else {
+                E4(0xF8207822);                      // str x2, [x1, x0, lsl #3]
+            }
+            return;
         }
         diags.Error("ngen: unsupported assignment target in an async method", asg.line, asg.col);
     }
