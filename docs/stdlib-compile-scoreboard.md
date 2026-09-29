@@ -1210,3 +1210,30 @@ async_csharp_task）；全量 624 sweep。
 **下一批候选**：async_csharp_task（`async Task<T>`/ValueTask<T> 方法声
 明糖 + Task 值的 Result/Wait/IsCompleted——cs_b15 共享后半）、cs_b*
 tuples/patterns/nullable、reflection intrinsics（独立大批次）。
+
+## v18l — async_csharp_task：Task 形接口 await 判定，async 阶段落幕（2026-09-29）
+
+**批次**：C# 拼法的接口成员不带 `async`（`Task<int> ComputeAsync(int a,
+int b);`），接口的抽象声明因此没有 async 修饰位，而具体覆写又不在接口
+自身的候选链上（静态类型是 IService，Service 挂在它**下方**，没有向下
+的查找图）——async_interface 里接口声明显式写了 `async int ...` 所以从
+未暴露。AsyncResolveCallNg 的实例判定改为：**无函数体且返回类型呈
+Task 形（Task / Task<T> / ValueTask<T>）的候选声明同样可 await**——C#
+里正是声明类型决定可等待性；vtable 派发不受影响（覆写的 ramp 填同一
+槽位，即 async_interface 已验证的机制）；返回 int 的普通接口成员照旧
+拒绝。修复前先探针确认：静态 `async Task<int>`/`ValueTask<int>` 的元素
+剥离与实例派发本来就好，缺口只有这一处判定。
+
+**数字**：sweep 503 → 507。async_csharp_task ncf→pass——**async 家族
+native 侧全绿**：12 例定向 pass + async_when_all（native 命中 golden，
+oracle 自己超时）。http_forwarder_stream rto→om：oracle 本轮跑完了，
+打出它的全 0 计数（直接验证过：其二进制 stream-status-200: 0、复跑挂
+死），native 侧打的是 golden——记录为 om，oracle 侧不修到不了 pass。
+async_landing_late_local / async_try_exit_depth 本轮落 pass（已知
+oracle 饿死摆针）；sdk_jd_client rto→pass、mysql_async_nonblocking
+om→rto、http_client_keepalive mne→em 计时摆动。**验证**：39/39 电池；
+阶段边界全量 624 sweep。
+
+**下一批候选**：cs_b* tuples/patterns/nullable（cs_b15 的 Task 值
+Result/Wait/IsCompleted 与本批同族）、reflection intrinsics（独立大批
+次）。

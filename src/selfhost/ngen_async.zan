@@ -116,6 +116,16 @@ partial class Ngen {
         return rt;
     }
 
+    // C#-spelling awaitability: a Task / Task<T> / ValueTask<T> return type
+    // (the interface spelling of an async method carries no `async`
+    // keyword -- the declared type is what makes it awaitable)
+    bool IsTaskShapedRetNg(Node m) {
+        string rt = m != null && m.type != null ? TypeFullName(m.type) : null;
+        if (rt == null) { return false; }
+        return rt == "Task" || rt.IndexOf("Task<") == 0
+                || rt.IndexOf("ValueTask<") == 0;
+    }
+
     // Hook C helper: the value type of `await <inner>`
     string AsyncAwaitElemTyNg(Node inner) {
         if (inner == null || inner.kind != AK.Call()) { return null; }
@@ -944,6 +954,29 @@ partial class Ngen {
         List<int> icands = new List<int>();
         InstanceCands(rc, name, icands);
         int im = icands.Count > 0 ? FitPickIdx(icands, call) : -1;
+        // C# spellings declare interface members without `async`
+        // (`Task<int> ComputeAsync(int a, int b);`), so the interface's
+        // abstract declaration carries no async mod even when every
+        // implementation is an async method (async_csharp_task); the
+        // concrete override is not on the interface's own chain either.
+        // The vtable dispatch is unaffected -- the override's ramp fills
+        // the same slot -- so a bodyless declaration with a Task-shaped
+        // return type is awaitable too (the declared type is what makes
+        // it awaitable in C#). Only the verdict reads these; the -2
+        // emission re-resolves on its own.
+        bool ifaceTask = false;
+        if (im >= 0 && !IsAsync(methNodes[im])) {
+            int ci2 = 0;
+            while (ci2 < icands.Count) {
+                Node cm = methNodes[icands[ci2]];
+                if (!HasMod(cm, MOD.Extern()) && !HasTypeParams(cm)
+                        && cm.d == null && IsTaskShapedRetNg(cm)) {
+                    ifaceTask = true;
+                    break;
+                }
+                ci2 = ci2 + 1;
+            }
+        }
         // The global name-only fallback is sound only for an implicit-this
         // call (rc == curCls): an explicit receiver (d.Add(k, v) on the
         // builtin Dict, List.Add, ...) must resolve on its own class chain.
@@ -956,7 +989,8 @@ partial class Ngen {
             return -1;
         }
         Node m = methNodes[im];
-        if (!IsAsync(m) || HasMod(m, MOD.Extern()) || HasTypeParams(m)) {
+        if ((!IsAsync(m) && !ifaceTask) || HasMod(m, MOD.Extern())
+                || HasTypeParams(m)) {
             asyncWhyNg = "inst-not-async im=" + Convert.ToString(im);
             return -1;
         }
