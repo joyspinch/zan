@@ -1036,3 +1036,53 @@ reflect_members/reflect_object_payload，3 例，需编译器发射类型记录�
 独立大批次）、收窄赋值检查、NativeMemory builtins、表达式位
 Task.Spawn/Run；ncf 残余簇：tuples/patterns/nullable（cs_b*）、
 web binding（6）、async 控制流（6）。
+
+## v18h — index 下标协议三例 + 参照重建（421 → 490）
+
+**批次**："unsupported index target" 三例（dict_view_chain、
+dict_remove_shared_prefix、operator_call_index）全部翻绿。ngen.zan
+四处修改：
+1. OpIndexFit 接受 indexer 协议的 static 拼写 `op_index(self, idx[,
+   val])`——self 参数须名 为被走 receiver 类，index/value 形参偏移 +1；
+   两种拼写的寄存器布局完全一致（x0 receiver、x1 index、x2 value），
+   发射端零改动。ArgParamScore 以 int 字面量→long 得 6、string→string
+   得 8 区分 CallableTable 的两个 op_index 重载。
+2. `d.Keys[i]`/`d.Values[i]`：新增 IsDictViewAccess（MemberAccess
+   Keys/Values、receiver 是 Dict——经 ExprCls 的 Call 臂，
+   `f.Make().Keys` 链同样成立）；Index 读复用 List 元素路径（成员读本就
+   落到 _zan_rt_dict_keys/_values 快照列表），ElemTyOf 回答 Dict 槽位
+   类型；`d.Keys.Count` 收编进同一 helper。
+3. TypeTagNg 追加 ival 数组层级——`f(int)` 与 `f(params int[])` 之前
+   混叠成同一符号（_CallableTable_op_call___CallableTable_int 定义两次，
+   ld 因重复 atom 断言崩溃）；标签在定义/调用两侧同一函数派生，自洽。
+4. CallRetTy 应用 op_call 协议：`E(args)`（E 为类实例）发射端改写成
+   `Cls.op_call(E, args)` 并按 FitPickIdx 择优，但类型模型无此臂——
+   `t("zan")` 类型为 null，WriteLine 把返回的 string 指针当整数打印
+   （5324699024）。现在 CallRetTy 解析同一合成调用、回答所选重载的声明
+   返回型；IsStrExpr/IsBoolExpr 均汇于 CallRetTy，一处修复全一致。
+
+**参照重建**：旧参照 zan-lang/build/zanc 是 Sep-13 二进制，早于
+packages 特性，119 例 ZANPKG_MISSING 无法编译。本批从当前 zan-lang
+源码 out-of-source 重建（cmake + homebrew LLVM；`-include ctype.h` 绕
+main.c 严格 C99 下 isalnum 隐式声明；仓库本身一字未动），部署在
+/tmp/v18h/ref/bin/zanc，旁置 exe 相对 stdlib（→ zan-lang/stdlib）与
+zanrt_*.o。seed 与参照分别锚定各自的 stdlib 树（FindStdlibRoot 的
+exe/../stdlib 优先于 parity 脚本的 cwd 符号链接），与生产布局一致。
+
+**数字**：sweep 421 → 490（+69）。旧 119 rcf 中 103 例解封：66 直达
+pass；22 rcf→ncf（chart_* 11 例、game_* 4 例、async_csharp_task、
+generic_iface_convert、null_forgiving、ternary_is_type、defer_test、
+app_update、sdk_wechat_* 2 例——这些 ngen 错误首次可见，是下一批的
+真实工作清单）；7 rcf→om（chart 布局、cast_string_object、
+sdk_jd_api）；4 rcf→em（dispatch_* 3 例、generic_deep_close）；
+4 rcf→mne。余 17 rcf 为 Gui 重型。reference_timeout 8 例（>60s 或
+网络型）。**回归共 6 例，全部参照侧**：namespace_qualified_call
+（当前 oracle 源码对嵌套类限定名 `Outer.Inner` 报错——Sep-13 二进制
+可编译，参照源码自身的回归，非我方）、http_bytes_redirect/
+http_server_stress om、http_client_redirect/ipv6/tdengine_pool rto
+（网络/计时 flapper）。**验证**：39/39 电池；events/delegates/dict/
+linq/generics/params_variadic 定向 19/19；全量 624 sweep。
+
+**下一批候选**：新解封的 ncf 清单里挑簇——chart_*（11 例，可能同
+根）、game_*（4 例）、cs_b* tuples/patterns/nullable、async 控制流；
+reflection intrinsics（3 例）仍留独立大批次。

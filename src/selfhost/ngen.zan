@@ -1068,15 +1068,27 @@ partial class Ngen {
                 int i = 0;
                 while (i < cs.Count) {
                     int mi = cs[i];
-                    if (methStat[mi] == 0) {
+                    if (methStat[mi] == 0 || methStat[mi] == 1) {
                         Node m = methNodes[mi];
-                        Node ip = ParamAt(m, 0);
+                        // the indexer protocol takes both spellings: an
+                        // instance op_index(idx[, val]) and a static
+                        // op_index(self, idx[, val]) -- the register layout
+                        // is identical either way (x0 receiver, x1 index,
+                        // x2 value), only the parameter offset shifts
+                        int ioff = 0;
+                        if (methStat[mi] == 1) {
+                            Node sp = ParamAt(m, 0);
+                            if (sp == null || sp.type == null
+                                    || TypeFullName(sp.type) != cur) { i = i + 1; continue; }
+                            ioff = 1;
+                        }
+                        Node ip = ParamAt(m, ioff);
                         if (ip == null || ip.type == null) { i = i + 1; continue; }
                         int s1 = ArgParamScore(idxExpr, TypeFullName(ip.type));
                         if (s1 <= -100) { i = i + 1; continue; }
                         int score = s1;
                         if (valExpr != null) {
-                            Node vp = ParamAt(m, 1);
+                            Node vp = ParamAt(m, ioff + 1);
                             if (vp == null || vp.type == null) { i = i + 1; continue; }
                             int s2 = ArgParamScore(valExpr, TypeFullName(vp.type));
                             if (s2 <= -100) { i = i + 1; continue; }
@@ -2602,8 +2614,7 @@ partial class Ngen {
             if (TryGenHostMember(e)) { return; }
             if (e.sval == "Count" && ExprCls(e.a) == "List") { GenListCount(e.a); }
             else if (e.sval == "Count" && ExprCls(e.a) == "Dict") { GenExpr(e.a); LdrU(0, 0, 0); }
-            else if (e.sval == "Count" && e.a != null && e.a.kind == AK.MemberAccess()
-                    && (e.a.sval == "Keys" || e.a.sval == "Values") && ExprCls(e.a.a) == "Dict") {
+            else if (e.sval == "Count" && IsDictViewAccess(e.a)) {
                 GenListCount(e.a);                       // d.Keys.Count / d.Values.Count
             }
             else if ((e.sval == "Keys" || e.sval == "Values") && ExprCls(e.a) == "Dict") {
@@ -3206,8 +3217,10 @@ partial class Ngen {
                 MovRR(1, 0);                         // x1 = key
                 E4(0xF84107E0);                      // pop dict -> x0
                 BLInternal("_zan_rt_dict_get");
-            } else if (ExprCls(e.a) == "List") {
+            } else if (ExprCls(e.a) == "List" || IsDictViewAccess(e.a)) {
                 // element get: data = obj+16, count = obj+0, 8-byte slots
+                // (a Dictionary Keys/Values snapshot view indexes the same
+                // way -- the member read already lowers to the snapshot list)
                 GenExpr(e.a);
                 E4(0xF81F0FE0);                      // push obj
                 GenExpr(e.b);
@@ -3937,6 +3950,9 @@ partial class Ngen {
                 int comma = inner.IndexOf(",");
                 el = comma >= 0 ? inner.Substring(comma + 1) : null;
             }
+        } else if (IsDictViewAccess(e.a)) {
+            // d.Keys[i] / d.Values[i]: the snapshot's element is the slot type
+            el = DictSlotTy(e.a.a, e.a.sval == "Keys");
         }
         if (el == null) {
             // an indexer's element type is the op_index method's declared
@@ -3951,6 +3967,14 @@ partial class Ngen {
     // "Dictionary<..."/"Dict<...": the builtin dict under either spelling
     bool IsDictTyName(string t) {
         return t != null && (t.IndexOf("Dictionary<") == 0 || t.IndexOf("Dict<") == 0);
+    }
+
+    // `d.Keys` / `d.Values` on a Dictionary expression: the snapshot-view
+    // access that indexes and counts exactly like a List
+    bool IsDictViewAccess(Node a) {
+        return a != null && a.kind == AK.MemberAccess()
+                && (a.sval == "Keys" || a.sval == "Values")
+                && a.a != null && ExprCls(a.a) == "Dict";
     }
 
     // normalize a declared type name to its class identity ("List<string>"
@@ -6633,6 +6657,30 @@ partial class Ngen {
             valTy = StaticTyOf(cc);
         }
         if (valTy != null && IsDelegateTyNg(valTy)) { return DelegateRetNg(valTy); }
+        // `E(args)` on a class instance dispatches the class's static
+        // op_call protocol (the emitter rewrites to Cls.op_call(E, args)
+        // and resolves by fit). The type model must answer with the SAME
+        // overload's declared return -- resolving the bare call by name
+        // finds nothing (the receiver is a local, not a class), consumers
+        // see "no type", and WriteLine prints the returned string pointer
+        // as an integer
+        if (valTy != null && e.a == cc && FindClass(valTy) != null
+                && e.kids != null && OpStaticSym(valTy, "op_call") != null) {
+            Node oma = new Node(AK.MemberAccess());
+            Node otn = new Node(AK.Ident());
+            otn.sval = valTy;
+            oma.a = otn;
+            oma.sval = "op_call";
+            Node osyn = new Node(AK.Call());
+            osyn.a = oma;
+            osyn.Add(cc);
+            int oki = 0;
+            while (oki < e.kids.Count) { osyn.Add(e.kids[oki]); oki = oki + 1; }
+            int oidx = ResolveStaticNg(osyn);
+            if (oidx >= 0 && methNodes[oidx].type != null) {
+                return TypeFullName(methNodes[oidx].type);
+            }
+        }
         string ht = HostCallRetTy(e);
         if (ht != null) { return ht; }
         string st = StringCallRetTy(e);
@@ -8599,6 +8647,10 @@ partial class Ngen {
         string s = t.sval;
         int i = 0;
         while (i < t.kids.Count) { s = s + "." + TypeTagNg(t.kids[i]); i = i + 1; }
+        // array levels ride in ival and must join the tag: `f(int)` and
+        // `f(params int[])` are distinct overloads sharing the element sval
+        int lv = t.ival;
+        while (lv > 0) { s = s + "[]"; lv = lv - 1; }
         return s;
     }
 
