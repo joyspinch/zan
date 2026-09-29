@@ -649,8 +649,8 @@ partial class Ngen {
             ty = ty + (lam.type != null ? TypeFullName(lam.type) : "int") + ">";
         }
         if (!CheckDelegateTyNg(ty, lam)) { return; }
-        if (lam.kids.Count != DelegateArityNg(ty) || HasTry(lam.d)) {
-            diags.Error("ngen delegate: lambda arity mismatch or unsupported try body", lam.line, lam.col); return;
+        if (lam.kids.Count != DelegateArityNg(ty)) {
+            diags.Error("ngen delegate: lambda arity mismatch", lam.line, lam.col); return;
         }
         Node m = new Node(AK.MethodDecl()); m.ival = -1;
         m.type = DelegateTypeNodeNg(DelegateRetNg(ty)); m.b = new Node(AK.Block());
@@ -802,6 +802,17 @@ partial class Ngen {
                 // inner lambda captured it ("v => { f = () => v; v = 33; }"):
                 // the same captured-and-rebound rule boxes the slot here
                 BoxLambdaWrittenLocalsNg(m.d);
+                // a lambda body may contain try/catch: the EH bookkeeping
+                // locals are seeded exactly as EmitMethod does for methods
+                curHasTry = HasTry(m.d);
+                if (curHasTry) {
+                    AddLoc("#ehtop", "int", false);
+                    AddLoc("#ehbase", "int", false);
+                    AddLoc("#ehbrk", "int", false);
+                    ehTopLocal = nloc - 3;
+                    ehBaseLocal = nloc - 2;
+                    ehBrkLocal = nloc - 1;
+                }
                 frame = 16 * nloc;
                 if (frame >= 4096) { diags.Error("ngen delegate: lambda frame exceeds native immediate limit", m.line, m.col); }
                 RtPrologue(); if (frame > 0) { AddSPImm(frame, false); }
@@ -814,6 +825,13 @@ partial class Ngen {
                         StoreLocal(i, 0);
                     }
                     i = i + 1;
+                }
+                if (curHasTry) {
+                    // start the top mirror exactly as EmitMethod does, or the
+                    // try arm arms its setjmp slot at a garbage index
+                    BLInternal("_zan_rt_eh_state");          // x0 = state
+                    LdrU(1, 0, 0);                           // top at entry
+                    StoreLocal(ehTopLocal, 1);
                 }
                 i = 0;
                 while (i < m.b.kids.Count) {

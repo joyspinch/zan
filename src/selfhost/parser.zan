@@ -756,7 +756,6 @@ class Parser {
         }
         QualifyTypes(unit);
         DesugarEvents(unit);
-        DesugarDispatchRt(unit);
         DesugarIterators(unit);
         StripTypeArgs(unit);
         return unit;
@@ -1204,17 +1203,10 @@ class Parser {
         if (n.kind == AK.Call() && n.a != null
                 && n.a.b != null && n.a.b.kind == AK.TypeRef()
                 && n.a.b.sval == "__typeargs") {
-            // record the explicit instantiation for ngen's monomorphizer:
-            // the args ride on the call's sval2 ("__"-joined) instead of a
-            // TypeRef the binder would trip over
-            string s = "";
-            int i = 0;
-            while (i < n.a.b.kids.Count) {
-                if (i > 0) { s = s + "__"; }
-                s = s + TypeName(n.a.b.kids[i]);
-                i = i + 1;
-            }
-            n.sval2 = s;
+            // record the explicit instantiation for ngen's monomorphizer on
+            // the call's d slot (TypeRef kids): sval2 is the named-argument
+            // marker, and a generic call used as an argument carries both
+            n.d = n.a.b;
             n.a.b = null;
         }
         if ((n.kind == AK.MemberAccess() || n.kind == AK.Ident())
@@ -1474,123 +1466,6 @@ class Parser {
         Node gu = gp.ParseUnit();
         int j = 0;
         while (j < gu.kids.Count) { unit.Add(gu.kids[j]); j = j + 1; }
-    }
-
-    // The UI-thread dispatch queue (`zan_dispatch_init/post/take` CRT entry
-    // points) has no native-lane implementation, so `[DllImport] extern`
-    // declarations targeting those symbols are rewritten into real forwarder
-    // methods over a generated `__DispatchQ` FIFO class (a static List of
-    // posted delegates). The declared signatures keep their delegate types,
-    // so call sites need no rewriting; extern ABI limits never apply.
-    void DesugarDispatchRt(Node unit) {
-        bool gen = false;
-        int di = 0;
-        while (di < unit.kids.Count) {
-            Node d = unit.kids[di];
-            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
-                int mi = 0;
-                while (mi < d.kids.Count) {
-                    Node m = d.kids[mi];
-                    if (m.kind == AK.MethodDecl() && HasModBit(m.mods, MOD.Extern())
-                            && m.sval2 != null && m.sval2.IndexOf("zan_dispatch_") == 0) {
-                        string op = m.sval2.Substring(13);
-                        int argc = 0;
-                        int ki = 0;
-                        Node arg0 = null;
-                        while (ki < m.kids.Count) {
-                            if (m.kids[ki].kind == AK.Param()) {
-                                argc = argc + 1;
-                                if (arg0 == null) { arg0 = m.kids[ki]; }
-                            }
-                            ki = ki + 1;
-                        }
-                        Node body = DispatchFwdBody(m, op, argc, arg0);
-                        if (body != null) {
-                            m.mods = m.mods - MOD.Extern();
-                            m.sval2 = "";
-                            m.d = body;
-                            gen = true;
-                        }
-                    }
-                    mi = mi + 1;
-                }
-            }
-            di = di + 1;
-        }
-        if (!gen) { return; }
-        int ui = 0;
-        while (ui < unit.kids.Count) {
-            Node u = unit.kids[ui];
-            if (u.kind == AK.ClassDecl() && u.sval == "__DispatchQ") { return; }
-            ui = ui + 1;
-        }
-        string src = "class __DispatchQ {\n";
-        src = src + "    static List<object> q;\n";
-        src = src + "    static void Init() {\n";
-        src = src + "        q = new List<object>();\n";
-        src = src + "    }\n";
-        src = src + "    static int Post(object h) {\n";
-        src = src + "        if (q == null) { q = new List<object>(); }\n";
-        src = src + "        q.Add(h);\n";
-        src = src + "        return 0;\n";
-        src = src + "    }\n";
-        src = src + "    static object Take() {\n";
-        src = src + "        if (q == null) { return null; }\n";
-        src = src + "        if (q.Count == 0) { return null; }\n";
-        src = src + "        object h = q[0];\n";
-        src = src + "        q.RemoveAt(0);\n";
-        src = src + "        return h;\n";
-        src = src + "    }\n";
-        src = src + "}\n";
-        Lexer dx = new Lexer(src);
-        List<Token> dt = dx.Run();
-        Parser dp = new Parser(dt, diags);
-        Node du = dp.ParseUnit();
-        int dj = 0;
-        while (dj < du.kids.Count) { unit.Add(du.kids[dj]); dj = dj + 1; }
-    }
-
-    // forwarder body for a dispatch entry point, or null when the shape does
-    // not fit the FIFO protocol (the extern declaration is then left for the
-    // backend to diagnose)
-    Node DispatchFwdBody(Node m, string op, int argc, Node arg0) {
-        if (op == "init" && argc == 0) {
-            Node blk = new Node(AK.Block());
-            Node es = new Node(AK.ExprStmt());
-            es.a = DispatchCall("Init", null);
-            blk.Add(es);
-            return blk;
-        }
-        if (op == "post" && argc == 1 && arg0 != null) {
-            Node id = new Node(AK.Ident());
-            id.sval = arg0.sval;
-            id.line = m.line; id.col = m.col;
-            Node blk2 = new Node(AK.Block());
-            Node ret = new Node(AK.ReturnStmt());
-            ret.a = DispatchCall("Post", id);
-            blk2.Add(ret);
-            return blk2;
-        }
-        if (op == "take" && argc == 0) {
-            Node blk3 = new Node(AK.Block());
-            Node ret2 = new Node(AK.ReturnStmt());
-            ret2.a = DispatchCall("Take", null);
-            blk3.Add(ret2);
-            return blk3;
-        }
-        return null;
-    }
-
-    Node DispatchCall(string meth, Node arg) {
-        Node ma = new Node(AK.MemberAccess());
-        Node t = new Node(AK.Ident());
-        t.sval = "__DispatchQ";
-        ma.a = t;
-        ma.sval = meth;
-        Node c = new Node(AK.Call());
-        c.a = ma;
-        if (arg != null) { c.Add(arg); }
-        return c;
     }
 
     // Merge `partial` type declarations: members (and base) of later parts are
@@ -2392,12 +2267,37 @@ class Parser {
     Node ParseBlock() {
         Node blk = new Node(AK.Block());
         Expect(TK.LBrace());
-        while (!At(TK.RBrace()) && !At(TK.Eof())) {
-            Node s = ParseStmt();
-            if (s != null) { blk.Add(s); }
-        }
+        ParseBlockStmtsDefer(blk);
         Expect(TK.RBrace());
         return blk;
+    }
+
+    // block statements with the contextual `defer` desugar (oracle parser.c
+    // parse_block_stmts): `defer D` turns the REST of the block into a try
+    // body whose finally holds D -- LIFO when several defers stack, and the
+    // deferred code runs on return/break/continue out of the tail too
+    void ParseBlockStmtsDefer(Node list) {
+        while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            if (K() == TK.Ident() && Cur().text == "defer") {
+                Next();
+                Node d = ParseStmt();
+                Node finBody = d;
+                if (finBody == null || finBody.kind != AK.Block()) {
+                    Node fb = new Node(AK.Block());
+                    if (d != null) { fb.Add(d); }
+                    finBody = fb;
+                }
+                Node tail = new Node(AK.Block());
+                ParseBlockStmtsDefer(tail);
+                Node tr = new Node(AK.TryStmt());
+                tr.a = tail;
+                tr.c = finBody;
+                list.Add(tr);
+                break;
+            }
+            Node s = ParseStmt();
+            if (s != null) { list.Add(s); }
+        }
     }
 
     // Stamp the start-of-construct source position onto nodes that would
@@ -3624,6 +3524,10 @@ class Parser {
                 Node pf = new Node(AK.PostfixUnary());
                 pf.op = op; pf.a = e; pf.line = e.line; pf.col = e.col;
                 e = pf;
+            } else if (k == TK.Bang()) {
+                // postfix null-forgiving `!` (C# parity): transparent to
+                // codegen and ARC -- the operand flows through unchanged
+                Next();
             } else {
                 return e;
             }

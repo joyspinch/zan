@@ -300,7 +300,33 @@ void *zan_eh_tls_state(void) {
     return zan_eh_tls;
 }
 
-static void *zan_thread_trampoline(void *arg) {
+/* Zan 方法体把 x19-x25 当作跨调用存活的工作寄存器（方法序言只保存
+ * x29/x30，Zan 世界内部自洽），但 POSIX 线程入口是 C→Zan 边界：
+ * libpthread 的 _pthread_start 在被调用者保存寄存器里放着线程自指针，
+ * 被工作线程 clobber 后 _pthread_exit 拿到代码地址当 self，
+ * 线程退出时在 self+0xa6 上 CAS 崩溃（dispatch_first_use 抓到）。
+ * oracle 的方法体全程用栈槽不触碰这些寄存器，因此不需要此屏障；
+ * 这层裸函数在任何 Zan 方法体外先存后取 x19-x28。 */
+extern void *zan_thread_trampoline_body(void *arg);
+__attribute__((naked)) void *zan_thread_trampoline(void *arg) {
+    __asm__ volatile(
+        "stp x19, x20, [sp, #-0x10]!\n"
+        "stp x21, x22, [sp, #-0x10]!\n"
+        "stp x23, x24, [sp, #-0x10]!\n"
+        "stp x25, x26, [sp, #-0x10]!\n"
+        "stp x27, x28, [sp, #-0x10]!\n"
+        "stp x29, x30, [sp, #-0x10]!\n"
+        "bl _zan_thread_trampoline_body\n"
+        "ldp x29, x30, [sp], #0x10\n"
+        "ldp x27, x28, [sp], #0x10\n"
+        "ldp x25, x26, [sp], #0x10\n"
+        "ldp x23, x24, [sp], #0x10\n"
+        "ldp x21, x22, [sp], #0x10\n"
+        "ldp x19, x20, [sp], #0x10\n"
+        "ret\n");
+}
+
+void *zan_thread_trampoline_body(void *arg) {
     void **closure = (void **)arg;
     void (*fn)(void *) = (void (*)(void *))closure[0];
     void *env = closure[1];
@@ -322,6 +348,81 @@ int64_t zan_thread_current_id(void) {
     uint64_t tid = 0;
     if (pthread_threadid_np(NULL, &tid) != 0) return 0;
     return (int64_t)tid;
+}
+
+/* ---- UI-thread dispatch queue (spec: oracle rt_sync.c zan_dispatch_*) ----
+ * The oracle ring retains a posted closure and releases on take/clear via the
+ * record's own dtor. Selfhost delegate values are interned process-lifetime
+ * blocks (_zan_dlg_intern) that never die, so entries move as plain pointers;
+ * all correctness lives in the OS mutex, which workers hit concurrently with
+ * the UI thread's drain. Post answers 1 on success -- callers branch on it. */
+#define ZAN_DISPATCH_CAP0 64
+#define ZAN_DISPATCH_CAP_MAX (1u << 20)
+static void *g_dispatch_static[ZAN_DISPATCH_CAP0];
+static void **g_dispatch_ring = g_dispatch_static;
+static int g_dispatch_cap = ZAN_DISPATCH_CAP0;
+static int g_dispatch_head = 0;
+static int g_dispatch_tail = 0;
+static pthread_mutex_t g_dispatch_mx = PTHREAD_MUTEX_INITIALIZER;
+
+void zan_dispatch_init(void) {
+    pthread_mutex_lock(&g_dispatch_mx);
+    g_dispatch_head = 0;
+    g_dispatch_tail = 0;
+    pthread_mutex_unlock(&g_dispatch_mx);
+}
+
+static int zan_dispatch_grow(void) {
+    if ((unsigned)g_dispatch_cap >= ZAN_DISPATCH_CAP_MAX) return 0;
+    int ncap = g_dispatch_cap * 2;
+    void **nring = (void **)malloc((size_t)ncap * sizeof *nring);
+    if (!nring) return 0;
+    int count = 0;
+    int i = g_dispatch_head;
+    while (i != g_dispatch_tail) {
+        nring[count++] = g_dispatch_ring[i];
+        i = (i + 1) % g_dispatch_cap;
+    }
+    if (g_dispatch_ring != g_dispatch_static) free(g_dispatch_ring);
+    g_dispatch_ring = nring;
+    g_dispatch_cap = ncap;
+    g_dispatch_head = 0;
+    g_dispatch_tail = count;
+    return 1;
+}
+
+int32_t zan_dispatch_post(void *fn) {
+    if (!fn) return 0;
+    int32_t ok = 0;
+    pthread_mutex_lock(&g_dispatch_mx);
+    int next = (g_dispatch_tail + 1) % g_dispatch_cap;
+    if (next == g_dispatch_head && zan_dispatch_grow())
+        next = (g_dispatch_tail + 1) % g_dispatch_cap;
+    if (next != g_dispatch_head) {
+        g_dispatch_ring[g_dispatch_tail] = fn;
+        g_dispatch_tail = next;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_dispatch_mx);
+    return ok;
+}
+
+void *zan_dispatch_take(void) {
+    void *fn = NULL;
+    pthread_mutex_lock(&g_dispatch_mx);
+    if (g_dispatch_head != g_dispatch_tail) {
+        fn = g_dispatch_ring[g_dispatch_head];
+        g_dispatch_head = (g_dispatch_head + 1) % g_dispatch_cap;
+    }
+    pthread_mutex_unlock(&g_dispatch_mx);
+    return fn;
+}
+
+void zan_dispatch_clear(void) {
+    pthread_mutex_lock(&g_dispatch_mx);
+    g_dispatch_head = 0;
+    g_dispatch_tail = 0;
+    pthread_mutex_unlock(&g_dispatch_mx);
 }
 
 /* ---- atomic int (spec: oracle rt_sync.c zan_atomic_int_*，C11 __atomic) ---- */

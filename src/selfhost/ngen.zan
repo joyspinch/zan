@@ -151,6 +151,8 @@ partial class Ngen {
     int finCur = -1;        // index of the finally body being emitted right now
     int lockSeq = 0;        // unique temp names for lowered lock statements
     List<int> cntL;         // innermost-enclosing-loop continue targets
+    List<string> gotoNames; // label names seen in the method being emitted
+    List<int> gotoIds;      // label id per name (created on first reference)
     bool curHasTry;         // method being emitted contains a try anywhere
     int ehTopLocal;         // #ehtop: mirror of the runtime EH top
     int ehBaseLocal;        // #ehbase: top at the outermost open try's arm
@@ -241,6 +243,8 @@ partial class Ngen {
         finBodies = new List<Node>();
         finInHandler = new List<int>();
         cntL = new List<int>();
+        gotoNames = new List<string>();
+        gotoIds = new List<int>();
         ehStack = new List<int>();
         brkLoop = new List<bool>();
         brkFinBase = new List<int>();
@@ -1521,6 +1525,8 @@ partial class Ngen {
     void EmitMethod(string cls, Node m, int mi) {
         curCls = cls;
         curMeth = m;
+        gotoNames.Clear();
+        gotoIds.Clear();
         bool inst = methStat[mi] == 0 || methStat[mi] == 2;
         if (methStat[mi] == 2) {
             // a per-instantiation ctor spec emits under its own symbol
@@ -2510,6 +2516,20 @@ partial class Ngen {
     }
 
     // ---- statements ----
+    // label id for `goto name` / `name:`: ids are created on first
+    // reference (forward gotos included) and reset per method
+    int GotoLabelId(string name) {
+        int i = 0;
+        while (i < gotoNames.Count) {
+            if (gotoNames[i] == name) { return gotoIds[i]; }
+            i = i + 1;
+        }
+        int id = NL();
+        gotoNames.Add(name);
+        gotoIds.Add(id);
+        return id;
+    }
+
     void GenStmt(Node s) {
         if (s == null) { return; }
         int saved = EnterEnvNg(s);
@@ -2573,6 +2593,10 @@ partial class Ngen {
             Node flat = FlatCompoundAssign(s.a);
             if (flat != null) { GenCompoundTemps(s.a); }
             GenExpr(flat != null ? flat : s.a);
+        } else if (k == AK.LabelStmt()) {
+            Mark(GotoLabelId(s.sval));
+        } else if (k == AK.GotoStmt()) {
+            EmitB(GotoLabelId(s.sval));
         } else if (k == AK.DeconDecl()) {
             GenDeconNg(s);
         } else if (k == AK.ReturnStmt()) {
@@ -4249,7 +4273,12 @@ partial class Ngen {
             int bi = e.op;
             while (bi < e.kids.Count) {
                 Node it = e.kids[bi];
-                if (it.kind == AK.Assignment() && it.a != null && it.a.kind == AK.Ident()) {
+                if (it.kind == AK.Assignment() && it.a != null && it.a.kind == AK.Ident()
+                        && it.b != null && it.b.kind == AK.NewExpr() && it.b.ival == 2
+                        && it.b.type == null) {
+                    // `member = { a, b }`: C# member collection initializer
+                    GenMemberCollInit(cls, it);
+                } else if (it.kind == AK.Assignment() && it.a != null && it.a.kind == AK.Ident()) {
                     Fld initFld = FindField(FindClass(cls), it.a.sval);
                     if (initFld == null) {
                         diags.Error("ngen: unknown field '" + it.a.sval + "' in initializer", it.line, it.col);
@@ -4272,6 +4301,102 @@ partial class Ngen {
             }
         }
         E4(0xF84107E0);                                  // ldr x0, [sp], #16 (obj)
+    }
+
+    // `member = { a, b }` inside an object initializer: read the member once
+    // off the object still on the stack (field load or getter-only property),
+    // then Add every item into it -- C# semantics: existing content survives
+    // and instances never share the collection. Dict members take flat
+    // key/value pairs.
+    void GenMemberCollInit(string cls, Node it) {
+        Cls fc = FindClass(cls);
+        Fld f = fc != null ? FindField(fc, it.a.sval) : null;
+        string getterSym = null;
+        string mty = null;
+        if (f != null) {
+            mty = f.ty;
+        } else {
+            Node g = fc != null ? AccessorInChain(cls, "get_" + it.a.sval) : null;
+            if (g == null) {
+                diags.Error("ngen: unknown member '" + it.a.sval
+                    + "' in collection initializer", it.line, it.col);
+                int di = 0;
+                while (di < it.b.kids.Count) { GenExpr(it.b.kids[di]); di = di + 1; }
+                return;
+            }
+            getterSym = MethSymNg(accOwnerCls, g);
+            mty = TypeFullName(g.type);
+        }
+        bool dict = mty != null && mty.IndexOf("Dict<") == 0;
+        // strip the declared generic: List<E> -> E, Dict<K,V> -> K / V
+        string args2 = "";
+        if (mty != null) {
+            int lt = mty.IndexOf("<");
+            if (lt > 0 && mty.Length - 1 > lt) {
+                args2 = mty.Substring(lt + 1, mty.Length - lt - 2);
+            }
+        }
+        string keyTy = args2;
+        string valTy = args2;
+        if (dict) {
+            int comma = args2.IndexOf(",");
+            if (comma > 0) {
+                keyTy = args2.Substring(0, comma);
+                valTy = args2.Substring(comma + 1, args2.Length - comma - 1);
+            }
+        } else {
+            valTy = args2;
+        }
+        // the member's collection reference, once: x0 = obj (peek) -> x0 = coll
+        E4(0xF84003E0);                                  // ldur x0, [sp] (obj)
+        if (f != null) {
+            LdrU(0, 0, f.off);
+        } else {
+            BLInternal(getterSym);                       // x0 = coll
+        }
+        E4(0xF81F0FE0);                                  // push coll (obj beneath)
+        int ii = 0;
+        while (ii < it.b.kids.Count) {
+            if (dict) {
+                if (ii + 1 >= it.b.kids.Count) {
+                    diags.Error("ngen: dictionary initializer needs key/value pairs", it.line, it.col);
+                    break;
+                }
+                GenExpr(it.b.kids[ii + 1]);              // value -> x0
+                CoerceCollElem(valTy, it.b.kids[ii + 1]);
+                E4(0xF81F0FE0);                          // push value
+                GenExpr(it.b.kids[ii]);                  // key -> x0
+                CoerceCollElem(keyTy, it.b.kids[ii]);
+                E4(0xF81F0FE0);                          // push key
+                // pushes are 16-byte cells (str x0, [sp, #-0x10]!): the
+                // stack is now [sp]=key, [sp+16]=value, [sp+32]=coll, with
+                // the peeked obj still beneath
+                RtLdur(0, 31, 32);                       // x0 = coll
+                E4(0xF81F0FE0);                          // push dict
+                RtDictSet3();                            // pops dict, key, value
+                ii = ii + 2;
+            } else {
+                GenExpr(it.b.kids[ii]);                  // item -> x0
+                CoerceCollElem(valTy, it.b.kids[ii]);
+                GenCloneIfStruct(it.b.kids[ii]);
+                MovRR(1, 0);                             // x1 = item
+                LdrU(0, 31, 0);                          // x0 = coll (peek)
+                ListAppendRaw();
+                ii = ii + 1;
+            }
+        }
+        AddSPImm(16, true);                              // pop coll (obj back on top)
+    }
+
+    // element coercion at a collection-initializer boundary, mirroring the
+    // inline List.Add rules (int slots widen, float slots round on the way in)
+    void CoerceCollElem(string ety, Node arg) {
+        if (ety == "double" && !IsDblExpr(arg)) { ConvI2D(); }
+        else if (ety == "int" && !IsDblExpr(arg) && !IsStrExpr(arg)) {
+            E4(0x93407C00);                              // sxtw x0, w0
+        } else if (ety == "float" && !IsStrExpr(arg)) {
+            NarrowF32();
+        }
     }
 
     // `new T[] { a, b, c }`: allocate with the element count, then store each
@@ -4565,7 +4690,10 @@ partial class Ngen {
                     && FindClass(e.a.sval) != null) {
                 return ClassTyOf(FindStaticTy(QualifiedCls(e.a.sval, e.sval2), e.sval));
             }
-            return null;
+            // property getter member (`obj.Prop` with no backing field):
+            // the accessor's declared return types the chain
+            // (`b.Tags.Count` needs ExprCls(b.Tags) == "List")
+            return ClassTyOf(PropGetterTy(e));
         }
         return null;
     }
@@ -5363,19 +5491,6 @@ partial class Ngen {
             n.a.sval = n.a.sval + "<" + Undunder(s2) + ">";
             n.sval2 = null;
             RegisterInstCls(n.a.sval);
-        }
-        if (n.kind == AK.Call() && n.sval2 != null && n.sval2 != "") {
-            // explicit instantiation args ride on sval2 ("__"-joined):
-            // substitute the same way so nested generic calls specialize
-            string s = n.sval2;
-            int i = 0;
-            while (i < tps.Count && i < args.Count) {
-                s = s.Replace("__" + tps[i], "__" + args[i])
-                      .Replace(tps[i] + "__", args[i] + "__");
-                if (s == tps[i]) { s = args[i]; }
-                i = i + 1;
-            }
-            n.sval2 = s;
         }
         int i2 = 0;
         while (i2 < n.kids.Count) { SubstTypeNode(n.kids[i2], tps, args); i2 = i2 + 1; }
@@ -6431,21 +6546,17 @@ partial class Ngen {
         }
         if (n.kind == AK.Call() && n.a != null
                 && (n.a.kind == AK.Ident() || n.a.kind == AK.MemberAccess())
-                && n.sval2 != null && n.sval2 != "") {
+                && n.d != null && n.d.kind == AK.TypeRef()
+                && n.d.sval == "__typeargs") {
             string name = n.a.sval;
             List<string> args = new List<string>();
-            // the parser pre-joins the explicit args with "__"
+            // the parser parked the explicit instantiation on the call's d
+            // slot as a TypeRef list
             int i = 0;
-            int start = 0;
-            string s2 = n.sval2;
-            while (i <= s2.Length - 2) {
-                if (s2.Substring(i, 2) == "__") {
-                    args.Add(s2.Substring(start, i - start));
-                    start = i + 2;
-                    i = i + 2;
-                } else { i = i + 1; }
+            while (i < n.d.kids.Count) {
+                args.Add(TypeFullName(n.d.kids[i]));
+                i = i + 1;
             }
-            args.Add(s2.Substring(start, s2.Length - start));
             // the receiver scopes the overload set: instantiate the generic
             // the receiver's own chain declares. Only when the chain names
             // nothing does the global bare-name rule apply (extension
@@ -6473,7 +6584,7 @@ partial class Ngen {
             SpecRegister(name, args, n, odi);
         } else if (n.kind == AK.Call() && n.a != null
                 && (n.a.kind == AK.Ident() || n.a.kind == AK.MemberAccess())
-                && (n.sval2 == null || n.sval2 == "")
+                && n.d == null
                 && n.kids.Count > 0
                 && TryPlanInferenceSpecNg(n)) {
             // un-annotated call: infer the type parameters from the
@@ -6491,7 +6602,7 @@ partial class Ngen {
             RegisterInstCls(cinst);
             SpecRegisterClass(cinst, n.a.sval, true, n);
         } else if (n.a != null && n.a.kind == AK.MemberAccess() && n.a.a != null
-                && (n.sval2 == null || n.sval2 == "")) {
+                && n.d == null) {
             // instance call on an instantiated generic receiver:
             // pc.Describe() with pc typed Pool<Conn>
             string rc = StaticTyOf(n.a.a);
