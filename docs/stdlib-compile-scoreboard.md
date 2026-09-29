@@ -1237,3 +1237,26 @@ om→rto、http_client_keepalive mne→em 计时摆动。**验证**：39/39 电�
 **下一批候选**：cs_b* tuples/patterns/nullable（cs_b15 的 Task 值
 Result/Wait/IsCompleted 与本批同族）、reflection intrinsics（独立大批
 次）。
+
+## v18m — cs_b18：无参构造的花括号对象初始化器（2026-09-29）
+
+**批次**：`new Point { X = 5, Y = 6 }` 打在只有双参构造的类上——ngen 的
+对象初始化器路径（ival==2：括号实参在前、字段写在后）只在类**完全没有**
+构造时才回退裸分配。改为：花括号独用形态（零括号实参 + 至少一个字段
+写）一律降为裸分配 + 成员写——即 reference 的形态（真 C# 要求无参构造，
+reference 不要求）；裸 `new C()` 在只有带参构造的类上照旧报错。与
+oracle 直接对拍 cs_b18_init ncf→pass；objinit_ctor_field_overwrite、
+record_types、cs_b16_keyvaluepair 不受影响；39/39 电池。
+
+**cs_b* 后续批次测绘**（已写入 baseline notes_v18m）：cs_b03 元组
+（表达式 kind 52）与 cs_b06 switch 表达式（kind 49）、cs_b19 的 `int?[]`
+在 oracle 里都是**多字聚合值**（LLVM struct：元组 map_tuple_struct、
+`T?` 为 {payload, i1}）——共同前置是 ngen 8 字节槽模型的多字值槽（局部、
+数组 ArrElemSize、save/reload）；cs_b08 集合表达式 `[1, 2]` 是 parser
+缺口（脱糖 new T[]{...}）；cs_b05 模式变量绑错声明；cs_b_opcall_params
+缺实参位的隐式 operator 转换；cs_b15（oracle 侧 rto）要 Task 值
+（.Wait/.Result/.IsCompleted 直读协程帧）。本轮为批中批次，全量 sweep
+留到 cs_b* 大批次阶段边界。
+
+**下一批候选**：cs_b* 大批次（多字值槽前置 + 上述五项）、reflection
+intrinsics（独立大批次）。
