@@ -301,6 +301,7 @@ partial class Ngen {
         MovRR(0, 9);
         AddImm(0, 0, 8);                             // x0 = &frame[1] (done)
         E4(0xF81F0FE9);                              // hold frame across the pump
+        LoadImm(1, 0);                               // mode 0: preempt on done
         BLInternal("_zan_co_sched_run_until");
         E4(0xF84107E9);                              // x9 = frame
         LdrU(2, 9, 48);                              // frame[6] (exc)
@@ -1782,6 +1783,7 @@ partial class Ngen {
         MovRR(0, 9);
         AddImm(0, 0, 8);                             // x0 = &frame[1] (done)
         E4(0xF81F0FE9);                              // hold sub across the pump
+        LoadImm(1, 0);                               // mode 0: preempt on done
         BLInternal("_zan_co_sched_run_until");       // pump until *this* is done
         E4(0xF84107E9);                              // x9 = sub
         AsyncSubExcCheckNg();
@@ -1934,16 +1936,28 @@ partial class Ngen {
         Mark(noStep);
         RtEpilogue();
 
-        // i64 _zan_co_sched_run_until(i64* done)
+        // i64 _zan_co_sched_run_until(i64* done, i64 mode)
         // When the ready queue drains with *done still clear: move every due
         // timer onto the queue and keep pumping; if none is due but timers
         // exist, sleep to the earliest deadline (rt_co.c's timer bridge /
         // zan_timer_next_timeout, irgen.c's timers_bb) and retry; with no
         // ready work, no timer and *done == 0 the reference exits too.
+        // mode (x1): 0 = preempt as soon as *done is seen (the await
+        // protocol and the async Main shim -- preserves the exact step
+        // interleaving the reference driver produces); 1 = quiesce: step
+        // every readied continuation and sleep out every pending timer
+        // before returning (Task.Wait/Task.Result -- the reference's own
+        // cs_b15 run shows the detached 20ms PrintLater printing between
+        // "t3 done=1" and the sum, i.e. its pump outlives the awaited
+        // frame's done flag until the timer queue empties).
         syms.Add(new Sym("_zan_co_sched_run_until", txt.Count));
         RtPrologue();
-        AddSPImm(16, false);
+        AddSPImm(32, false);
         StrU(0, 31, 0);                              // [sp] = done
+        StrU(1, 31, 8);                              // [sp+8] = mode (x1: 0 = preempt
+                                                     //  on *done (await/shim), 1 =
+                                                     //  quiesce (Task.Wait/Result));
+                                                     //  [sp+16] = timer-wait scratch
         int loopL = NL();
         int drained = NL();
         int stepL = NL();
@@ -1967,6 +1981,10 @@ partial class Ngen {
         StrU(2, 0, 0);                               // coq = 0
         StrU(2, 3, 0);                               // coqt = 0
         Mark(popped);
+        LdrU(3, 31, 8);                              // mode
+        CbnzReg(3, stepL);                           // quiesce: step every readied
+                                                     //  continuation regardless of
+                                                     //  the done flag
         LdrU(3, 31, 0);                              // done
         CbzReg(3, stepL);
         LdrU(3, 3, 0);
@@ -1977,6 +1995,9 @@ partial class Ngen {
         E4(0xD63F0020);                              // blr x1
         EmitB(loopL);
         Mark(drained);
+        LdrU(3, 31, 8);                              // mode
+        CbnzReg(3, notDone);                         // quiesce: keep going to the
+                                                     //  timer queue regardless
         LdrU(3, 31, 0);
         CbzReg(3, notDone);                          // null done: drain mode
         LdrU(3, 3, 0);
@@ -1985,12 +2006,12 @@ partial class Ngen {
         BLInternal("_zan_co_timers_due");            // x0 = due timers readied
         CbnzReg(0, loopL);
         BLInternal("_zan_co_timer_wait");            // x0 = ns to earliest / -1
-        StrU(0, 31, 8);                              // stash it ([sp+8] scratch)
+        StrU(0, 31, 16);                             // stash it ([sp+16] scratch)
         BLExtern("_zan_io_poll");                    // poll the parked io watchers
                                                      // (bounded by the timer wait):
                                                      // 1 = watchers exist, loop
         CbnzReg(0, loopL);
-        LdrU(0, 31, 8);                              // no watchers: timer sleep
+        LdrU(0, 31, 16);                             // no watchers: timer sleep
         E4(0xEB1F001F);                              // cmp x0, xzr
         EmitBcond(11, outL);                         // no timers: exit
         // cap each sleep at one second: a saturated (never-due) deadline
@@ -2013,7 +2034,7 @@ partial class Ngen {
         AddSPImm(32, true);
         EmitB(loopL);                                // retry: dispatch due timers
         Mark(outL);
-        AddSPImm(16, true);
+        AddSPImm(32, true);
         RtEpilogue();
 
         // _zan_co_after(i64 ms, i64 frame, i64 step): register a one-shot

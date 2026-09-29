@@ -2949,6 +2949,10 @@ partial class Ngen {
                 // EnumType.Member constant
                 LoadImm(0, enVal[FindEnumMemIdx(e.a.sval, e.sval)]);
             }
+            else if ((e.sval == "IsCompleted" || e.sval == "Result")
+                    && TaskTyOfNg(e.a) != null) {
+                GenTaskMemberRead(e);                    // property-style read
+            }
             else { GenFieldLoad(e); }
         } else if (k == AK.Binary() && e.op == TK.AmpAmp()) {
             // short-circuit AND: the right operand runs only when the left
@@ -4435,6 +4439,47 @@ partial class Ngen {
         E4(0xF84107E1);                                  // pop payload -> x1
     }
 
+    // the Task / Task<T> shape of an expression's static type, else null
+    string TaskTyOfNg(Node e) {
+        string t = StaticTyOf(e);
+        if (t != null && (t == "Task" || t.IndexOf("Task<") == 0)) { return t; }
+        return null;
+    }
+
+    // t.IsCompleted / t.Result property reads on a Task-typed value -- the
+    // same semantics as the call forms: the null frame of an inline-run
+    // Task.Run body is already done with result 0; Result pumps the driver
+    // until the frame completes, rethrows a captured exception, and reads
+    // frame+32
+    void GenTaskMemberRead(Node e) {
+        GenExpr(e.a);                                    // x0 = frame handle
+        int tnull = NL();
+        int tend = NL();
+        if (e.sval == "IsCompleted") {
+            CbzReg(0, tnull);
+            LdrU(0, 0, 8);                               // frame.done
+            E4(0xEB1F001F);                              // cmp x0, xzr
+            E4(0x9A9F07E0);                              // cset x0, ne
+            EmitB(tend);
+            Mark(tnull);
+            LoadImm(0, 1);                               // null frame: done
+            Mark(tend);
+            return;
+        }
+        CbzReg(0, tnull);
+        E4(0xF81F0FE0);                                  // frame stays live
+        AddImm(0, 0, 8);                                 // x0 = &frame.done
+        LoadImm(1, 1);                                   // mode 1: quiesce
+        BLInternal("_zan_co_sched_run_until");
+        E4(0xF84107E9);                                  // x9 = frame
+        AsyncSubExcCheckNg();                            // Result rethrows
+        LdrU(0, 9, 32);                                  // frame.result
+        EmitB(tend);
+        Mark(tnull);
+        LoadImm(0, 0);                                   // null frame: inline-run body, no result
+        Mark(tend);
+    }
+
     // the type test half of `x is T` with the value already in x0: x0 <- 1
     // when it is a T, 0 otherwise. GenSwitchExpr peeks its pushed scrutinee
     // through here so arms share GenIs's exact matching rule (gen0's rule:
@@ -4630,6 +4675,15 @@ partial class Ngen {
         if (e.kind == AK.AsExpr() && e.type != null) { return e.type.sval; }
         if (e.kind == AK.AwaitExpr()) { return AsyncAwaitElemTyNg(e.a); }
         if (e.kind == AK.TupleExpr()) { return TupleExprMangledNg(e); }
+        if (e.kind == AK.MemberAccess() && (e.sval == "IsCompleted" || e.sval == "Result")) {
+            string tt2 = StaticTyOf(e.a);
+            if (tt2 != null && (tt2 == "Task" || tt2.IndexOf("Task<") == 0)) {
+                if (e.sval == "IsCompleted") { return "int"; }
+                int lt2 = tt2.IndexOf("<");
+                if (lt2 > 0) { return tt2.Substring(lt2 + 1, tt2.Length - lt2 - 2); }
+                return "int";
+            }
+        }
         if (e.kind == AK.Ident()) { return NamedSlotTy(e.sval); }
         if (e.kind == AK.Call()) { return CallRetTy(e); }
         if (e.kind == AK.MemberAccess()) {
@@ -7545,6 +7599,49 @@ partial class Ngen {
         Node callee = e.a;
         if (callee != null && callee.kind == AK.MemberAccess()) {
             Node recv = callee.a;
+            // Task-value members: t.Wait() pumps the driver until the frame
+            // completes (and rethrows a captured exception, like Task.Wait);
+            // t.Result waits and reads frame+32; t.IsCompleted answers the
+            // done word. The null frame (an inline-run Task.Run body) is
+            // already done with no result.
+            if (recv != null) {
+                string rtt = StaticTyOf(recv);
+                if (rtt != null && (rtt == "Task" || rtt.IndexOf("Task<") == 0)
+                        && (callee.sval == "Wait" || callee.sval == "Result"
+                            || callee.sval == "IsCompleted")) {
+                    GenExpr(recv);                       // x0 = frame handle
+                    int tnull = NL();
+                    int tend = NL();
+                    if (callee.sval == "IsCompleted") {
+                        CbzReg(0, tnull);
+                        LdrU(0, 0, 8);                   // frame.done
+                        E4(0xEB1F001F);                  // cmp x0, xzr
+                        E4(0x9A9F07E0);                  // cset x0, ne
+                        EmitB(tend);
+                        Mark(tnull);
+                        LoadImm(0, 1);                   // null frame: done
+                        Mark(tend);
+                        return;
+                    }
+                    CbzReg(0, tnull);
+                    E4(0xF81F0FE0);                      // hold frame (receiver
+                                                         //  must evaluate once)
+                    AddImm(0, 0, 8);                     // x0 = &frame.done
+                    LoadImm(1, 1);                       // mode 1: quiesce
+                    BLInternal("_zan_co_sched_run_until");
+                    E4(0xF84107E9);                      // x9 = frame
+                    if (callee.sval == "Result") {
+                        AsyncSubExcCheckNg();            // Wait/Result rethrow
+                        LdrU(0, 9, 32);                  // frame.result
+                    }
+                    EmitB(tend);
+                    Mark(tnull);
+                    LoadImm(0, 0);                       // null frame: inline-run
+                                                         //  body, done, no result
+                    Mark(tend);
+                    return;
+                }
+            }
             // base.Method(args): invoke the nearest implementation above
             // curCls directly (nonvirtual) with `this` as the receiver
             if (recv != null && recv.kind == AK.Ident() && recv.sval == "base") {
@@ -7862,6 +7959,34 @@ partial class Ngen {
                     BLInternal("_zan_co_ready");
                     E4(0xF84107E0);                      // x0 = sub (the handle)
                     return;
+                }
+                // a delegate-shaped argument (a lambda, an anonymous
+                // delegate, an Action/Func variable) runs to completion
+                // INLINE -- the cooperative model: Run returns only after
+                // the body finishes, so Wait/IsCompleted read an
+                // already-done task. The handle is the null frame.
+                Node scall = new Node(AK.Call());
+                scall.a = spt;
+                scall.line = e.line; scall.col = e.col;
+                if (TryGenDelegateCall(scall)) {
+                    LoadImm(0, 0);
+                    return;
+                }
+                if (spt.kind == AK.Lambda()) {
+                    string ldt = StaticTyOf(spt);
+                    PrepareDelegateValue(spt, ldt != null && IsDelegateTyNg(ldt) ? ldt : "Action");
+                    if (TryGenDelegateExpr(spt)) {       // x0 = delegate value
+                        int dlive = NL();
+                        EmitCbnz(0, dlive);
+                        LoadImm(0, 1);
+                        BLExtern("_exit");               // null invocation fails closed
+                        Mark(dlive);
+                        LdrU(9, 0, 0);
+                        LdrU(0, 0, 8);
+                        E4(0xD63F0120);                  // blr x9
+                        LoadImm(0, 0);                   // null frame: done
+                        return;
+                    }
                 }
                 // not an async call: fall through so the normal call path
                 // fires its own diagnostic, like the reference
