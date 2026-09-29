@@ -136,6 +136,86 @@ class Program {
         return "stdlib";
     }
 
+    // ---- package stores (the C host's package.c + auto_include_namespace):
+    // a using namespace with no stdlib directory also reaches installed
+    // packages' source trees, scanned in the C host's store order ----
+    static string pkgProjectRoot;   // nearest zan.proj owner of the input
+    static string pkgExeStore;      // toolchain sibling packages/
+    static string pkgGlobalStore;   // ~/.local/share/zan/packages (or XDG)
+
+    static string PkgParentDir(string path) {
+        int last = -1;
+        int i = 0;
+        while (i < path.Length) {
+            if (path.Substring(i, 1) == "/") { last = i; }
+            i = i + 1;
+        }
+        if (last <= 0) { return "."; }
+        return path.Substring(0, last);
+    }
+
+    // walk up from the input file to the nearest zan.proj manifest,
+    // defaulting to the working directory (resolve_package_project_root)
+    static string ResolvePkgProjectRoot(string input) {
+        string dir = PkgParentDir(input);
+        for (;;) {
+            if (File.Exists(dir + "/zan.proj")) { return dir; }
+            string parent = PkgParentDir(dir);
+            if (parent == dir) { break; }
+            dir = parent;
+        }
+        return ".";
+    }
+
+    static void PiInitPkg(string firstInput) {
+        pkgProjectRoot = ResolvePkgProjectRoot(firstInput);
+        string exe = Environment.ExeDir();
+        pkgExeStore = exe + "/../packages";
+        string base0 = Environment.GetEnvironmentVariable("XDG_DATA_HOME");
+        if (base0 == null || base0.Length == 0) {
+            base0 = Environment.GetEnvironmentVariable("HOME");
+        }
+        if (base0 == null || base0.Length == 0) {
+            pkgGlobalStore = "";
+        } else {
+            pkgGlobalStore = base0 + "/.local/share/zan/packages";
+        }
+    }
+
+    // one store: every installed package providing the namespace directory
+    // (<pkg>/src/<ns>, then <pkg>/stdlib/<ns>, then flat <pkg>/<ns>)
+    static void PiGlobStore(PiDir d, string store) {
+        if (store == null || store.Length == 0) { return; }
+        string ents = Directory.ListNames(store + "/*");
+        int en = ents.Length;
+        int ei = 0;
+        string ecur = "";
+        while (ei <= en) {
+            string c = "";
+            if (ei < en) { c = ents.Substring(ei, 1); }
+            if (c == "\n" || ei == en) {
+                if (ecur.Length > 0 && ecur.Substring(0, 1) != ".") {
+                    string root = store + "/" + ecur;
+                    PiGlobFiles(d, root + "/src/" + d.subdir);
+                    PiGlobFiles(d, root + "/stdlib/" + d.subdir);
+                    PiGlobFiles(d, root + "/" + d.subdir);
+                }
+                ecur = "";
+            } else {
+                ecur = ecur + c;
+            }
+            ei = ei + 1;
+        }
+    }
+
+    // reach the namespace through every package store
+    static void PiGlobPkgs(PiDir d) {
+        PiGlobStore(d, pkgProjectRoot + "/packages");
+        PiGlobStore(d, pkgProjectRoot + "/.zan-packages");
+        PiGlobStore(d, pkgExeStore);
+        PiGlobStore(d, pkgGlobalStore);
+    }
+
     // ---- demand-driven pull-in state ----
     static List<PiName> piTable;   // hash buckets, null-filled
     static PiDir piDirs;
@@ -611,6 +691,19 @@ class Program {
             }
             ei = ei + 1;
         }
+        // installed packages providing this namespace (project stores,
+        // toolchain sibling, then the global user store; direct glob only,
+        // like the C host's package branch of auto_include_namespace)
+        PiGlobPkgs(d);
+    }
+
+    static bool PiDirHasFile(PiDir d, string path) {
+        int i = 0;
+        while (i < d.files.Count) {
+            if (d.files[i].path == path) { return true; }
+            i = i + 1;
+        }
+        return false;
     }
 
     static void PiGlobFiles(PiDir d, string dir) {
@@ -622,7 +715,10 @@ class Program {
             string c = "";
             if (i < n) { c = names.Substring(i, 1); }
             if (c == "\n" || i == n) {
-                if (cur != "") { d.files.Add(new PiFile(dir + "/" + cur)); }
+                if (cur != "") {
+                    string path = dir + "/" + cur;
+                    if (!PiDirHasFile(d, path)) { d.files.Add(new PiFile(path)); }
+                }
                 cur = "";
             } else {
                 cur = cur + c;
@@ -804,6 +900,7 @@ class Program {
             // live name or an extension-method host requires them, to a
             // fixpoint, before anything parses.
             stdlibRoot = FindStdlibRoot();
+            PiInitPkg(Environment.ArgAt(1));
             piDb = File.Exists("/tmp/zan_pullin_debug");
             PiInit();
             int pi = 0;

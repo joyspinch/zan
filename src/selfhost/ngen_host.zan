@@ -155,7 +155,18 @@ partial class Ngen {
         // ---- raw memory intrinsics (System.Runtime.InteropServices) ----
         if (HostStatic(e, "NativeMemory", "Alloc", 1)
                 || HostStatic(e, "NativeMemory", "Sha256", 2)
-                || HostStatic(e, "NativeMemory", "FindNotAnyOf", 4)) { return "long"; }
+                || HostStatic(e, "NativeMemory", "FindNotAnyOf", 4)
+                || HostStatic(e, "NativeMemory", "Load64", 2)
+                || HostStatic(e, "NativeMemory", "AsI64", 1)
+                || HostStatic(e, "NativeMemory", "ScanNotByte", 4)
+                || HostStatic(e, "NativeMemory", "ScanNotAnyOf", 4)) { return "long"; }
+        // AsF64 keeps the argument's bits; only the type model's spelling
+        // changes (both scalars ride x0 as raw patterns)
+        if (HostStatic(e, "NativeMemory", "AsF64", 1)) { return "double"; }
+        if (HostStatic(e, "NativeMemory", "Compare", 3)
+                || HostStatic(e, "NativeMemory", "Find", 4)) { return "int"; }
+        if (HostStatic(e, "NativeMemory", "Copy", 3)
+                || HostStatic(e, "NativeMemory", "Fill", 3)) { return "void"; }
         // Crc32 is typed by its stdlib extern decl (int) and CallStaticNg
         // skips the sext for it; no ret-ty arm here -- with the stdlib
         // pulled this gate never fires anyway.
@@ -983,6 +994,128 @@ partial class Ngen {
             Mark(clean);
             E4(0x92800000);                        // movn x0, #0 (-1)
             Mark(done2);
+            return true;
+        }
+        // Copy(dst, src, n) -> memmove (overlap-safe by contract)
+        if (HostStatic(e, "NativeMemory", "Copy", 3)) {
+            GenExpr(e.kids[0]); ExtPush(0);
+            GenExpr(e.kids[1]); ExtPush(0);
+            GenExpr(e.kids[2]); ExtPush(0);
+            ExtPop(2); ExtPop(1); ExtPop(0);
+            BLExtern("_memmove");
+            LoadImm(0, 0);
+            return true;
+        }
+        // Fill(p, v, n) -> memset; v contributes its low 8 bits
+        if (HostStatic(e, "NativeMemory", "Fill", 3)) {
+            GenExpr(e.kids[0]); ExtPush(0);
+            GenExpr(e.kids[1]); ExtPush(0);
+            GenExpr(e.kids[2]); ExtPush(0);
+            ExtPop(2); ExtPop(1); ExtPop(0);
+            BLExtern("_memset");
+            LoadImm(0, 0);
+            return true;
+        }
+        // Compare(a, b, n) -> memcmp; the sign is the result, so sext
+        if (HostStatic(e, "NativeMemory", "Compare", 3)) {
+            GenExpr(e.kids[0]); ExtPush(0);
+            GenExpr(e.kids[1]); ExtPush(0);
+            GenExpr(e.kids[2]); ExtPush(0);
+            ExtPop(2); ExtPop(1); ExtPop(0);
+            BLExtern("_memcmp");
+            E4(0x93407C00);                        // sxtw x0, w0
+            return true;
+        }
+        // Find(p, off, b, n) -> memchr(p + off, b, n) reported as an offset
+        // from p (resumable), or -1 when the byte is absent
+        if (HostStatic(e, "NativeMemory", "Find", 4)) {
+            GenExpr(e.kids[0]); ExtPush(0);
+            GenExpr(e.kids[1]); ExtPush(0);
+            GenExpr(e.kids[2]); ExtPush(0);
+            GenExpr(e.kids[3]); ExtPush(0);
+            ExtPop(3); ExtPop(2); ExtPop(1); ExtPop(0);
+            ExtPush(0);                            // keep p across the call
+            AddRR(0, 0, 1);                        // start = p + off
+            MovRR(1, 2);                           // x1 = b
+            MovRR(2, 3);                           // x2 = n
+            BLExtern("_memchr");                   // x0 = hit or 0
+            ExtPop(1);                             // x1 = p
+            int fHit = NL(); int fMiss = NL();
+            CbzReg(0, fMiss);
+            E4(0xCB010000);                        // sub x0, x0, x1 (hit - p)
+            EmitB(fHit);
+            Mark(fMiss);
+            E4(0x92800000);                        // movn x0, #0 (-1)
+            Mark(fHit);
+            return true;
+        }
+        // ScanNotAnyOf(p, off, acceptSet, n) -> strspn(p + off, accept),
+        // the leading run of accepted bytes clamped to the window
+        if (HostStatic(e, "NativeMemory", "ScanNotAnyOf", 4)) {
+            GenExpr(e.kids[0]); ExtPush(0);
+            GenExpr(e.kids[1]); ExtPush(0);
+            GenExpr(e.kids[2]); ExtPush(0);
+            GenExpr(e.kids[3]); ExtPush(0);
+            ExtPop(3); ExtPop(2); ExtPop(1); ExtPop(0);
+            AddRR(0, 0, 1);                        // start = p + off
+            MovRR(1, 2);                           // x1 = accept set
+            ExtPush(3);                            // keep n across the call
+            BLExtern("_strspn");                   // x0 = run (stops at NUL)
+            ExtPop(1);                             // x1 = n
+            ExtMov(2, 0);                          // x2 = run
+            E4(0xEB01005F);                        // cmp x2, x1 (unsigned)
+            int sOver = NL(); int sDone = NL();
+            EmitBcond(8, sOver);                   // b.hi run > n
+            EmitB(sDone);
+            Mark(sOver);
+            MovRR(0, 1);                           // clamp to n
+            Mark(sDone);
+            return true;
+        }
+        // ScanNotByte(p, off, b, n) -> strspn(p + off, {b, 0}); the 2-byte
+        // NUL-terminated set is built on the stack per call (b == 0 would
+        // make an empty set, which callers never do)
+        if (HostStatic(e, "NativeMemory", "ScanNotByte", 4)) {
+            GenExpr(e.kids[0]); ExtPush(0);
+            GenExpr(e.kids[1]); ExtPush(0);
+            GenExpr(e.kids[2]); ExtPush(0);
+            GenExpr(e.kids[3]); ExtPush(0);
+            ExtPop(3); ExtPop(2); ExtPop(1); ExtPop(0);
+            ExtPush(3);                            // keep n
+            AddRR(0, 0, 1);                        // start = p + off
+            ExtPush(0);                            // keep start
+            AddSPImm(16, false);                   // set buffer below sp
+            E4(0x390003E2);                        // strb w2, [sp]      (set[0] = b)
+            E4(0x390007FF);                        // strb wzr, [sp, #1] (set[1] = NUL)
+            AddImm(1, 31, 0);                      // x1 = &set
+            BLExtern("_strspn");                   // x0 = run
+            AddSPImm(16, true);                    // free the set
+            ExtPop(1);                             // x1 = start
+            ExtPop(2);                             // x2 = n
+            ExtMov(3, 0);                          // x3 = run
+            E4(0xEB02007F);                        // cmp x3, x2 (unsigned)
+            int bOver = NL(); int bDone = NL();
+            EmitBcond(8, bOver);                   // b.hi run > n
+            EmitB(bDone);
+            Mark(bOver);
+            MovRR(0, 2);                           // clamp to n
+            Mark(bDone);
+            return true;
+        }
+        // Load64(p, off) -> the unaligned 8-byte load at p + off (the SWAR
+        // primitive; callers own the bounds check)
+        if (HostStatic(e, "NativeMemory", "Load64", 2)) {
+            GenExpr(e.kids[0]); ExtPush(0);
+            GenExpr(e.kids[1]); ExtPop(1);
+            AddRR(0, 0, 1);                        // addr = p + off
+            LdrU(0, 0, 0);                         // *addr
+            return true;
+        }
+        // AsI64(d) / AsF64(v): pure bit reinterprets -- scalars already ride
+        // x0 as raw patterns, so only the ret spelling changes
+        if (HostStatic(e, "NativeMemory", "AsI64", 1)
+                || HostStatic(e, "NativeMemory", "AsF64", 1)) {
+            GenExpr(e.kids[0]);
             return true;
         }
         // ---- current working directory ----

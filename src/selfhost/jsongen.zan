@@ -28,6 +28,7 @@ class Jsongen {
     // field-kind classification (mirrors jg_fk_t)
     static int FkSkip() { return 0; }
     static int FkInt() { return 1; }
+    static int FkLong() { return 9; }
     static int FkFloat() { return 2; }
     static int FkBool() { return 3; }
     static int FkString() { return 4; }
@@ -35,6 +36,7 @@ class Jsongen {
     static int FkClass() { return 6; }
     static int FkJson() { return 7; }
     static int FkList() { return 8; }
+    static int FkList2() { return 10; }
 
     // Classify() side results for list element types.
     string elemName;
@@ -61,9 +63,12 @@ class Jsongen {
     }
 
     bool IsIntName(string n) {
-        return n == "int" || n == "long" || n == "short" || n == "byte"
-            || n == "sbyte" || n == "uint" || n == "ushort" || n == "ulong"
-            || n == "char";
+        return n == "int" || n == "short" || n == "byte"
+            || n == "sbyte" || n == "uint" || n == "ushort" || n == "char";
+    }
+
+    bool IsLongName(string n) {
+        return n == "long" || n == "ulong";
     }
 
     bool IsFloatName(string n) {
@@ -71,6 +76,7 @@ class Jsongen {
     }
 
     int ClassifyBase(string name) {
+        if (IsLongName(name)) { return Jsongen.FkLong(); }
         if (IsIntName(name)) { return Jsongen.FkInt(); }
         if (IsFloatName(name)) { return Jsongen.FkFloat(); }
         if (name == "bool") { return Jsongen.FkBool(); }
@@ -88,7 +94,23 @@ class Jsongen {
         if (tref.ival == 1) { return Jsongen.FkSkip(); } // arrays unsupported
         if (tref.sval == "List" && tref.kids.Count == 1) {
             Node ea = tref.kids[0];
-            if (ea == null || ea.kind != AK.TypeRef() || ea.ival == 1 || ea.kids.Count > 0) {
+            if (ea == null || ea.kind != AK.TypeRef() || ea.ival == 1) {
+                return Jsongen.FkSkip();
+            }
+            // nested List<List<elem>>: matrix fields (SDK response DTOs)
+            if (ea.sval == "List" && ea.kids.Count == 1) {
+                Node e2 = ea.kids[0];
+                if (e2 == null || e2.kind != AK.TypeRef() || e2.ival == 1
+                        || e2.kids.Count > 0) {
+                    return Jsongen.FkSkip();
+                }
+                int ik2 = ClassifyBase(e2.sval);
+                if (ik2 == Jsongen.FkSkip()) { return Jsongen.FkSkip(); }
+                elemName = e2.sval;
+                elemKind = ik2;
+                return Jsongen.FkList2();
+            }
+            if (ea.kids.Count > 0) {
                 return Jsongen.FkSkip();
             }
             int ek = ClassifyBase(ea.sval);
@@ -192,7 +214,7 @@ class Jsongen {
     // ---- per-class code generation ----
 
     string WriteScalar(int k, string item, string tname) {
-        if (k == Jsongen.FkInt() || k == Jsongen.FkFloat()) {
+        if (k == Jsongen.FkInt() || k == Jsongen.FkLong() || k == Jsongen.FkFloat()) {
             return "sb.Append(Convert.ToString(" + item + "));";
         }
         if (k == Jsongen.FkEnum()) {
@@ -212,7 +234,7 @@ class Jsongen {
     }
 
     string TreeScalar(int k, string item, string tname) {
-        if (k == Jsongen.FkInt() || k == Jsongen.FkFloat()) {
+        if (k == Jsongen.FkInt() || k == Jsongen.FkLong() || k == Jsongen.FkFloat()) {
             return "JsonValue.NewNum(Convert.ToString(" + item + "))";
         }
         if (k == Jsongen.FkEnum()) {
@@ -227,6 +249,9 @@ class Jsongen {
     string BindElem(int k, string item, string tname) {
         if (k == Jsongen.FkInt()) {
             return "(" + tname + ")" + item + ".AsInt(0)";
+        }
+        if (k == Jsongen.FkLong()) {
+            return "(" + tname + ")" + item + ".AsLong(0)";
         }
         if (k == Jsongen.FkEnum()) {
             // enum casts are not parseable; int -> enum is implicit
@@ -275,7 +300,8 @@ class Jsongen {
                 continue;
             }
             if (fk == Jsongen.FkClass()) { NeedAdd(tname); }
-            if (fk == Jsongen.FkList() && ek == Jsongen.FkClass()) { NeedAdd(en); }
+            if ((fk == Jsongen.FkList() || fk == Jsongen.FkList2())
+                    && ek == Jsongen.FkClass()) { NeedAdd(en); }
 
             if (mode == 2) {
                 string comma = "";
@@ -295,12 +321,36 @@ class Jsongen {
                     s = s + "            }\n";
                     s = s + "        }\n";
                     s = s + "        sb.Append(\"]\");\n";
+                } else if (fk == Jsongen.FkList2()) {
+                    string item = "o." + f + "[i_" + f + "][k_" + f + "]";
+                    string wr = WriteScalar(ek, item, en);
+                    s = s + "        sb.Append(\"[\");\n";
+                    s = s + "        if (o." + f + " != null) {\n";
+                    s = s + "            int i_" + f + " = 0;\n";
+                    s = s + "            while (i_" + f + " < o." + f + ".Count) {\n";
+                    s = s + "                if (i_" + f + " > 0) { sb.Append(\",\"); }\n";
+                    s = s + "                sb.Append(\"[\");\n";
+                    s = s + "                if (o." + f + "[i_" + f + "] != null) {\n";
+                    s = s + "                    int k_" + f + " = 0;\n";
+                    s = s + "                    while (k_" + f + " < o." + f + "[i_" + f + "].Count) {\n";
+                    s = s + "                        if (k_" + f + " > 0) { sb.Append(\",\"); }\n";
+                    s = s + "                        " + wr + "\n";
+                    s = s + "                        k_" + f + " = k_" + f + " + 1;\n";
+                    s = s + "                    }\n";
+                    s = s + "                }\n";
+                    s = s + "                sb.Append(\"]\");\n";
+                    s = s + "                i_" + f + " = i_" + f + " + 1;\n";
+                    s = s + "            }\n";
+                    s = s + "        }\n";
+                    s = s + "        sb.Append(\"]\");\n";
                 } else {
                     s = s + "        " + WriteScalar(fk, "o." + f, tname) + "\n";
                 }
             } else if (mode == 1) {
                 if (fk == Jsongen.FkInt()) {
                     s = s + "        o." + f + " = (" + tname + ")v.Int(\"" + f + "\", 0);\n";
+                } else if (fk == Jsongen.FkLong()) {
+                    s = s + "        o." + f + " = (" + tname + ")v.Long(\"" + f + "\", 0);\n";
                 } else if (fk == Jsongen.FkEnum()) {
                     // enum casts are not parseable; int -> enum is implicit
                     s = s + "        o." + f + " = v.Int(\"" + f + "\", 0);\n";
@@ -315,7 +365,7 @@ class Jsongen {
                 } else if (fk == Jsongen.FkClass()) {
                     s = s + "        JsonValue j_" + f + " = v.Get(\"" + f + "\");\n";
                     s = s + "        if (j_" + f + " != null && j_" + f + ".IsObject()) { o." + f + " = __JsonBind.B_" + tname + "(j_" + f + "); }\n";
-                } else {
+                } else if (fk == Jsongen.FkList()) {
                     // list: array binds element-wise; a lone object becomes a
                     // one-element list
                     string convAt = BindElem(ek, "j_" + f + ".At(i_" + f + ")", en);
@@ -331,6 +381,28 @@ class Jsongen {
                     s = s + "        } else if (j_" + f + " != null && !j_" + f + ".IsNull()) {\n";
                     s = s + "            o." + f + ".Add(" + convOne + ");\n";
                     s = s + "        }\n";
+                } else {
+                    // list of lists: strictly row arrays, no single-object
+                    // fallback
+                    string convRow = BindElem(ek, "row_" + f + ".At(k_" + f + ")", en);
+                    s = s + "        JsonValue j_" + f + " = v.Get(\"" + f + "\");\n";
+                    s = s + "        o." + f + " = new List<List<" + en + ">>();\n";
+                    s = s + "        if (j_" + f + " != null && j_" + f + ".IsArray()) {\n";
+                    s = s + "            int i_" + f + " = 0;\n";
+                    s = s + "            while (i_" + f + " < j_" + f + ".Count()) {\n";
+                    s = s + "                JsonValue row_" + f + " = j_" + f + ".At(i_" + f + ");\n";
+                    s = s + "                List<" + en + "> values_" + f + " = new List<" + en + ">();\n";
+                    s = s + "                if (row_" + f + " != null && row_" + f + ".IsArray()) {\n";
+                    s = s + "                    int k_" + f + " = 0;\n";
+                    s = s + "                    while (k_" + f + " < row_" + f + ".Count()) {\n";
+                    s = s + "                        values_" + f + ".Add(" + convRow + ");\n";
+                    s = s + "                        k_" + f + " = k_" + f + " + 1;\n";
+                    s = s + "                    }\n";
+                    s = s + "                }\n";
+                    s = s + "                o." + f + ".Add(values_" + f + ");\n";
+                    s = s + "                i_" + f + " = i_" + f + " + 1;\n";
+                    s = s + "            }\n";
+                    s = s + "        }\n";
                 }
             } else {
                 // tree (serialize) direction
@@ -341,6 +413,25 @@ class Jsongen {
                     s = s + "            int i_" + f + " = 0;\n";
                     s = s + "            while (i_" + f + " < o." + f + ".Count) {\n";
                     s = s + "                a_" + f + ".Append(" + conv + ");\n";
+                    s = s + "                i_" + f + " = i_" + f + " + 1;\n";
+                    s = s + "            }\n";
+                    s = s + "        }\n";
+                    s = s + "        v.Put(\"" + f + "\", a_" + f + ");\n";
+                } else if (fk == Jsongen.FkList2()) {
+                    string conv2 = TreeScalar(ek, "o." + f + "[i_" + f + "][k_" + f + "]", en);
+                    s = s + "        JsonValue a_" + f + " = JsonValue.NewArray();\n";
+                    s = s + "        if (o." + f + " != null) {\n";
+                    s = s + "            int i_" + f + " = 0;\n";
+                    s = s + "            while (i_" + f + " < o." + f + ".Count) {\n";
+                    s = s + "                JsonValue row_" + f + " = JsonValue.NewArray();\n";
+                    s = s + "                if (o." + f + "[i_" + f + "] != null) {\n";
+                    s = s + "                    int k_" + f + " = 0;\n";
+                    s = s + "                    while (k_" + f + " < o." + f + "[i_" + f + "].Count) {\n";
+                    s = s + "                        row_" + f + ".Append(" + conv2 + ");\n";
+                    s = s + "                        k_" + f + " = k_" + f + " + 1;\n";
+                    s = s + "                    }\n";
+                    s = s + "                }\n";
+                    s = s + "                a_" + f + ".Append(row_" + f + ");\n";
                     s = s + "                i_" + f + " = i_" + f + " + 1;\n";
                     s = s + "            }\n";
                     s = s + "        }\n";
@@ -403,7 +494,8 @@ class Jsongen {
                 continue;
             }
             if (fk == Jsongen.FkClass()) { NeedAdd(tname); }
-            if (fk == Jsongen.FkList() && elemKind == Jsongen.FkClass()) { NeedAdd(elemName); }
+            if ((fk == Jsongen.FkList() || fk == Jsongen.FkList2())
+                    && elemKind == Jsongen.FkClass()) { NeedAdd(elemName); }
         }
     }
 
