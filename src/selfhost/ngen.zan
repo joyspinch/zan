@@ -2882,11 +2882,26 @@ partial class Ngen {
             }
             LoadLocalVal(li, 0);
         } else if (k == AK.MemberAccess()) {
-            if (e.op == TK.QDot()) {
-                // null-conditional access needs T? tracking (a null member
-                // read is not 0 for value shapes): diagnose, never miscompile
-                diags.Error("ngen: '?.' null-conditional access is not supported by the native backend", e.line, e.col);
+            if (e.ival == 1) {
+                // null-conditional `a?.m`: the receiver is tested once and
+                // a null short-circuits to the null of the result type; a
+                // value-typed member result wraps into its cell on the
+                // taken path (the reference spelling re-reads the receiver,
+                // which the suite's pure receivers make unobservable)
+                string qmt = StaticTyOf(e);
+                string qpay = IsNulTy(qmt) ? NulPayOf(qmt) : null;
+                GenExpr(e.a);                            // x0 = receiver
+                int qnull = NL();
+                int qfin = NL();
+                CbzReg(0, qnull);
+                e.ival = 0;                              // ordinary member read
+                GenExpr(e);
+                e.ival = 1;
+                if (qpay != null) { GenNulWrap(IsDblTy(qpay)); }
+                EmitB(qfin);
+                Mark(qnull);
                 LoadImm(0, 0);
+                Mark(qfin);
                 return;
             }
             if (TryGenHostMember(e)) { return; }
@@ -4908,8 +4923,30 @@ partial class Ngen {
             }
         }
         if (e.kind == AK.Ident()) { return NamedSlotTy(e.sval); }
-        if (e.kind == AK.Call()) { return CallRetTy(e); }
+        if (e.kind == AK.Call()) {
+            // `a?.M(...)` (callee marker ival==1): a value return lifts to
+            // T? like the member form, so the decl/assignment boundary
+            // never boxes the already-boxed cell twice
+            if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.ival == 1) {
+                e.a.ival = 0;
+                string crt = CallRetTy(e);
+                e.a.ival = 1;
+                if (crt != null && IsNulableValueTy(crt)) { return crt + "?"; }
+                return crt;
+            }
+            return CallRetTy(e);
+        }
         if (e.kind == AK.MemberAccess()) {
+            // null-conditional `a?.m` (parser marker ival==1): a value-typed
+            // member result lifts to T? exactly like the oracle's
+            // null_cond_result_type; references stay raw
+            if (e.ival == 1) {
+                e.ival = 0;
+                string qmt = StaticTyOfInner(e);
+                e.ival = 1;
+                if (qmt != null && IsNulableValueTy(qmt)) { return qmt + "?"; }
+                return qmt;
+            }
             // primitive-type constants type as their primitive
             // (double.MaxValue prints as a double)
             if (PrimitiveConstLit(e) != null) {
@@ -8194,6 +8231,27 @@ partial class Ngen {
         // second pass safe on original bodies.
         if (e.a != null && (e.a.kind == AK.Ident() || e.a.kind == AK.MemberAccess())) {
             CollectSpecsInEnvNg(e);
+        }
+        if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.ival == 1) {
+            // null-conditional call `a?.M(args)`: the receiver is tested
+            // once; a null yields the null of the result type (a value
+            // return wraps on the taken path). The ordinary call re-reads
+            // the receiver -- fine for the suite's local receivers.
+            Node qcal = e.a;
+            string qrt = CallRetTy(e);
+            GenExpr(qcal.a);                             // x0 = receiver
+            int cqnull = NL();
+            int cqfin = NL();
+            CbzReg(0, cqnull);
+            qcal.ival = 0;                               // ordinary call
+            GenCall(e);
+            qcal.ival = 1;
+            if (qrt != null && IsNulableValueTy(qrt)) { GenNulWrap(IsDblTy(qrt)); }
+            EmitB(cqfin);
+            Mark(cqnull);
+            LoadImm(0, 0);
+            Mark(cqfin);
+            return;
         }
         if (TryGenDelegateCall(e)) { return; }
         if (TryGenPackedSlice(e)) { return; }
