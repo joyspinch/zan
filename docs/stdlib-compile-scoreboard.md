@@ -1086,3 +1086,36 @@ linq/generics/params_variadic 定向 19/19；全量 624 sweep。
 **下一批候选**：新解封的 ncf 清单里挑簇——chart_*（11 例，可能同
 根）、game_*（4 例）、cs_b* tuples/patterns/nullable、async 控制流；
 reflection intrinsics（3 例）仍留独立大批次。
+
+## v18i — AddSPImm 大帧编码 + Chart 包同步（490 → 497）
+
+**批次**：两个修复。
+1. ngen.zan AddSPImm：ARM64 imm12 上限 4095，可选 lsl #12 是 ×4096 而
+   非加宽——超过 4095 字节的帧把立即数 bit12 静默溢出进 sh 位，6,432
+   字节的帧（新 ChartModel.zan FromJsonValue 的 402 个局部槽）编成
+   `#imm12, lsl #12` == 9.5MB，在 8MB 主线程栈上第一次调用即 SIGSEGV
+   （崩在 callee 的 stp 上）。任何局部槽 >251 的方法都会中招——这是
+   更丰富的 stdlib 代码踩出的潜在编译器 bug，不是 Chart 专属。
+   AddSPImm 改为分块发射：先 x4096 缩放形式、后普通余数（16 对齐
+   保持；ngen_guard 早有同样的分块先例）。
+2. stdlib/Gui/Component/Chart 从上游 Zan.Gui.Charts 包同步（10 文件
+   更新、ChartBootstrap/ChartViewMatrix 新增、themes 刷新）——冻结
+   快照早于 breaks/Matrix 时代（快照 ChartAxis 无 breaks 字段；包内
+   ChartModel 24 处 breaks vs 快照 1 处）。其余核心 stdlib 校验为
+   同步（494/495 一致；唯一 Linq 差异是我方 query 脱糖的刻意扩展）。
+
+**数字**：sweep 490 → 497。6 ncf→pass（chart_axis_breaks/
+splitline_pointer、chart_cached_events、chart_datazoom、chart_levels、
+chart_option_behavior）；2 om→pass（chart_dataset_transform、
+http_bytes_redirect flapper 回摆）；3 ncf→mne（chart_force_params、
+chart_series_zorder、chart_tree_depth——能跑了但退出码非零）；1
+ncf→om（chart_radar_values）。**遗留**：chart pie/layout 的 hugeTotal
+路径——真实 ChartViewPie 里宽累计在 32 位回绕，而 `long += (int)(dbl+
+0.5)` 的最小复现全对——更深的 ngen bug，下批开篇。http_forwarder_
+keepalive 从 reference_timeout 后面浮出：已知 Task.Spawn 缺口。
+mysql_async_nonblocking pass→rto（计时）。**验证**：39/39 电池；全量
+624 sweep。
+
+**下一批候选**：chart wide 累计回绕根因（mne 3 例 + om 复用同簇）、
+Task.Spawn/Run（表达式位）、cs_b* tuples/patterns/nullable、
+reflection intrinsics（独立大批次）。

@@ -40,14 +40,13 @@ partial class ChartView {
             if (o.zoom && o.iwid != 0 && hFullN > 1) {
                 hi0 = Chart.ZoomI0(app, o, o.iwid, hFullN);
                 hi1 = Chart.ZoomI1(app, o, o.iwid, hFullN);
-                hzoomH = Chart.zoomBarHidden ? 0 : app.Scale(24);
+                hzoomH = Chart.zoomBarHidden ? 0 : Chart.ZoomBandH(app, o, h);
             }
             List<string> hWin = Chart.WindowLabels(labels, hi0, hi1);
             ChartFrame hf = ChartView.HBarCore(app, x, y, w, h - hzoomH, o,
                 hWin, series, hstack, g, hi0);
             if (hzoomH > 0 && hf != null) {
-                Chart.DrawZoomBar(app, hf.plotX, hf.plotW, y + h - app.Scale(18),
-                    app.Scale(12), o.iwid, hFullN);
+                Chart.DrawZoomBar(app, o, hf.plotX, hf.plotW, x, y, w, h, o.iwid, hFullN);
             }
             return;
         }
@@ -74,7 +73,7 @@ partial class ChartView {
         if (o.zoom && o.iwid != 0 && fullN > 1) {
             i0 = Chart.ZoomI0(app, o, o.iwid, fullN);
             i1 = Chart.ZoomI1(app, o, o.iwid, fullN);
-            zoomH = Chart.zoomBarHidden ? 0 : app.Scale(24);
+            zoomH = Chart.zoomBarHidden ? 0 : Chart.ZoomBandH(app, o, h);
         }
         List<string> winLabels = Chart.WindowLabels(labels, i0, i1);
 
@@ -85,11 +84,12 @@ partial class ChartView {
         // 值对柱形不依赖类目槽：类目数为 0 也要继续渲染。
         if (xValBars) { n = 1; }
         if (stacked) { leftData = Chart.MaxStackW(series, n, i0); }
-        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.title, series, o.iwid, o.showLegend);
+        // dataZoom 滑条预留带先于面板头声明：底部图例锚点据此上移。
+        Chart.zoomBandReserve = Chart.zoomBarHidden ? 0 : Chart.ZoomBandH(app, o, h);
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.legendTextColor, o.title, series, o.iwid, o.showLegend);
         ChartFrame f = Chart.BuildAxesR(app, x, y, w, h - zoomH, plotTop, winLabels, o, series, leftData, 0 - 1, i0, i1);
         if (zoomH > 0) {
-            Chart.DrawZoomBar(app, f.plotX, f.plotW, y + h - app.Scale(18),
-                app.Scale(12), o.iwid, fullN);
+            Chart.DrawZoomBar(app, o, f.plotX, f.plotW, x, y, w, h, o.iwid, fullN);
         }
         Chart.DrawMarkArea(app, f, o);
         ChartView.DrawMarkAreaBands(app, f, o, i0, n,
@@ -191,7 +191,7 @@ partial class ChartView {
                         // A9：基线取 stackStrategy 链的结果
                         // 减自己值（无前驱时恰为 0）。
                         long segBase = (long)(ChartView.StackBaseAt(series, si, oi)
-                            * 1000.0 + (vF >= 0 ? 0.5 : 0 - 0.5)) - vF;
+                            * 1000.0 + (vF >= 0 ? 0.5 : 0 - 0.5));
                         // vF 是 ×1000 定点，堆叠和×g(0..1000) 必超 int32，
                         // 全程 long 走 YOfFL。
                         int yTop = f.YOfFL((segBase + vF) * (long)g / 1000L, 0);
@@ -662,6 +662,11 @@ partial class ChartView {
             }
             c.PopClip();
         }
+        // A15：breakArea 锯齿带画在系列之上（官方 zigzagZ=100，
+        // rectCoordBuildBreakAxis 挂轴组之后）。tooltip 仍在其上。
+        Chart.DrawBreakAreas(c, f, o.YAxis0(), 0);
+        Chart.DrawBreakAreas(c, f, o.YAxis1(), 1);
+        Chart.DrawBreakAreas(c, f, o.XAxis0(), 2);
         if (o.showTooltip) {
             if (xValBars && anyPts) {
                 ChartView.PointsHover(app, f, series, i0, i1, g, o.pointerCross);
@@ -865,11 +870,15 @@ partial class ChartView {
         Theme t = app.theme;
         c.PushClip(x, y, w, h);
         int pad = t.paddingMedium;
+        // 迷你面板（matrix 锚格 ~40px 高）：主题 pad 在整幅上是留白，
+        // 在迷你格里上下各吃一行后绘图区成负值、整格柱子静默不画
+        // ——格内留白收缩（官方 mini-bar 柱条几乎撑满格子）。
+        if (h < app.Scale(60)) { pad = app.Scale(3); }
         int axisFs = ChartFonts.AxisLabel(app);
         int n = labels.Count;
         int ns = series.Count;
         int wid = o.iwid;
-        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.title, series, wid, o.showLegend);
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.legendTextColor, o.title, series, wid, o.showLegend);
         // 剔除隐藏序列，使槽位布局只按可见序列分配；事件 payload
         // 仍通过原始 option 回查系列下标。
         List<ChartSeries> visSeries = new List<ChartSeries>();
@@ -951,6 +960,16 @@ partial class ChartView {
                 lo = (int)Chart.NiceMin((double)Chart.MinBarStackGroupsW(series, stMax, baseIdx));
             }
         }
+        // 值轴是 x 轴（横条）：声明 min/max（含 'dataMin'/'dataMax'
+        // 字面量）固定定义域——watermark max:10887、bar-race
+        // max:'dataMax'（钉原始数据上界，不 nice）。之前全不读。
+        ChartAxis hval = o.XAxis0();
+        if (hval != null && hval.type != ChartAxisType.Category) {
+            if (hval.minDataB) { lo = Chart.BarDataMinRaw(series); }
+            else if (hval.min != ChartOption.Auto()) { lo = hval.min; }
+            if (hval.maxDataB) { hi = Chart.BarDataMaxRaw(series); }
+            else if (hval.max != ChartOption.Auto()) { hi = hval.max; }
+        }
         if (hi <= lo) { hi = lo + 1; }
         int span = hi - lo;
 
@@ -960,7 +979,12 @@ partial class ChartView {
             int lw = Canvas.MeasureText(labels[li], axisFs);
             if (lw + app.Scale(12) > leftGut) { leftGut = lw + app.Scale(12); }
         }
-        int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
+        // 底部 x 轴标签带只随 axisLabel.show 占位（matrix-mini-bar-geo
+        // 的锚格轴全隐）：42px 迷你格若照搬整幅 botGut，绘图区算成
+        // 负值，整格柱子静默不画。
+        bool hbarXLabOn = o.xAxes.Count < 1 || o.xAxes[0].labelShow;
+        int botGut = hbarXLabOn
+            ? Canvas.FontHeight(axisFs) + app.Scale(8) : 0;
         int plotX = x + pad + leftGut;
         int plotY = plotTop;
         int plotW = (x + w - pad) - plotX;
@@ -1404,7 +1428,7 @@ partial class ChartView {
         if (o.zoom && o.iwid != 0 && fullN > 1) {
             i0 = Chart.ZoomI0(app, o, o.iwid, fullN);
             i1 = Chart.ZoomI1(app, o, o.iwid, fullN);
-            zoomH = Chart.zoomBarHidden ? 0 : app.Scale(24);
+            zoomH = Chart.zoomBarHidden ? 0 : Chart.ZoomBandH(app, o, h);
         }
         List<string> winLabels = Chart.WindowLabels(labels, i0, i1);
         int n = winLabels.Count;
@@ -1432,11 +1456,12 @@ partial class ChartView {
         if (o.yAxes.Count == 0 && minC < 0) {
             o.yAxes.Add(ChartAxis.ValueRange(minC, Chart.NiceMax(maxC)));
         }
-        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.title, series, o.iwid, o.showLegend);
+        // dataZoom 滑条预留带先于面板头声明：底部图例锚点据此上移。
+        Chart.zoomBandReserve = Chart.zoomBarHidden ? 0 : Chart.ZoomBandH(app, o, h);
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.legendTextColor, o.title, series, o.iwid, o.showLegend);
         ChartFrame f = Chart.BuildAxesR(app, x, y, w, h - zoomH, plotTop, winLabels, o, series, maxC, 0 - 1, i0, i1);
         if (zoomH > 0) {
-            Chart.DrawZoomBar(app, f.plotX, f.plotW, y + h - app.Scale(18),
-                app.Scale(12), o.iwid, fullN);
+            Chart.DrawZoomBar(app, o, f.plotX, f.plotW, x, y, w, h, o.iwid, fullN);
         }
         // 瀑布柱列仍由 barGrid 解算（官方 bar-waterfall 的两/三条系列
         // 共用 stack 'Total' → 一条列），不再用 `step*5/10` 近似。
@@ -1540,6 +1565,11 @@ partial class ChartView {
             c.PopClip();
         }
 
+        // A15：breakArea 锯齿带画在系列之上（官方 zigzagZ=100，
+        // rectCoordBuildBreakAxis 挂轴组之后）。tooltip 仍在其上。
+        Chart.DrawBreakAreas(c, f, o.YAxis0(), 0);
+        Chart.DrawBreakAreas(c, f, o.YAxis1(), 1);
+        Chart.DrawBreakAreas(c, f, o.XAxis0(), 2);
         if (o.showTooltip) {
             int mx = app.mouseX;
             int my = app.mouseY;

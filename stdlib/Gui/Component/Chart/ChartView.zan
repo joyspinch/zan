@@ -41,13 +41,61 @@ partial class ChartView {
     bool disposed;
     ChartEventHub eventHub;
     int eventHitId;
-    bool pointerWasOver;
     ChartHit currentHit;
-    ChartHit previousHit;
     int lastZoomLo;
     int lastZoomHi;
     int lastEventStateWid;
     static ChartView activeEventView;
+
+    // —— 跨帧悬停槽（按 wid）——
+    // Keyed 每帧新建实例，悬停的跨帧状态（上一帧命中、指针是否
+    // 在图上）放在实例字段必然断档：fadeFocus 渐隐读不到上一帧
+    // 命中、enter/leave 每帧重触发。状态搬进 wid 键槽，实例可丢弃。
+    static List<int> hoverSlotWids;
+    static List<ChartHit> hoverSlotHits;
+    static List<int> hoverSlotOvers;
+
+    static int HoverSlotIdx(int wid) {
+        if (ChartView.hoverSlotWids == null) { return 0 - 1; }
+        for (int i = 0; i < ChartView.hoverSlotWids.Count; i = i + 1) {
+            if (ChartView.hoverSlotWids[i] == wid) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    /// wid 槽记录的上一帧悬停命中（无则 null）。
+    static ChartHit HoverSlotHit(int wid) {
+        int i = ChartView.HoverSlotIdx(wid);
+        return i < 0 ? null : ChartView.hoverSlotHits[i];
+    }
+
+    static bool HoverSlotOver(int wid) {
+        int i = ChartView.HoverSlotIdx(wid);
+        return i >= 0 && ChartView.hoverSlotOvers[i] != 0;
+    }
+
+    static void HoverSlotSet(int wid, ChartHit hit, bool over) {
+        if (ChartView.hoverSlotWids == null) {
+            ChartView.hoverSlotWids = new List<int>();
+            ChartView.hoverSlotHits = new List<ChartHit>();
+            ChartView.hoverSlotOvers = new List<int>();
+        }
+        int i = ChartView.HoverSlotIdx(wid);
+        if (i < 0) {
+            // 图表数量有限；换页孤儿槽到量即整表重建。
+            if (ChartView.hoverSlotWids.Count > 64) {
+                ChartView.hoverSlotWids = new List<int>();
+                ChartView.hoverSlotHits = new List<ChartHit>();
+                ChartView.hoverSlotOvers = new List<int>();
+            }
+            ChartView.hoverSlotWids.Add(wid);
+            ChartView.hoverSlotHits.Add(hit);
+            ChartView.hoverSlotOvers.Add(over ? 1 : 0);
+            return;
+        }
+        ChartView.hoverSlotHits[i] = hit;
+        ChartView.hoverSlotOvers[i] = over ? 1 : 0;
+    }
 
     /// 初始化保留式生命周期字段（事件、动画/版本跟踪、事件 hub）。
     void InitLifecycle() {
@@ -64,9 +112,7 @@ partial class ChartView {
         disposed = false;
         eventHub = new ChartEventHub();
         eventHitId = 0 - 1;
-        pointerWasOver = false;
         currentHit = null;
-        previousHit = null;
         lastZoomLo = 0 - 1;
         lastZoomHi = 0 - 1;
         lastEventStateWid = 0 - 1;
@@ -98,6 +144,7 @@ partial class ChartView {
     /// 层级图表（treemap/sunburst）最近一次的悬停命中。
     /// 由命中追踪辅助函数设置，调用方立即读取以绘制工具提示，
     /// 因此不会跨帧存留。
+    static bool tailHooked;    // App 呈现尾段已挂（首帧渲染时自挂）
     static string ttName;
     static int ttVal;
     static int ttX;        // treemap：命中单元格矩形
@@ -330,13 +377,37 @@ partial class ChartView {
                 if (oi < 0 || oi >= s.Count()) { continue; }
                 int px = f.CatX(vi, n);
                 int py = f.YOf((int)((long)s.Value(oi) * g / 1000L), s.axisIndex);
-                int dx = mx - px;
-                int dy = my - py;
-                int d2 = dx * dx + dy * dy;
-                if (best == null || d2 < bestD) {
-                    bestD = d2;
+                int pdx = mx - px;
+                int pdy = my - py;
+                int pd2 = pdx * pdx + pdy * pdy;
+                if (best == null || pd2 < bestD) {
+                    bestD = pd2;
                     best = ChartView.MakeDataHit(s, si, oi, labels[vi],
                         elementType, px, py, s.Value(oi));
+                }
+                // 线体命中（官方 linePrecision 沿整条折线，不只数据
+                // 点半径）：指针到相邻两点连线的距离也计入，归属较
+                // 近的端点，值/名语义与点命中一致。平滑曲线近似为
+                // 数据点弦，粗抓半径下与视觉线重合。
+                if (vi + 1 < n && oi + 1 < s.Count()) {
+                    int oj = oi + 1;
+                    int qx = f.CatX(vi + 1, n);
+                    int qy = f.YOf((int)((long)s.Value(oj) * g / 1000L),
+                        s.axisIndex);
+                    int sd2 = ChartView.SegDist2(mx, my, px, py, qx, qy);
+                    if (sd2 >= 0 && (best == null || sd2 < bestD)) {
+                        int qdx = mx - qx;
+                        int qdy = my - qy;
+                        bool nearerQ = qdx * qdx + qdy * qdy
+                            <= pdx * pdx + pdy * pdy;
+                        int ui = nearerQ ? vi + 1 : vi;
+                        int uoi = nearerQ ? oj : oi;
+                        int ux = nearerQ ? qx : px;
+                        int uy = nearerQ ? qy : py;
+                        bestD = sd2;
+                        best = ChartView.MakeDataHit(s, si, uoi, labels[ui],
+                            elementType, ux, uy, s.Value(uoi));
+                    }
                 }
             }
         }
@@ -346,6 +417,24 @@ partial class ChartView {
             best.pixelY = my;
             if (forceTopmost) { ChartView.OfferActiveHit(best); }
             else { ChartView.OfferTopmostCategoryHit(best); }
+            // ECharts trigger:'item' 的数据点悬停卡：列卡由
+            // CartesianTooltip 负责，声明 item 时它整体不画，官方
+            // 凹凸图"悬停某条线出该点值卡"的观感由这里补齐。
+            // --nomouse 把 showTooltip 关掉，截图/回归不进卡。
+            if (Chart.legendOpt != null && Chart.legendOpt.showTooltip
+                && Chart.legendOpt.tooltipTrigger == "item") {
+                ChartSeries bs = series[best.seriesIndex];
+                string vt = Convert.ToString(best.value);
+                if (bs.SeriesFrac(best.dataIndex)) {
+                    double dn = bs.Number(best.dataIndex);
+                    vt = Chart.FracText((int)(dn * 1000
+                        + (dn >= 0 ? 0.5 : 0 - 0.5)));
+                }
+                List<TooltipRow> rows = new List<TooltipRow>();
+                rows.Add(TooltipRow.Of(0, best.dataName));
+                rows.Add(TooltipRow.Of(bs.color, bs.name + "  " + vt));
+                ChartView.TooltipCard(app, mx, my, f.plotX + f.plotW, rows);
+            }
         }
     }
 
@@ -355,6 +444,24 @@ partial class ChartView {
         if (v.eventHub != null && v.eventHub.Count(type) > 0) { return true; }
         if (v.controller != null && v.controller.HasEvent(type)) { return true; }
         return false;
+    }
+
+    /// 指针到线段 p→q 的距离平方（px²，纯整数运算）；退化段返回
+    /// -1。t = ((m-p)·ab) 对 len2 的比例钳在 [0,1]，投影点取整后
+    /// 求距——抓取半径 10px 量级下误差可忽略。
+    static int SegDist2(int mx, int my, int px, int py, int qx, int qy) {
+        long abx = qx - px;
+        long aby = qy - py;
+        long len2 = abx * abx + aby * aby;
+        if (len2 <= 0) { return 0 - 1; }
+        long t = (long)(mx - px) * abx + (long)(my - py) * aby;
+        if (t < 0) { t = 0; }
+        if (t > len2) { t = len2; }
+        long cx = px + (t * abx) / len2;
+        long cy = py + (t * aby) / len2;
+        long dx = mx - cx;
+        long dy = my - cy;
+        return (int)(dx * dx + dy * dy);
     }
 
     /// id 是否属于当前 activeEventView 的可点击命中（id < 0 恒假）；
@@ -377,12 +484,23 @@ partial class ChartView {
             hit.pixelX = app.mouseX;
             hit.pixelY = app.mouseY;
         }
-        bool entered = over && !this.pointerWasOver;
-        bool left = !over && this.pointerWasOver;
-        bool hitChanged = !ChartHit.Same(this.previousHit, hit);
-        if ((hitChanged || left) && this.previousHit != null) {
+        bool wasOver = ChartView.HoverSlotOver(this.wid);
+        ChartHit prevHit = ChartView.HoverSlotHit(this.wid);
+        bool entered = over && !wasOver;
+        bool left = !over && wasOver;
+        bool hitChanged = !ChartHit.Same(prevHit, hit);
+        if (hitChanged || entered || left) {
+            // 悬停可见反馈晚命中一帧：emphasis.focus 渐隐在下一帧
+            // 渲染入口才读悬停槽（fadeFocus 帧内静态），item 悬停卡
+            // 也随命中重画。hitTester 的 hover 不含系列命中，鼠标
+            // 停住后不再有 mousemove 调度重绘——光标停在数据点上会
+            // 永远等不到下一帧。命中变化时这里补一帧。
+            app.NoteRedrawWhy("chart-hover");
+            app.needsRedraw = true;
+        }
+        if ((hitChanged || left) && prevHit != null) {
             ChartInteractionEvent me = ChartView.EventFromHit(
-                ChartEventType.MouseOut, this.wid, this.previousHit);
+                ChartEventType.MouseOut, this.wid, prevHit);
             this.RaiseInteraction(me);
         }
         if ((hitChanged || entered) && hit != null) {
@@ -393,12 +511,11 @@ partial class ChartView {
             ChartInteractionEvent he2 = ChartView.EventAt(
                 ChartEventType.Hover, this.wid, app.mouseX, app.mouseY);
             this.RaiseInteraction(he2);
-        } else if (left && hit == null && this.previousHit == null) {
+        } else if (left && hit == null && prevHit == null) {
             ChartInteractionEvent me2 = ChartView.EventAt(
                 ChartEventType.MouseOut, this.wid, app.mouseX, app.mouseY);
             this.RaiseInteraction(me2);
         }
-        this.pointerWasOver = over;
         if (statusNow == "ready" && this.eventHitId >= 0
             && Ui.Clicked(app, this.eventHitId)) {
             if (hit != null) {
@@ -420,7 +537,8 @@ partial class ChartView {
                                     app.mouseX, app.mouseY);
             this.RaiseInteraction(de);
         }
-        this.previousHit = ChartHit.Copy(hit);
+        ChartView.HoverSlotSet(this.wid,
+            hit == null ? null : ChartHit.Copy(hit), over);
         ChartView.activeEventView = null;
     }
 
@@ -794,6 +912,7 @@ partial class ChartView {
     /// 内容不同的标签/名称折叠出不同值，避免陈旧缓存。
     /// 空串返回 h 原值。
     static int FoldStr(int h, string s, int seed) {
+        if (s == null) { return h; }
         for (int i = 0; i < s.Length; i = i + 1) {
             h = (h * 31 + (s[i] & 255) + i * 5 + seed) % 2000000000;
         }
@@ -823,6 +942,26 @@ partial class ChartView {
         h = ChartView.FoldStr(h, o.markLabel, 1);
         h = ChartView.FoldStr(h, o.title, 2);
         h = (h * 31 + o.gridLeft + o.gridRight + o.gridTop + o.gridBottom) % 2000000000;
+        // A16：原始六参（px/%/关键字）直接决定矩形，折进指纹
+        //（kind + 量值 + 关键字串）。
+        ChartBoxParam[] fps = new ChartBoxParam[] { o.gridLeftRaw, o.gridRightRaw,
+            o.gridTopRaw, o.gridBottomRaw, o.gridWidthRaw, o.gridHeightRaw };
+        for (int fi = 0; fi < 6; fi = fi + 1) {
+            ChartBoxParam fpv = fps[fi];
+            if (fpv == null) { h = (h * 31 + 29) % 2000000000; continue; }
+            h = (h * 31 + fpv.kind * 3 + (int)(fpv.num * 4.0)) % 2000000000;
+            h = ChartView.FoldStr(h, fpv.kw != null ? fpv.kw : "", 31 + fi);
+        }
+        if (o.obDeclared) {
+            ChartBoxParam[] fob = new ChartBoxParam[] { o.obLeftRaw, o.obRightRaw,
+                o.obTopRaw, o.obBottomRaw };
+            for (int fi2 = 0; fi2 < 4; fi2 = fi2 + 1) {
+                ChartBoxParam fov = fob[fi2];
+                if (fov == null) { h = (h * 31 + 23) % 2000000000; continue; }
+                h = (h * 31 + fov.kind * 5 + (int)(fov.num * 4.0)) % 2000000000;
+                h = ChartView.FoldStr(h, fov.kw != null ? fov.kw : "", 41 + fi2);
+            }
+        }
         for (int ri = 0; ri < o.radarMax.Count; ri = ri + 1) {
             h = (h * 31 + o.radarMax[ri]) % 2000000000;
         }
@@ -998,6 +1137,11 @@ partial class ChartView {
                 h = (h * 31 + cs.regions[gi].value
                     + cs.regions[gi].rings.Count) % 2000000000;
             }
+            // 台账③：geo/map 底图区域描边色/宽（mapBorderW/C，
+            // 官方缺省 0.5px #b7b9be），改了会改快照像素，与快照
+            // 指纹（DrawMap 的 CacheFingerprint 段）同源折叠。
+            h = (h * 31 + cs.mapBorderC) % 2000000000;
+            h = (h * 31 + cs.mapBorderW) % 2000000000;
             for (int mi = 0; mi < cs.marks.Count; mi = mi + 1) {
                 h = ChartView.FoldStr(h, cs.marks[mi].kind, 20);
                 h = (h * 31 + cs.marks[mi].dataIndex
@@ -1021,7 +1165,16 @@ partial class ChartView {
 
     /// 第一个可见序列（整图系列族从中选取布局
     /// 标志位 —— innerPct、roseType、sort、hbar、custom）。
+    /// N7：ZSort 重排绘制序后，主导系列仍按**声明序**取（declOrder
+    /// 快照）——官方每系列自带 view，面板主导型不随 z 漂移。
     static ChartSeries LeadSeries(ChartOption o) {
+        if (o.declOrder != null && o.declOrder.Count > 0
+            && o.declOrder.Count == o.series.Count) {
+            for (int d = 0; d < o.declOrder.Count; d = d + 1) {
+                if (!o.declOrder[d].hidden) { return o.declOrder[d]; }
+            }
+            return o.declOrder[0];
+        }
         if (o.series.Count < 1) { return null; }
         for (int i = 0; i < o.series.Count; i = i + 1) {
             if (!o.series[i].hidden) { return o.series[i]; }
@@ -1050,7 +1203,15 @@ partial class ChartView {
 
     /// 第一个可见系列的下标；全部隐藏时返回 0，无系列返回 -1。
     static int LeadSeriesIndex(ChartOption o) {
-        if (o == null || o.series.Count < 1) { return 0 - 1; }
+        if (o == null) { return 0 - 1; }
+        // N7：与 LeadSeries 同源——declOrder 快照优先（声明序语义）。
+        if (o.declOrder != null && o.declOrder.Count == o.series.Count) {
+            for (int d = 0; d < o.declOrder.Count; d = d + 1) {
+                if (!o.declOrder[d].hidden) { return d; }
+            }
+            return 0;
+        }
+        if (o.series.Count < 1) { return 0 - 1; }
         for (int i = 0; i < o.series.Count; i = i + 1) {
             if (!o.series[i].hidden) { return i; }
         }
@@ -1071,11 +1232,82 @@ partial class ChartView {
     /// 笛卡尔系列族则逐序列混用）。全部隐藏时仍用首条系列类型，
     /// 保留坐标轴/图例，而不是整图变成空状态。
     static ChartType LeadType(ChartOption o) {
+        // N7：声明序语义（declOrder 快照优先，见 LeadSeries）。
+        if (o.declOrder != null && o.declOrder.Count == o.series.Count) {
+            for (int d = 0; d < o.declOrder.Count; d = d + 1) {
+                if (!o.declOrder[d].hidden) { return o.declOrder[d].type; }
+            }
+            return o.declOrder[0].type;
+        }
         for (int i = 0; i < o.series.Count; i = i + 1) {
             if (!o.series[i].hidden) { return o.series[i].type; }
         }
         if (o.series.Count > 0) { return o.series[0].type; }
         return ChartType.Line;
+    }
+
+    /// N7 系列绘制键 = zlevel*1000 + z（zrender 显示列表序的静态投影；
+    /// z2 只作用于同系列内图元/hover 层，静态渲染无此层）。未声明的 z
+    /// 在解析期已按系列型官方缺省赋好（bar/pie/scatter 等 2、line 3——
+    /// 各 Series.ts）。
+    static int ZKeyOf(ChartSeries s) {
+        return s.zlevel * 1000 + s.z;
+    }
+
+    /// 稳定 argsort：返回按 ZKeyOf 升序的声明下标表（同键保持声明
+    /// 序——zrender 显示列表稳定语义）。与 hidden 无关：图例开关不得
+    /// 改变绘制序/键位，否则交互态在帧间漂移。Resolve（图例键绑定、
+    /// palette、CSS series-N）与 ZSort（物理排序）共用本函数，两处的
+    /// 序恒等——交互键才能跨帧对上。
+    static void ZOrder(ChartOption o, List<int> order) {
+        order.Clear();
+        int n = o.series.Count;
+        List<int> keys = new List<int>();
+        for (int i = 0; i < n; i = i + 1) {
+            order.Add(i);
+            keys.Add(ChartView.ZKeyOf(o.series[i]));
+        }
+        for (int a = 1; a < n; a = a + 1) {
+            int ov = order[a];
+            int kv = keys[a];
+            int b = a - 1;
+            while (b >= 0 && keys[b] > kv) {
+                order[b + 1] = order[b];
+                keys[b + 1] = keys[b];
+                b = b - 1;
+            }
+            order[b + 1] = ov;
+            keys[b + 1] = kv;
+        }
+    }
+
+    /// 把 o.series 就地重排为 ZOrder 绘制序。重排前先快照声明序
+    /// （declOrder）：LeadSeries/LeadType/DispatchKind 等「主导系列」
+    /// 语义读声明序首条可见系列——官方每系列自带 view，面板主导型
+    /// 不随 z 重排漂移（custom trend z=100 重排后仍是 lead，kind 不变，
+    /// 只是它画的线落在柱群之上）。快照与 o.series 同引用，图例等
+    /// 就地写仍穿透。drawOption 每帧由 Resolve 重新物化，声明序恒为准。
+    static void ZSort(ChartOption o) {
+        if (o.series.Count < 2) { return; }
+        List<int> order = new List<int>();
+        ChartView.ZOrder(o, order);
+        bool idem = true;
+        for (int i = 0; i < order.Count; i = i + 1) {
+            if (order[i] != i) { idem = false; break; }
+        }
+        if (idem) { return; }
+        if (o.declOrder == null || o.declOrder.Count != o.series.Count) {
+            List<ChartSeries> decl = new List<ChartSeries>();
+            for (int i = 0; i < o.series.Count; i = i + 1) {
+                decl.Add(o.series[i]);
+            }
+            o.declOrder = decl;
+        }
+        List<ChartSeries> sorted = new List<ChartSeries>();
+        for (int i = 0; i < order.Count; i = i + 1) {
+            sorted.Add(o.series[order[i]]);
+        }
+        o.series = sorted;
     }
 
     /// 渲染器分发键：每个 ChartType 和 custom kind 都映射到
@@ -1085,10 +1317,25 @@ partial class ChartView {
     static string DispatchKind(ChartOption o) {
         // 无系列才画空状态。图例关掉最后一条系列时仍按原类型
         // 分发，只是渲染器跳过隐藏序列（坐标轴/图例还在）。
-        if (o.series.Count < 1) { return "empty"; }
+        // 例外：纯组件 option（只有 radar 指示器或 polar 轴、没有
+        // 系列）官方画坐标骨架不画 "(no data)"——两个渲染器的
+        // 骨架路径 0 系列本就安全。
+        if (o.series.Count < 1) {
+            if (o.radarMax.Count > 0 || o.radarNames.Count > 0) { return "radar"; }
+            if (o.polars.Count > 0 || o.angleAxes.Count > 0) { return "polarCoord"; }
+            return "empty";
+        }
         // calendar 坐标系优先于系列类型分发：日历网格是面板骨架，
         // 子系列（heatmap/scatter/graph/pie）都是叠在格上的装饰。
         if (o.calendars.Count > 0) { return "calendar"; }
+        // matrix 坐标系同理（ECharts6 coord/matrix）：维度树头带 +
+        // 叶子体格是面板骨架，heatmap 等系列是格上的填色。组件缺席
+        // 时不劫持（无从布局，落回原类型渲染器）。
+        if (o.matrix != null) {
+            for (int mxsi = 0; mxsi < o.series.Count; mxsi = mxsi + 1) {
+                if (o.series[mxsi].coordSys == "matrix") { return "matrix"; }
+            }
+        }
         // 极坐标同理（ECharts5/6 angleAxis/radiusAxis 圆框）：
         // coordinateSystem:"polar" 的 line/scatter 系列按角度投影。
         for (int psi = 0; psi < o.series.Count; psi = psi + 1) {
@@ -1178,7 +1425,16 @@ partial class ChartView {
             // ECharts type:'line' 的值对系列（line7 双数值轴）走折线
             // 渲染器：连线 + 符号 + markLine/markPoint 全套；
             // type:'scatter' 的点云仍走散点渲染器（只画点不连线）。
-            if (leadS.type == ChartType.Line) { return "lines"; }
+            if (leadS.type == ChartType.Line) {
+                // 堆叠判得在点系列判定**之前**：时间值对（line-tooltip-touch
+                // 的 [[ts,v],...] + stack:'a'）落在 points 里，若先按
+                // "点系列 → lines" 返回，堆叠判定永远轮不到——两条
+                // stack 同名系列各自按原始值画，官方是累计面积带。
+                if (leadS.stack != 0 || leadS.stackName.Length > 0) {
+                    return "stackedArea";
+                }
+                return "lines";
+            }
             return "scatter";
         }
         // 折线族：堆叠的引导序列渲染累计填充带，其余绘制折线。
@@ -1353,6 +1609,13 @@ partial class ChartView {
     /// 并派发指针交互与 Rendered/Resized/Updated/DataChanged 事件。
     void Render(App app, int x, int y, int w, int h) {
         if (this.disposed) { return; }
+        // 首帧自挂 App 呈现尾段（延迟提示的刷新从 App.PresentFrame
+        // 的挂点走——App 编译图不背 Chart 家族，真渲染图表的程序才
+        // 走到这条注册）。
+        if (!ChartView.tailHooked) {
+            ChartView.tailHooked = true;
+            App.AddPresentTail(ChartView.FlushTooltips);
+        }
         bool resized = this.hasRendered && (this.lastRenderW != w || this.lastRenderH != h);
         bool updated = false;
         if (this.controller != null) {
@@ -1405,16 +1668,17 @@ partial class ChartView {
 
         // 把每种图表裁剪到自己的矩形，防止绘图线、柱条、
         // 轴标签和图例溢出到相邻控件。
-        // emphasis.focus='series' 渐隐的帧内状态源：下面的渲染会
-        // 重置并重测命中，先把上一帧悬停系列记进 Chart 帧内静态；
-        // 该系列声明 focus:'series' 时渲染器把其余系列乘残透明
-        // （官方 bump 图"鼠标经过其余线渐变"的观感）。
+        // emphasis.focus='series' 渐隐的帧内状态源：读 wid 悬停槽里
+        // 上一帧的命中（下面的渲染会重置并重测 currentHit），该系列
+        // 声明 focus:'series' 时渲染器把其余系列乘残透明（官方
+        // bump 图"鼠标经过其余线渐变"的观感）。
         Chart.fadeFocusIdx = -1;
-        if (this.currentHit != null && this.currentHit.seriesIndex >= 0
-            && this.currentHit.seriesIndex < drawOption.series.Count
-            && drawOption.series[this.currentHit.seriesIndex].emphasisFocus
+        ChartHit hoverPrev = ChartView.HoverSlotHit(this.wid);
+        if (hoverPrev != null && hoverPrev.seriesIndex >= 0
+            && hoverPrev.seriesIndex < drawOption.series.Count
+            && drawOption.series[hoverPrev.seriesIndex].emphasisFocus
                 == "series") {
-            Chart.fadeFocusIdx = this.currentHit.seriesIndex;
+            Chart.fadeFocusIdx = hoverPrev.seriesIndex;
         }
         ChartView.activeEventView = this;
         this.currentHit = null;
@@ -1550,6 +1814,11 @@ partial class ChartView {
     /// 落到正确的渲染器）。
     static void RenderOnce(App app, int x, int y, int w, int h,
                            ChartOption option, int g) {
+        // N7 z/zlevel 绘制序兜底重排（Resolve 主路径已在解析期把
+        // 系列表排成 ZOrder 序，这里的调用覆盖直接以源 option 渲染的
+        // 路径——Keyed 缓存 miss、图例回放、探针直渲）。同键保持声明
+        // 序，本帧排序不回写源 option，声明序恒为准。
+        if (!option.overlay) { ChartView.ZSort(option); }
         string kind = ChartView.DispatchKind(option);
         ChartSeries leadS = ChartView.LeadSeries(option);
         // 底部图例占位每图清零（不经 DrawPanelI 的视图不背上一图的值）。
@@ -1558,6 +1827,11 @@ partial class ChartView {
             ChartView.DrawPie(app, x, y, w, h, option, option.pieLabels, g);
         } else if (kind == "calendar") {
             ChartView.DrawCalendar(app, x, y, w, h, option, g);
+        } else if (kind == "matrix") {
+            ChartView.DrawMatrix(app, x, y, w, h, option, g);
+            if (!option.overlay) {
+                ChartView.MatrixHover(app, x, y, w, h, option);
+            }
         } else if (kind == "polarCoord") {
             ChartView.DrawPolarCoord(app, x, y, w, h, option, g);
         } else if (kind == "rose") {
