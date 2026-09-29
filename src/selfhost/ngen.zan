@@ -196,6 +196,7 @@ partial class Ngen {
     int guardArrFail;
     int guardArrNull;
     int guardStrNull;
+    int guardNulVal;
     string srcFile;
 
     List<Node> methNodes;
@@ -320,6 +321,7 @@ partial class Ngen {
         guardArrFail = InternStr("array allocation failed\n");
         guardArrNull = InternStr("null reference where an array is required (.Length)\n");
         guardStrNull = InternStr("null reference where a string is required\n");
+        guardNulVal = InternStr("Nullable object must have a value\n");
         if (mainCls == null || mainCls == "") {
             diags.Error("ngen: no static Main() found", 0, 0);
             return txt;
@@ -2888,6 +2890,11 @@ partial class Ngen {
                 return;
             }
             if (TryGenHostMember(e)) { return; }
+            if ((e.sval == "HasValue" || e.sval == "Value") && e.a != null
+                    && IsNulTy(StaticTyOf(e.a))) {
+                GenNulMemberRead(e);                     // nullable payload read
+                return;
+            }
             if (e.sval == "Count" && ExprCls(e.a) == "List") { GenListCount(e.a); }
             else if (e.sval == "Count" && ExprCls(e.a) == "Dict") { GenExpr(e.a); LdrU(0, 0, 0); }
             else if (e.sval == "Count" && IsDictViewAccess(e.a)) {
@@ -2980,6 +2987,30 @@ partial class Ngen {
             if (TryOpOverloadNg(e)) {
                 // the overload call left its result (value or object) in x0
             } else if (TryGenConversionBinaryNg(e)) {
+            } else if (e.op == TK.QQ() && IsNulExpr(e.a)) {
+                // nullable-value coalescing: the left side is a cell; the
+                // result is a payload exactly when the right side is one
+                int useB = NL();
+                int doneQ = NL();
+                bool resDbl = IsDblTy(NulPayOf(StaticTyOf(e.a)));
+                GenExpr(e.a);
+                CbzReg(0, useB);
+                if (!IsNulExpr(e.b)) {
+                    LdrU(0, 0, 0);                       // payload out of the cell
+                    if (resDbl) { E4(0x9E670000); }      // fmov d0, x0
+                } else if (resDbl && IsDblTy(NulPayOf(StaticTyOf(e.b)))) {
+                    LdrU(0, 0, 0);                       // both cells: unwrap left
+                    E4(0x9E670000);                      // fmov d0, x0
+                }
+                EmitB(doneQ);
+                Mark(useB);
+                GenExpr(e.b);
+                if (IsNulExpr(e.b) && IsDblTy(NulPayOf(StaticTyOf(e.b)))) {
+                    E4(0x9E670000);                      // fmov d0, x0 (cell -> payload)
+                }
+                Mark(doneQ);
+            } else if (IsLiftedNulBinary(e)) {
+                GenLiftedNulBinary(e);
             } else if (e.op == TK.QQ() && QQRefShapeNg(e.a) && !IsDblExpr(e.b)) {
                 // null coalescing on reference shapes: a != null ? a : b
                 int useB = NL();
@@ -3038,20 +3069,28 @@ partial class Ngen {
                 // string concatenation: non-string operands convert through
                 // zan_rt_int2str (gen0 prints them with "%lld"), then
                 // lhs -> x0, rhs -> x1, zan_rt_strcat2(lhs, rhs)
-                GenExpr(e.a);
-                if (!IsStrExpr(e.a)) {
-                    if (IsDblExpr(e.a)) { BLInternal("_zan_rt_dbl2str"); }
-                    else if (IsCharExpr(e.a)) { BLInternal("_zan_rt_chrstr"); }
-                    else if (IsUlongExpr(e.a)) { BLInternal("_zan_rt_uint2str"); }
-                    else { BLInternal("_zan_rt_int2str"); }
+                if (IsNulExpr(e.a) && NulPayOf(StaticTyOf(e.a)) != null) {
+                    GenNulToStr(e.a);                    // null renders ""
+                } else {
+                    GenExpr(e.a);
+                    if (!IsStrExpr(e.a)) {
+                        if (IsDblExpr(e.a)) { BLInternal("_zan_rt_dbl2str"); }
+                        else if (IsCharExpr(e.a)) { BLInternal("_zan_rt_chrstr"); }
+                        else if (IsUlongExpr(e.a)) { BLInternal("_zan_rt_uint2str"); }
+                        else { BLInternal("_zan_rt_int2str"); }
+                    }
                 }
                 E4(0xF81F0FE0);                          // str x0, [sp, #-16]!
-                GenExpr(e.b);
-                if (!IsStrExpr(e.b)) {
-                    if (IsDblExpr(e.b)) { BLInternal("_zan_rt_dbl2str"); }
-                    else if (IsCharExpr(e.b)) { BLInternal("_zan_rt_chrstr"); }
-                    else if (IsUlongExpr(e.b)) { BLInternal("_zan_rt_uint2str"); }
-                    else { BLInternal("_zan_rt_int2str"); }
+                if (IsNulExpr(e.b) && NulPayOf(StaticTyOf(e.b)) != null) {
+                    GenNulToStr(e.b);                    // null renders ""
+                } else {
+                    GenExpr(e.b);
+                    if (!IsStrExpr(e.b)) {
+                        if (IsDblExpr(e.b)) { BLInternal("_zan_rt_dbl2str"); }
+                        else if (IsCharExpr(e.b)) { BLInternal("_zan_rt_chrstr"); }
+                        else if (IsUlongExpr(e.b)) { BLInternal("_zan_rt_uint2str"); }
+                        else { BLInternal("_zan_rt_int2str"); }
+                    }
                 }
                 E4(0xF84107E1);                          // ldr x1, [sp], #16 (lhs)
                 E4(0xAA0003E9);                          // mov x9, x0
@@ -4112,10 +4151,14 @@ partial class Ngen {
         cnt.ival = n;
         GenArrNew(cnt, esz);
         bool f32 = esz == 4 && ArrElemName(TypeFullName(e.type) + "[]") == "float";
+        string ieln = TypeFullName(e.type);              // declared element type
         E4(0xF81F0FE0);                                  // push arr
         int k = 0;
         while (k < n) {
             GenExpr(e.kids[k]);                          // x0 = element value
+            if (IsNulTy(ieln) && !IsNulExpr(e.kids[k])) {
+                GenNulWrap(IsDblTy(NulPayOf(ieln)));     // payload -> cell
+            }
             if (f32) { NarrowF32Bits(); }
             E4(0xF84107E1);                              // pop arr -> x1
             E4((int)(0xD2800000 | (((long)k) << 5) | 2)); // movz x2, #k
@@ -4450,7 +4493,7 @@ partial class Ngen {
     // normalize a declared type name to its class identity ("List<string>"
     // behaves as its open type; primitive arrays carry none), else null
     string ClassTyOf(string t) {
-        if (t == null || t == "" || t == "int" || t == "string" || t == "bool"
+        if (t == null || t == "" || IsNulTy(t) || t == "int" || t == "string" || t == "bool"
                 || t == "void" || t == "char" || t == "double" || t == "long"
                 || t == "ulong") { return null; }
         if (t.Length > 5 && t.Substring(0, 5) == "List<") { return "List"; }
@@ -4876,6 +4919,12 @@ partial class Ngen {
             }
             if ((e.sval == "Keys" || e.sval == "Values") && ExprCls(e.a) == "Dict") {
                 return "List<" + DictSlotTy(e.a, e.sval == "Keys") + ">";
+            }
+            // nullable payload members: HasValue is bool, Value the payload
+            string nrt = e.a != null ? StaticTyOf(e.a) : null;
+            if (nrt != null && IsNulTy(nrt)) {
+                if (e.sval == "HasValue") { return "bool"; }
+                if (e.sval == "Value") { return NulPayOf(nrt); }
             }
             // EnumType.Member constants carry their enum identity
             if (e.a != null && e.a.kind == AK.Ident() && FindEnum(e.a.sval) >= 0) { return e.a.sval; }
@@ -6535,6 +6584,11 @@ partial class Ngen {
             }
             n = n + ">";
         }
+        // `T?` marks a nullable VALUE payload (primitive, enum, struct): the
+        // question rides the payload name ahead of any array suffix.
+        // Reference types erase it -- a null reference needs no wrapper
+        // (the oracle's `int[]?` is equally a no-op).
+        if (t.op == 1 && IsNulableValueTy(n)) { n = n + "?"; }
         // multidim rank: sval2 counts the commas of the level that carried
         // them ("int[,]" 1, "int[,,]" 2, "int[][,]" 1 from the inner level)
         // -- the comma suffix renders on the final level
@@ -7193,6 +7247,11 @@ partial class Ngen {
         if (e.kind == AK.Unary() && e.op == TK.Minus()) { return IsDblExpr(e.a); }
         if (e.kind == AK.Binary()) {
             int op = e.op;
+            if (op == TK.QQ()) {
+                // a coalesce over a floating payload yields a double
+                return IsDblExpr(e.b)
+                    || (IsNulTy(StaticTyOf(e.a)) && IsDblTy(NulPayOf(StaticTyOf(e.a))));
+            }
             if (op == TK.Plus() || op == TK.Minus() || op == TK.Star() || op == TK.Slash()) {
                 return IsDblExpr(e.a) || IsDblExpr(e.b);
             }
@@ -7402,6 +7461,260 @@ partial class Ngen {
         return Int32Kind(e) != 0;
     }
 
+    // ---- nullable value types (`int?`, `double?`, `T?` over enum/struct) ----
+    // a nullable value is an 8-byte heap cell: the pointer IS the value, 0
+    // is null, and the payload rides at [cell]. This mirrors gen0's
+    // {payload, i1} struct observably: HasValue is ptr != 0, .Value guards
+    // on null before loading, and lifted operators branch on the nulls
+    // BEFORE any arithmetic (so `b / 0` with b null never divides).
+    // Reference-type `?` erases at TypeFullName and never reaches here.
+
+    // does the type NAME denote a nullable value?
+    bool IsNulTy(string t) {
+        return t != null && t.Length > 1 && t.Substring(t.Length - 1, 1) == "?";
+    }
+    string NulPayOf(string t) {
+        return IsNulTy(t) ? t.Substring(0, t.Length - 1) : null;
+    }
+    // does this payload type name accept a `?`?
+    bool IsNulableValueTy(string t) {
+        if (t == "bool" || t == "byte" || t == "sbyte" || t == "short"
+                || t == "ushort" || t == "int" || t == "uint" || t == "long"
+                || t == "ulong" || t == "nint" || t == "nuint"
+                || t == "char" || t == "float" || t == "double") { return true; }
+        if (FindEnum(t) >= 0) { return true; }
+        Cls sc = FindClass(t);
+        return sc != null && sc.isStruct == 1;
+    }
+    // does this expression carry a nullable value (or the null literal,
+    // which rides as the null cell)?
+    bool IsNulExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.NullLit()) { return true; }
+        if (IsNulTy(StaticTyOf(e))) { return true; }
+        if (e.kind == AK.Binary()) {
+            if (e.op == TK.QQ()) { return IsNulExpr(e.b); }
+            if (e.op == TK.Plus() || e.op == TK.Minus() || e.op == TK.Star()
+                    || e.op == TK.Slash() || e.op == TK.Percent()) {
+                return IsNulExpr(e.a) || IsNulExpr(e.b);
+            }
+        }
+        return false;
+    }
+
+    // box a payload (x0, or d0 for floating kinds) into a fresh nullable
+    // cell; x0 leaves holding the cell
+    void GenNulWrap(bool dbl) {
+        if (dbl) { E4(0x9E660000); }                 // fmov x0, d0
+        E4(0xF81F0FE0);                              // push payload
+        LoadImm(0, 8);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");                 // x0 = zeroed cell
+        E4(0xF84107E1);                              // x1 = payload
+        StrU(1, 0, 0);                               // cell->payload
+    }
+
+    // string form of a nullable value for concat/Write: null renders ""
+    // (gen0 prints the empty string), a payload renders per its kind
+    void GenNulToStr(Node e) {
+        string pay = NulPayOf(StaticTyOf(e));
+        GenExpr(e);                                  // x0 = cell
+        int isnul = NL();
+        int fin = NL();
+        CbzReg(0, isnul);                            // null: the empty string
+        LdrU(0, 0, 0);                               // payload
+        if (pay != null && IsDblTy(pay)) { BLInternal("_zan_rt_dbl2str"); }
+        else if (pay == "char") { BLInternal("_zan_rt_chrstr"); }
+        else if (pay == "ulong") { BLInternal("_zan_rt_uint2str"); }
+        else { BLInternal("_zan_rt_int2str"); }
+        EmitB(fin);
+        Mark(isnul);
+        LoadStr(InternStr(""), 0);
+        Mark(fin);
+    }
+
+    // `x.HasValue` / `x.Value` on a nullable value
+    void GenNulMemberRead(Node e) {
+        GenExpr(e.a);                                // x0 = cell
+        if (e.sval == "HasValue") {
+            int no = NL();
+            int fin = NL();
+            CbzReg(0, no);
+            LoadImm(0, 1);
+            EmitB(fin);
+            Mark(no);
+            LoadImm(0, 0);
+            Mark(fin);
+            return;
+        }
+        int ok = NL();
+        CbnzReg(0, ok);
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardNulVal, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        LoadImm(0, 0);
+        Mark(ok);
+        LdrU(0, 0, 0);                               // payload
+        if (IsDblTy(NulPayOf(StaticTyOf(e.a)))) { E4(0x9E670000); }   // fmov d0, x0
+    }
+
+    // a builtin binary op with a nullable VALUE operand: lifted semantics.
+    // String operands stay on the concat/strcmp paths.
+    bool IsLiftedNulBinary(Node e) {
+        int op = e.op;
+        if (op == TK.Plus() || op == TK.Minus() || op == TK.Star()
+                || op == TK.Slash() || op == TK.Percent()
+                || op == TK.Less() || op == TK.Greater()
+                || op == TK.LessEq() || op == TK.GreaterEq()
+                || op == TK.EqEq() || op == TK.BangEq()) {
+            if (IsStrExpr(e.a) || IsStrExpr(e.b)) { return false; }
+            return (e.a != null && IsNulTy(StaticTyOf(e.a)))
+                || (e.b != null && IsNulTy(StaticTyOf(e.b)));
+        }
+        return false;
+    }
+
+    // lifted operator over nullables: either side may be null; arithmetic
+    // yields null without running (so `b / 0` with b null never divides),
+    // == answers both-null as equal, relational answers false. Arithmetic
+    // wraps its result into a fresh cell.
+    void GenLiftedNulBinary(Node e) {
+        int op = e.op;
+        bool arith = op == TK.Plus() || op == TK.Minus() || op == TK.Star()
+            || op == TK.Slash() || op == TK.Percent();
+        string pay = NulPayOf(StaticTyOf(e.a));
+        if (pay == null) { pay = NulPayOf(StaticTyOf(e.b)); }
+        bool dbl = IsDblTy(pay);
+        GenExpr(e.a);
+        if (!IsNulExpr(e.a)) { GenNulWrap(IsDblExpr(e.a)); }    // payload -> cell
+        E4(0xF81F0FE0);                              // push left cell
+        GenExpr(e.b);
+        if (!IsNulExpr(e.b)) { GenNulWrap(IsDblExpr(e.b)); }
+        E4(0xF84107E1);                              // x1 = left, x0 = right
+        int done = NL();
+        int lnn = NL();
+        int rnn = NL();
+        CbnzReg(1, lnn);
+        // left null: == true, everything else null/false
+        if (op == TK.EqEq()) { LoadImm(0, 1); } else { LoadImm(0, 0); }
+        EmitB(done);
+        Mark(lnn);
+        CbnzReg(0, rnn);
+        // right null: != true, the rest false
+        if (op == TK.BangEq()) { LoadImm(0, 1); } else { LoadImm(0, 0); }
+        EmitB(done);
+        Mark(rnn);
+        // both non-null: apply the operator to the payloads
+        if (dbl) {
+            LdrU(2, 1, 0);                           // left payload bits
+            LdrU(3, 0, 0);                           // right payload bits
+            E4(0x9E670040);                          // fmov d0, x2
+            E4(0x9E670061);                          // fmov d1, x3
+            if (op == TK.Plus()) {
+                E4(0x1E602820);                      // fadd d0, d1, d0
+            } else if (op == TK.Minus()) {
+                E4(0x1E603820);                      // fsub d0, d1, d0
+            } else if (op == TK.Star()) {
+                E4(0x1E604820);                      // fmul d0, d1, d0
+            } else if (op == TK.Slash()) {
+                E4(0x1E605820);                      // fdiv d0, d1, d0
+            } else if (op == TK.Less()) {
+                E4(0x1E602020);                      // fcmp d1, d0
+                E4(0x9A9FA7E0);                      // cset x0, lt
+            } else if (op == TK.Greater()) {
+                E4(0x1E602020);
+                E4(0x9A9FD7E0);                      // cset x0, gt
+            } else if (op == TK.LessEq()) {
+                E4(0x1E602020);
+                E4(0x9A9FC7E0);                      // cset x0, le
+            } else if (op == TK.GreaterEq()) {
+                E4(0x1E602020);
+                E4(0x9A9FB7E0);                      // cset x0, ge
+            } else if (op == TK.EqEq()) {
+                E4(0x1E602020);
+                E4(0x9A9F17E0);                      // cset x0, eq
+            } else if (op == TK.BangEq()) {
+                E4(0x1E602020);
+                E4(0x9A9F07E0);                      // cset x0, ne
+            }
+            if (arith) {
+                E4(0x9E660000);                      // fmov x0, d0
+                GenNulWrap(true);
+            }
+        } else {
+            LdrU(1, 1, 0);                           // left payload -> x1
+            LdrU(0, 0, 0);                           // right payload -> x0
+            if (op == TK.Plus()) {
+                E4(0x8B000020);                      // add x0, x1, x0
+                if (pay == "int") { Wrap32(1); }
+            } else if (op == TK.Minus()) {
+                E4(0xCB000020);                      // sub x0, x1, x0
+                if (pay == "int") { Wrap32(1); }
+            } else if (op == TK.Star()) {
+                E4(0x9B007C20);                      // mul x0, x1, x0
+                if (pay == "int") { Wrap32(1); }
+            } else if (op == TK.Slash() || op == TK.Percent()) {
+                // the lifted divide keeps the ordinary guards; a null
+                // operand never reaches this point
+                int bad = NL();
+                int cont = NL();
+                int safe = NL();
+                CbzReg(0, bad);
+                EmitB(cont);
+                Mark(bad);
+                E4(0xF81F0FE1);                      // keep dividend
+                LoadSymRef("l_.str." + guardFileIdx, 0);
+                LoadImm(1, curLine);
+                LoadImm(2, curCol);
+                if (op == TK.Slash()) { LoadSymRef("l_.str." + guardDivIdx, 3); }
+                else { LoadSymRef("l_.str." + guardModIdx, 3); }
+                BLInternal("_zan_rt_guard_fail3");
+                E4(0xF84107E1);
+                LoadImm(0, 1);                       // safe divisor
+                Mark(cont);
+                LoadImm(2, 0x8000000000000000);
+                LoadImm(3, -1);
+                E4(0xEB03001F);                      // cmp x0, x3
+                EmitBcond(1, safe);
+                E4(0xEB02003F);                      // cmp x1, x2
+                EmitBcond(1, safe);
+                LoadImm(0, 1);
+                Mark(safe);
+                if (op == TK.Slash()) {
+                    E4(0x9AC00C20);                  // sdiv x0, x1, x0
+                    if (pay == "int") { Wrap32(1); }
+                } else {
+                    E4(0x9AC00C24);                  // sdiv x4, x1, x0
+                    E4(0x9B008480);                  // msub x0, x4, x0, x1
+                }
+            } else if (op == TK.Less()) {
+                E4(0xEB00003F);                      // cmp x1, x0
+                E4(0x9A9FA7E0);                      // cset x0, lt
+            } else if (op == TK.Greater()) {
+                E4(0xEB00003F);
+                E4(0x9A9FD7E0);                      // cset x0, gt
+            } else if (op == TK.LessEq()) {
+                E4(0xEB00003F);
+                E4(0x9A9FC7E0);                      // cset x0, le
+            } else if (op == TK.GreaterEq()) {
+                E4(0xEB00003F);
+                E4(0x9A9FB7E0);                      // cset x0, ge
+            } else if (op == TK.EqEq()) {
+                E4(0xEB00003F);
+                E4(0x9A9F17E0);                      // cset x0, eq
+            } else if (op == TK.BangEq()) {
+                E4(0xEB00003F);
+                E4(0x9A9F07E0);                      // cset x0, ne
+            } else {
+                LoadImm(0, 0);
+            }
+            if (arith) { GenNulWrap(false); }
+        }
+        Mark(done);
+    }
+
     // does this expression evaluate to a bool? (comparisons / bool locals,
     // fields and method results -- WriteLine renders those true/false)
     bool IsBoolExpr(Node e) {
@@ -7416,6 +7729,7 @@ partial class Ngen {
         }
         if (e.kind == AK.Unary()) { return e.op == TK.Bang(); }
         if (e.kind == AK.MemberAccess()) {
+            if (e.sval == "HasValue" && e.a != null && IsNulTy(StaticTyOf(e.a))) { return true; }
             Fld f = FieldOf(e);
             if (f != null) { return f.ty == "bool"; }
             return PropGetterTy(e) == "bool";
@@ -7888,6 +8202,29 @@ partial class Ngen {
         Node callee = e.a;
         if (callee != null && callee.kind == AK.MemberAccess()) {
             Node recv = callee.a;
+            // nullable.GetValueOrDefault([fallback]): the payload when the
+            // cell is set, else the fallback (0 / default(T))
+            if (callee.sval == "GetValueOrDefault" && recv != null
+                    && IsNulTy(StaticTyOf(recv))) {
+                string gpay = NulPayOf(StaticTyOf(recv));
+                GenExpr(recv);                           // x0 = cell
+                int gnull = NL();
+                int gend = NL();
+                CbzReg(0, gnull);
+                LdrU(0, 0, 0);                           // has: the payload
+                if (IsDblTy(gpay)) { E4(0x9E670000); }   // fmov d0, x0
+                EmitB(gend);
+                Mark(gnull);
+                if (e.kids.Count == 1) {
+                    GenExpr(e.kids[0]);                  // null: the fallback
+                    if (IsDblTy(gpay) && !IsDblExpr(e.kids[0])) { ConvI2D(); }
+                } else {
+                    LoadImm(0, 0);
+                    if (IsDblTy(gpay)) { E4(0x9E670000); }   // fmov d0, x0
+                }
+                Mark(gend);
+                return;
+            }
             // Task-value members: t.Wait() pumps the driver until the frame
             // completes (and rethrows a captured exception, like Task.Wait);
             // t.Result waits and reads frame+32; t.IsCompleted answers the
@@ -7987,6 +8324,33 @@ partial class Ngen {
                 } else if (IsUlongExpr(e.kids[0])) {
                     GenExpr(e.kids[0]);
                     BLInternal("_zan_rt_print_uint");
+                } else if (IsNulExpr(e.kids[0])
+                        && NulPayOf(StaticTyOf(e.kids[0])) != null) {
+                    // a nullable value prints its payload, or an empty line
+                    // when null (gen0's Nullable.ToString())
+                    Node w0 = e.kids[0];
+                    string wpay = NulPayOf(StaticTyOf(w0));
+                    GenExpr(w0);                         // x0 = cell
+                    int wnull = NL();
+                    int wend = NL();
+                    CbzReg(0, wnull);                    // null: empty line
+                    LdrU(0, 0, 0);                       // payload
+                    if (IsDblTy(wpay)) {
+                        E4(0x9E670000);                  // fmov d0, x0
+                        BLExtern("_zan_rt_print_double");
+                    } else if (wpay == "char") {
+                        BLInternal("_zan_rt_chrstr");
+                        BLInternal("_zan_rt_println");
+                    } else if (wpay == "ulong") {
+                        BLInternal("_zan_rt_print_uint");
+                    } else {
+                        BLInternal("_zan_rt_print_int");
+                    }
+                    EmitB(wend);
+                    Mark(wnull);
+                    LoadStr(InternStr(""), 0);
+                    BLInternal("_zan_rt_println");
+                    Mark(wend);
                 } else {
                     GenExpr(e.kids[0]);
                     BLInternal("_zan_rt_print_int");
@@ -8022,6 +8386,8 @@ partial class Ngen {
                     GenExpr(arg); BLInternal("_zan_rt_dbl2str");
                 } else if (IsUlongExpr(arg)) {
                     GenExpr(arg); BLInternal("_zan_rt_uint2str");
+                } else if (IsNulExpr(arg) && NulPayOf(StaticTyOf(arg)) != null) {
+                    GenNulToStr(arg);                    // null renders ""
                 } else {
                     GenExpr(arg); BLInternal("_zan_rt_int2str");
                 }
