@@ -1,6 +1,45 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-27 · v17 · 定点见下方 v17 节
+日期：2026-09-29 · v18o · 定点见下方 v18o 节
+
+## v18 阶段边界批（2026-09-29，sweep 507→518，ncf 55→43，检查点 /tmp/v18n/fix/bin/zanc = run.KqvY7o）
+
+cs_b* 语言核心阶段收口：v18n/v18o 两轮共五个批次把 conformance 的语言核心残留清完，全量
+sweep 624 例 **507→518 pass**（sweep 后 qdot 又把 null_conditional +
+null_conditional_value 翻绿，活状态 520/15 em）。1. **switch 表达式 + 类型/关系模式 +
+when、元组、op_call**（v18n/v18o-1/2）。2. **cs_b15 Task 面**（19932a1）：Task.Run 内联
+delegate、Task<T> Result/Wait/IsCompleted、quiesce 泵模式——oracle 自身 rto，按库内
+golden 逐字节对齐。3. **cs_b08 矩形多维数组**（8737b3e）：逗号秩声明 + 多下标索引解析、
+oracle 头布局（arr=raw+32、dims 在 arr+8d、count 在 -16、rank 在 -8）、寄存器化
+GenMdArrNew（x19-x25，绝不跨 calloc 持调用者保存寄存器）、行主扁平索引、行主初始化器
+（str imm12 按宽度**缩放**：w 用 off/4<<10、b 用 off<<10——这两处是 cs_b08 最后的
+om 根因）、int[][,] 锯齿嵌矩形、返回多维数组的方法。硬老师：MUL 是 MADD Ra=xzr
+（0x9B…），SDIV 基址 0x9AC00C00，LDUR 基址 0xF8400000（0xF8000000 是 STUR），BL
+偏移从 bl 自身地址起算，lldb 断点在这批二进制上不可用（二进制补丁 + 带内探针定位）。
+4. **nullable 值类型**（f10fbe5）：T?（基元/枚举/struct）= 8 字节堆单元（指针即值、
+0 即 null、payload 在 [cell]），引用型 ? 在 TypeFullName 抹除；装箱收口在
+GenConversionValueNg 单一边界（声明/赋值/返回/数组初始化器），null 字面量保持 null
+单元；?? 对单元，提升 + - * / % == != < > <= >= **先查空再做算术**（b 为 null 的
+b/0 永不除）；.HasValue/.Value/GetValueOrDefault + oracle 的 "Nullable object must
+have a value" 守卫；WriteLine/Write/串接把 null 渲染为空串。5. **真 null 条件
+?.**（f272f2d）：解析器把 `?.` 记为 MemberAccess ival==1，旧检查盯 op==TK.QDot
+（永不成立）→ `a?.Get()` 在 null 接收者上 SIGSEGV。现按 oracle emit_null_cond：接收者
+判空一次、null 短路为结果类型之 null、值型成员/调用结果在取用路径装箱；StaticTyOf
+把两种形态都提升为 T?，声明边界不再二次装箱（m=1、h=指针 的双装箱类）；链式
+b?.Self()?.name 可用。验证：cs_b19_nullable_arr、nullable_value_types、
+nullable_safety_test、nullable_reference_types、null_conditional、
+null_conditional_value 全 pass；battery 39/39；crossboot 支路未动。sweep 归因：
+dispatch_queue_growth / dispatch_delegate_ownership / dispatch_first_use /
+generic_deep_close 随批次从 ncf 变为"能编译、运行崩"（Dispatcher.Take/Post、new
+UiEvent、泛型 ToString 的解析在批次中出现）——运行时缺口列入 open；oracle 漂移
+flapper 照旧（arr_lit_rc/enum_257 本轮落 pass，http_forwarder_keepalive rto→em，
+foreach_protocol mne→em，redis_client em→mne）。
+
+**下一批**（按既定顺序）：泛型 delegate 簇（generic_delegate_ctor、
+generic_delegate_ctor_methodgroup、generic_iface_convert、generic_nested_generic_field、
+ternary_is_type、type_test_ops、closure_mutable_capture）→ Web 绑定族（web_* 6 例）→
+JSON 簇（3）+ Game（4）→ 所有权/异常簇与 em 清账 → reflection intrinsics（3）→
+misc 单例。
 
 ## v17 阶段边界批（2026-09-27，chart 1670→252，sweep 316→380，检查点 run.y2Gm7Q/run.iIz2Mx）
 
