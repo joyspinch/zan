@@ -35,6 +35,9 @@ partial class Ngen {
     List<string> dlgSubTps;     // last DelegateDeclTyNg match: decl type params
     List<string> dlgSubArgs;    // and the reference's substituted arguments
     int lastInferGroupMi = -1;  // method InferGroupTyNg invented a signature from
+    string pendingCtorInstNg;   // instantiation whose ctor PushCallArgs feeds
+                                // ("Bag<Item>"): its type args substitute the
+                                // open param types before delegate registration
 
     void InitDelegateNg() {
         if (delegateThunks != null) { return; }
@@ -178,6 +181,18 @@ partial class Ngen {
             if (c != null) { return c.isStruct == 0; }
         }
         return false;
+    }
+
+    // substitute a generic class's type parameters into an open type name
+    // using an instantiation string ("Bag<Item>" -> T becomes Item); a bare
+    // or unknown name returns the input unchanged
+    string SubstClsInstNg(string ty, string inst) {
+        if (ty == null || inst == null) { return ty; }
+        int lp = inst.IndexOf("<");
+        if (lp <= 0) { return ty; }
+        Cls c = FindClass(inst.Substring(0, lp));
+        if (c == null || c.tps.Count == 0) { return ty; }
+        return SubstTy(ty, c.tps, SplitTyArgs(inst.Substring(lp + 1, inst.Length - lp - 2)));
     }
 
     bool CheckDelegateTyNg(string ty, Node site) {
@@ -429,12 +444,17 @@ partial class Ngen {
             }
             return;
         }
-        // A boxed local (some lambda in this body assigns it) captures as the
-        // shared cell itself: reads and writes on either side land in the one
-        // variable. Writes to unboxed locals stay rejected -- their snapshot
-        // would never propagate (A33-2b).
+        // A boxed local (some lambda in this body assigns it, or the method
+        // rebinds a captured one) captures as the shared cell itself: reads
+        // and writes on either side land in the one variable. A struct value
+        // shares only through that cell -- unboxed, the capture is the stable
+        // pre-rebind pointer, which the pre-pass guarantees is never rebound
+        // (it boxes exactly the captured-and-rebound slots). Writes to
+        // unboxed locals stay rejected -- their snapshot would never
+        // propagate (A33-2b).
         bool boxed = LocBoxedNg(slot);
-        if (locRef[slot] || !DelegateWordNg(locTy[slot], false) || (write && !boxed)) {
+        bool word = DelegateWordNg(locTy[slot], false);
+        if (locRef[slot] || (!word && !boxed) || (write && !boxed)) {
             diags.Error("ngen delegate: unsupported captured write, ref/out, or non-word value '" + name + "'", site.line, site.col);
             return;
         }
@@ -670,6 +690,7 @@ partial class Ngen {
             diags.Error("ngen delegate: value is not a method group", e.line, e.col); return;
         }
         int found = -1; List<string> args = DelegateArgsNg(ty);
+        Cls oc = owner != null ? FindClass(owner) : null;
         List<int> cs = owner != null ? MethCandsClsName(owner, name) : null;
         if (cs != null) {
             int i = 0;
@@ -678,12 +699,22 @@ partial class Ngen {
                 Node m = methNodes[mi];
                 bool ok = !HasTypeParams(m)
                     && !HasMod(m, MOD.Extern()) && (methStat[mi] == 0 || methStat[mi] == 1)
-                    && ParamCount(m) == DelegateArityNg(ty) && TypeFullName(m.type) == DelegateRetNg(ty);
+                    && ParamCount(m) == DelegateArityNg(ty);
                 if (receiver != null && methStat[mi] != 0) { ok = false; }
+                // an erased owner type parameter in the target's signature
+                // accepts the concrete expected type: one shared body serves
+                // every instantiation and the thunk passes the same word
+                if (ok) {
+                    string mrt = TypeFullName(m.type);
+                    if (mrt != DelegateRetNg(ty)
+                            && (oc == null || IndexOfStrNg(oc.tps, mrt) < 0)) { ok = false; }
+                }
                 int p = 0;
                 while (ok && p < ParamCount(m)) {
                     Node a = ParamAt(m, p);
-                    if (a.ival != 0 || TypeFullName(a.type) != args[p]) { ok = false; }
+                    string apt = TypeFullName(a.type);
+                    if (a.ival != 0 || (apt != args[p]
+                            && (oc == null || IndexOfStrNg(oc.tps, apt) < 0))) { ok = false; }
                     p = p + 1;
                 }
                 if (ok) {
@@ -750,18 +781,35 @@ partial class Ngen {
                 curCls = delegateOwners[id]; curMeth = m; curHasTry = false;
                 InitLocalsNg(); AddLoc("#delegateEnv", "nint", false);
                 int i = 0;
-                while (i < m.kids.Count) { AddLoc(m.kids[i].sval, TypeFullName(m.kids[i].type), false); i = i + 1; }
+                while (i < m.kids.Count) {
+                    AddLoc(m.kids[i].sval, TypeFullName(m.kids[i].type), false);
+                    paramSlotsNg.Add(nloc - 1);
+                    i = i + 1;
+                }
                 int capStart = nloc; i = 0;
                 while (i < m.b.kids.Count) {
                     Node c = m.b.kids[i]; AddLoc(c.sval, TypeFullName(c.type), false);
                     if ((int)c.ival < 0) { locBoxed[nloc - 1] = 1; }  // keep the cell pointer live
                     i = i + 1;
                 }
-                ReserveLocals(m.d); frame = 16 * nloc;
+                ReserveLocals(m.d);
+                // a lambda body can itself write a captured variable after an
+                // inner lambda captured it ("v => { f = () => v; v = 33; }"):
+                // the same captured-and-rebound rule boxes the slot here
+                BoxLambdaWrittenLocalsNg(m.d);
+                frame = 16 * nloc;
                 if (frame >= 4096) { diags.Error("ngen delegate: lambda frame exceeds native immediate limit", m.line, m.col); }
                 RtPrologue(); if (frame > 0) { AddSPImm(frame, false); }
                 i = 0;
-                while (i <= m.kids.Count) { StoreLocal(i, i); i = i + 1; }
+                while (i <= m.kids.Count) {
+                    StoreLocal(i, i);
+                    if (boxParamSlots.Contains(i)) {
+                        LoadLocal(i, 0);
+                        GenNulWrap(false);
+                        StoreLocal(i, 0);
+                    }
+                    i = i + 1;
+                }
                 i = 0;
                 while (i < m.b.kids.Count) {
                     // env[i] is the capture's value word; for a boxed capture

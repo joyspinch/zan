@@ -1610,8 +1610,11 @@ class Parser {
         if (At(TK.Ident())) { cls.sval = Next().text; }
         if (At(TK.Less())) { while (!At(TK.Greater()) && !At(TK.Eof())) { Next(); } Expect(TK.Greater()); }
         if (Eat(TK.Colon())) {
-            if (At(TK.Ident())) { cls.sval2 = Next().text; }
-            while (Eat(TK.Comma())) { if (At(TK.Ident())) { Next(); } }
+            if (At(TK.Ident())) {
+                cls.sval2 = Next().text;
+                SkipTypeArgs();   // first base may be generic (`BoxSource<T> : Box<T>`)
+            }
+            while (Eat(TK.Comma())) { SkipType(); }
         }
         SkipWhereClauses();
         Expect(TK.LBrace());
@@ -3078,11 +3081,13 @@ class Parser {
                 if (At(TK.Null())) { Next(); }
                 else {
                     ie.type = ParseType();
+                    FixIsTernaryQ(ie);
                     if (At(TK.Ident())) { ie.sval = Next().text; }
                 }
                 ie.op = 1;                               // negated test
             } else {
                 ie.type = ParseType();
+                FixIsTernaryQ(ie);
                 if (At(TK.Ident())) { ie.sval = Next().text; }
             }
             left = ie;
@@ -3094,9 +3099,56 @@ class Parser {
             Node ae = new Node(AK.AsExpr());
             ae.a = left;
             ae.type = ParseType();
+            FixIsTernaryQ(ae);
             left = ae;
         }
         return left;
+    }
+
+    // `x is T? ...`: C# conditional-operator precedence -- a type-final `?`
+    // opens the ternary when a `:` pairs with it at bracket depth 0 before
+    // any statement terminator (o is string ? "a" : "b"); only a genuine
+    // nullable suffix keeps it (`is int? x` patterns and trailing `is int?`
+    // have no paired colon). Rewinds over the `?` so ParseCond reads it.
+    void FixIsTernaryQ(Node ie) {
+        if (ie == null || ie.type == null || ie.type.op != 1) { return; }
+        if (pos <= 0 || toks[pos - 1].kind != TK.Question()) { return; }
+        if (!TernaryColonAhead()) { return; }
+        pos = pos - 1;
+        ie.type.op = 0;
+    }
+
+    // is there a `:` pairing with a `?` at the current spot? `tern` counts
+    // open ternaries INCLUDING the `?` under decision (start 1): a colon at
+    // tern==1 closes it (rewind), deeper colons close nested ternaries, and
+    // `?`/`:` inside parens/brackets never count -- `o is string ?
+    // (s is string ? "a" : "b") : "c"` rewinds while `is int? n2 ? 1 : 0`
+    // (a `;` arrives with our `?` still open) stays a nullable binding
+    bool TernaryColonAhead() {
+        int paren = 0;
+        int tern = 1;
+        int i = pos;
+        while (i < toks.Count) {
+            int k2 = toks[i].kind;
+            if (k2 == TK.LParen() || k2 == TK.LBracket()) { paren = paren + 1; }
+            else if (k2 == TK.RParen() || k2 == TK.RBracket()) {
+                if (paren == 0) { return false; }
+                paren = paren - 1;
+            }
+            else if (k2 == TK.Question()) {
+                if (paren == 0) { tern = tern + 1; }
+            }
+            else if (k2 == TK.Colon()) {
+                if (paren == 0) {
+                    if (tern <= 1) { return true; }
+                    tern = tern - 1;
+                }
+            }
+            else if (paren == 0 && tern == 1 && (k2 == TK.Semicolon() || k2 == TK.LBrace()
+                    || k2 == TK.RBrace() || k2 == TK.Eof())) { return false; }
+            i = i + 1;
+        }
+        return false;
     }
     Node ParseShift() {
         Node left = ParseAdd();

@@ -167,6 +167,12 @@ partial class Ngen {
     List<int> locBoxed;     // lambda-written slots: the slot holds a shared heap
                             // cell (A33-2b), reads and writes go through it
     List<string> boxNames;  // names any nested lambda assigns (per method)
+    List<string> boxCaptured; // names any nested lambda reads (per method)
+    List<string> boxOuterWrote; // names the method body itself assigns
+    List<int> boxParamSlots; // param frame slots boxed this method (prologue
+                             // wraps the incoming value in a shared cell)
+    List<int> paramSlotsNg;  // frame slots of the method's own parameters, in
+                             // declaration order (boxable capture targets)
     List<Node> patStamped;  // pattern nodes whose bindings were pre-stamped
     List<int> locOpaq;      // string slot holding an extern-call result: no
                             // length header, no trusted NUL bound (the stdlib
@@ -683,7 +689,12 @@ partial class Ngen {
             return;
         }
         List<string> ats = ext ? ExternArgClassTys(m, e) : null;
+        // a delegate-typed parameter of a generic-class static method arrives
+        // open; the receiver's static type (an instance or extension
+        // receiver) supplies the substitution source
+        pendingCtorInstNg = e.a != null ? StaticTyOf(e.a) : null;
         int pushed = PushCallArgs(m, e);
+        pendingCtorInstNg = null;
         // AAPCS64 allocation (extern only): the first eight integer-class
         // slots land in x0..x7 by their position among integer args; the
         // first eight float/double slots in d/s0..7 by their position among
@@ -919,6 +930,49 @@ partial class Ngen {
         return s;
     }
 
+    // is a slot-key tag an OPEN type parameter: a bare identifier that
+    // resolves to no declared type or primitive ("T" in Box<T>.Put(T, T)).
+    // Under erasure one shared body serves every instantiation, so such a
+    // tag accepts any word tag the implementation declares.
+    bool ErasedTagNg(string tag) {
+        if (tag == null || tag.Length == 0) { return false; }
+        if (tag.IndexOf("[") >= 0) { return false; }
+        int dot = tag.IndexOf(".");
+        string head = dot > 0 ? tag.Substring(0, dot) : tag;
+        if (head == "int" || head == "long" || head == "ulong" || head == "double"
+                || head == "bool" || head == "char" || head == "string"
+                || head == "object" || head == "byte" || head == "sbyte"
+                || head == "short" || head == "ushort" || head == "uint"
+                || head == "float" || head == "nint" || head == "void") { return false; }
+        return FindClass(head) == null;
+    }
+
+    // does a method occupy a slot key: exact key equality, or a generic
+    // base's erased key ("Put_T_T") matching a concrete implementation
+    // ("Put_int_int") tag-for-tag with open tags as wildcards
+    bool SlotKeyMatchNg(Node m, string key) {
+        string mk = SlotKeyNg(m);
+        if (mk == key) { return true; }
+        int un = mk.IndexOf("_");
+        int uk = key.IndexOf("_");
+        if (un <= 0 || uk <= 0) { return false; }
+        if (mk.Substring(0, un) != key.Substring(0, uk)) { return false; }
+        int i = un + 1;
+        int j = uk + 1;
+        while (i < mk.Length || j < key.Length) {
+            int e1 = mk.IndexOf("_", i); if (e1 < 0) { e1 = mk.Length; }
+            int e2 = key.IndexOf("_", j); if (e2 < 0) { e2 = key.Length; }
+            string t1 = mk.Substring(i, e1 - i);
+            string t2 = key.Substring(j, e2 - j);
+            if (t1 != t2 && !ErasedTagNg(t2)) { return false; }
+            if (e1 == mk.Length && e2 == key.Length) { return true; }
+            if (e1 == mk.Length || e2 == key.Length) { return false; }
+            i = e1 + 1;
+            j = e2 + 1;
+        }
+        return true;
+    }
+
     // virtual-slot keys of cls, base classes first; a derived
     // re-declaration of an inherited virtual keeps the base slot
     void CollectVSlotsNg(string cls, List<string> slots) {
@@ -1117,7 +1171,7 @@ partial class Ngen {
                 while (i < cs.Count) {
                     // an abstract declaration does not implement its own slot;
                     // the search continues down the chain to the concrete body
-                    if (methStat[cs[i]] == 0 && SlotKeyNg(methNodes[cs[i]]) == key
+                    if (methStat[cs[i]] == 0 && SlotKeyMatchNg(methNodes[cs[i]], key)
                             && !HasMod(methNodes[cs[i]], MOD.Abstract())) { return cur; }
                     i = i + 1;
                 }
@@ -1145,7 +1199,7 @@ partial class Ngen {
         if (cs == null) { return null; }
         int i = 0;
         while (i < cs.Count) {
-            if (methStat[cs[i]] == 0 && SlotKeyNg(methNodes[cs[i]]) == key) { return methNodes[cs[i]]; }
+            if (methStat[cs[i]] == 0 && SlotKeyMatchNg(methNodes[cs[i]], key)) { return methNodes[cs[i]]; }
             i = i + 1;
         }
         return null;
@@ -1498,6 +1552,7 @@ partial class Ngen {
             if (p.kind == AK.Param()) {
                 AddLoc(p.sval, TypeFullName(p.type), p.ival == 1);
                 if (locTy[nloc - 1] == "string") { locOpaq[nloc - 1] = 1; }
+                paramSlotsNg.Add(nloc - 1);
             }
             pi = pi + 1;
         }
@@ -1528,6 +1583,14 @@ partial class Ngen {
             Node p = m.kids[pi];
             if (p.kind == AK.Param()) {
                 StoreLocal(argReg, argReg);
+                // a captured-and-rebound parameter shares its value through a
+                // heap cell: the slot becomes the cell, the incoming argument
+                // its payload (the same wrap shape a T? value uses)
+                if (boxParamSlots.Contains(argReg)) {
+                    LoadLocal(argReg, 0);
+                    GenNulWrap(false);
+                    StoreLocal(argReg, 0);
+                }
                 argReg = argReg + 1;
             }
             pi = pi + 1;
@@ -1546,7 +1609,11 @@ partial class Ngen {
         if (methStat[mi] == 2 && m.c != null) {
             int tix = FitCtorIdx(cls, m.c, false, m);
             if (tix >= 0) {
+                // same-class chaining on a generic spec: the spec this-type
+                // ("Pool<Conn>") supplies the substitution source
+                pendingCtorInstNg = m.sval2 != null && m.sval2 != "" ? m.sval2 : cls;
                 int tpushed = PushCallArgs(methNodes[tix], m.c);
+                pendingCtorInstNg = null;
                 int tr = tpushed;
                 while (tr >= 1) { E4(0xF84107E0 | tr); tr = tr - 1; } // args reversed
                 LoadLocal(0, 0);                                 // this -> x0
@@ -1651,6 +1718,7 @@ partial class Ngen {
         locOpaq = new List<int>();
         locBoxed = new List<int>();
         boxNames = new List<string>();
+        paramSlotsNg = new List<int>();
         envNodes = new List<Node>(); envHeads = new List<int>();
         patStamped = new List<Node>();
         locHead = -1; nloc = 0;
@@ -1850,19 +1918,38 @@ partial class Ngen {
     // test exercises stays byte-identical.
     void BoxLambdaWrittenLocalsNg(Node body) {
         boxNames = new List<string>();
+        boxCaptured = new List<string>();
+        boxOuterWrote = new List<string>();
         BoxWritesNg(body, new List<string>(), false, 0);
+        // a captured variable the method itself rebinds must box even though
+        // no lambda writes it: the delegate must observe the rebinding, and
+        // a value snapshot would keep reporting the pre-rebind word
+        boxParamSlots = new List<int>();
         int li = 0;
         while (li < locDecl.Count) {
             Node d = locDecl[li];
+            bool captured = IndexOf(boxCaptured, locName[li]) >= 0;
+            bool rebound = IndexOf(boxOuterWrote, locName[li]) >= 0;
             // plain VarDecl slots only: foreach/catch/for-var decls register
             // other node kinds (or none) and their per-iteration stores write
-            // the slot directly; params have no decl node at all
+            // the slot directly; params are handled below through their
+            // recorded frame slots
             if (d != null && d.kind == AK.VarDecl() && locRef[li] == false
-                    && DelegateWordNg(locTy[li], false)
-                    && IndexOf(boxNames, locName[li]) >= 0) {
+                    && (IndexOf(boxNames, locName[li]) >= 0 || (captured && rebound))) {
                 locBoxed[li] = 1;
             }
             li = li + 1;
+        }
+        int ps = 0;
+        while (ps < paramSlotsNg.Count) {
+            int li2 = (int)paramSlotsNg[ps];
+            if (locRef[li2] == false
+                    && IndexOf(boxCaptured, locName[li2]) >= 0
+                    && IndexOf(boxOuterWrote, locName[li2]) >= 0) {
+                locBoxed[li2] = 1;
+                boxParamSlots.Add(li2);
+            }
+            ps = ps + 1;
         }
     }
 
@@ -1884,6 +1971,18 @@ partial class Ngen {
             if (depth > 0 && write && IndexOf(bound, n.sval) < 0
                     && IndexOf(locName, n.sval) >= 0 && IndexOf(boxNames, n.sval) < 0) {
                 boxNames.Add(n.sval);
+            }
+            // reads at depth > 0 make the name a capture candidate; a depth-0
+            // write marks a method-body rebind. Captured + rebound is the
+            // C# closure shape (the variable is one cell), so the pair boxes
+            // even though no lambda ever assigns it.
+            if (depth > 0 && IndexOf(bound, n.sval) < 0
+                    && IndexOf(locName, n.sval) >= 0 && IndexOf(boxCaptured, n.sval) < 0) {
+                boxCaptured.Add(n.sval);
+            }
+            if (depth == 0 && write && IndexOf(bound, n.sval) < 0
+                    && IndexOf(locName, n.sval) >= 0 && IndexOf(boxOuterWrote, n.sval) < 0) {
+                boxOuterWrote.Add(n.sval);
             }
             return;
         }
@@ -2449,13 +2548,23 @@ partial class Ngen {
                 // `S x;` with S a struct: a fresh zero-filled value (gen0
                 // zero-inits inline storage); a boxed word local still needs
                 // its cell from the declaration point on; other types start
-                // unassigned
+                // unassigned. A BOXED struct wraps the fresh value in the
+                // shared cell -- later field writes go through it.
                 Cls dc = s.type != null ? FindClass(TypeFullName(s.type)) : null;
                 if (dc != null && dc.isStruct == 1) {
+                    int dslot = DeclSlotNg(s);
                     LoadImm(0, dc.size + 16);
                     LoadImm(1, 0);
-                    BLInternal("_zan_rt_alloc");
-                    StoreLocal(DeclSlotNg(s), 0);
+                    BLInternal("_zan_rt_alloc");             // x0 = zeroed struct
+                    if (LocBoxedNg(dslot)) {
+                        E4(0xF81F0FE0);                      // push struct
+                        LoadImm(0, 8);
+                        LoadImm(1, 0);
+                        BLInternal("_zan_rt_alloc");         // x0 = cell
+                        E4(0xF84107E1);                      // x1 = struct
+                        StrU(1, 0, 0);                       // cell->struct
+                    }
+                    StoreLocal(dslot, 0);
                 } else {
                     StoreDeclZeroCellNg(s);
                 }
@@ -4087,6 +4196,11 @@ partial class Ngen {
             while (ai < e.op && ai < e.kids.Count) { tmp.Add(e.kids[ai]); ai = ai + 1; }
             callN = tmp;
         }
+        // the instantiation substitutes open ctor parameter types both in
+        // overload scoring (ArgParamScore) and at delegate registration
+        // (PushCallArgs snapshots it)
+        string instNg = TypeFullName(e.type);
+        pendingCtorInstNg = instNg != null && instNg.IndexOf("<") > 0 ? instNg : null;
         int cix = FitCtorIdx(cls, callN, false, null);
         // `new C { X = v }` over a type whose ctors all take arguments: the
         // brace-only initializer lowers to a bare allocation plus its member
@@ -4113,11 +4227,14 @@ partial class Ngen {
         int pushed;
         if (cix >= 0) {
             pushed = PushCallArgs(methNodes[cix], callN);
+            pendingCtorInstNg = null;
         } else if (CtorCountNg(cls) > 0 && !braceOnly) {
+            pendingCtorInstNg = null;
             diags.Error("ngen: no constructor of '" + cls + "' takes "
                 + callN.kids.Count + " argument(s)", e.line, e.col);
             return;
         } else {
+            pendingCtorInstNg = null;
             pushed = 0;
         }
         int r = pushed;
@@ -4799,7 +4916,10 @@ partial class Ngen {
             }
             return;
         }
-        string tt = e.type.sval;
+        // the FULL pattern name: a bare sval is just the head ("List", or
+        // "int" with the nullable `?` parked in op), which could never match
+        // the receiver's rendered static type ("List<int?>", "int?")
+        string tt = TypeFullName(e.type);
         string st = StaticTyOf(e.a);
         if (e.sval != null) {
             // `x is T v`: evaluate once and hold the value across the test;
@@ -7523,6 +7643,15 @@ partial class Ngen {
         Cls sc = FindClass(t);
         return sc != null && sc.isStruct == 1;
     }
+
+    // sizeof(T): the mapped store width (oracle map_type: i1/i8 -> 1,
+    // i16 -> 2, i32/f32 -> 4, i64/f64 -> 8; char maps to i64)
+    int SizeOfTyName(string t) {
+        if (t == "bool" || t == "byte" || t == "sbyte") { return 1; }
+        if (t == "short" || t == "ushort") { return 2; }
+        if (t == "int" || t == "uint" || t == "float") { return 4; }
+        return 8;
+    }
     // does this expression carry a nullable value (or the null literal,
     // which rides as the null cell)?
     bool IsNulExpr(Node e) {
@@ -8254,6 +8383,16 @@ partial class Ngen {
             return;
         }
         if (TryGenDelegateCall(e)) { return; }
+        if (e.a != null && e.a.kind == AK.Ident() && e.a.sval == "sizeof"
+                && e.kids.Count == 1) {
+            // sizeof(T): the mapped type's store width (the oracle's
+            // LLVMSizeOf -- char rides the i64 spelling, so 8); unknown
+            // shapes answer the word size
+            Node stk = e.kids[0];
+            string stn = stk != null ? (stk.type != null ? TypeFullName(stk.type) : stk.sval) : "";
+            LoadImm(0, SizeOfTyName(stn));
+            return;
+        }
         if (TryGenPackedSlice(e)) { return; }
         if (TryGenHostCall(e)) { return; }
         if (TryGenStringCall(e)) { return; }
@@ -9375,7 +9514,11 @@ partial class Ngen {
             int vslot = rc != null ? VSlotOf(rc, methNodes[mi]) : -1;
             GenExpr(recv);
             E4(0xF81F0FE0);                              // str x0, [sp, #-16]! (receiver)
+            // generic receiver ("Bag<Item>"): its type args substitute the
+            // method's open delegate parameter types at registration
+            pendingCtorInstNg = StaticTyOf(recv);
             int pushed = PushCallArgs(methNodes[mi], e);
+            pendingCtorInstNg = null;
             int r = pushed;
             while (r >= 1) { E4(0xF84107E0 | r); r = r - 1; } // ldr xr, [sp], #16 (args reversed)
             E4(0xF84107E0);                              // ldr x0, [sp], #16 (receiver)
@@ -9909,6 +10052,10 @@ partial class Ngen {
     // x0.. in reverse.
     int PushCallArgs(Node m, Node e) {
         string calleeName = e.a != null ? e.a.sval : "constructor";
+        // the caller's substitution source, read once: nested argument
+        // evaluation (a nested call's own bracket) must not disturb later
+        // registrations in this loop
+        string callInstNg = pendingCtorInstNg;
         int pc = ParamCount(m);
         Node lastP = pc > 0 ? ParamAt(m, pc - 1) : null;
         bool variadic = lastP != null && lastP.op == 1;
@@ -10008,7 +10155,12 @@ partial class Ngen {
             if (pa2 != null) {
                 Node wrapped = WrapImplicitCtorArg(pa2, ae);
                 if (wrapped != null) { ak[i] = wrapped; ae = wrapped; }
-                PrepareDelegateValue(ae, TypeFullName(pa2.type));
+                // snapshotted at entry, so nested argument evaluation (a
+                // nested call resets the field) cannot disturb later
+                // registrations in this loop
+                string pdTy = TypeFullName(pa2.type);
+                if (callInstNg != null) { pdTy = SubstClsInstNg(pdTy, callInstNg); }
+                PrepareDelegateValue(ae, pdTy);
             }
             if (ae.kind == AK.OutArg()) {
                 GenRefArg(ae);                        // x0 = storage address
@@ -10154,6 +10306,28 @@ partial class Ngen {
         if (pt == null || pt == "") { return 0; }
         int conversionScore = ConversionArgScoreNg(arg, pt);
         if (conversionScore != 0) { return conversionScore; }
+        // delegate parameters: a lambda or a method group (no static type of
+        // its own) converts implicitly, and a delegate-typed expression
+        // converts under erasure even when the reference carries concrete
+        // arguments and the parameter is open ("TextOf<Item>" -> TextOf<T>)
+        if (IsDelegateTyNg(pt)) {
+            if (arg.kind == AK.Lambda()) {
+                // rank by the lambda's known result: an explicitly typed one
+                // carries it in arg.type; otherwise infer the body silently
+                // (a param-dependent body infers to null and stays neutral,
+                // so the first-declared candidate keeps the tie)
+                string lrt = arg.type != null ? TypeFullName(arg.type) : null;
+                if (lrt == null || lrt == "" || lrt == "var") {
+                    lrt = arg.a != null ? StaticTyOf(arg.a) : null;
+                }
+                if (lrt == null || lrt == "" || lrt == "var") { return 8; }
+                return DelegateRetNg(pt) == lrt ? 8 : 3;
+            }
+            if ((arg.kind == AK.Ident() || arg.kind == AK.MemberAccess())
+                    && StaticTyOf(arg) == null) { return 7; }
+            string at2 = StaticTyOf(arg);
+            if (at2 != null && IsDelegateTyNg(at2)) { return 6; }
+        }
         if (!KnownParamTy(pt)) { return 0; }
         string at = StaticTyOf(arg);
         if (at != null) { return at == pt ? 8 : 0; }
@@ -10234,6 +10408,12 @@ partial class Ngen {
                 while (j < argc && compatible) {
                     Node p = ParamAt(methNodes[ti], j);
                     string pt = p != null && p.type != null ? TypeFullName(p.type) : null;
+                    // score against the instantiation: a generic ctor's open
+                    // parameter names ("Col<T>") never equal the reference's
+                    // concrete static types ("Col<Item>") unsubstituted
+                    if (pt != null && pendingCtorInstNg != null) {
+                        pt = SubstClsInstNg(pt, pendingCtorInstNg);
+                    }
                     int s = ArgParamScore(callNode.kids[j], pt);
                     if (s <= -100) { compatible = false; }
                     score = score + s;
