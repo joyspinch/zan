@@ -7302,16 +7302,62 @@ partial class Ngen {
                 LdrU(0, 0, 8);                           // x0 = frame[1] (done)
                 return;
             }
-            // Task.Cancel(handle): set the frame's cancel flag in the one
-            // free slot (+56). Cooperative observation at await boundaries is
-            // not modelled yet; the flag is stored so the call is total.
+            // Task.Cancel(handle): mark the frame -- and, down the child
+            // chain, whatever it is transitively suspended on -- cancelled;
+            // each marked frame completes early at its next $resume entry
+            // (get_co_cancel_fn, irgen_call.c:698)
             if (recv != null && recv.kind == AK.Ident() && recv.sval == "Task"
                     && callee.sval == "Cancel" && e.kids.Count == 1) {
+                EnsureAsyncRuntimeNg();
                 GenExpr(e.kids[0]);                      // frame handle
-                LoadImm(1, 1);
-                StrU(1, 0, 56);                          // frame[7] = 1
+                BLInternal("_zan_ng_co_cancel");
                 LoadImm(0, 0);
                 return;
+            }
+            // Task.IsCancellationRequested(): inside an async body the
+            // frame's own cancel slot; 0 anywhere else (irgen_call.c:726)
+            if (recv != null && recv.kind == AK.Ident() && recv.sval == "Task"
+                    && callee.sval == "IsCancellationRequested"
+                    && e.kids.Count == 0) {
+                if (inAsyncNg) {
+                    LoadLocal(asyncFrameLocal, 1);
+                    LdrU(0, 1, 56);
+                } else {
+                    LoadImm(0, 0);
+                }
+                return;
+            }
+            // Task.Spawn(asyncCall) / Task.Run(asyncCall) in value position:
+            // emit the callee ramp, detach (awaiter = reap marker, no pump --
+            // the body first runs at the next one), yield the frame handle
+            // (irgen_call.c:621; only statement-level spawns that discard it
+            // take PrepareAsyncStmtNg's path)
+            if (recv != null && recv.kind == AK.Ident() && recv.sval == "Task"
+                    && (callee.sval == "Spawn" || callee.sval == "Run")
+                    && e.kids.Count == 1) {
+                Node spt = e.kids[0];
+                int spm = AsyncResolveCallNg(spt);
+                if (spm >= 0) {
+                    if (HasTypeParams(methNodes[spm])) {
+                        diags.Error("ngen: a spawned generic async call is not supported by the native backend", e.line, e.col);
+                        LoadImm(0, 0);
+                        return;
+                    }
+                    EnsureAsyncRuntimeNg();
+                    EmitAsyncCallNg(spm, spm, spt);      // x0 = sub frame
+                    MovRR(9, 0);
+                    StrU(9, 9, 16);                      // sub.awaiter = sub (reap marker)
+                    LoadSymRef("_zan_co_reap", 1);
+                    StrU(1, 9, 24);                      // sub.awaiter_step = reap
+                    E4(0xF81F0FE9);                      // hold sub across ready
+                    LdrU(1, 9, 40);                      // sub own_resume
+                    MovRR(0, 9);
+                    BLInternal("_zan_co_ready");
+                    E4(0xF84107E0);                      // x0 = sub (the handle)
+                    return;
+                }
+                // not an async call: fall through so the normal call path
+                // fires its own diagnostic, like the reference
             }
             // Console.ReadLine: gen0 allocates a 1024-byte string, NUL-
             // terminates it up front, fgets()s into it keeping the trailing

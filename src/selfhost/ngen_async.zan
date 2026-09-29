@@ -344,6 +344,13 @@ partial class Ngen {
         asyncSwBase = asyncFeBase + asyncFeNodes.Count;
         asyncFinRetLocal = asyncSwBase + asyncSwNodes.Count;
 
+        // heap-frame map (words): [0..8] header (state/done/awaiter/
+        // awaiter_step/result/own_resume/exc/cancel/child), then the saved
+        // local mirror, then one slot per await's sub handle. The child word
+        // is what Task.Cancel's walk follows: a frame awaiting a sub records
+        // it there, so cancelling a parent marks everything it is
+        // transitively suspended on.
+
         // ---- ramp: <Cls>_<name>(args...) -> frame ----
         syms.Add(new Sym(rampSym, txt.Count));
         RtPrologue();
@@ -352,7 +359,7 @@ partial class Ngen {
         // is 16 bytes, so sp stays 16-aligned for any argument count)
         int ar = nArgs;
         while (ar > 0) { ar = ar - 1; E4(0xF81F0FE0 | ar); }   // push x(nArgs-1)..x0
-        LoadImm(0, (8 + nSlots + nAwaits) * 8);
+        LoadImm(0, (9 + nSlots + nAwaits) * 8);
         LoadImm(1, 0);
         BLInternal("_zan_rt_alloc");                 // zeroed heap frame
         MovRR(9, 0);
@@ -361,7 +368,7 @@ partial class Ngen {
         ar = 0;
         while (ar < nArgs) {
             E4(0xF84107E0 | ar);                     // pop x0.. in order
-            StrU(ar, 9, 64 + 8 * ar);                // frame[8+i] = arg i
+            StrU(ar, 9, 72 + 8 * ar);                // frame[9+i] = arg i
             ar = ar + 1;
         }
         MovRR(0, 9);                                 // the ramp returns the frame
@@ -373,7 +380,7 @@ partial class Ngen {
         asyncFrameLocal = nloc - 2;
         asyncEhtopLocal = nloc - 1;
         asyncSaveCount = nloc - 2;
-        asyncSubBase = 8 + (nloc - 2);
+        asyncSubBase = 9 + (nloc - 2);
         asyncSubNext = 0;
         asyncNextState = 1;
         asyncResumeLbls = new List<int>();
@@ -392,6 +399,40 @@ partial class Ngen {
         E4(0x910003FD);                              // mov x29, sp
         if (frame > 0) { AddSPImm(frame, false); }
         StoreLocal(asyncFrameLocal, 0);              // x0 = frame
+
+        // cancellation (irgen_async.c's emit_async_cancel_check, hoisted to
+        // the one boundary every state passes through): a marked frame never
+        // runs body code again -- it completes early through the normal
+        // completion protocol (done = 1, state = -1, wake the awaiter),
+        // exactly once; later wakeups (its own delay timer still pending, a
+        // stray re-ready) just return. Nothing here can throw, so the check
+        // sits before the setjmp arm; a suspended frame's buffers are
+        // disarmed anyway. This is what makes a spawn cancelled before the
+        // scheduler ever steps it never start at all.
+        LoadLocal(asyncFrameLocal, 9);
+        LdrU(10, 9, 56);                             // cancel flag
+        int uncancelled = NL();
+        CbzReg(10, uncancelled);
+        LdrU(10, 9, 8);                              // done
+        int alreadyDone = NL();
+        CbnzReg(10, alreadyDone);
+        MovRR(1, 9);
+        LoadImm(0, 1);
+        StrU(0, 1, 8);                               // done = 1
+        LoadImm(0, -1);
+        StrU(0, 1, 0);                               // state = -1
+        LdrU(2, 1, 16);                              // awaiter
+        int noAwC = NL();
+        CbzReg(2, noAwC);
+        LdrU(3, 1, 24);                              // awaiter_step
+        MovRR(0, 2);
+        MovRR(1, 3);
+        BLInternal("_zan_co_ready");
+        Mark(noAwC);
+        Epilogue();
+        Mark(alreadyDone);
+        Epilogue();
+        Mark(uncancelled);
 
         // one setjmp trampoline per $resume invocation (irgen_async.c:1300):
         // armed at entry, disarmed on every exit path
@@ -437,7 +478,7 @@ partial class Ngen {
         // state 0: pull this/params out of the frame (locals start zeroed)
         LoadLocal(asyncFrameLocal, 1);
         int ri = 0;
-        while (ri < nArgs) { LdrU(0, 1, 64 + 8 * ri); StoreLocal(ri, 0); ri = ri + 1; }
+        while (ri < nArgs) { LdrU(0, 1, 72 + 8 * ri); StoreLocal(ri, 0); ri = ri + 1; }
 
         inAsyncNg = true;
         GenAsyncStmtNg(m.d);
@@ -512,7 +553,7 @@ partial class Ngen {
         int i = 0;
         while (i < asyncSaveCount) {
             LoadLocal(i, 0);
-            StrU(0, 1, 64 + 8 * i);                  // heap 8+i mirrors stack i
+            StrU(0, 1, 72 + 8 * i);                  // heap 9+i mirrors stack i
             i = i + 1;
         }
     }
@@ -521,7 +562,7 @@ partial class Ngen {
         LoadLocal(asyncFrameLocal, 1);
         int i = 0;
         while (i < asyncSaveCount) {
-            LdrU(0, 1, 64 + 8 * i);
+            LdrU(0, 1, 72 + 8 * i);
             StoreLocal(i, 0);
             i = i + 1;
         }
@@ -1008,6 +1049,8 @@ partial class Ngen {
         // heap slot for this await's sub handle
         LoadLocal(asyncFrameLocal, 2);               // x2 = frame (x9 survives)
         StrU(9, 2, subOff);                          // stash the handle
+        StrU(9, 2, 64);                              // frame[8] = child (Task.Cancel's
+                                                     // walk reaches the sub we park on)
         StrU(2, 9, 16);                              // sub.awaiter = self frame
         LoadSymRef(asyncResumeSym, 2);
         StrU(2, 9, 24);                              // sub.awaiter_step = $resume
@@ -1798,6 +1841,29 @@ partial class Ngen {
         dglbs.Add(new DGlob("co_tq", 8, dataLen));  // timer list head
         dataLen = dataLen + 8;
 
+        // _zan_ng_co_cancel(i64 frame) -- Task.Cancel's lowering target
+        // (get_co_cancel_fn, irgen_async.c:328): mark the frame cancelled and
+        // follow the CHILD chain, marking everything it is transitively
+        // suspended on. Each marked frame observes the flag at its next
+        // $resume entry and completes early. The scheduler is not touched:
+        // a frame parked on a timer is only cancelled once that wait fires.
+        // Frames are never freed on the native lane, so a stale handle is
+        // still valid memory -- re-marking a completed frame is harmless;
+        // a zero handle (never spawned) just returns.
+        syms.Add(new Sym("_zan_ng_co_cancel", txt.Count));
+        RtPrologue();
+        MovRR(9, 0);                                 // x9 = frame
+        int cchead = NL();
+        int ccdone = NL();
+        Mark(cchead);
+        CbzReg(9, ccdone);
+        LoadImm(0, 1);
+        StrU(0, 9, 56);                              // frame[7] = cancel
+        LdrU(9, 9, 64);                              // frame[8] = child
+        EmitB(cchead);
+        Mark(ccdone);
+        RtEpilogue();
+
         // _zan_co_ready(i64 frame, i64 step)
         syms.Add(new Sym("_zan_co_ready", txt.Count));
         RtPrologue();
@@ -1893,6 +1959,17 @@ partial class Ngen {
         LdrU(0, 31, 8);                              // no watchers: timer sleep
         E4(0xEB1F001F);                              // cmp x0, xzr
         EmitBcond(11, outL);                         // no timers: exit
+        // cap each sleep at one second: a saturated (never-due) deadline
+        // must not hand nanosleep a tv_nsec past its 999999999 field --
+        // EINVAL returns at once and the pump would spin at 100% cpu.
+        // Re-dispatching on wake keeps the semantics (dispatch is
+        // deadline-based, so nothing fires early)
+        LoadImm(10, 999999999);
+        E4(0xEB000000 | (10 << 16) | (0 << 5) | 31); // cmp x0, cap
+        int slKeep = NL();
+        EmitBcond(9, slKeep);                        // b.ls: within the field
+        MovRR(0, 10);
+        Mark(slKeep);
         AddSPImm(32, false);                         // [sp]=req.sec [sp+8]=req.nsec [sp+16]=rem
         E4(0xF90003FF);                              // str xzr, [sp] (tv_sec = 0)
         StrU(0, 31, 8);                              // tv_nsec = wait ns (x0 survives)
@@ -1935,9 +2012,34 @@ partial class Ngen {
         EmitBcond(12, msPos);                        // b.gt: positive ms
         LoadImm(0, 0);                               // clamp ms <= 0 to 0
         Mark(msPos);
+        // deadline = now + ms*1e6, saturating at int64 max like the
+        // reference's zan_timer_saturating_due (rt_timer.c:674): the plain
+        // multiply+add wraps for Task.Delay(int64.MaxValue), the wrapped
+        // deadline compares due immediately, and the huge-delay task wins
+        // every WhenAny it enters -- exactly what async_delay_max pins. A
+        // saturated deadline is never due (max > any now) and its sleep
+        // argument is capped in the pump below.
+        int dSat = NL();
+        int dMul = NL();
+        int dFine = NL();
+        int dStore = NL();
+        LoadImm(10, 9223372036854);                  // floor(int64max / 1e6)
+        E4(0xEB000000 | (10 << 16) | (0 << 5) | 31); // cmp ms, floor
+        EmitBcond(13, dMul);                         // b.le: multiply stays exact
+        EmitB(dSat);
+        Mark(dMul);
         LoadImm(10, 1000000);
         E4(0x9B000000 | (31 << 10) | (0 << 16) | (10 << 5) | 10);  // mul x10, x0, x10
-        AddRR(9, 9, 10);                             // deadline_ns
+        LoadImm(11, 9223372036854775807);
+        E4(0xCB000000 | (9 << 16) | (11 << 5) | 11); // sub x11, x11, x9 (headroom)
+        E4(0xEB000000 | (11 << 16) | (10 << 5) | 31); // cmp delay, headroom
+        EmitBcond(13, dFine);                        // b.le: now+delay fits
+        Mark(dSat);
+        LoadImm(9, 9223372036854775807);             // deadline = int64 max
+        EmitB(dStore);
+        Mark(dFine);
+        AddRR(9, 9, 10);                             // deadline_ns = now + delay
+        Mark(dStore);
         StrU(9, 31, 16);
         LoadImm(0, 32);
         LoadImm(1, 0);

@@ -1163,3 +1163,50 @@ http_forwarder_stream 以 rto→ncf 浮出：v18i 的 seed 同样编译失败
 **下一批候选**：async 后端（async_mt_sched 静默编译失败 + Task.Spawn/
 Run 表达式位）、cs_b* tuples/patterns/nullable、reflection intrinsics
 （独立大批次）。
+
+## v18k — async 后端：Task.Spawn/WhenAll/真取消（2026-09-29）
+
+**批次**：7 个 ncf 同三根。1. **表达式位 Task.Spawn/Run**：ngen 只有语句
+弃位形态（PrepareAsyncStmtNg），`fan.Add(Task.Spawn(Leaf(i)))` 一类取值
+位置全部 "unknown method 'Spawn'"。GenExpr 新增同构臂：发射被调 ramp、
+awaiter=self（reap 标记）、awaiter_step=_zan_co_reap、ready、**不泵**，
+x0 留帧句柄（irgen_call.c:621）。泛型实例化（async_generic_method 的
+`Spawn(Slow<int>(5))`）走既有特化路径直接可用；非 async 实参落回普通
+诊断，与 reference 一致。2. **await Task.WhenAll/WhenAny**：自宿 parser
+缺 desugar_task_join（main.zan 只镜像了 prelude 拉取那一半）。ParsePostfix
+把裸 Task 接收者的 WhenAll/WhenAny 改写成 TaskJoin——await 变成普通的
+非泛型 async 方法 await，轮询由 stdlib TaskJoin.zan（与 oracle 逐字节
+相同）的 IsDone + Delay 退避完成。3. **真取消**：原模型只是写标志无人
+观察。帧头扩一词——child 在 +64（state/done/awaiter/step/result/
+own_resume/exc/cancel 保持 0..7；args、保存局部镜像、sub 槽整体后移一
+词，全量电池 + async 家族验证位移无害）；EmitAwaitNg 把被等的 sub 记入
+child 槽；Task.Cancel 改为发射 _zan_ng_co_cancel 走链（标 frame[7]、
+顺 child 下行）；每个 $resume 入口**先查** cancel，命中即走正常完成协议
+（done=1、state=-1、唤醒 awaiter）且只做一次——后续唤醒（自己的 delay
+定时器仍在途）直接返回，不再跑任何函数体。这正是 irgen_async.c
+emit_async_cancel_check 的语义：调度器没踩过就被 cancel 的 spawn 永不
+启动（never_hit=0）；cancel 父帧时它正挂着的 child 链在下一语句边界一起
+死（Outer 被取消 → Worker 死，marks 保持 0）。4. **IsCancellationRequested
+()**：async 体内读本帧 cancel 槽，体外 0（Probe 打出 before=0/after=1）。
+5. **顺带根因**：_zan_co_after 的 deadline = now + ms*1e6 是回绕算术——
+Task.Delay(int64.MaxValue) 回绕成"立即到期"，赢得它进入的每个 WhenAny
+（async_delay_max 的靶心；oracle 在 rt_timer.c:674 饱和）。乘加两级都
+饱和到 int64 max；泵里每次 nanosleep 截到 1s，永不到期的 deadline 不再
+把 >999999999 的 tv_nsec 递给内核（EINVAL 会原地打转）。
+
+**数字**：sweep 500 → 503。4 ncf→pass（async_cancel、async_mt_sched、
+async_delay_max、async_generic_method）。http_forwarder_stream/tunnel
+ncf→rto、keepalive 维持 rto：**native 侧三个用例已全部编译通过并逐字节
+命中 golden .out（直接验证）**，但 oracle 自己过不了——它的二进制在
+stream 上打出全 0 计数、在 tunnel/keepalive/stream 复跑上挂满 60s，而
+reference_timeout 在 native 运行前短路，oracle 侧不修就永远到不了
+pass。async_when_all 同理（native = golden，oracle 超时）。
+sdk_jd_api rto→om、sdk_jd_client pass→rto 计时摆动；http_client_keepalive
+em→mne（退出码对齐、两侧同非零）；async_landing_late_local、
+async_try_exit_depth 本轮仍 om、重跑即 pass（oracle async 饿死，与
+v18j 相同）。**验证**：39/39 电池；async 家族 13 例定向（12 pass +
+async_csharp_task）；全量 624 sweep。
+
+**下一批候选**：async_csharp_task（`async Task<T>`/ValueTask<T> 方法声
+明糖 + Task 值的 Result/Wait/IsCompleted——cs_b15 共享后半）、cs_b*
+tuples/patterns/nullable、reflection intrinsics（独立大批次）。
