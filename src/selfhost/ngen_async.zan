@@ -1798,6 +1798,37 @@ partial class Ngen {
     // `Task.Spawn(<async call>)` / `Task.Run(<async call>)` detach the same
     // way (the handle they return is the frame; only statement-level spawns
     // that discard it are recognized here).
+    // Task.Spawn(<async call>) / Task.Run(<async call>) in a VALUE position:
+    // the same detach as the statement form, but the coroutine handle (the
+    // frame pointer as a long) stays on the expression so the caller can
+    // join it later (web_typed_binding joins through TaskJoin.WhenAll).
+    bool TryGenTaskSpawnValueNg(Node e) {
+        if (e == null || e.a == null || e.a.kind != AK.MemberAccess()
+                || e.a.a == null || e.a.a.kind != AK.Ident()
+                || e.a.a.sval != "Task"
+                || (e.a.sval != "Spawn" && e.a.sval != "Run")
+                || e.kids.Count != 1) { return false; }
+        Node target = e.kids[0];
+        int mi = AsyncResolveCallNg(target);
+        if (mi == -1) { return false; }              // not an async call shape
+        if (mi >= 0 && HasTypeParams(methNodes[mi])) {
+            diags.Error("ngen: a generic async call is not supported by the native backend", e.line, e.col);
+            return true;
+        }
+        EnsureAsyncRuntimeNg();
+        EmitAsyncCallNg(mi, mi, target);             // x0 = sub frame
+        E4(0xF81F0FE0);                              // hold the frame
+        MovRR(9, 0);
+        StrU(9, 9, 16);                              // sub.awaiter = sub (marker)
+        LoadSymRef("_zan_co_reap", 1);
+        StrU(1, 9, 24);                              // sub.awaiter_step = reap
+        LdrU(1, 9, 40);                              // sub own_resume
+        MovRR(0, 9);
+        BLInternal("_zan_co_ready");
+        E4(0xF84107E0);                              // x0 = the handle
+        return true;
+    }
+
     bool PrepareAsyncStmtNg(Node s) {
         if (s == null || s.kind != AK.ExprStmt() || s.a == null
                 || s.a.kind != AK.Call()) { return false; }

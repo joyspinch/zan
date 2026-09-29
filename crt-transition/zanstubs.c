@@ -528,6 +528,26 @@ int64_t zan_shared_table_create(
     return (int64_t)(intptr_t)t;
 }
 
+/* 匿名表登记：OsHandle/Attach 的同进程承载物。句柄=表指针，登记表
+ * 只用来区分"本进程创建的匿名表"（可往返）与具名表/野指针（不可）。 */
+static zt_table *zt_anon_reg[256];
+static int zt_anon_n = 0;
+static pthread_mutex_t zt_anon_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static zt_table *zt_anon_lookup(int64_t handle) {
+    zt_table *t = (zt_table *)(intptr_t)handle;
+    if (!t) return NULL;
+    pthread_mutex_lock(&zt_anon_mu);
+    for (int i = 0; i < zt_anon_n; i++) {
+        if (zt_anon_reg[i] == t) {
+            pthread_mutex_unlock(&zt_anon_mu);
+            return t;
+        }
+    }
+    pthread_mutex_unlock(&zt_anon_mu);
+    return NULL;
+}
+
 int64_t zan_shared_table_create_anon(
     int32_t capacity, int32_t key_size, const char *schema) {
     if (capacity <= 0 || capacity > ZT_MAX_CAPACITY ||
@@ -536,7 +556,16 @@ int64_t zan_shared_table_create_anon(
     zt_table *t = zt_new_table(NULL, capacity, key_size);
     if (!t) return 0;
     if (!zt_parse_schema(schema, t)) { free(t); return 0; }
-    return (int64_t)(intptr_t)t; /* 不入注册表：匿名 */
+    /* 入匿名登记表：web_shared_scope 的 master 把自己的匿名表交给
+     * 同进程的 "worker" 管理器（RateLimiter.Attach/LockManager.Attach），
+     * OsHandle/Attach 必须在同一进程内往返同一张表。句柄值就是表指针
+     * 本身（非零），attach 校验登记表成员后再放行。 */
+    pthread_mutex_lock(&zt_anon_mu);
+    if (zt_anon_n < (int)(sizeof(zt_anon_reg) / sizeof(zt_anon_reg[0]))) {
+        zt_anon_reg[zt_anon_n++] = t;
+    }
+    pthread_mutex_unlock(&zt_anon_mu);
+    return (int64_t)(intptr_t)t;
 }
 
 int64_t zan_shared_table_open(const char *name) {
@@ -554,15 +583,17 @@ int64_t zan_shared_table_open(const char *name) {
 }
 
 long zan_shared_table_handle(int64_t handle) {
-    /* 具名表按文档返回 0；匿名表本该返回可继承的描述符——过渡运行时
-     * 没有跨进程承载物，诚实返回 0。 */
-    (void)handle;
-    return 0;
+    /* 具名表按文档返回 0（本就按名字打开）；匿名表返回可交给
+     * Attach 的句柄（同进程内即表指针本身）。 */
+    if (!zt_anon_lookup(handle)) return 0;
+    return handle;
 }
 
 int64_t zan_shared_table_attach(int64_t os_handle) {
-    (void)os_handle;
-    return 0; /* 跨进程附着在过渡运行时不存在 */
+    /* 同进程附着：句柄是本进程创建的匿名表时返回它，attach 出来的
+     * SharedTable 与建表方共享同一份行数据和互斥量。 */
+    if (!zt_anon_lookup(os_handle)) return 0;
+    return os_handle;
 }
 
 void zan_shared_table_close(int64_t handle) {
