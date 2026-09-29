@@ -7186,6 +7186,19 @@ partial class Ngen {
                 return TypeFullName(methNodes[oidx].type);
             }
         }
+        // instance op_call: `E(args)` is E.op_call(args); answer the same
+        // overload's declared return so consumers see the real type
+        if (valTy != null && e.a == cc && FindClass(valTy) != null
+                && cc != null && cc.kind == AK.Ident() && LocalIdx(cc.sval) >= 0) {
+            List<int> occ = new List<int>();
+            InstanceCands(valTy, "op_call", occ);
+            if (occ.Count > 0) {
+                int ocPick = FitPickIdx(occ, e);
+                if (ocPick >= 0 && methNodes[ocPick].type != null) {
+                    return TypeFullName(methNodes[ocPick].type);
+                }
+            }
+        }
         string ht = HostCallRetTy(e);
         if (ht != null) { return ht; }
         string st = StringCallRetTy(e);
@@ -8528,6 +8541,42 @@ partial class Ngen {
         if (callee == null || callee.kind != AK.Ident()) {
             diags.Error("ngen: unsupported call target", e.line, e.col);
             return;
+        }
+        // invoked-object protocol: `E(args)` where E names a class-typed
+        // local lowers to the class's op_call -- an instance op_call is a
+        // normal method call on E; a static one takes E as its explicit
+        // first argument. The rewrite re-dispatches, so overload fit,
+        // params packing and argument conversions apply unchanged.
+        if (LocalIdx(callee.sval) >= 0) {
+            string oct = StaticTyOf(callee);
+            if (oct != null && FindClass(oct) != null) {
+                List<int> occ = new List<int>();
+                InstanceCands(oct, "op_call", occ);
+                if (occ.Count > 0 && FitPickIdx(occ, e) >= 0) {
+                    Node ic = new Node(AK.Ident());
+                    ic.sval = callee.sval;
+                    ic.line = callee.line; ic.col = callee.col;
+                    Node ma = new Node(AK.MemberAccess());
+                    ma.a = ic; ma.sval = "op_call";
+                    ma.line = e.line; ma.col = e.col;
+                    e.a = ma;
+                    GenCall(e);
+                    return;
+                }
+                Node otn = new Node(AK.Ident());
+                otn.sval = oct;
+                Node oma2 = new Node(AK.MemberAccess());
+                oma2.a = otn; oma2.sval = "op_call";
+                oma2.line = e.line; oma2.col = e.col;
+                Node osyn = new Node(AK.Call());
+                osyn.a = oma2;
+                osyn.line = e.line; osyn.col = e.col;
+                osyn.Add(callee);
+                int oki = 0;
+                while (oki < e.kids.Count) { osyn.Add(e.kids[oki]); oki = oki + 1; }
+                int oidx = ResolveStaticNg(osyn);
+                if (oidx >= 0) { CallStaticNg(oidx, osyn); return; }
+            }
         }
         // static call: candidates from the current class chain first, then
         // (legacy) any class declaring the bare name; overloads resolve by fit
