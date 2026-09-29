@@ -1478,6 +1478,9 @@ partial class Ngen {
             syms.Add(new Sym(MethSymNg(cls, m), txt.Count));
         }
         InitLocalsNg();
+        // late-synthesized specializations may carry tuple types the
+        // program sweep never saw; registration is idempotent
+        TupleSweepMethodNg(m);
         // instance methods and ctors take `this` as their first argument;
         // a specialization of a generic-class method types `this` as the
         // instantiation ("Pool<Conn>") so field types substitute
@@ -1691,6 +1694,136 @@ partial class Ngen {
             int i = 0;
             while (i < n.kids.Count) { StampPatternBindings(n.kids[i]); i = i + 1; }
         }
+    }
+
+    // ---- tuples: `(T1, T2)` values are the synthesized __Tuple_<elems>
+    // classes (parser mangles the name into the type ref's sval). ngen
+    // registers the layout on demand -- Item1..N fields at 8-byte strides,
+    // boxed like any class instance -- so .ItemN reads resolve through the
+    // ordinary field path and the literal allocates and stores by field.
+    // Unlike gen0's LLVM struct values these are heap pointers, but the
+    // observable behavior (construction, member reads, deconstruction)
+    // matches as long as nobody mutates through two aliases of one tuple.
+
+    // the parser's SanTy: alphanumerics kept, '[' -> A, '?' -> q, every
+    // other non-alphanumeric collapses to one underscore
+    string SanTyNg(string s) {
+        string r = "";
+        int i = 0;
+        while (i < s.Length) {
+            int c = s[i];
+            if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)) { r = r + Convert.ToString((char)c); }
+            else if (c == 91) { r = r + "A"; }
+            else if (c == 63) { r = r + "q"; }
+            else if (r.Length > 0 && r.Substring(r.Length - 1, 1) != "_") { r = r + "_"; }
+            i = i + 1;
+        }
+        while (r.Length > 0 && r.Substring(r.Length - 1, 1) == "_") { r = r.Substring(0, r.Length - 1); }
+        return r;
+    }
+
+    string TupleMangleNg(List<string> etys) {
+        string r = "__Tuple_";
+        int i = 0;
+        while (i < etys.Count) {
+            if (i > 0) { r = r + "_"; }
+            r = r + SanTyNg(etys[i]);
+            i = i + 1;
+        }
+        return r;
+    }
+
+    // static element type of a tuple literal's element expression
+    string TupleElemTyNg(Node e) {
+        string t = e != null ? InferExprTyNg(e) : null;
+        return t != null && t != "" ? t : "object";
+    }
+
+    // mangled name of a tuple literal, memoized onto the node (StaticTyOf
+    // asks repeatedly and the element inference is not free)
+    string TupleExprMangledNg(Node e) {
+        if (e.sval2 != null && e.sval2 != "") { return e.sval2; }
+        List<string> etys = new List<string>();
+        int i = 0;
+        while (i < e.kids.Count) { etys.Add(TupleElemTyNg(e.kids[i])); i = i + 1; }
+        e.sval2 = TupleMangleNg(etys);
+        return e.sval2;
+    }
+
+    void EnsureTupleClsNg(string name, List<string> etys) {
+        if (FindClass(name) != null) { return; }
+        Cls c = new Cls(name);
+        int i = 0;
+        while (i < etys.Count) {
+            c.flds.Add(new Fld("Item" + Convert.ToString(i + 1), i * 8, etys[i]));
+            i = i + 1;
+        }
+        c.size = etys.Count * 8;
+        RegCls(c);
+    }
+
+    void TupleSweepTyNg(Node t) {
+        if (t == null) { return; }
+        if (t.op == 2 && t.sval != null && t.sval.IndexOf("__Tuple_") == 0) {
+            List<string> etys = new List<string>();
+            int i = 0;
+            while (i < t.kids.Count) { etys.Add(TypeFullName(t.kids[i])); i = i + 1; }
+            EnsureTupleClsNg(t.sval, etys);
+            return;
+        }
+        TupleSweepTyNg(t.a);
+        int k = 0;
+        if (t.kids != null) {
+            while (k < t.kids.Count) { TupleSweepTyNg(t.kids[k]); k = k + 1; }
+        }
+    }
+
+    void TupleSweepNg(Node n) {
+        if (n == null) { return; }
+        if (n.kind == AK.TupleExpr()) {
+            List<string> etys = new List<string>();
+            int i = 0;
+            while (i < n.kids.Count) { etys.Add(TupleElemTyNg(n.kids[i])); i = i + 1; }
+            EnsureTupleClsNg(TupleMangleNg(etys), etys);
+        }
+        TupleSweepNg(n.a);
+        TupleSweepNg(n.b);
+        TupleSweepNg(n.c);
+        TupleSweepNg(n.d);
+        if (n.kids != null) {
+            int i = 0;
+            while (i < n.kids.Count) { TupleSweepNg(n.kids[i]); i = i + 1; }
+        }
+    }
+
+    // whole method: return type, parameter types and body. Runs at the
+    // program sweep (so cross-method order never matters -- Main may read
+    // GetPair().Item2 before GetPair's body is ever emitted) and again per
+    // method for later-synthesized specializations.
+    void TupleSweepMethodNg(Node m) {
+        if (m == null) { return; }
+        TupleSweepTyNg(m.type);
+        int pi = 0;
+        while (pi < m.kids.Count) {
+            if (m.kids[pi].kind == AK.Param()) { TupleSweepTyNg(m.kids[pi].type); }
+            pi = pi + 1;
+        }
+        TupleSweepNg(m.d);
+    }
+
+    // deconstruction element type: the declared per-target type, else the
+    // rhs tuple's registered field type (the program sweep guarantees the
+    // class exists by the time any method body is emitted)
+    string TupleDeconElemTyNg(Node rhs, int i) {
+        if (rhs != null && rhs.kind == AK.TupleExpr() && i < rhs.kids.Count) {
+            return TupleElemTyNg(rhs.kids[i]);
+        }
+        string rt = rhs != null ? InferExprTyNg(rhs) : null;
+        if (rt != null && rt.IndexOf("__Tuple_") == 0) {
+            Cls c = FindClass(rt);
+            if (c != null && i < c.flds.Count) { return c.flds[i].ty; }
+        }
+        return "object";
     }
 
     // Frame allocation and visibility are separate. Leaving a lexical scope
@@ -2034,6 +2167,7 @@ partial class Ngen {
             }
             return null;
         }
+        if (k == AK.TupleExpr()) { return TupleExprMangledNg(e); }
         if (k == AK.Binary() && e.op == TK.QQ()) {
             string qa = InferExprTyNg(e.a);
             return qa != null ? qa : InferExprTyNg(e.b);
@@ -2096,6 +2230,17 @@ partial class Ngen {
                 AddDeclNg(d, d.sval, InferDeclTyNg(d));
                 MarkOpaqIfExtern(d.sval, d.b);
                 di = di + 1;
+            }
+        } else if (k == AK.DeconDecl()) {
+            // `var (a, b) = rhs;` binds one local per element; the element
+            // type is the declared one, else the rhs tuple's field type
+            int i = 0;
+            while (i < s.kids.Count) {
+                Node p = s.kids[i];
+                string ty = p.type != null ? TypeFullName(p.type)
+                        : TupleDeconElemTyNg(s.b, i);
+                AddDeclNg(p, p.sval, ty);
+                i = i + 1;
             }
         } else if (k == AK.IfStmt()) {
             int saved = locHead;
@@ -2317,6 +2462,8 @@ partial class Ngen {
             Node flat = FlatCompoundAssign(s.a);
             if (flat != null) { GenCompoundTemps(s.a); }
             GenExpr(flat != null ? flat : s.a);
+        } else if (k == AK.DeconDecl()) {
+            GenDeconNg(s);
         } else if (k == AK.ReturnStmt()) {
             if (s.a != null) {
                 GenConversionValueNg(s.a, curMeth != null ? TypeFullName(curMeth.type) : null);
@@ -3715,6 +3862,8 @@ partial class Ngen {
             Mark(endL);
         } else if (k == AK.SwitchExpr()) {
             GenSwitchExpr(e);
+        } else if (k == AK.TupleExpr()) {
+            GenTupleNg(e);
         } else if (k == AK.PostfixUnary()) {
             // x++ / x--: yield the OLD value, then store old +/- 1; any
             // place (local, ref local, field, static, element) goes through
@@ -4224,6 +4373,68 @@ partial class Ngen {
         Mark(endL);
     }
 
+    // tuple literal: alloc the synthesized layout and store each element
+    // (clone semantics match a field write -- strings share, structs copy)
+    void GenTupleNg(Node e) {
+        string mangled = TupleExprMangledNg(e);
+        EnsureTupleClsNg(mangled, TupleClsElemTysOfNg(mangled, e));
+        int n2 = e.kids.Count;
+        LoadImm(0, n2 * 8 + 16);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");                     // x0 = zeroed payload
+        E4(0xF81F0FE0);                                  // hold the payload
+        int i = 0;
+        while (i < e.kids.Count) {
+            GenExpr(e.kids[i]);                          // x0 = element
+            GenCloneIfStruct(e.kids[i]);
+            LdrU(1, 31, 0);                              // x1 = payload (peek;
+                                                         //  element eval pushes
+                                                         //  are balanced)
+            StrU(0, 1, 8 * i);                           // ItemN = element
+            i = i + 1;
+        }
+        E4(0xF84107E0);                                  // pop payload -> x0
+    }
+
+    // the element types a registered tuple class was built with, computed
+    // from the literal when the class lookup loses the race (both paths
+    // mangle identically, so this only fires on inference-order edges)
+    List<string> TupleClsElemTysOfNg(string mangled, Node lit) {
+        Cls c = FindClass(mangled);
+        if (c != null) {
+            List<string> fs = new List<string>();
+            int i = 0;
+            while (i < c.flds.Count) { fs.Add(c.flds[i].ty); i = i + 1; }
+            return fs;
+        }
+        List<string> etys = new List<string>();
+        int j = 0;
+        while (j < lit.kids.Count) { etys.Add(TupleElemTyNg(lit.kids[j])); j = j + 1; }
+        return etys;
+    }
+
+    // deconstruction: `var (a, b) = rhs;` / `(int x, int y) = rhs;` -- the
+    // rhs evaluates once to the tuple payload; slot i loads into the
+    // pre-stamped binding local
+    void GenDeconNg(Node s) {
+        GenExpr(s.b);                                    // x0 = tuple payload
+        E4(0xF81F0FE0);                                  // hold it
+        int i = 0;
+        while (i < s.kids.Count) {
+            Node p = s.kids[i];
+            // slot by DECL NODE: the statement's env snapshot predates the
+            // bound locals, so the name chain is trimmed back here
+            int li = p.sval != null ? DeclSlotNg(p) : -1;
+            if (li >= 0) {
+                LdrU(0, 31, 0);                          // x0 = payload (peek)
+                LdrU(2, 0, 8 * i);                       // x2 = element i
+                StoreLocal(li, 2);
+            }
+            i = i + 1;
+        }
+        E4(0xF84107E1);                                  // pop payload -> x1
+    }
+
     // the type test half of `x is T` with the value already in x0: x0 <- 1
     // when it is a T, 0 otherwise. GenSwitchExpr peeks its pushed scrutinee
     // through here so arms share GenIs's exact matching rule (gen0's rule:
@@ -4418,6 +4629,7 @@ partial class Ngen {
         if (e.kind == AK.CastExpr() && e.type != null) { return e.type.sval; }
         if (e.kind == AK.AsExpr() && e.type != null) { return e.type.sval; }
         if (e.kind == AK.AwaitExpr()) { return AsyncAwaitElemTyNg(e.a); }
+        if (e.kind == AK.TupleExpr()) { return TupleExprMangledNg(e); }
         if (e.kind == AK.Ident()) { return NamedSlotTy(e.sval); }
         if (e.kind == AK.Call()) { return CallRetTy(e); }
         if (e.kind == AK.MemberAccess()) {
@@ -6075,6 +6287,9 @@ partial class Ngen {
 
     string TypeFullName(Node t) {
         if (t == null) { return ""; }
+        // tuple ref: sval already carries the mangled "__Tuple_<elems>"
+        // class name; the element types ride in kids for layout only
+        if (t.op == 2) { return t.sval + ArrSuffix(t.ival); }
         string n = t.sval;
         if (t.kids != null && t.kids.Count > 0) {
             n = n + "<";
