@@ -481,8 +481,11 @@ partial class Ngen {
         EmitStringRuntime();
     }
 
-    // ptr zan_rt_int2str(i64 v) -- malloc a 32-byte scratch buffer and
+    // ptr zan_rt_int2str(i64 v) -- str_alloc a 32-byte buffer and
     // sprintf("%lld", v) into it; 32 bytes hold any 64-bit decimal + NUL.
+    // The string goes out with the standard header at buf-8 (str_alloc
+    // reserves the slot): Length/Substring read it, and a bare malloc
+    // buffer would hand them malloc's own size word as the length.
     // Darwin arm64 passes variadic arguments on the stack (at [sp] at the
     // call), not in x2..x7, so v gets a dedicated stack slot.
     void RtEmitInt2Str() {
@@ -490,7 +493,7 @@ partial class Ngen {
         RtPrologue();
         E4(0xF81F0FE0);                        // str x0, [sp, #-16]! (save v)
         LoadImm(0, 32);
-        BLExtern("_malloc");                  // x0 = buf
+        BLInternal("_zan_rt_str_alloc");      // x0 = buf (header slot at buf-8)
         E4(0xF81F0FE0);                        // str x0, [sp, #-16]! (save buf)
         LdrU(2, 31, 16);                       // x2 = v (reload)
         if (EnvTargetElf() == 1) {
@@ -505,6 +508,16 @@ partial class Ngen {
         if (EnvTargetElf() == 0) {
             AddSPImm(16, true);                // drop the vararg slot
         }
+        // stamp the Zan string header at buf-8: magic | strlen(buf).
+        // strlen0/Substring/Length all read that header -- a bare malloc
+        // buffer makes them read malloc's own size word as the length
+        LdrU(0, 31, 0);                        // x0 = buf
+        BLExtern("_strlen");                  // x0 = len
+        LoadImm(4, 0x5A414E5300000000);
+        E4(0xAA040001);                        // orr x1, x0, x4
+        LdrU(5, 31, 0);                        // x5 = buf
+        SubImm(5, 5, 8);
+        StrU(1, 5, 0);                         // str x1, [buf-8]
         LdrU(0, 31, 0);                        // x0 = buf
         AddSPImm(32, true);                    // pop buf + v
         RtEpilogue();
@@ -533,7 +546,7 @@ partial class Ngen {
         RtPrologue();
         E4(0xF81F0FE0);                        // str x0, [sp, #-16]! (save v)
         LoadImm(0, 32);
-        BLExtern("_malloc");                  // x0 = buf
+        BLInternal("_zan_rt_str_alloc");      // x0 = buf (header slot at buf-8)
         E4(0xF81F0FE0);                        // str x0, [sp, #-16]! (save buf)
         LdrU(2, 31, 16);                       // x2 = v (reload)
         if (EnvTargetElf() == 1) {
@@ -548,6 +561,14 @@ partial class Ngen {
         if (EnvTargetElf() == 0) {
             AddSPImm(16, true);                // drop the vararg slot
         }
+        // stamp the Zan string header at buf-8, like int2str
+        LdrU(0, 31, 0);                        // x0 = buf
+        BLExtern("_strlen");                  // x0 = len
+        LoadImm(4, 0x5A414E5300000000);
+        E4(0xAA040001);                        // orr x1, x0, x4
+        LdrU(5, 31, 0);                        // x5 = buf
+        SubImm(5, 5, 8);
+        StrU(1, 5, 0);                         // str x1, [buf-8]
         LdrU(0, 31, 0);                        // x0 = buf
         AddSPImm(32, true);                    // pop buf + v
         RtEpilogue();
@@ -971,7 +992,8 @@ partial class Ngen {
     // Two passes exactly like gen0's __zan_str_join: one strlen pass for
     // the total (sep counted n-1 times, only when n > 0), then str_alloc
     // of align32(total + 1) (min 32) and a copy pass with the sep between
-    // elements. Null elements count as "". No length header is written.
+    // elements. Null elements count as "". The length header is stamped
+    // at buf-8 like every other heap-string producer.
     // Frame slots: [0]=total [8]=i [16]=list [24]=sep [32]=seplen
     // [40]=pos [48]=buf [56]=elem [64]=sl.
     void RtEmitStrjoin() {
@@ -1101,6 +1123,14 @@ partial class Ngen {
         LdrU(9, 31, 40);                       // pos
         E4(0x8B090000);                        // add x0, x0, x9
         Strb0(0);                              // buf[pos] = NUL
+        // stamp the Zan string header at buf-8: magic | pos. Join results
+        // flow into the same Length/Substring readers as any other string
+        LdrU(1, 31, 40);                       // x1 = pos (the copy length)
+        LoadImm(4, 0x5A414E5300000000);
+        E4(0xAA040021);                        // orr x1, x1, x4
+        LdrU(5, 31, 48);                       // x5 = buf
+        SubImm(5, 5, 8);
+        StrU(1, 5, 0);                         // str x1, [buf-8]
         LdrU(0, 31, 48);                       // return buf
         AddSPImm(80, true);
         RtEpilogue();

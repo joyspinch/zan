@@ -1119,3 +1119,47 @@ mysql_async_nonblocking pass→rto（计时）。**验证**：39/39 电池；全
 **下一批候选**：chart wide 累计回绕根因（mne 3 例 + om 复用同簇）、
 Task.Spawn/Run（表达式位）、cs_b* tuples/patterns/nullable、
 reflection intrinsics（独立大批次）。
+
+## v18j — chart 宽累计回绕根因 + 字符串头三连（2026-09-29）
+
+**批次**：四个 ngen 修复，全部靠在真实 ChartViewPie/ChartViewPolarBar 代码
+路径上加插桩定位——同形状的最小复现全对，只有真实类出错。
+
+1. ngen.zan Int32Kind 的 Ident 臂让**同名字段覆盖局部类型**：
+   `t = locTy[li]` 之后无条件 `t = fld.ty`——PieLayout 同时声明
+   `int total` 字段（55 行）和 Of 里的 `long total` 局部，于是
+   `total = total + s.Value(di)` 被判成 int32，在 64 位 add 之后发射
+   Wrap32（`sxtw x0,w0`）把和截断回 -1294967296（hugeTotal 路径）。
+   修复：局部优先，命中局部即返回；rt/acc/acc2 不中招正因为没有同名字
+   段——这解释了为什么全部最小复现与环模式路径都对，只有合并饼路径
+   回绕。
+2. ngen_obj.zan int2str/uint2str 返回裸 malloc(32) 缓冲、无 buf-8 字符
+   串头——Convert.ToString 结果上的 Length/Substring/EndsWith 全部把
+   malloc 的尺寸字读成长度，答出垃圾/空串（radar FracText "5000.50"、
+   axis F() "2.800"——去尾零循环全数失效）。改走 str_alloc(32)（保留
+   头槽位）并像 strcat2/substr3/fmt/chrstr 一样盖 magic|strlen。
+3. strjoin 同样缺盖——string.Join 结果补上头。
+4. ngen.zan IsDblExpr 的 Index 臂没有 List 分支（只有 Dict/数组/
+   IsDblListOf——后者自身无 Index 臂），`List<List<double>>` 的链式
+   元素读（PolarStackTops 的 tops[si][i]）被判成非 double，字符串拼接
+   按 int2str 打出原始位型 4615063718147915776。补
+   `ExprCls(e.a)=="List" -> IsDblTy(ElemTyOf(e))`（ElemTyOf 经
+   StaticTyOf 递归可解链）。
+
+**数字**：sweep 497 → 500。5 om→pass（chart_pie_layout、chart_radar_
+values、chart_axis_interval_align、chart_polar_bar_layout、chart_stack_
+strategy）；tdengine_pool flapper 回摆 rto→pass。4 个 chart mne
+（cat_backfill/force_params/series_zorder/tree_depth）双侧 stdout 完全
+一致——用例本身在 oracle 上也非零退出，属行为匹配而非缺口。**逐例重跑
+确认零回归**：ws_client_auth pass→em 是 oracle 侧 SIGABRT（我方输出完
+整，reference 4 行即崩）；async_landing_late_local、async_try_exit_
+depth 重跑即 pass（oracle async 饿死打出空 stdout）；mysql_async_
+nonblocking rto↔om 计时；sdk_jd_api om→rto。async_mt_sched、
+http_forwarder_stream 以 rto→ncf 浮出：v18i 的 seed 同样编译失败
+（干净 exit 1、stderr 空）——既有 async 后端缺口恰逢本轮 reference 没
+超时才显形，与 Task.Spawn 同族，下批开篇。**验证**：39/39 电池；chart
+家族 46 pass + 4 mne + 2 rcf（reference 侧编译失败）；全量 624 sweep。
+
+**下一批候选**：async 后端（async_mt_sched 静默编译失败 + Task.Spawn/
+Run 表达式位）、cs_b* tuples/patterns/nullable、reflection intrinsics
+（独立大批次）。
