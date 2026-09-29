@@ -3326,6 +3326,10 @@ class Parser {
                 Next();
                 Node idx = new Node(AK.Index());
                 idx.a = e; idx.line = lb.line; idx.col = lb.col; idx.b = ParseExpr();
+                // rectangular arrays index with several subscripts: m[i, j]
+                // -- the extra subscripts ride in kids (mirrors the oracle
+                // parser's index.extra list)
+                while (Eat(TK.Comma())) { idx.Add(ParseExpr()); }
                 Expect(TK.RBracket());
                 e = idx;
             } else if (k == TK.PlusPlus() || k == TK.MinusMinus()) {
@@ -3575,12 +3579,26 @@ class Parser {
             Next();
             n.ival = 1; // array
             if (!At(TK.RBracket())) { n.b = ParseExpr(); }
+            // rectangular ranks: `new int[2,3]` -- the extra sizes ride in
+            // kids BEFORE any brace initializer items, and sval2 records the
+            // full dim count so codegen can split dims from items
+            if (At(TK.Comma())) {
+                while (Eat(TK.Comma())) { n.Add(ParseExpr()); }
+                n.sval2 = Convert.ToString(n.kids.Count + 1);
+            }
             Expect(TK.RBracket());
-            // jagged trailing ranks: `new int[2][]` allocates the outer
-            // array only; op counts how many empty ranks followed
-            while (At(TK.LBracket()) && K1() == TK.RBracket()) {
-                Next(); Next();
-                n.op = n.op + 1;
+            // jagged trailing ranks: `new int[3][]` allocates the outer
+            // array only; op counts how many empty ranks followed. Rank
+            // specifiers with commas (`new int[2][,]` -- rows of int[,])
+            // allocate the same outer ref array, so they only need eating
+            while (At(TK.LBracket())) {
+                int commas = 0;
+                while (!At(TK.RBracket()) && !At(TK.Eof())) {
+                    if (At(TK.Comma())) { commas = commas + 1; }
+                    Next();
+                }
+                Expect(TK.RBracket());
+                if (commas == 0) { n.op = n.op + 1; }
             }
         } else if (At(TK.LParen())) {
             int k0 = n.kids.Count;

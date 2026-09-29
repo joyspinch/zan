@@ -2144,7 +2144,7 @@ partial class Ngen {
         if (k == AK.NullLit()) { return "object"; }
         if (k == AK.NewExpr()) {
             if (e.type == null) { return null; }
-            return e.ival == 1 ? TypeFullName(e.type) + ArrSuffix(1 + e.op) : TypeFullName(e.type);
+            return e.ival == 1 ? NewArrTyOf(e) : TypeFullName(e.type);
         }
         if (k == AK.CastExpr() || k == AK.AsExpr()) { return e.type != null ? TypeFullName(e.type) : null; }
         if (k == AK.Call()) { return CallRetTy(e); }
@@ -3417,6 +3417,15 @@ partial class Ngen {
                 E4(0xF84107E1);                      // pop s
                 LoadImm(0, 0);                       // safe index
                 Mark(done);
+            } else if (e.a != null && ArrContainerTy(e.a) != null && e.kids.Count > 0) {
+                // rectangular element get (B8): per-dim bounds then a
+                // row-major flat index; dims at arr+8d, data at arr+8*rank
+                int nsub = 1 + e.kids.Count;
+                string ct = ArrContainerTy(e.a);
+                MdPrologueNg(e);
+                MdFlatNg(e, nsub, e.line, e.col);
+                AddImm(19, 19, 8 * nsub);          // data base = arr + 8*rank
+                EmitArrElemLoad(ArrElemSize(ct), ArrElemName(ct), 19, 9, 0);
             } else if (ArrContainerTy(e.a) != null) {
                 // array element get: len = i64 at arr-16; a bad index reports
                 // and continues with index 0 (gen0 parity). int[] stores i32.
@@ -3630,6 +3639,33 @@ partial class Ngen {
                     return;
                 }
                 StoreLocalVal(li, 0);
+            } else if (e.a != null && e.a.kind == AK.Index() && e.a.kids.Count > 0
+                    && ArrContainerTy(e.a.a) != null) {
+                // rectangular element set: the value rides the stack while
+                // the subscripts bounds-check (same rule as the get)
+                int nsub = 1 + e.a.kids.Count;
+                int esz = ArrElemSize(ArrContainerTy(e.a.a));
+                E4(0xF81F0FE0);                      // push value
+                MdPrologueNg(e.a);
+                MdFlatNg(e.a, nsub, e.line, e.col);
+                E4(0xF84107E2);                      // pop value -> x2
+                AddImm(1, 19, 8 * nsub);             // x1 = data
+                if (esz == 4) {
+                    E4(0x8B090821);                  // add x1, x1, x9, lsl #2
+                } else if (esz == 8) {
+                    E4(0x8B090C21);                  // add x1, x1, x9, lsl #3
+                } else {
+                    E4(0x8B090021);                  // add x1, x1, x9
+                }
+                if (esz == 1) {
+                    E4(0x39000022);                  // strb w2, [x1]
+                } else if (esz == 2) {
+                    E4(0x79000022);                  // strh w2, [x1]
+                } else if (esz == 4) {
+                    E4(0xB9000022);                  // str w2, [x1]
+                } else {
+                    E4(0xF9000022);                  // str x2, [x1]
+                }
             } else if (e.a != null && e.a.kind == AK.Index() && ArrContainerTy(e.a.a) != null) {
                 // array element set: same bounds rule as the get; the value
                 // and index survive the guard call on the stack
@@ -3934,13 +3970,22 @@ partial class Ngen {
             return;
         }
         if (e.ival == 1) {
+            string etn = TypeFullName(e.type);
+            int dims = e.sval2 != null && e.sval2 != "" ? (int)Convert.ToInt64(e.sval2) : 1;
+            if (dims > 1) {
+                GenMdArrNew(e, dims);
+                return;
+            }
+            // the element of `new T[a][b]` is itself an array (8-byte refs):
+            // the size reads from T plus ALL ranks, sized + trailing
+            int Jesz = ArrElemSize(etn + ArrSuffix(e.op + 1));
             if (e.kids.Count > 0) {
                 // array initializer: `new T[] { a, b, c }` (an explicit size,
                 // if any, must equal the element count)
-                GenArrInit(e, ArrElemSize(TypeFullName(e.type) + "[]"));
+                GenArrInit(e, Jesz);
                 return;
             }
-            GenArrNew(e.b, ArrElemSize(TypeFullName(e.type) + "[]"));
+            GenArrNew(e.b, Jesz);
             return;
         }
         Cls c = cls != null ? FindClass(cls) : null;
@@ -4089,6 +4134,141 @@ partial class Ngen {
         E4(0xF84107E0);                                  // pop arr -> x0
     }
 
+    // rectangular multidim alloc (B8), the reference zan_mdarray_alloc:
+    // each dim evaluates once (a negative one reports and keeps its value),
+    // the total product folds on wrap ("array allocation overflow"), then
+    // calloc(32 + 8*rank + total*esz) with rc=1, RCMAGIC, count=total and
+    // rank in the site slot; dims[d] land at arr+8d, data at arr+8*rank.
+    // `new int[2,2] { ... }` row-major items store right after.
+    void GenMdArrNew(Node e, int rank) {
+        string ety = TypeFullName(e.type);
+        int esz = ArrElemSize(ety + "[]");
+        if (rank > 4) {
+            diags.Error("ngen: rectangular arrays above rank 4 are not supported by the native backend", e.line, e.col);
+            LoadImm(0, 0);
+            return;
+        }
+        // dims in callee-saved x19..x22, evaluated in source order (x19 is
+        // statement scratch; x20-x25 are free across GenExpr here)
+        int di = 0;
+        while (di < rank) {
+            Node dn = di == 0 ? e.b : e.kids[di - 1];
+            if (dn == null) { LoadImm(0, 0); } else { GenExpr(dn); }
+            E4(0xEB1F001F);                              // cmp x0, xzr
+            int okneg = NL();
+            EmitBcond(10, okneg);                        // b.ge okneg
+            LoadSymRef("l_.str." + guardFileIdx, 0);
+            LoadImm(1, curLine);
+            LoadImm(2, curCol);
+            LoadSymRef("l_.str." + guardArrNeg, 3);
+            BLInternal("_zan_rt_guard_fail3");
+            LoadImm(0, 0);                               // safe dim
+            Mark(okneg);
+            MovRR(19 + di, 0);
+            di = di + 1;
+        }
+        // total = product of dims; a negative product means the multiply
+        // wrapped ("array allocation overflow", folded to 0)
+        LoadImm(9, 1);
+        di = 0;
+        while (di < rank) {
+            MovRR(0, 19 + di);
+            E4(0x9B007D29);                              // mul x9, x9, x0
+            di = di + 1;
+        }
+        E4(0xEB1F013F);                                  // cmp x9, xzr
+        int okt = NL();
+        EmitBcond(10, okt);
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardArrOvf, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        LoadImm(9, 0);
+        Mark(okt);
+        MovRR(23, 9);                                    // x23 = total (count)
+        if (esz == 4) {
+            E4(0xD37EF529);                              // lsl x9, x9, #2
+        } else if (esz == 8) {
+            E4(0xD37DF129);                              // lsl x9, x9, #3
+        } else if (esz == 2) {
+            E4(0xD37FF929);                              // lsl x9, x9, #1
+        }
+        // wrapped bytes fold to the bare header, as in the reference
+        E4(0xEB1F013F);                                  // cmp x9, xzr
+        int okb = NL();
+        EmitBcond(10, okb);
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardArrOvf, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        LoadImm(9, 32 + 8 * rank);
+        Mark(okb);
+        E4(0x91000000 | ((32 + 8 * rank) << 10) | (9 << 5) | 9); // add x9, x9, #hdr
+        MovRR(24, 9);                                    // x24 = bytes
+        MovRR(0, 24);
+        LoadImm(1, 1);
+        BLExtern("_calloc");                             // x0 = raw
+        MovRR(25, 0);                                    // x25 = raw
+        int okalloc = NL();
+        CbnzReg(0, okalloc);
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardArrFail, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        Mark(okalloc);
+        MovRR(0, 25);
+        LoadImm(2, 1);
+        StrU(2, 0, 0);                                   // raw->rc = 1
+        LoadImm(2, 25404552263127619);
+        StrU(2, 0, 8);                                   // raw->rcmagic
+        StrU(23, 0, 16);                                 // raw->count = total
+        LoadImm(2, rank);
+        StrU(2, 0, 24);                                  // site slot = rank
+        di = 0;
+        while (di < rank) {
+            StrU(19 + di, 0, 32 + 8 * di);               // dims[di] (arr+8*di)
+            di = di + 1;
+        }
+        E4(0x91000000 | (32 << 10));                     // add x0, x0, #32 (arr; dims live at arr+8*d)
+        // row-major initializer items, if any: each `{ ... }` kid is a row
+        int it = rank - 1;
+        if (it < e.kids.Count) {
+            bool f32 = esz == 4 && ety == "float";
+            bool dbl = esz == 8 && ety == "double";
+            E4(0xF81F0FE0);                              // push arr
+            int k = 0;
+            while (it < e.kids.Count) {
+                Node row = e.kids[it];
+                int ri = 0;
+                while (ri < row.kids.Count) {
+                    Node itm = row.kids[ri];
+                    GenExpr(itm);
+                    if (dbl && !IsDblExpr(itm)) { ConvI2D(); }
+                    if (f32) { NarrowF32Bits(); }
+                    E4(0xF84107E1);                      // pop arr -> x1
+                    int off = 8 * rank + k * esz;
+                    if (esz == 8) {
+                        StrU(0, 1, off);
+                    } else if (esz == 4) {
+                        E4(0xB9000000 | ((off / 4) << 10) | (1 << 5));   // str w0, [x1, #off] (imm scaled)
+                    } else if (esz == 1) {
+                        E4(0x39000000 | (off << 10) | (1 << 5));         // strb w0
+                    } else {
+                        E4(0x79000000 | ((off / 2) << 10) | (1 << 5));   // strh w0 (imm scaled)
+                    }
+                    E4(0xF81F0FE1);                      // push arr back
+                    k = k + 1;
+                    ri = ri + 1;
+                }
+                it = it + 1;
+            }
+            E4(0xF84107E0);                              // pop arr -> x0
+        }
+    }
+
     // a literal node for a primitive-type constant read (`int.MaxValue`),
     // or null when `mem` is not one
     Node PrimitiveConstLit(Node mem) {
@@ -4224,7 +4404,7 @@ partial class Ngen {
         string el = null;
         if (ArrContainerTy(e.a) != null) {
             string at = ArrContainerTy(e.a);
-            if (at != null && at.Length > 2) { el = at.Substring(0, at.Length - 2); }
+            if (at != null && at.Length > 2) { el = ArrElemName(at); }
         } else if (ExprCls(e.a) == "List") {
             string ct = StaticTyOf(e.a);
             if (ct != null && ct.Length > 5 && ct.Substring(0, 5) == "List<"
@@ -6355,13 +6535,42 @@ partial class Ngen {
             }
             n = n + ">";
         }
+        // multidim rank: sval2 counts the commas of the level that carried
+        // them ("int[,]" 1, "int[,,]" 2, "int[][,]" 1 from the inner level)
+        // -- the comma suffix renders on the final level
+        if (t.ival > 0 && t.sval2 != null && t.sval2 != "") {
+            int commas = (int)Convert.ToInt64(t.sval2);
+            string suf = "[";
+            int ci = 0;
+            while (ci < commas) { suf = suf + ","; ci = ci + 1; }
+            return n + ArrSuffix(t.ival - 1) + suf + "]";
+        }
         return n + ArrSuffix(t.ival);
     }
 
-    // array-type helpers ("int[]" style declared types)
+    // array-type helpers ("int[]" style declared types). The outermost
+    // bracket group decides the shape: it holds nothing (jagged "[]") or
+    // commas only (rectangular "[,]", "[,,]")
     bool IsArrTy(string t) {
         if (t == null || t.Length < 2) { return false; }
-        return t.Substring(t.Length - 2, 2) == "[]";
+        if (t.Substring(t.Length - 1, 1) != "]") { return false; }
+        int i = t.Length - 2;
+        while (i >= 0) {
+            string c = t.Substring(i, 1);
+            if (c == "[") { return true; }
+            if (c != ",") { return false; }
+            i = i - 1;
+        }
+        return false;
+    }
+    // rank of the outermost level ("int[]" 1, "int[,]" 2, "int[,,]" 3);
+    // non-array types answer 1
+    int ArrRankOf(string t) {
+        if (!IsArrTy(t)) { return 1; }
+        int i = t.Length - 2;
+        int commas = 0;
+        while (i >= 0 && t.Substring(i, 1) != "[") { commas = commas + 1; i = i - 1; }
+        return commas + 1;
     }
     bool IsArrExpr(Node e) {
         if (e == null) { return false; }
@@ -6384,6 +6593,23 @@ partial class Ngen {
         return s2;
     }
 
+    // allocated array type of a `new T[...]` node: one sized rank (dims
+    // count rides in sval2 -- "new int[2,3]" is "int[,]") plus one suffix
+    // per trailing rank-only bracket ("new int[3][]" is "int[][]")
+    string NewArrTyOf(Node e) {
+        string n = TypeFullName(e.type);
+        int dims = e.sval2 != null && e.sval2 != "" ? (int)Convert.ToInt64(e.sval2) : 1;
+        if (dims > 1) {
+            string suf = "[";
+            int ci = 1;
+            while (ci < dims) { suf = suf + ","; ci = ci + 1; }
+            n = n + suf + "]";
+        } else {
+            n = n + "[]";
+        }
+        return n + ArrSuffix(e.op);
+    }
+
     string ArrTyOf(Node e) {
         if (e.kind == AK.Ident()) {
             int li = LocalIdx(e.sval);
@@ -6393,7 +6619,7 @@ partial class Ngen {
             return "int[]";
         }
         if (e.kind == AK.NewExpr() && e.type != null && e.ival == 1) {
-            return TypeFullName(e.type) + ArrSuffix(1 + e.op);
+            return NewArrTyOf(e);
         }
         return "int[]";
     }
@@ -6416,7 +6642,7 @@ partial class Ngen {
             return null;
         }
         if (e.kind == AK.NewExpr() && e.type != null && e.ival == 1) {
-            return TypeFullName(e.type) + ArrSuffix(1 + e.op);
+            return NewArrTyOf(e);
         }
         if (e.kind == AK.CastExpr() && e.type != null) {
             string ct = TypeFullName(e.type);
@@ -6450,16 +6676,22 @@ partial class Ngen {
         return null;
     }
     int ArrElemSize(string t) {
-        string el = t.Substring(0, t.Length - 2);
+        string el = ArrElemName(t);
         if (el == "int" || el == "uint" || el == "float" || el == "char") { return 4; }
         if (el == "short" || el == "ushort") { return 2; }
         if (el == "byte" || el == "sbyte" || el == "bool") { return 1; }
         return 8;
     }
 
-    // element type name of an array type ("byte[]" -> "byte")
+    // element type name of an array type: strips the outermost bracket
+    // group ("byte[]" -> "byte", "int[,]" -> "int", "int[][,]" -> "int[]")
     string ArrElemName(string t) {
         if (t == null || t.Length < 3) { return ""; }
+        if (IsArrTy(t)) {
+            int i = t.Length - 2;
+            while (i >= 0 && t.Substring(i, 1) != "[") { i = i - 1; }
+            if (i > 0) { return t.Substring(0, i); }
+        }
         return t.Substring(0, t.Length - 2);
     }
 
@@ -6472,12 +6704,69 @@ partial class Ngen {
         return 0;
     }
 
+    // ---- rectangular multidim arrays (B8) ----
+    // one subscript's bounds check: `reg` holds the index, x1 the dim; a
+    // bad index reports the array guard and continues with 0 (gen0 parity)
+    void MdBoundNg(int reg, int line, int col) {
+        int bad = NL();
+        int cont = NL();
+        E4(0xEB000000 | (1 << 16) | (reg << 5) | 31);    // cmp reg, x1 (dim)
+        EmitBcond(10, bad);                              // b.ge bad
+        E4(0xEB000000 | (31 << 16) | (reg << 5) | 31);   // cmp reg, xzr
+        EmitBcond(11, bad);                              // b.lt bad
+        EmitB(cont);
+        Mark(bad);
+        E4(0xF81F0FE0 | reg);                            // keep index
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, line);
+        LoadImm(2, col);
+        LoadSymRef("l_.str." + guardArrIdx, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        E4(0xF84107E0 | reg);                            // pop index
+        LoadImm(reg, 0);
+        Mark(cont);
+    }
+
+    // element-access prologue: the array lands in x19 (callee-saved in the
+    // C ABI, untouched by the internal helpers) and the subscripts are
+    // pushed in reverse so i0 pops first
+    void MdPrologueNg(Node idx) {
+        GenExpr(idx.a);                                  // arr -> x0
+        MovRR(19, 0);
+        int si = idx.kids.Count;
+        while (si >= 1) {
+            GenExpr(idx.kids[si - 1]);
+            E4(0xF81F0FE0);
+            si = si - 1;
+        }
+        GenExpr(idx.b);                                  // i0 last (top)
+        E4(0xF81F0FE0);
+    }
+
+    // row-major flat index: pops every subscript and folds
+    // ((i0*D1 + i1)*D2 + ...) into x9, each against its own dim
+    void MdFlatNg(Node idx, int nsub, int line, int col) {
+        E4(0xF84107E0);                                  // pop i0 -> x0
+        LdrU(1, 19, 0);                                  // dims[0]
+        MovRR(9, 0);
+        MdBoundNg(9, line, col);
+        int d = 1;
+        while (d < nsub) {
+            E4(0xF84107E0);                              // pop i_d -> x0
+            LdrU(1, 19, 8 * d);                          // dims[d]
+            MdBoundNg(0, line, col);
+            LdrU(1, 19, 8 * d);                          // (guard clobbers x1)
+            E4(0x9B017D29);                              // mul x9, x9, x1
+            E4(0x8B000129);                              // add x9, x9, x0
+            d = d + 1;
+        }
+    }
+
     // element load with the reference compiler's packed layout and value
     // extension rules: x1 = array data, x0 = index -> x0 = element.
     // byte/bool zero-extend, sbyte/short sign-extend, ushort/uint/char
     // zero-extend, int sign-extends; long/ulong/double load full words.
-    void EmitArrElemLoad(int esz, string el, int arrReg, int idxReg, int dstReg) {
-        if (esz == 1) {
+    void EmitArrElemLoad(int esz, string el, int arrReg, int idxReg, int dstReg) {        if (esz == 1) {
             if (el == "sbyte") {
                 E4(0x38C06800 | (idxReg << 16) | (arrReg << 5) | dstReg);  // ldrsb xd, [xn, xi]
             } else {
@@ -7641,6 +7930,18 @@ partial class Ngen {
                     Mark(tend);
                     return;
                 }
+            }
+            // rect.GetLength(d): the dim lives at arr + 8*d in the mdarray
+            // header (the rank>1 shape only)
+            if (recv != null && callee.sval == "GetLength" && e.kids.Count == 1
+                    && ArrContainerTy(recv) != null
+                    && ArrRankOf(ArrContainerTy(recv)) > 1) {
+                GenExpr(recv);                           // x0 = arr
+                E4(0xF81F0FE0);
+                GenExpr(e.kids[0]);                      // x0 = dim
+                E4(0xF84107E1);                          // pop arr -> x1
+                E4(0xF8607820);                          // ldr x0, [x1, x0, lsl #3]
+                return;
             }
             // base.Method(args): invoke the nearest implementation above
             // curCls directly (nonvirtual) with `this` as the receiver
@@ -9033,6 +9334,17 @@ partial class Ngen {
             Mark(contl);
             E4(0x8B000C89);                              // add x9, x4, x0, lsl #3
             MovRR(0, 9);
+            return;
+        }
+        if (t.kind == AK.Index() && t.kids.Count > 0 && ArrContainerTy(t.a) != null) {
+            // rectangular element address (for ++/-- and ref uses): the
+            // same per-dim bounds then row-major flat as the get
+            int nsub = 1 + t.kids.Count;
+            int sh = ArrElemShift(ArrElemSize(ArrContainerTy(t.a)));
+            MdPrologueNg(t);
+            MdFlatNg(t, nsub, t.line, t.col);
+            E4(0x8B000000 | (9 << 16) | (sh << 10) | (19 << 5)); // add x0, x19, x9, lsl #sh
+            AddImm(0, 0, 8 * nsub);
             return;
         }
         if (t.kind == AK.Index() && ArrContainerTy(t.a) != null) {
