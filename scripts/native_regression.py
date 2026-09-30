@@ -30,7 +30,9 @@ def main():
         ROOT / 'tests/selfhost/native_lexical.zan', ROOT / 'tests/selfhost/native_local_frame.zan',
         ROOT / 'tests/selfhost/native_dict_out_address.zan', ROOT / 'tests/selfhost/native_numeric_runtime.zan',
         ROOT / 'tests/selfhost/native_string_ops.zan', ROOT / 'tests/selfhost/host_args_bounds.zan',
-        ROOT / 'tests/selfhost/native_generic_overload_fit.zan', ROOT / 'tests/selfhost/native_float_return_arg.zan']
+        ROOT / 'tests/selfhost/native_generic_overload_fit.zan', ROOT / 'tests/selfhost/native_float_return_arg.zan',
+        ROOT / 'tests/selfhost/native_float_shapes.zan',
+        ROOT / 'tests/selfhost/native_varargs.zan', ROOT / 'tests/selfhost/native_varargs_elf.zan']
     failed = 0
     for i, fixture in enumerate(fixtures):
         fixture = fixture.resolve()

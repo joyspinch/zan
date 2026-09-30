@@ -533,17 +533,35 @@ partial class Ngen {
         return 8;
     }
 
-    // declared Span<T> type of a plain local or field used as an indexing
-    // target (`Span<byte> sp; sp[i]`), or null. The view's value is a boxed
-    // {base, len} pair (the oracle's 2-field struct, one 16-byte allocation
-    // per view -- views are short-lived, leak-by-design like the interned
-    // delegates), so accesses through these views bounds-check like arrays.
+    // declared Span<T> type of a plain local, field or static used as an
+    // indexing target (`Span<byte> sp; sp[i]`), or null. The view's value is
+    // a boxed {base, len} pair (the oracle's 2-field struct, one 16-byte
+    // allocation per view -- views are short-lived, leak-by-design like the
+    // interned delegates), so accesses through these views bounds-check like
+    // arrays. Statics (bare and class-qualified) mirror ArrContainerTy.
     string SpanContainerTy(Node e) {
-        if (e == null || e.kind != AK.Ident()) { return null; }
-        int li = LocalIdx(e.sval);
-        if (li >= 0 && locTy[li] != null && locTy[li].IndexOf("Span<") == 0) { return locTy[li]; }
-        Fld f = CurField(e.sval);
-        if (f != null && f.ty != null && f.ty.IndexOf("Span<") == 0) { return f.ty; }
+        if (e == null) { return null; }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0 && locTy[li] != null && locTy[li].IndexOf("Span<") == 0) { return locTy[li]; }
+            Fld f = CurField(e.sval);
+            if (f != null && f.ty != null && f.ty.IndexOf("Span<") == 0) { return f.ty; }
+            string st = FindStaticTy(curCls, e.sval);
+            if (st != null && st.IndexOf("Span<") == 0) { return st; }
+            return null;
+        }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            if (f != null && f.ty != null && f.ty.IndexOf("Span<") == 0) { return f.ty; }
+            // class-qualified static view (`Va2c.sview[0]`): the receiver
+            // must NAME a class, the same guard as the static write path --
+            // a plain local receiver (`bb.view`) is an instance field
+            if (e.a != null && e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0
+                    && FindClass(e.a.sval) != null) {
+                string sq = FindStaticTy(QualifiedCls(e.a.sval, e.a.sval2), e.sval);
+                if (sq != null && sq.IndexOf("Span<") == 0) { return sq; }
+            }
+        }
         return null;
     }
 
@@ -891,10 +909,15 @@ partial class Ngen {
         int[] ireg = null;
         int[] freg = null;
         int[] sidx = null;
+        int[] tireg = null;
+        int[] tfreg = null;
+        int[] tsidx = null;
         int sres = 0;
         int vres = 0;
         int ntail = 0;
+        int csTot = 0;
         bool dllVar = false;
+        bool elfVar = false;
         if (ext) {
             ireg = new int[pushed];
             freg = new int[pushed];
@@ -914,27 +937,60 @@ partial class Ngen {
                 }
                 pi = pi + 1;
             }
-            sres = cs + (cs % 2);
-            // [DllImport(Variadic = true)]: the ... tail rides the STACK
-            // varargs area (Apple arm64), reserved beneath the fixed stack
-            // args; the reservation keeps sp 16-aligned (pad above the tail)
+            // [DllImport(Variadic = true)]: the two arms64 ABIs disagree on
+            // where the ... tail goes. Apple arm64 passes every variadic
+            // argument on the stack, right above any fixed stack-class args;
+            // aarch64-linux instead allocates each tail by its natural class,
+            // continuing the ordinary integer/fp register sequences and the
+            // packed overflow area (clang oracle: fmt->x0, int varargs
+            // w1,w2, double d0). Either way the tail values stage into
+            // ntail(+pad) slots above the fixed dest slots: Apple leaves
+            // them there as the ABI varargs area, ELF reads them back into
+            // their destinations after the fixed readback.
             dllVar = m != null && HasMod(m, MOD.Variadic());
             ntail = dllVar ? (e != null ? e.kids.Count : 0) - pushed : 0;
             if (ntail < 0) { ntail = 0; }
+            elfVar = dllVar && ntail > 0 && EnvTargetElf() == 1;
+            if (ntail > 0) {
+                tireg = new int[ntail];
+                tfreg = new int[ntail];
+                tsidx = new int[ntail];
+            }
+            int vk0 = 0;
+            while (vk0 < ntail) {
+                Node ae = e.kids[pushed + vk0];
+                string tt = ae.kind == AK.OutArg() ? "" : StaticTyOf(ae);
+                if (!elfVar) {
+                    tireg[vk0] = -3;                     // Apple: tail is a stack arg
+                } else if (IsDblExpr(ae) || tt == "float") {
+                    // fp class: doubles as-is, floats as the doubles the C
+                    // default promotions guarantee
+                    if (cf < 8) { tireg[vk0] = -1; tfreg[vk0] = cf; cf = cf + 1; }
+                    else { tireg[vk0] = -2; tsidx[vk0] = cs; cs = cs + 1; }
+                } else if (ci < 8) {
+                    tireg[vk0] = ci; ci = ci + 1;
+                } else {
+                    tireg[vk0] = -2; tsidx[vk0] = cs; cs = cs + 1;
+                }
+                vk0 = vk0 + 1;
+            }
+            sres = cs + (cs % 2);
+            csTot = cs;
             vres = dllVar ? ntail + (ntail % 2) : 0;
             if (sres + vres > 0) {
                 AddSPImm(8 * (sres + vres), false);      // sub sp, reserved
             }
         }
         if (ext && dllVar && ntail > 0) {
-            // the ... tail: evaluate in order into the stack varargs area
-            // (Apple arm64 passes variadic arguments on the stack, starting
-            // at sp above any fixed stack-class args); each value carries the
-            // C default promotions (float widens to double, ints/pointers
-            // pass as i64). This must run BEFORE the register readback --
-            // GenExpr targets x0 and would clobber the values being read
-            // back; the readback loads by absolute offset, so the push slots
-            // are undisturbed.
+            // the ... tail: evaluate in order into the slots right above the
+            // fixed dest slots. On Apple those slots ARE the ABI varargs
+            // area (starting at sp above any fixed stack-class args); on
+            // ELF they are staging for the post-readback move below. Each
+            // value carries the C default promotions (float widens to
+            // double, ints/pointers pass as i64). This must run BEFORE the
+            // register readback -- GenExpr targets x0 and would clobber the
+            // values being read back; the readback loads by absolute
+            // offset, so the push slots are undisturbed.
             int vk = 0;
             while (vk < ntail) {
                 Node ae = e.kids[pushed + vk];
@@ -948,7 +1004,12 @@ partial class Ngen {
                         E4(0x9E660000);                  // fmov x0, d0
                     }
                 }
-                StrU(0, 31, 8 * sres + 8 * vk);          // [sp + off] = vararg k
+                // Apple va_list starts just above the named stack args --
+                // cs slots, NOT the 16-alignment-padded sres: an odd fixed
+                // overflow count would otherwise shift every tail by 8.
+                // ELF keeps staging at 8*sres, clear of its overflow dest
+                // slots; the post-readback below does the ABI move.
+                StrU(0, 31, 8 * (elfVar ? sres : csTot) + 8 * vk);   // [sp + off] = vararg k
                 vk = vk + 1;
             }
         }
@@ -990,6 +1051,26 @@ partial class Ngen {
                 E4(0xF84107E0 | ireg[r]);                // pop xr, keep sp 16-aligned
             }
             r = r - 1;
+        }
+        if (ext && elfVar) {
+            // ELF variadic readback: each tail moves staging -> destination.
+            // Register-class tails fill x/d slots continuing the fixed
+            // sequences; overflow tails copy into their packed stack slot.
+            // Doubles keep all 8 bits; no single-precision narrowing -- the
+            // C default promotions already widened every float tail.
+            int vk2 = ntail - 1;
+            while (vk2 >= 0) {
+                if (tireg[vk2] == -2) {
+                    LdrU(10, 31, 8 * sres + 8 * vk2);
+                    StrU(10, 31, 8 * tsidx[vk2]);    // staging -> overflow slot
+                } else if (tireg[vk2] == -1) {
+                    LdrU(10, 31, 8 * sres + 8 * vk2);
+                    E4(0x9E670000 | (10 << 5) | tfreg[vk2]);   // fmov dN, x10
+                } else if (tireg[vk2] >= 0) {
+                    LdrU(tireg[vk2], 31, 8 * sres + 8 * vk2);
+                }
+                vk2 = vk2 - 1;
+            }
         }
         if (!ext) {
             BLInternal(MethSymNg(methCls[mi], m));
@@ -8643,16 +8724,16 @@ partial class Ngen {
             } else if (op == TK.Slash()) {
                 E4(0x1E605820);                      // fdiv d0, d1, d0
             } else if (op == TK.Less()) {
-                E4(0x1E602020);                      // fcmp d1, d0
+                E4(0x1E612000);                      // fcmp d0, d1 (d0 = left)
                 E4(0x9A9FA7E0);                      // cset x0, lt
             } else if (op == TK.Greater()) {
-                E4(0x1E602020);
+                E4(0x1E612000);
                 E4(0x9A9FD7E0);                      // cset x0, gt
             } else if (op == TK.LessEq()) {
-                E4(0x1E602020);
+                E4(0x1E612000);
                 E4(0x9A9FC7E0);                      // cset x0, le
             } else if (op == TK.GreaterEq()) {
-                E4(0x1E602020);
+                E4(0x1E612000);
                 E4(0x9A9FB7E0);                      // cset x0, ge
             } else if (op == TK.EqEq()) {
                 E4(0x1E602020);
@@ -10601,6 +10682,14 @@ partial class Ngen {
         if (p == null || p.type == null) { return; }
         if (TryEmitConversionNg(arg, TypeFullName(p.type), false, false)) { return; }
         string pt = TypeFullName(p.type);
+        // a nullable-value parameter boxes a raw payload into its cell (the
+        // same boundary GenConversionValueNg applies at assignments); null
+        // and already-nullable arguments ride as the null cell / pointer
+        if (pt != null && IsNulTy(pt) && !IsNulExpr(arg)) {
+            GenCloneIfStruct(arg);
+            GenNulWrap(IsDblTy(NulPayOf(pt)));
+            return;
+        }
         if (IsDblTy(pt) && !IsDblExpr(arg)) {
             ConvI2D();
             if (pt == "float") { NarrowF32(); }          // float params round on entry
