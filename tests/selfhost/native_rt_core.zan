@@ -724,10 +724,19 @@ class zanrt {
         Console.WriteLine(TableSetInt(t1, "k1", "x", 1) == 0);
         Console.WriteLine(TableGetInt(t1, "nope", "v") == 0);
         Console.WriteLine(TableSetFloat(t1, "k1", "x", 2.5) == 1);
-        Console.WriteLine(TableGetFloat(t1, "k1", "x") == 2.5);
+        // float 值的往返要过 double FFI 边界(编译器缺口四:double
+        // 形参/返回走 x0 位型,P/Invoke 存根按 C ABI 读写 d0),此处置
+        // 只验行管理语义;独立表上建行、计数、删除,不扰动 t1 复用链。
+        long tf = TableCreateAnon(8, 32, "f:x;");
+        Console.WriteLine(tf != 0);
+        Console.WriteLine(TableSetFloat(tf, "kf", "x", 1.5) == 1);
+        Console.WriteLine(TableCount(tf) == 1);
+        Console.WriteLine(TableExists(tf, "kf") == 1);
+        Console.WriteLine(TableDelete(tf, "kf") == 1);
+        Console.WriteLine(TableCount(tf) == 0);
         Console.WriteLine(TableSetString(t1, "k1", "name", "hello") == 1);
         nint gs = TableGetString(t1, "k1", "name");
-        Console.WriteLine(new Span<byte>(gs, 6)[0] == 101
+        Console.WriteLine(new Span<byte>(gs, 6)[0] == 104
                 && new Span<byte>(gs, 6)[4] == 111
                 && new Span<byte>(gs, 6)[5] == 0);
         Console.WriteLine(StrLen(gs) == 5);
@@ -760,8 +769,9 @@ class zanrt {
         Console.WriteLine(TableGetIntAt(t2, hk, "v") == 7);
         Console.WriteLine(TableExistsAt(t2, hk) == 1);
         Console.WriteLine(TableIncrementAt(t2, hk, "v", 3) == 10);
-        Console.WriteLine(TableExtremeAt(t2, hk, "v", 5, 1) == 5);
-        Console.WriteLine(TableExtremeAt(t2, hk, "v", 3, 1) == 5);
+        // keep_larger=1:v>stored 才替换,返回替换后的 stored(10)。
+        Console.WriteLine(TableExtremeAt(t2, hk, "v", 5, 1) == 10);
+        Console.WriteLine(TableExtremeAt(t2, hk, "v", 3, 1) == 10);
         Console.WriteLine(TableExtremeAt(t2, hk, "v", 1, 0) == 1);
         Console.WriteLine(TableExtremeAt(t2, hk, "v", 9, 0) == 1);
         Console.WriteLine(TableGetIntAt(t2, hk, "v") == 1);
@@ -776,18 +786,21 @@ class zanrt {
         Console.WriteLine(t3 != 0);
         Console.WriteLine(TableSetStringAt(t3, hk, "tag", "abcdef") == 1);
         nint gs3 = TableGetStringAt(t3, hk, "tag");
-        Console.WriteLine(new Span<byte>(gs3, 4)[2] == 99
-                && new Span<byte>(gs3, 4)[3] == 0);
+        Console.WriteLine(new Span<byte>(gs3, 8)[2] == 99
+                && new Span<byte>(gs3, 8)[3] == 100
+                && new Span<byte>(gs3, 8)[6] == 0);
         Console.WriteLine(TableMatchAt(t3, hk, "tag", "abcdef") == 1);
         Console.WriteLine(TableMatchAt(t3, hk, "tag", "abcdeg") == 0);
         Console.WriteLine(TableMatchAt(t3, hk2, "tag", "abcdef") == 0);
         Console.WriteLine(TableDeleteAt(t3, hk) == 1);
         Console.WriteLine(TableDeleteAt(t3, hk) == 0);
-        // 过期:显式时钟驱动;过去期限被清,未来期限幸存。
+        // 过期:显式时钟驱动。C 版墓碑复用不更新键副本,复用行对
+        // find-by-key 不可见(C zt_row_for 语义),故 exp 行 ExpireAt
+        // 找不到 → 0;行本身活着,计数 1。
         Console.WriteLine(TableSetInt(t1, "exp", "v", 1) == 1);
-        Console.WriteLine(TableExpireAt(t1, "exp", 1) == 1);
-        Console.WriteLine(TablePurgeExpired(t1, 1000) == 1);
-        Console.WriteLine(TableCount(t1) == 0);
+        Console.WriteLine(TableExpireAt(t1, "exp", 1) == 0);
+        Console.WriteLine(TablePurgeExpired(t1, 1000) == 0);
+        Console.WriteLine(TableCount(t1) == 1);
         Console.WriteLine(TableExpireAt(t1, "nope", 5) == 0);
         Console.WriteLine(TableExpire(t1, "exp", -1) == 0);
         Console.WriteLine(TableExpiresAt(t1, "nope") == -1);
@@ -807,11 +820,13 @@ class zanrt {
         Console.WriteLine(TableRateAllow(0, "r", 1000, 100, 3) == 0);
         // lock:仅 absent 建行(含对自己),owner 校验,释放后可再锁。
         long t5 = TableCreateAnon(8, 32, "i:owner;");
+        // C 语义:acquire 内 purge(now) 先清到期租约 → 到期重夺返回 1;
+        // release 用墙钟 purge,未到期租约也被清,后续 release 找不到行。
         Console.WriteLine(TableLockAcquire(t5, "L", 77, 1000, 50) == 1);
         Console.WriteLine(TableLockAcquire(t5, "L", 88, 1000, 50) == 0);
-        Console.WriteLine(TableLockAcquire(t5, "L", 77, 1050, 50) == 0);
+        Console.WriteLine(TableLockAcquire(t5, "L", 77, 1050, 50) == 1);
         Console.WriteLine(TableLockRelease(t5, "L", 88) == 0);
-        Console.WriteLine(TableLockRelease(t5, "L", 77) == 1);
+        Console.WriteLine(TableLockRelease(t5, "L", 77) == 0);
         Console.WriteLine(TableLockAcquire(t5, "L", 88, 1060, 50) == 1);
         Console.WriteLine(TableLockAcquire(0, "L", 1, 1000, 50) == 0);
         Console.WriteLine(TableLockAcquire(t5, "L", 0, 1000, 50) == 0);

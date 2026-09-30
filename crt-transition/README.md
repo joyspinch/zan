@@ -8,9 +8,9 @@
     cc -c -o zanhost.o  zanhost.c
     cc -o zanc zanc.o zanstubs.o zanhost.o -lSystem
 
-## Zan 运行时第一批~第七批(runtime_core.zan)
+## Zan 运行时第一批~第八批(runtime_core.zan)
 
-`runtime_core.zan` 用 Zan 重新实现了过渡 C 运行时的七批符号:
+`runtime_core.zan` 用 Zan 重新实现了过渡 C 运行时的八批符号:
 `zan_monotonic_ns` / `zan_monotonic_us` / `zan_sha256` / `zan_sha512`(第一批)、
 `zan_alloc` / `zan_free` / `zan_crc32`(第二批)、
 `zan_pkg_fopen` / `zan_file_fopen` / `remove` / `rename` / `read_path`、
@@ -27,14 +27,18 @@ resolve_sa/ipv4/all(+async)、connect_sa/status)——第五批;
 `zan_atomic_int_*` 七符号(create/destroy/load/store/add/exchange/
 compare_exchange)——第六批;
 `zan_audio_*` 21 桩、`zan_monitor_enter/exit`、`zan_dispatch_*`(CAS
-自旋锁环)、`zan_eh_tls_state`(pthread key)——第七批。
+自旋锁环)、`zan_eh_tls_state`(pthread key)——第七批;
+`zan_shared_table_*` 36 符号(命名/匿名表的建开挂删、schema 解析、
+int/float/string 三型列读写、_at 哈希族、hash/exists/count/stat、
+increment/extreme、expire 三件、rate_allow 窗口、lock 租约两件、
+clear/destroy)——第八批。
 注意第五批不是 zanstubs.c 的全部:`#ifndef ZAN_RT_CORE_ZAN` 只编出
 `zan_io_*` 纯函数段,native io reactor(watch 表、close_notify、poll、
 DNS worker)仍留在 C,五个 await 形态等后续批次;`zan_thread_*`
-(naked asm 屏障 + 函数指针调用)与 `zan_shared_table_*` 同样仍在 C。
+(naked asm 屏障 + 函数指针调用)仍在 C。
 它由原生自举编译器(ngen)编译成对象,再用 `localize_syms.py` 把 API 面
 之外的符号本地化——ngen 会把整套运行时帮助函数以全局符号发射进每个
-对象,不本地化则与程序对象撞符号。产出恰好导出 89 个强符号 + 4 个弱
+对象,不本地化则与程序对象撞符号。产出恰好导出 125 个强符号 + 4 个弱
 符号(embed 族经 `--weaken` 置 N_WEAK_DEF,带内嵌资源的程序对象自带的
 强定义在链接时获胜):
 
@@ -47,14 +51,15 @@ Zan 配置链接面:
 
     python3 scripts/native_regression.py --seed "$SEED" \
       --runtime "crt-transition/runtime_core.o crt-transition/zanstubs_rest.o crt-transition/zanhost_rest.o" \
-      tests/selfhost/native_rt_core.zan          # 七批端到端(163 行金标)
+      tests/selfhost/native_rt_core.zan          # 八批端到端(276 行金标)
 
 39 项 kernel 回归同样接受上述 `--runtime`。两个配置(A/B)都已全量验证:
-fixture(163 行金标,双配置字节一致)、默认 kernel 套件 39/39、自举固定点
+fixture(276 行金标,双配置字节一致)、默认 kernel 套件 39/39、自举固定点
 (含 stage1.o 引用的全部 24 个文件族符号由 Zan 对象供给;第四批后另含
 net/ping 两符号,第五批后另含 17 个 io 符号,第六批后另含 7 个原子符号,
-第七批后另含 audio/monitor/dispatch/eh 28 个符号;两路 run.hRFc5s /
-run.bymKSs 均 stage2.o == stage3.o)。第四批的 net 文本还与 C oracle
+第七批后另含 audio/monitor/dispatch/eh 28 个符号,第八批后另含
+shared_table 36 个符号;两路 run.YiwvNk / run.muwNsg 均
+stage2.o == stage3.o)。第四批的 net 文本还与 C oracle
 做过逐字节 A/B(同一台机器 probe 程序直接 dump zan_plat_net_interfaces
 返回缓冲,两路 diff 为空)。
 
@@ -125,6 +130,19 @@ unsigned long)。`double` 形参/返回的 DllImport 可用:0.0 走
 `(double)0L` 显式转换,不写字面量;audio 的 A/B 签名以 C 桩为准
 (stdlib AudioNative 声明与 C 桩本就有漂移,桩忽略多余实参)。
 
+第八批追加:shared table 的块布局是自定的(表 3152B:[0]名串 [1]容量
+[2]键长 [3]列数 [4]行距 [5]行链头 [6]行数 [7]在册 [8]自旋锁,列区从
+80 起每列 96B;行 48B 六槽),不必对齐 C 的 zt_table——A/B 只对
+符号级行为负责。注册表/匿名表/锁单元沿用"静态存指针 + 惰性建块"
+单线程假设,互斥本身是 OSAtomic CAS 自旋。三个 C 行为怪癖按 oracle
+逐字保留并钉进 fixture:墓碑复用不更新键副本(复用行对
+find-by-key 不可见);lock_acquire 先 purge(传入 now)→ 到期租约
+即被清、重夺返回 1;lock_release 用墙钟 purge → 未到期租约也被清、
+后续 release 返回 0。schema 解析的 `*p++ != ':'` 无论成败都消耗
+冒号,列判重是 strlen 等长 + memcmp;FNV-1a 的 XOR 以
+`(a|b)-(a&b)` 恒等式实现。指针算术一律经 `st_ptr(long)` 两步
+——`(nint)(表达式)` 括号强转被解析器当方法调用(缺口三的旁证)。
+
 **已发现编译器缺口**(ngen,均有探针/反汇编证据,详见
 `runtime_core.zan` 头注,本文件全部绕行):
 1. 变参调用降级不可用——8 参 DllImport→snprintf 入口寄存器逐个验证
@@ -137,13 +155,20 @@ unsigned long)。`double` 形参/返回的 DllImport 可用:0.0 走
    仍为零)——模式一律"静态存、用点取新局部";
 3. 字符串字面量经数据槽间接寻址、槽由本对象静态初始化填充,第二个
    ngen 对象的 init 不被调用→槽恒 0——runtime 内禁写字面量。
+4. double 字面量在非首对象里被编译成 `strtod(字面串槽)` 调用,槽未
+   初始化即 fastParse64(NULL) 段错误(缺口三的 double 变体)——
+   runtime 内 0.0 一律写 `(double)0L`。更进一步:double 的 FFI 边界
+   不成立——P/Invoke 存根按 C ABI 读写 d0,ngen 方法体却把 double
+   形参收在 x 寄存器、返回位型放 x0(`fmov x0, d0` 只在存根/存储路径
+   出现),且 Span<double> 读出后紧跟多余 scvtf、出口前任何 malloc 调
+   用即污染 d0——set/get_float 的"值"无法跨边界,A/B 只验行管理语义
+   (fixture 第八批注明)。第七批 audio 的 `== 0.0` 断言只是出口前无
+   调用、scvtf 的 0.0 恰好留在 d0 才通过,不是 ABI 正确。
 
 
 - `zanstubs.c`:gen0 主机原语(Alloc/Free/Copy/…/Crc32 legacy 别名)、
   Win 代码页 API、`zan_thread_*`(naked asm 屏障 + 函数指针调用,
-  等编译器函数指针特性)、`zan_shared_table_*`
-  同步族(语义对照 oracle `src/runtime/rt_sync.c`;
-  shared_table 为单进程诚实移植,跨进程面 OsHandle/Attach 诚实失败)、
+  等编译器函数指针特性)、
   `zan_io_*` 原生 io reactor
   (watch 表 + close_notify + poll + DNS worker;audio 桩、monitor、
   dispatch、eh_tls_state 第七批已移入 runtime_core.zan,`-D` 时编出;

@@ -97,6 +97,25 @@
 // 是 unsigned long)。double 形参/返回可用:0.0 走 (double)0L 显式
 // 转换,不写字面量。
 //
+// 第八批追加约束:shared_table 的块布局自定(不必对齐 C zt_table,
+// A/B 只对符号级行为负责)——表块 3152B 十槽([0]名串 [1]容量 [2]键长
+// [3]列数 [4]行距 [5]行链头 [6]行数 [7]在册 [8]自旋锁,字节 64 即锁),
+// 列区从 80 起每列 96B(type/size/offset 三 long + 名 64B NUL 垫),
+// 行块 48B 六槽(next/hash/键副本/alive/expires_at/data)。三个 C 怪癖
+// 按 oracle 逐字保留:墓碑复用不更新键副本(zt_row_for 只刷
+// hash/expires/data/alive,复用行对 find-by-key 不可见);lock_acquire
+// 先 purge(调用方 now)——到期租约(<=now)即清、absent 重建返回 1;
+// lock_release 用墙钟 purge——未到期租约也被清、后续 release 找不到
+// 行返回 0。schema 解析:C 的 *p++ != ':' 无论成败都消耗冒号(i/f 型
+// 漏消耗会让列名带前导冒号、int/float 列永不匹配、string 型却正常,
+// 本次翻车根因);判重是 strlen 等长 && memcmp(纯前缀 memcmp 会把
+// "a" 误判为 "ab" 的重名);ncol>=32 的拒绝在条目顶部(C 循环顶)。
+// FNV-1a 的 XOR 以 (a|b)-(a&b) 恒等式实现(^ 未验证);_at 族的占位
+// 键 = 哈希十进制串(udec_into 不写 NUL,调用方补)。哈希值不钉进
+// 金标——FNV 质数乘法恒定但探针观测过值随实现细节漂移的先例,金标
+// 只断言 != 0。指针算术一律经 st_ptr(long) 两步:((nint)(表达式))
+// 括号强转被解析器当方法调用(见缺口 3 旁注),(nint)标识符才合法。
+//
 // 已发现编译器缺口(ngen,待独立批次处理;本文件全部绕行):
 //   1) 变参调用降级不可用——8 参 DllImport→snprintf 在入口寄存器
 //      逐个验证正确(lldb 断点读 x0..x7 且 x/s 指向正确内容),被调
@@ -112,6 +131,16 @@
 //   3) 字符串字面量经数据槽间接寻址,槽由本对象静态初始化填充,
 //      而第二个 ngen 对象的 init 不被调用→槽恒为 0——runtime 内
 //      不得写字面量,libc 的名字/格式串一律 lit_buf 按字节拼。
+//   4) double 字面量在非首对象里被编译成 strtod(字面串槽) 调用,
+//      槽未初始化即 fastParse64(NULL) 段错误(缺口 3 的 double 变体)
+//      ——runtime 内 0.0 一律 (double)0L。更深一层:double 的 FFI
+//      边界不成立——P/Invoke 存根按 C ABI 读写 d0(fmov x0, d0),
+//      ngen 方法体却把 double 形参收在 x 寄存器、返回位型放 x0;
+//      Span<double> 读出后紧跟多余 scvtf(位型被再当整数转换),
+//      出口前任何 malloc(经 Span 视图构造)即污染 d0——set/get_float
+//      的"值"无法跨边界(第八批 fixture 只验行管理语义)。第七批
+//      audio 的 == 0.0 断言只是出口前无调用、scvtf 的 0.0 恰好留在
+//      d0 才通过,不是 ABI 正确;待独立批次定 double 的 ABI。
 //
 // 命名纪律:libc 导入一律别名(cfree/malloc/…),公开 ABI 方法名
 // (free/alloc/crc32/…必须与 libc 导入名错开——同类两个方法名会
@@ -2243,17 +2272,21 @@ class zan {
                 long type = -1;
                 long size = 0;
                 int ch = sv[(int)i];
-                if (ch == 105) {
+                if (ncol >= 32) { fail = 1; done = 1; }
+                else if (ch == 105) {
                     type = 0;
                     size = 8;
                     i = i + 1;
+                    // C 的 *p++ != ':' 无论成败都消耗冒号。
                     if (sv[(int)i] != 58) { fail = 1; }
+                    else { i = i + 1; }
                 }
                 else if (ch == 102) {
                     type = 1;
                     size = 8;
                     i = i + 1;
                     if (sv[(int)i] != 58) { fail = 1; }
+                    else { i = i + 1; }
                 }
                 else if (ch == 115) {
                     type = 2;
@@ -2303,8 +2336,10 @@ class zan {
                         long j = 0;
                         while (fail == 0 && j < ncol) {
                             nint pn = st_ptr((long)t + 80 + j * 96 + 24);
-                            if (cmemcmp(pn, st_ptr((long)schema + start),
-                                    nlen) == 0) {
+                            // 等长才可判重(C 是 strlen==nlen 且 memcmp)。
+                            if (cstrlen(pn) == nlen
+                                    && cmemcmp(pn, st_ptr((long)schema + start),
+                                        nlen) == 0) {
                                 fail = 1;
                             }
                             else {
@@ -2333,12 +2368,7 @@ class zan {
                         }
                     }
                 }
-                if (fail == 0) {
-                    if (ncol >= 32) { fail = 1; }
-                }
-                else {
-                    done = 1;
-                }
+                if (fail != 0) { done = 1; }
             }
         }
         if (fail != 0) { return 0; }
@@ -2678,12 +2708,12 @@ class zan {
     public static double shared_table_get_float(
             long handle, nint key, nint column) {
         nint t = (nint)handle;
-        if (t == 0 || key == 0) { return 0.0; }
+        if (t == 0 || key == 0) { return (double)0L; }
         st_lock(t);
         st_purge(t, st_wall());
         long c = st_find_col(t, column, 1);
         long r = c != 0 ? st_find_row(t, key) : 0;
-        double v = 0.0;
+        double v = (double)0L;
         if (r != 0) {
             nint slot = st_ptr(st_rget(r, 5) + st_coff(c));
             Span<double> sv = new Span<double>(slot, 1);

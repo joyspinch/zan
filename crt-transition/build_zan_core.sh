@@ -6,7 +6,8 @@
 #
 # Produces an object exporting exactly the 125 allowlisted zan_* symbols
 # (monotonic/sha256/sha512/alloc/free/crc32 + pkg_fopen/file_*/plat_*/
-# io_* + weakened embed_*). Link it with the -DZAN_RT_CORE_ZAN builds of
+# io_* + atomic/audio/monitor/dispatch/eh/shared_table + weakened
+# embed_*). Link it with the -DZAN_RT_CORE_ZAN builds of
 # zanstubs.c and zanhost.c wherever those symbols are needed:
 #
 #   python3 scripts/native_regression.py --seed "$SEED" \
