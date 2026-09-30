@@ -19,6 +19,20 @@ namespace Zan;
 // it cannot speed up the very scans it appears in; this table gives O(1)
 // key probes. Buckets chain in append order, so iteration inside a bucket
 // matches the old flat table scan exactly.
+// 缺口四 a: compile-time decimal -> IEEE-754 bits for float literals.
+// The emitter calls libc strtod in its own process (the P/Invoke stub
+// hands the result bits back in x0 under the internal value model),
+// parks them in a raw 8-byte buffer, and re-reads them as an i64
+// immediate. Replaces the lazy `dbl.N` __DATA slot: only the first
+// object of a link ever ran its static initialization, so every later
+// object's slots stayed zero and the lazy conversion fired on a null
+// literal-text pointer (the batch-8 float-value crashes).
+class NgenDblEnv {
+    [DllImport("crt", EntryPoint="strtod")] public static extern double StrToD(string s, long endp);
+    [DllImport("crt", EntryPoint="zan_alloc")] public static extern nint Alloc(int size);
+    [DllImport("crt", EntryPoint="zan_free")] public static extern void Free(nint p);
+}
+
 class MethIndex {
     List<string> keys;
     List<int> head;
@@ -1103,10 +1117,15 @@ partial class Ngen {
         return n;
     }
 
-    // symbol for a method (static or instance). With a single declaration
-    // the historical `_Cls_name` stands; with overloads the parameter tags
-    // are appended so two methods cannot collide (mirrors CtorSymNg)
-    string MethSymNg(string cls, Node m) {
+    // exported symbol for a method (static or instance). With a single
+    // declaration the historical `_Cls_name` stands; with overloads the
+    // parameter tags are appended so two methods cannot collide (mirrors
+    // CtorSymNg). 缺口四: this plain name now carries the C-ABI export
+    // shim; the compiled body lives one "__body" suffix away, and every
+    // internal reference (BLInternal calls, vtable slots, delegate and
+    // method-group loads, reflection thunks, async ramps) resolves to the
+    // body through MethSymNg below.
+    string MethExportSymNg(string cls, Node m) {
         string cs = ConversionSymNg(cls, m);
         if (cs != null) { return cs; }
         if (MethodCountNg(cls, m.sval) <= 1) { return "_" + cls + "_" + m.sval; }
@@ -1118,6 +1137,13 @@ partial class Ngen {
             i = i + 1;
         }
         return s;
+    }
+
+    // symbol of the compiled body of a method: MethExportSymNg plus the
+    // "__body" suffix. Constructed only here so registration and every
+    // reference stay in lockstep.
+    string MethSymNg(string cls, Node m) {
+        return MethExportSymNg(cls, m) + "__body";
     }
 
     // vtable slot key of a method declaration: name + parameter type tags.
@@ -1648,7 +1674,7 @@ partial class Ngen {
         syms.Add(new Sym("_main", txt.Count));
         E4(0xA9BF7BFD);                                  // stp x29, x30, [sp, #-16]! (save lr: bl below clobbers it)
         EmitHostEntryArgs();
-        BLInternal("_zan_rt_strpool_init");              // stamp literals first
+        BLInternal("_zan_rt_strpool_init");              // transition stub: literals are static __data blobs now, this body is empty
         if (embedDataIdx >= 0) { EmitEmbedRegisterCall(); }
         // static field initializers run before Main, in declaration order,
         // then each `static T()` type initializer in declaration order (gen0
@@ -1862,6 +1888,108 @@ partial class Ngen {
         E4(0xF84107E0);                              // array -> first Main argument
     }
 
+    // 缺口四: C-ABI export shim in front of a method body. AAPCS64 hands
+    // float/double arguments over in v0-v7 and reads the result back from
+    // s0/d0; the internal value model carries every scalar as its bit
+    // pattern in x0-x7 and returns bits in x0. The shim permutes incoming
+    // registers, calls the body, and converts the result back. Signatures
+    // it cannot permute bit-exactly (more than 8 argument slots, struct
+    // or other aggregate shapes) keep the historical passthrough branch,
+    // which is exactly what pre-shim objects exported. Leaf code: no frame.
+    void EmitExportShimNg(string cls, Node m, bool inst) {
+        string rt = m.type != null ? TypeFullName(m.type) : "void";
+        if (rt == null || rt.Length == 0) { rt = "void"; }
+        int npc = 0;
+        int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) { npc = npc + 1; }
+            i = i + 1;
+        }
+        int np = npc + (inst ? 1 : 0);
+        // kind per internal slot: 0 integer-like (or this), 1 double,
+        // 2 float
+        int[] kind = new int[np];
+        bool ok = np <= 8 && (rt == "void" || ShimIntLikeTy(rt)
+            || rt == "float" || rt == "double");
+        if (ok) {
+            i = 0;
+            int slot = inst ? 1 : 0;
+            while (ok && i < m.kids.Count) {
+                Node p = m.kids[i];
+                if (p.kind == AK.Param()) {
+                    string pt = TypeFullName(p.type);
+                    if (pt == "double") { kind[slot] = 1; }
+                    else if (pt == "float") { kind[slot] = 2; }
+                    else if (!ShimIntLikeTy(pt)) { ok = false; }
+                    slot = slot + 1;
+                }
+                i = i + 1;
+            }
+        }
+        if (!ok) {
+            E4(0x14000001);                              // b <next insn> = body
+            return;
+        }
+        // the bl below clobbers lr: save the caller's return address and
+        // the frame chain around the whole shim (same shape EmitMainShim
+        // uses in front of its bl)
+        E4(0xA9BF7BFD);                                  // stp x29, x30, [sp, #-16]!
+        // integer slots, descending source order: the destination index of
+        // the k-th integer slot only grows with k (float slots push it up),
+        // so a descending walk never overwrites a source it still needs
+        int nInt = 0;
+        int q = 0;
+        while (q < np) { if (kind[q] == 0) { nInt = nInt + 1; } q = q + 1; }
+        int[] intPos = new int[nInt];
+        int fill = 0;
+        q = 0;
+        while (q < np) {
+            if (kind[q] == 0) { intPos[fill] = q; fill = fill + 1; }
+            q = q + 1;
+        }
+        int k = nInt - 1;
+        while (k >= 0) {
+            if (intPos[k] != k) { MovRR(intPos[k], k); }  // mov x_dst, x_k
+            k = k - 1;
+        }
+        // float/double slots, ascending; the v-register cursor counts them
+        // in declaration order, exactly how AAPCS64 assigned v0-v7.
+        // 0x9E66.. = fmov xd, vn (SIMD -> general), 0x9E67.. = fmov vd, xn
+        int vi = 0;
+        q = 0;
+        while (q < np) {
+            if (kind[q] == 1) {
+                E4(0x9E660000 | (vi << 5) | q);          // fmov x_q, d_vi
+                vi = vi + 1;
+            } else if (kind[q] == 2) {
+                E4(0x1E22C000 | (vi << 5) | 16);         // fcvt d16, s_vi
+                E4(0x9E660000 | (16 << 5) | q);          // fmov x_q, d16
+                vi = vi + 1;
+            }
+            q = q + 1;
+        }
+        BLInternal(MethSymNg(cls, m));
+        if (rt == "double") {
+            E4(0x9E670000);                              // fmov d0, x0
+        } else if (rt == "float") {
+            E4(0x9E670010);                              // fmov d16, x0
+            E4(0x1E624200);                              // fcvt s0, d16
+        }
+        E4(0xA8C17BFD);                                  // ldp x29, x30, [sp], #16
+        E4(0xD65F03C0);                                  // ret
+    }
+
+    // scalar kinds that ride x slots unchanged in both the internal value
+    // model and AAPCS64 (references are raw pointers; out/ref parameters
+    // arrive as addresses). Anything aggregate falls back to the
+    // passthrough branch above.
+    bool ShimIntLikeTy(string t) {
+        return t == "int" || t == "long" || t == "nint" || t == "uint"
+            || t == "ulong" || t == "nuint" || t == "byte" || t == "sbyte"
+            || t == "short" || t == "ushort" || t == "char" || t == "bool"
+            || t == "string" || t == "object";
+    }
+
     void EmitMethod(string cls, Node m, int mi) {
         curCls = cls;
         curMeth = m;
@@ -1877,6 +2005,14 @@ partial class Ngen {
         } else if (methStat[mi] == 3) {
             syms.Add(new Sym("_" + cls + "_cctor", txt.Count));
         } else {
+            // 缺口四: the export shim is emitted first and owns the plain
+            // exported name; the body follows under the "__body" symbol
+            // every internal reference resolves to. Ctors/cctors keep the
+            // historical single-symbol layout (internal-only callers).
+            string ex = MethExportSymNg(cls, m);
+            int shimAt = txt.Count;
+            EmitExportShimNg(cls, m, inst);
+            syms.Add(new Sym(ex, shimAt));
             syms.Add(new Sym(MethSymNg(cls, m), txt.Count));
         }
         InitLocalsNg();
@@ -3360,6 +3496,19 @@ partial class Ngen {
         locHead = saved;
     }
 
+    // 缺口四 a: strtod in the emitter's own process, then a raw-memory
+    // roundtrip turns the double (bits in x0 per the internal value
+    // model) into the i64 immediate LoadImm emits directly.
+    long DblBitsOf(string txt) {
+        nint buf = NgenDblEnv.Alloc(8);
+        Span<double> dv = new Span<double>(buf, 1);
+        dv[0] = NgenDblEnv.StrToD(txt, 0);
+        Span<long> lv = new Span<long>(buf, 1);
+        long bits = lv[0];
+        NgenDblEnv.Free(buf);
+        return bits;
+    }
+
     void GenExprInEnvNg(Node e) {
         // ngen_async hook A: `await <async call>` (root drive; diagnosed
         // inside an async body, where only statement-head awaits suspend)
@@ -3390,27 +3539,12 @@ partial class Ngen {
             // string vs decimal per context, like gen0)
             LoadImm(0, e.ival);
         } else if (k == AK.FloatLit()) {
-            // materialise the IEEE bits through libc strtod -- lazily, into
-            // a zero-initialised __DATA slot (0.0 simply reconverts, so the
-            // conversion path stays idempotent)
-            int di = InternStr(e.sval);
-            dglbs.Add(new DGlob("dbl." + di, 8, dataLen));
-            dataLen = dataLen + 8;
-            LoadSymRef(DGlobalSym("dbl." + di), 9);
-            LdrU(0, 9, 0);
-            int need = NL();
-            int done = NL();
-            CbzReg(0, need);
-            EmitB(done);
-            Mark(need);
-            LoadStr(di, 0);                          // x0 = literal text
-            LoadImm(1, 0);
-            BLExtern("_strtod");
-            E4(0x9E660000);                          // fmov x0, d0
-            LoadSymRef(DGlobalSym("dbl." + di), 9);  // x9 is caller-saved: reload the slot
-            StrU(0, 9, 0);
-            LdrU(0, 9, 0);
-            Mark(done);
+            // 缺口四 a: IEEE bits resolved at compile time and emitted as
+            // a movz/movk immediate. The previous lazy `dbl.N` __DATA
+            // slot (strtod on first load) only worked in the first object
+            // of a link; later objects' slots stayed zero and the
+            // conversion fired on a null literal-text pointer.
+            LoadImm(0, DblBitsOf(e.sval));
         } else if (k == AK.ThisExpr()) {
             LoadLocal(LocalIdx("this"), 0);
         } else if (k == AK.Ident()) {
@@ -8134,6 +8268,13 @@ partial class Ngen {
             // a List's own element type (ElemTyOf resolves chains:
             // PolarStackTops' `tops[si][i]` reads List<List<double>>)
             if (ExprCls(e.a) == "List") { return IsDblTy(ElemTyOf(e)); }
+            // Span<double>/Span<float> views carry their payload as FP bit
+            // patterns (EmitSpanElemLoad shapes them so). Without this the
+            // read types as integer and any double-domain consumer
+            // re-converts the bits with scvtf -- the shared_table
+            // float-column read corruption.
+            string sct = SpanContainerTy(e.a);
+            if (sct != null) { return IsDblTy(SpanTyElem(sct)); }
             return IsDblListOf(e.a);
         }
         if (e.kind == AK.MemberAccess()) {
@@ -8381,10 +8522,12 @@ partial class Ngen {
         return false;
     }
 
-    // box a payload (x0, or d0 for floating kinds) into a fresh nullable
-    // cell; x0 leaves holding the cell
+    // box a payload into a fresh nullable cell; x0 leaves holding the cell.
+    // The payload ALWAYS rides x0 as its bit pattern (the internal value
+    // model); dbl names the payload kind only, nothing reads d0 here. No
+    // caller may rely on GenExpr leaving a value in d0: since FloatLit
+    // became a compile-time immediate it only sets x0.
     void GenNulWrap(bool dbl) {
-        if (dbl) { E4(0x9E660000); }                 // fmov x0, d0
         E4(0xF81F0FE0);                              // push payload
         LoadImm(0, 8);
         LoadImm(1, 0);
@@ -11693,7 +11836,7 @@ partial class Ngen {
         // report like the oracle (irgen_stmt.c reh.*): a string throw prints
         // its text, a class throw the class name via _zan_eh_cls_name,
         // nothing in flight the bare note -- then exit(1). Everything rides
-        // strpool heap strings + _zan_rt_strcat2/_zan_rt_println, the exact
+        // literal blobs + _zan_rt_strcat2/_zan_rt_println, the exact
         // path Console.WriteLine uses, so no printf/raw-cstring variables.
         LdrU(0, 1, 8);                               // exc
         int none = NL();
@@ -11906,10 +12049,10 @@ partial class Ngen {
         strRefs.Add(r);
     }
     void LoadStr(int si, int reg) {
-        // literals live in the startup pool as stamped heap strings; the
-        // l_.g.strp.N slot holds the pointer (see RtEmitStrpool)
-        LoadSymRef("l_.g.strp." + si, reg);
-        LdrU(reg, reg, 0);
+        // literals are directly-addressed immutable __data blobs (see
+        // RtEmitStrpool); hand out the payload pointer at blob+16
+        LoadSymRef(DGlobalSym("strd." + si), reg);
+        AddImm(reg, reg, 16);
     }
 
     // one-argument libm double call: the value arrives as its bit pattern

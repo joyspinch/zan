@@ -55,10 +55,10 @@ Zan 配置链接面:
 
     python3 scripts/native_regression.py --seed "$SEED" \
       --runtime "crt-transition/runtime_core.o crt-transition/zanstubs_rest.o crt-transition/zanhost_rest.o" \
-      tests/selfhost/native_rt_core.zan          # 九批端到端(359 行金标)
+      tests/selfhost/native_rt_core.zan          # 九批端到端(366 行金标)
 
 39 项 kernel 回归同样接受上述 `--runtime`。两个配置(A/B)都已全量验证:
-fixture(359 行金标,双配置字节一致)、默认 kernel 套件 39/39、自举固定点
+fixture(366 行金标,双配置字节一致)、默认 kernel 套件 39/39、自举固定点
 (含 stage1.o 引用的全部 24 个文件族符号由 Zan 对象供给;第四批后另含
 net/ping 两符号,第五批后另含 17 个 io 符号,第六批后另含 7 个原子符号,
 第七批后另含 audio/monitor/dispatch/eh 28 个符号,第八批后另含
@@ -69,6 +69,57 @@ hook!=0 全链:编译器发射的 _zan_co_ready 注册 hook → reactor 停泊 �
 zt_io_resume 恢复),双配置 4/4。第四批的 net 文本还与 C oracle
 做过逐字节 A/B(同一台机器 probe 程序直接 dump zan_plat_net_interfaces
 返回缓冲,两路 diff 为空)。
+
+缺口三批次(ngen 字面量直接物化,不改 runtime 符号面):原状 LoadStr
+经 `l_.g.strp.N` 数据槽间接寻址,槽由 `_zan_rt_strpool_init` 在启动垫
+片里盖章,而该 init 只从持有 Main 的对象被调用——第二个 ngen 对象的
+槽恒 0。litlib 二对象探针实证:库对象导出的 Greet 返回 null、
+Length/索引报 null reference(旧编译器),同源同 link 的新编译器
+4/4(greet/len/chr/join 全对)。修复(ngen 四处):(a) `DGlob` 增
+`bytes` 载荷;(b) `RtEmitStrpool` 重写为逐字面量发 8 对齐的
+`l_.g.strd.N` 初始化块(rc=−1 不朽哨兵、64 位域,同反射 blob 先例
+——本车道无任何 rc 递减路径,哨兵纯文档化;+8 处 SNAZ<<32|len 头,
+载荷=blob+16,字节+NUL+对齐垫),`_zan_rt_strpool_init` 保留为空函
+数(启动垫片仍调,过渡符号);(c) `LoadStr` 改 adrp+add 后 `add #16`
+直取载荷;(d) 三个目标写手(macho/elf/coff)的 `__data` 载荷改经
+`EmitDataPayload` 发已初始化字节(零填充电位 + 逐块覆盖)。原始
+`l_.str.N` cstring 与 ~12 处直用点不变;FindNotAnyOf 的 strcspn 路径
+从"依赖 init 补 NUL"变为 blob 自带 NUL,更稳。过程教训:首轮自举
+stage3 全程异常串打印丢开头 4 字符("Unhandled exception:
+KeyNotFoundException"→"ndled exception: NotFoundException")——快照
+早于 rc 扩 8 字节的修正,12 字节头与 blob+16 载荷指针错位 4 字节,
+每串打印从头跳 4;16 字节头(/rc qword + /头 qword)对齐后全绿。
+blob 磁盘布局经 otool+nm 直读验证(rc/len/magic/字节逐一对)。
+全矩阵:fixture 366 行双车道字节一致、39/39 × 双配置、async 4/4 ×
+双配置、自举固定点 run.LIgI93(Zan 道)/ run.E8bVwz(C 基线道)均
+stage2.o == stage3.o(收尾轮,含最终头注;Zan 道过程轮为
+run.SbZmUP,基线道过程轮 run.jUjjFl);ELF/COFF 车道由 crossboot
+39 fixture 全绿(qemu 执行 + elfcheck/coffcheck 结构验证;其
+-mstrict-align 无 MMU 环境同时钉住 blob 的 8 对齐)。
+
+缺口四批次(ngen double 边界修复,不改 runtime 符号面):编译器三处
+改动——(a) 字面量惰性 `dbl.N` 槽改编译期 strtod 位型 + LoadImm 直发
+(`DblBitsOf`:编译器自进程经 DllImport 调 strtod,Span 往返取回位型,
+任意对象序成立);(b) 方法体统一改名 `_Cls_meth__body`(35 处内部
+引用:BLInternal/vtable/委托/方法组/反射 thunk/async ramp/$resume
+经 MethSymNg 自动跟随),导出名上发 C-ABI 垫片——整形槽降序搬移、
+`fmov x_q, d_vi` 重排(float 形参经 `fcvt d16`)、`fmov d0, x0` /
+`fcvt s0, d16` 收返回,>8 槽或聚合签名回退纯分支(与旧布局字节同形);
+垫片自存 x29/x30(`bl body` 会打 lr);(c) `IsDblExpr` 的 Index 分支
+补 `SpanContainerTy` 情形——原 Span<double> 元读被当 long,赋 double
+局部再 scvtf 一次,即第八批 get_float 的潜伏值 bug。垫片编码本身踩掉
+四个坑(bl 打 lr 未保存 → 自举 stage3 单指令自旋;ldp 后索引 #32/#16
+错配 → sp 漂移段错误;`0x9E66`/`0x9E67` 的 fmov 方向与 fcvt 操作数
+次序写反 → double 形参恒 0、float 返回恒 0)。ABI 逐位探针:C 驱动
+直调 Zan 导出 7/7(double/float 形参返回、int/double 混排双向位移、
+5 参三浮点),float 专项 4/4,Zan 经真实 double 型 DllImport 调
+fmin/fabs/fmod 5/5。runtime 对象以新编译器重建后导出面不变(133 强
++ 4 弱,411 本地化——多出的 78 个即 `__body` 符号)。第八批 fixture
+的 float 段升级为逐位值往返(1.5/0.1/-0.75/π,359→366 行金标,双
+配置字节一致)。全矩阵:39/39 × 双配置、async 4/4 × 双配置、自举
+固定点 run.Ct1l0a(Zan 道)/ run.j0eAnc(C 基线道)均
+stage2.o == stage3.o(收尾轮,含最终头注;Zan 道过程轮为
+run.ZZM9QN / run.wuA9Cs,基线道过程轮 run.9EyNuC)。
 
 第二批的改名机制：stdlib 的 `NativeMemory.Alloc/Free/Crc32` 声明加
 `EntryPoint = "zan_alloc" / "zan_free" / "zan_crc32"`——DllImport 的
@@ -180,15 +231,14 @@ u32:127.0.0.1 → 0x0100007F = 16777343),"localhost" 可能 ::1 在前,
    仍为零)——模式一律"静态存、用点取新局部";
 3. 字符串字面量经数据槽间接寻址、槽由本对象静态初始化填充,第二个
    ngen 对象的 init 不被调用→槽恒 0——runtime 内禁写字面量。
-4. double 字面量在非首对象里被编译成 `strtod(字面串槽)` 调用,槽未
-   初始化即 fastParse64(NULL) 段错误(缺口三的 double 变体)——
-   runtime 内 0.0 一律写 `(double)0L`。更进一步:double 的 FFI 边界
-   不成立——P/Invoke 存根按 C ABI 读写 d0,ngen 方法体却把 double
-   形参收在 x 寄存器、返回位型放 x0(`fmov x0, d0` 只在存根/存储路径
-   出现),且 Span<double> 读出后紧跟多余 scvtf、出口前任何 malloc 调
-   用即污染 d0——set/get_float 的"值"无法跨边界,A/B 只验行管理语义
-   (fixture 第八批注明)。第七批 audio 的 `== 0.0` 断言只是出口前无
-   调用、scvtf 的 0.0 恰好留在 d0 才通过,不是 ABI 正确。
+4. 【缺口四,已修,全矩阵验证绿】double 边界的原状三层:字面量惰性
+   `dbl.N` 槽 + 运行时 strtod(字面串槽),非首对象 fastParse64(NULL)
+   段错误;导出方法体直收 C ABI 调用(double 形参在 d 寄存器被按 x
+   寄存器读);Span<double> 元读被静态当 long、赋 double 局部再
+   scvtf 一次——第八批 get_float 的潜伏值 bug(fixture 当时只验行
+   管理语义;第七批 audio 的 `== 0.0` 断言只是出口前无调用、scvtf 的
+   0.0 恰好留在 d0 才通过)。修复见下"缺口四批次"节;runtime 内
+   `(double)0L` 写法保留(无害)。
 5. 无间接调用/函数指针:`LoadSymRef` 能取全局地址,但没有经寄存器的
    `blr`。受害形态:协程恢复 hook(`zan_co_ready_hook`)、线程体
    (`pthread_create` 的 fn)。绕行:C 侧包装 thunk(zan_open_creat

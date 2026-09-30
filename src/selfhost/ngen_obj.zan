@@ -55,7 +55,8 @@ class DGlob {
                         // off is relative to that section instead of __data
     public int size;
     public int off;     // offset within __DATA,__data (or __nl_symbol_ptr)
-    public DGlob(string n, int s, int o) { name = n; size = s; off = o; }
+    public List<int> bytes; // initialized payload, or null for zero-filled
+    public DGlob(string n, int s, int o) { name = n; size = s; off = o; bytes = null; }
 }
 
 partial class Ngen {
@@ -1151,46 +1152,64 @@ partial class Ngen {
         RtEpilogue();
     }
 
-    // initialise the string-literal pool: every interned literal becomes a
-    // stamped heap string (rc=1, SNAZ header with the real length) stored
-    // in a l_.g.strp.N slot; LoadStr loads the pointer from that slot. This
-    // mirrors gen0's stamped literal constants and lets Length/index probe
-    // the header. Runs once from _main before user code.
+    // every interned literal becomes a directly-addressed immutable blob in
+    // __data: [off+0] rc = -1 (immortal sentinel, mirroring the reflect
+    // blobs — nothing in this lane decrements, but -1 documents
+    // non-ownership), [off+8] = 0x5A414E53<<32|len, [off+16..] text + NUL,
+    // padded to 8. LoadStr hands out blob+16, so Length/index probe the same
+    // header layout as any heap string. This replaced the old
+    // _zan_rt_strpool_init startup stamping: those l_.g.strp.N slots were
+    // only filled when the object holding Main ran its startup shim, so a
+    // separately compiled library object's literals read as null.
     void RtEmitStrpool() {
         syms.Add(new Sym("_zan_rt_strpool_init", txt.Count));
         RtPrologue();
+        RtEpilogue();
         int i = 0;
-        while (i < strs.Count) {
-            dglbs.Add(new DGlob("strp." + i, 8, dataLen));
-            dataLen = dataLen + 8;
-            LoadSymRef("l_.str." + i, 0);      // x0 = literal text
-            E4(0xF81F0FE0);                    // push text
-            BLExtern("_strlen");               // x0 = len
-            E4(0xF81F0FE0);                    // push len
-            AddImm(0, 0, 1);                   // size = len + 1
-            BLInternal("_zan_rt_str_alloc");   // x0 = dst (stamped unknown)
-            E4(0xF81F0FE0);                    // push dst
-            LdrU(0, 31, 0);
-            LdrU(1, 31, 32);                   // text
-            LdrU(2, 31, 16);                   // len
-            BLExtern("_memcpy");
-            LdrU(0, 31, 0);
-            LdrU(1, 31, 16);
-            AddRR(0, 0, 1);
-            Strb0(0);                          // dst[len] = 0
-            LdrU(0, 31, 0);
-            E4(0xD1002009);                    // sub x9, x0, #8
-            LoadImm(1, 0x5A414E5300000000);
-            LdrU(2, 31, 16);                   // len
-            E4(0xAA020020);                    // orr x0, x1, x2
-            StrU(0, 9, 0);                     // stamp real length
-            LoadSymRef("l_.g.strp." + i, 9);
-            LdrU(0, 31, 0);
-            StrU(0, 9, 0);                     // strp.slot = dst
-            AddSPImm(48, true);                // pop dst/len/text
+        while (i < strs.Count) { EmitStrdBlob(i); i = i + 1; }
+    }
+
+    // one literal's initialized __data blob (8-aligned start and size)
+    void EmitStrdBlob(int si) {
+        string s = strs[si];
+        int len = s.Length;
+        int pad = dataLen - (dataLen / 8) * 8;
+        if (pad != 0) { dataLen = dataLen + 8 - pad; }
+        int sz = 16 + len + 1;
+        int rem = sz - (sz / 8) * 8;
+        if (rem != 0) { sz = sz + 8 - rem; }
+        DGlob g = new DGlob("strd." + si, sz, dataLen);
+        g.bytes = new List<int>();
+        Put32(g.bytes, -1);            // rc: immortal sentinel (64-bit field)
+        Put32(g.bytes, -1);
+        Put32(g.bytes, len);           // header low word = length
+        Put32(g.bytes, 0x5A414E53);    // header high word = SNAZ magic
+        int k = 0;
+        while (k < len) { g.bytes.Add(ByteAt((int)s[k], 0)); k = k + 1; }
+        g.bytes.Add(0);
+        while (g.bytes.Count < sz) { g.bytes.Add(0); }
+        dglbs.Add(g);
+        dataLen = dataLen + sz;
+    }
+
+    // __data payload: zeroed except DGlobs carrying initialized bytes (the
+    // literal blobs). "nl." slots live past dataLen and never carry bytes.
+    void EmitDataPayload(List<int> img) {
+        List<int> payload = new List<int>();
+        int i = 0;
+        while (i < dataLen) { payload.Add(0); i = i + 1; }
+        i = 0;
+        while (i < dglbs.Count) {
+            if (dglbs[i].bytes != null && IsNlSlot(dglbs[i].name) == 0) {
+                int k = 0;
+                while (k < dglbs[i].bytes.Count) {
+                    payload[dglbs[i].off + k] = dglbs[i].bytes[k];
+                    k = k + 1;
+                }
+            }
             i = i + 1;
         }
-        RtEpilogue();
+        Append(img, payload, 0, dataLen);
     }
 
     // ptr _zan_eh_cls_name(long site): pure-code lookup returning the HEAP
