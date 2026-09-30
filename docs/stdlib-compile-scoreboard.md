@@ -1557,3 +1557,30 @@ mne 18 = 两侧同非零 stdout 逐字节一致。剩余非 pass 全部 oracle �
   golden(1107 行 fixture,366 行 golden)双 runtime 字节一致;battery
   39/39 ×2 配置;crossboot 78/78;sweep 572/624 新高(4 个记载 flapper 转
   pass;唯一新 om 名 async_landing_late_local 单测通过,满载扰动)。
+
+## v18o-18 (2026-10-01) — 门禁硬化:native_float_shapes 电池夹具 + gate_probes.sh + 两处陈年浮点修复
+
+- v18o-17 记录的"自举定点看不见浮点 bug"(src/selfhost 无浮点字面量、无
+  double 参数方法)本批固化为仓库机制,不再依赖临时探针:
+  tests/selfhost/native_float_shapes.zan(+oracle golden)成为 battery 第
+  40 个夹具,覆盖立即数化 FloatLit 可能破坏的全部形态——字面量立即数、
+  可空装箱(初始化/??/提升运算/数组元素/字段)、float 收窄、double 参数
+  返回、可空调用;native_regression.py 注册(stdout 对 .out golden 字比)。
+- scripts/gate_probes.sh:可重复的种子验收门——4 个浮点编译形态 + 可运行
+  可空字面量程序(golden 1.5)+ 双对象 C-ABI 垫片探针(localize_syms,
+  golden 3.5/0.25)。负测通过:修复前 d0-bug 种子在可空探针打印 denormal
+  而 FAIL。
+- 新夹具立刻抓到两个陈年 bug(对 v18o-15b 种子双向 bisect 确认早已存在,
+  非缺口四引入):
+  1. ConvArg:可空值参数从不装箱原始实参——字面量 double 位型直接当 cell
+     指针解引用,Sum(1.5,2.5) SIGSEGV(管道块缓冲下 stdout 全丢)。根因:
+     赋值路径经 GenConversionValueNg 有 wrap,调用实参路径 ConvArg 没有。
+     现在 ConvArg 应用同一边界:可空目标 + 非可空实参 ⇒ clone-if-struct
+     + GenNulWrap;null/已可空实参原样透传。
+  2. GenLiftedNulBinary:double? 四个有序比较操作数反了(fcmp d1,d0 配未
+     补偿的 lt/gt/le/ge cset),1.5 < 2.5 答 false。改为 fcmp d0,d1
+     (d0 = 左),与标量下降约定一致;EqEq/BangEq 操作数对称,不动。
+- 门禁(终树 zanc_fin,定点 run.YBPEHG):gate_probes 全绿;battery 40/40
+  ×2 配置;crossboot 78/78;卸载 sweep 570/624,非 pass 名单全部落在记载
+  族内(flapper 带 569–572;mqtt_lwt_retain/http_server_stress/
+  tdengine_pool 随载出入,无新名)。
