@@ -1519,3 +1519,19 @@ mne 18 = 两侧同非零 stdout 逐字节一致。剩余非 pass 全部 oracle �
 - 环境异常记录:并发会话把在途第九批(io reactor co 助手)写进工作树,
   已快照至 /tmp/v18q/batch9_wip 并还原 HEAD,上述门禁均在 batch-8 提交态
   上运行。
+
+## v18o-16 (2026-10-01) — elfcheck 补 .rela.data 校验 + Linux 车道精确侦察
+
+- elfcheck.py 新增 .rela.data 段校验(v18o-15b 引入的段此前只有链接器实测):
+  存在性 ⇔ l_.g.nl.* 槽全局存在;link/info 必须 .symtab/.data;每槽一条
+  R_AARCH64_ABS64(257)、addend 0、8 对齐、落在 .data 槽尾、绑定 SHN_UNDEF
+  外部符号、槽四字必须零初始化。负测双向:改重定位类型→FAIL、槽内容
+  非零→FAIL;39×2 crossboot 复跑全绿(78 PASS/0 FAIL)。
+- Linux 用户态车道侦察(写精确清单入 known_open):Zan 侧需 3 组 per-OS
+  shim(__error→__errno_location、OSAtomic*→C11 原子、_NSGetExecutablePath→
+  /proc/self/exe);编译器发射的 mach_task_self_/mach_vm_read_overwrite/
+  ___stdXXXp 需同名 C shim;其余 trio 已可移植(clock_gettime/pthread/
+  POSIX sockets,grepped)。两道环境阻塞:本机无 Linux 头/交叉 cc
+  (无 zig/musl-cross/aarch64-linux-gnu-gcc);无执行载体(qemu linux-user
+  不支持 macOS 宿主、brew qemu 无 qemu-aarch64、无 docker/lima/UTM/
+  OrbStack)。任一载体到位即可按清单开工。

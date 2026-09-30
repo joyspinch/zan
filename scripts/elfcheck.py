@@ -11,6 +11,9 @@ Checks, without any cross toolchain:
     relocation type matches the instruction word it patches (opcode and the
     zero immediate the compiler leaves for the linker), addends as emitted
     (-4 for CALL26, 0 otherwise), no duplicate/overlapping offsets
+  * .rela.data (when the homemade __nl_symbol_ptr slots exist): one ABS64
+    per l_.g.nl.* slot at the tail of .data, binding a SHN_UNDEF extern,
+    zero-initialized quads, header link/info wiring
   * pairing: every relocated adrp is followed by a relocated add/ldr at +4
   * coverage: every BL/ADRP with a zero immediate in .text has a relocation
   * naming: no extern keeps a Mach-O "_" prefix (strip rule held)
@@ -295,6 +298,56 @@ def check(path):
         nm = symname(nmoff)
         if nm.startswith("_") and nm not in DARWIN_ONLY:
             problems.append(f"undefined symbol '{nm}' keeps a Mach-O underscore prefix")
+
+    # ---- .rela.data (homemade __nl_symbol_ptr slot bindings, v18o-15b) ----
+    # present iff the object defines l_.g.nl.* slot globals: one ABS64 per
+    # slot quad at the tail of .data, binding the SHN_UNDEF dylib-data
+    # extern the linker writes into the quad. The target is data, not text,
+    # so there is no opcode-shape check -- but header wiring, offsets,
+    # types, symbol hygiene and the zero-initialized quads are validated.
+    slot_names = [symname(s[0]) for s in syms[1:] if symname(s[0]).startswith("l_.g.nl.")]
+    rela_data = by_name.get(".rela.data")
+    if rela_data is not None:
+        if rela_data.typ != SHT_RELA or rela_data.entsize != 24:
+            problems.append(".rela.data: expected SHT_RELA entsize 24")
+        if rela_data.link != symtab.idx or rela_data.info != data.idx:
+            problems.append(f".rela.data link/info must be .symtab({symtab.idx})/"
+                            f".data({data.idx}), got {rela_data.link}/{rela_data.info}")
+        nd = rela_data.size // 24
+        if nd != len(slot_names):
+            problems.append(f".rela.data: {nd} entries but {len(slot_names)} "
+                            "l_.g.nl.* slot globals")
+        data_blob = blob[data.off: data.off + data.size]
+        slot_base = data.size - len(slot_names) * 8
+        seen_off = set()
+        for i in range(nd):
+            r_offset, r_info, r_addend = struct.unpack_from("<QQq", blob, rela_data.off + i * 24)
+            r_sym, r_type = r_info >> 32, r_info & 0xFFFFFFFF
+            if r_offset % 8 != 0:
+                problems.append(f".rela.data {i}: r_offset {r_offset:#x} not 8-aligned")
+            if r_offset < slot_base or r_offset + 8 > data.size:
+                problems.append(f".rela.data {i}: r_offset {r_offset:#x} outside the "
+                                f"slot tail [{slot_base:#x},{data.size:#x}) of .data")
+            if r_offset in seen_off:
+                problems.append(f".rela.data {i}: duplicate relocation at {r_offset:#x}")
+            seen_off.add(r_offset)
+            if r_type != 257:
+                problems.append(f".rela.data {i}: expected R_AARCH64_ABS64(257), got {r_type}")
+            if r_addend != 0:
+                problems.append(f".rela.data {i}: addend {r_addend}, expected 0")
+            if not (0 <= r_sym < nsyms):
+                problems.append(f".rela.data {i}: symbol index {r_sym} out of range")
+            elif syms[r_sym][2] != SHN_UNDEF:
+                problems.append(f".rela.data {i}: slot binds a defined symbol "
+                                "(expected a SHN_UNDEF extern)")
+            if r_offset + 8 <= len(data_blob):
+                quad = struct.unpack_from("<Q", data_blob, r_offset)[0]
+                if quad != 0:
+                    problems.append(f".rela.data {i}: slot quad at {r_offset:#x} "
+                                    "is not zero-initialized")
+        info.append(f".rela.data: {nd} slot bindings (nl_symbol_ptr)")
+    elif slot_names:
+        problems.append("l_.g.nl.* slot globals present but .rela.data missing")
 
     info.append(f"relocs: {nrel} total, " +
                 ", ".join(f"{RELOC_NAMES[t].replace('R_AARCH64_', '')}={c}"
