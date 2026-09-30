@@ -1,11 +1,15 @@
-// Zan 运行时第一批(crt-transition/runtime_core.zan)的端到端回归:
+// Zan 运行时第一批+第二批(crt-transition/runtime_core.zan)的端到端回归:
 // zan_monotonic_ns/us 的单调性与量纲一致,zan_sha256/zan_sha512 的
 // FIPS 180-4 已知答案,含尾块两条路径(56 字节触发 SHA-256 的
-// tail+1>56 双块路径,120 字节触发 SHA-512 的 tail+1>112 路径)。
+// tail+1>56 双块路径,120 字节触发 SHA-512 的 tail+1>112 路径);
+// zan_crc32 的 IEEE 已知答案("123456789" → 0xCBF43926),以及
+// zan_alloc/zan_free 往返(经 stdlib NativeMemory 的 EntryPoint
+// 改名路径,证明改名机制端到端生效)。
 //
-// stdlib-free:运行时符号契约只依赖 crt ABI(程序对象同样不拉
-// stdlib,链接面是 fixture.o + runtime_core.o + zanstubs_rest.o +
-// libSystem)。
+// 链接面:fixture.o + runtime_core.o + zanstubs_rest.o + libSystem
+// (+ zanhost.o,stdlib 拉入的 embed 声明需要)。
+
+using System;
 
 class zanrt {
     [DllImport("crt", EntryPoint = "zan_monotonic_ns")]
@@ -22,6 +26,8 @@ class zanrt {
     public static extern void free(nint p);
     [DllImport("crt", EntryPoint = "memcpy")]
     public static extern nint memcpy(nint dst, string src, long n);
+    [DllImport("crt", EntryPoint = "zan_crc32")]
+    public static extern int Crc32Direct(nint data, int len);
 
     static string HexDigit(int n) {
         string digits = "0123456789abcdef";
@@ -82,5 +88,22 @@ class zanrt {
         Console.WriteLine(Sha512Hex("aaa", 3));
         string long120 = long56 + long56 + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a";
         Console.WriteLine(Sha512Hex(long120, 120));
+        // CRC-32 已知答案:stdlib NativeMemory 的 EntryPoint 改名路径与
+        // 直连符号必须一致;"123456789" → 0xCBF43926(int 域为负)。
+        nint cbuf = malloc(9);
+        memcpy(cbuf, "123456789", 9);
+        Console.WriteLine(NativeMemory.Crc32(cbuf, 9));
+        Console.WriteLine(Crc32Direct(cbuf, 9));
+        Console.WriteLine(Crc32Direct(cbuf, 0));
+        memcpy(cbuf, "aaa", 3);
+        Console.WriteLine(Crc32Direct(cbuf, 3));
+        free(cbuf);
+        // zan_alloc/zan_free 往返:非零地址、calloc 清零、写读一致。
+        nint abuf = NativeMemory.Alloc(16);
+        Console.WriteLine(abuf != 0);
+        new Span<byte>(abuf, 16)[0] = 0x5A;
+        Console.WriteLine(new Span<byte>(abuf, 16)[0]);
+        Console.WriteLine(new Span<byte>(abuf, 16)[1]);
+        NativeMemory.Free(abuf);
     }
 }

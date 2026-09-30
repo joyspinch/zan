@@ -1328,3 +1328,39 @@ record_types、cs_b16_keyvaluepair 不受影响；39/39 电池。
 
 **下一批候选**：cs_b* 大批次（多字值槽前置 + 上述五项）、reflection
 intrinsics（独立大批次）。
+
+## v18o-11 — 泛型特化声明类型解析 + 裸重抛/字符串抛出双车道 + 过渡运行时定点（2026-09-30）
+
+**批次**：sweep 564 → 573，om 3 → 0。(1) `CurDeclTyNg`（挂在 AddLoc 上）：
+用类类型参数声明的局部/参数（`T keep = item;`）在声明时把参数名烧进
+locTy，所有按键型降级（ToString 派发、string/bool/double 探测、标量分
+类）都看到不可解析的 "T" 而落进名字匹配派发——`keep.ToString()` 对裸
+字符串指针发射 `bl _Exception_ToString`（对字符字节做 strlen，故障地址
+0x6f6c6c6560 就是 "hello" 正文；generic_class_async_generic_method，同
+步 repro 同炸）。字段读取本来就经 CurField/sval2 惰性替换、CallRetTy 本
+来就替换成员调用返回——声明局部现在走同一替换；开放模板（无 sval2）保
+持擦除。(2) SpecRegister：扫描中的 spec 体内裸泛型调用（Pool<string>.
+Chain<U> 克隆体里的 `Wrap<U>(x)`）继承被扫体的接收者实例化
+（specScanMeth，RunSpecPipeline 每轮设、发射前清；owned 检查防扩展方法
+误读），实例化并加入 spec 名（`Wrap$int$Pool.string`）——仅方法类型参
+数会在类实例化间撞名，先注册的体赢走所有调用点（pi.Chain<int> 的裸
+Wrap<int> 复用 Pool<string> 的体、对 int 做 strlen）。(3) EH：字符串抛
+出点在 GenTryStmt 与 EmitAsyncTryNg 双车道都跳过 typed catch（async try
+是独立降级——调试踪迹证实 async 体从不进 GenTry）；catch 子句内的裸
+`throw;` 从子句自己的 #ehcx 帧槽重抛（体内嵌套 try 会覆盖全局在飞异
+常）。exception_rethrow、ws_client_auth、generic_deep_close、
+sqlserver_tls、string_throw_dispatch、cast_string_object 同批转绿。
+(4) crt-transition：trio 重建；定点 run.z2BtL3 stage2.o == stage3.o
+（字节一致）——NativeMemory 加 EntryPoint="zan_alloc" 改名后首个干净定
+点（拉 repo stdlib 的编译器发射 _zan_rt_alloc → zan_alloc，严格链接需
+runtime_core.o；parity seed 拉 ref stdlib 走内部路线故旧桩仍可链接）。
+39/39 电池双运行时配置全绿；native_rt_core pass。**oracle 侧直证结
+案**：firebird_wire（ref 自家 SRP 握手 "string index out of bounds" 3/3
+确定崩溃；native 127/0==golden）、http_server_stress（ref MT 工人池并
+发丢请求 33/7、29/11；native 每轮 golden 40/0）、http_forwarder_stream
+（ref 全零计数或挂死；native==golden 字节一致）、closure_mutable_capture
+（ref SIGSEGV；native==golden 直证）。**剩余种子侧**：linq_query_clauses
+ncf（LINQ 簇，已用 38171e5 种子验证为既有缺口非本批回归）。
+**验证**：39/39 电池（两配置）；定向 generic/async/closure 34/35（唯一
+失败即 oracle SIGSEGV）；EH 16/16；dict/linq/event/delegate 17/18；全量
+624 sweep。

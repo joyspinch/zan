@@ -8,16 +8,33 @@
  * runtime_core.zan (compiled by the native bootstrap compiler, localized
  * except for its zan_* exports) are compiled out with -DZAN_RT_CORE_ZAN so
  * the Zan object supplies them at link time. Batch 1: zan_monotonic_ns/us,
- * zan_sha256, zan_sha512. */
+ * zan_sha256, zan_sha512. Batch 2: zan_alloc, zan_free, zan_crc32 (the
+ * stdlib NativeMemory decls now carry matching EntryPoints).
+ *
+ * Legacy aliases: artifacts produced from a pre-rename stdlib snapshot
+ * (e.g. a stage1 compiled by an older seed beside its frozen stdlib) still
+ * reference the bare Alloc/Free/Crc32 names. These forwarders are
+ * deliberately NOT guarded — in the Zan configuration they resolve the
+ * zan_* names from runtime_core.o at link time. They die once the pinned
+ * seed postdates the rename. */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
 
 long long zan_monotonic_ns(void);
+void *zan_alloc(int size);
+void zan_free(void *p);
+long long zan_crc32(void *p, long long len);
 
-void *Alloc(int size) { return calloc(1, (size_t)(size > 0 ? size : 1)); }
-void Free(void *p) { free(p); }
+void *Alloc(int size) { return zan_alloc(size); }
+void Free(void *p) { zan_free(p); }
+long long Crc32(void *p, long long len) { return zan_crc32(p, len); }
+
+#ifndef ZAN_RT_CORE_ZAN
+void *zan_alloc(int size) { return calloc(1, (size_t)(size > 0 ? size : 1)); }
+void zan_free(void *p) { free(p); }
+#endif /* ZAN_RT_CORE_ZAN */
 void Copy(void *dst, void *src, int n) { memmove(dst, src, (size_t)n); }
 void Fill(void *p, int v, int n) { memset(p, v, (size_t)n); }
 int Compare(void *a, void *b, int n) { return memcmp(a, b, (size_t)n); }
@@ -44,9 +61,10 @@ void *GetString(void *p, int off, int len) {
     return data;
 }
 
-/* int Crc32(nint p, int len): IEEE 802.3 reflected CRC32 (poly 0xEDB88320),
- * table-driven, matching the oracle's self-contained nm_crc32_fn. */
-long long Crc32(void *p, long long len) {
+#ifndef ZAN_RT_CORE_ZAN
+/* long long zan_crc32(nint p, long long len): IEEE 802.3 reflected CRC32
+ * (poly 0xEDB88320), table-driven, matching the oracle's nm_crc32_fn. */
+long long zan_crc32(void *p, long long len) {
     static unsigned int table[256];
     static int ready = 0;
     if (!ready) {
@@ -64,7 +82,6 @@ long long Crc32(void *p, long long len) {
      * int return prints the crc negative from Zan */
     return (long long)(c ^ 0xFFFFFFFFu);
 }
-#ifndef ZAN_RT_CORE_ZAN
 /* void zan_sha512(data, len, md): FIPS 180-4 SHA-512, self-contained — the
  * emitted runtime calls this instead of CC_SHA512, which misbehaved through
  * the chained-fixup stub path (a direct C call in the same binary produced

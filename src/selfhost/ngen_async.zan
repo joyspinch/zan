@@ -1338,7 +1338,7 @@ partial class Ngen {
                 if (first) {
                     LoadImm(3, classes.Count);
                     E4(0xEB03005F);                  // cmp x2, x3
-                    EmitBcond(8, hitL);              // b.hi (string/legacy site)
+                    EmitBcond(8, missL);             // b.hi: string/legacy site misses typed
                     CbzReg(0, hitL);                 // null exception object
                 }
                 List<int> msn = MatchSites(ctname);
@@ -1356,7 +1356,15 @@ partial class Ngen {
                 int ci = DeclSlotNg(cc);
                 if (ci >= 0) { StoreLocal(ci, 0); }
             }
+            // the clause's own exception, kept for a bare rethrow inside (a
+            // frame slot, so it survives any suspension the body takes)
+            int cxSlot2 = ClauseExcSlotOf(s, cc);
+            if (cxSlot2 >= 0) {
+                StoreLocal(cxSlot2, 0);
+                clauseExcOpen.Add(cxSlot2);
+            }
             GenAsyncStmtNg(cc.a);
+            if (cxSlot2 >= 0) { clauseExcOpen.RemoveAt(clauseExcOpen.Count - 1); }
             EmitB(doneL);
             first = false;
             if (cc.b != null) { Mark(missL); }
@@ -1714,9 +1722,16 @@ partial class Ngen {
             if (s.a != null) {
                 GenExpr(s.a);
             } else {
-                // bare rethrow: the in-flight exception stays in the state block
-                BLInternal("_zan_rt_eh_state");
-                LdrU(0, 0, 8);
+                // bare rethrow: the owning catch clause's OWN exception (a
+                // nested try inside the clause body overwrites the in-flight
+                // global; the reference keeps the original per clause), else
+                // the in-flight exception in the state block
+                if (clauseExcOpen.Count > 0) {
+                    LoadLocal(clauseExcOpen[clauseExcOpen.Count - 1], 0);
+                } else {
+                    BLInternal("_zan_rt_eh_state");
+                    LdrU(0, 0, 8);
+                }
             }
             E4(0xF81F0FE0);                          // hold the exception value
             AsyncRunFinsNg(0, true);                 // finallys of abandoned catches

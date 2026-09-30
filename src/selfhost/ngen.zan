@@ -157,7 +157,17 @@ partial class Ngen {
     int ehTopLocal;         // #ehtop: mirror of the runtime EH top
     int ehBaseLocal;        // #ehbase: top at the outermost open try's arm
     int ehBrkLocal;         // #ehbrk: top at loop entry (break/continue disarm)
+    List<Node> clauseExcNodes; // catch clauses, in reserve order: a bare
+                               // `throw;` rethrows the innermost open
+                               // clause's OWN exception, not the mutable
+                               // in-flight global (a nested try inside the
+                               // clause body overwrites the global)
+    List<int> clauseExcSlots;  // frame slot per clause holding its exception
+    List<int> clauseExcOpen;   // slots of the clauses whose bodies are being
+                               // emitted, innermost last
     int ctmpSeq;            // hidden single-eval temps for compound assigns
+    bool dbgEh = false;     // temporary: trace EH arm (7M+depth) and rethrow
+                            // (8M+runtime top) through zan_rt_print_int
 
     string curCls;
     int stTyDepth;          // StaticTyOf recursion guard: cyclic static-type
@@ -232,6 +242,10 @@ partial class Ngen {
     string mainCls;
     bool mainAsync;     // Main is async: the shim ramps + pumps instead of calling it
     Node curMeth;           // method being emitted (spec sval2 = this type)
+    Node specScanMeth;      // method RunSpecPipeline is scanning: a bare
+                            // generic call inside a scanned spec body
+                            // inherits the body's receiver instantiation
+                            // (curMeth is emission-only, null during the scan)
 
     List<string> enName;    // enum type name per declaration
     List<int> enOff;        // start index into the flat member arrays
@@ -256,6 +270,9 @@ partial class Ngen {
         gotoNames = new List<string>();
         gotoIds = new List<int>();
         ehStack = new List<int>();
+        clauseExcNodes = new List<Node>();
+        clauseExcSlots = new List<int>();
+        clauseExcOpen = new List<int>();
         brkLoop = new List<bool>();
         brkFinBase = new List<int>();
         cntFinBase = new List<int>();
@@ -1611,6 +1628,17 @@ partial class Ngen {
             if (f != null && (f.ty == "int" || f.ty == "long"
                     || f.ty == "short" || f.ty == "byte")) { return "int"; }
         }
+        // computed scalar shapes (parenthesized arithmetic, shifts, unary):
+        // the bool/double/ulong probes above already classified their kinds,
+        // so what remains of these operators renders through the int renderer
+        if (e.kind == AK.Binary()) {
+            int op = e.op;
+            if (op == TK.Plus() || op == TK.Minus() || op == TK.Star()
+                    || op == TK.Slash() || op == TK.Percent()
+                    || op == TK.LessLess() || op == TK.GreaterGreater()
+                    || op == TK.GreaterGreaterGreater()) { return "int"; }
+        }
+        if (e.kind == AK.Unary() && e.op == TK.Minus()) { return "int"; }
         return null;
     }
 
@@ -2213,9 +2241,30 @@ partial class Ngen {
         return "object";
     }
 
+    // declared types inside a specialization body: a local or param declared
+    // with the CLASS's type parameter ("T keep = item;") burns the parameter
+    // name into locTy at decl time, and every type-keyed lowering (ToString
+    // dispatch, string/bool/double probes, scalar classification) then sees
+    // an unresolvable "T" and falls into name-match dispatch. Field reads
+    // resolve lazily through CurField/sval2, and CallRetTy substitutes
+    // member-call returns -- declared locals need the same substitution.
+    // Open template bodies (no sval2) keep the erased parameter.
+    string CurDeclTyNg(string ty) {
+        if (ty == null || curMeth == null || curMeth.sval2 == null
+                || curMeth.sval2 == "") { return ty; }
+        int lt = curMeth.sval2.IndexOf("<");
+        if (lt <= 0) { return ty; }
+        Cls c = FindClass(curMeth.sval2.Substring(0, lt));
+        if (c == null || c.tps.Count == 0) { return ty; }
+        List<string> args = SplitTyArgs(curMeth.sval2.Substring(lt + 1, curMeth.sval2.Length - lt - 2));
+        if (args.Count != c.tps.Count) { return ty; }
+        return SubstTy(ty, c.tps, args);
+    }
+
     // Frame allocation and visibility are separate. Leaving a lexical scope
     // restores its chain head, never its allocated storage.
     void AddLoc(string name, string ty, bool isRef) {
+        ty = CurDeclTyNg(ty);
         locName.Add(name); locTy.Add(ty); locOff.Add(16 * nloc);
         locRef.Add(isRef); locDecl.Add(null); locPrev.Add(locHead);
         locOpaq.Add(0);
@@ -2687,6 +2736,11 @@ partial class Ngen {
             locHead = saved;
         } else if (k == AK.TryStmt()) {
             ReserveScopedNg(s.a);
+            // one frame slot per catch clause holds that clause's OWN
+            // exception while its body runs: a bare `throw;` inside must
+            // rethrow it even after a nested try in the body overwrote the
+            // in-flight global (the reference's kept-exception rule)
+            s.ival = clauseExcNodes.Count;
             Node cc = s.b;
             while (cc != null) {
                 int saved = locHead;
@@ -2694,6 +2748,9 @@ partial class Ngen {
                 if (cc.sval != null && cc.sval != "") {
                     AddDeclNg(cc, cc.sval, cc.type != null ? TypeFullName(cc.type) : "string");
                 }
+                clauseExcNodes.Add(cc);
+                clauseExcSlots.Add(nloc);
+                AddLoc("#ehcx", "int", false);
                 ReserveScopedNg(cc.a);
                 locHead = saved;
                 cc = cc.b;
@@ -6045,6 +6102,37 @@ partial class Ngen {
         }
         if (open || di < 0) { return; }
         Node decl = methNodes[di];
+        // the call may sit on an instantiated generic receiver
+        // (`ps.Pair<int>(3)` with ps: Pool<string>): carry that
+        // instantiation on the spec so its `this`-relative field types
+        // resolve (CurField reads sval2) and its declared locals substitute
+        // (CurDeclTyNg). A bare call inside a scanned spec body inherits
+        // the body's own receiver instantiation (`Wrap<U>(x)` inside
+        // Pool<string>.Chain<U>): the open template saw no receiver -- but
+        // only when the declaration belongs to that very class, so a
+        // bare-name match in an unrelated class (extension methods) never
+        // reads this class's type arguments into its body. The
+        // instantiation joins the spec NAME: the method's own type
+        // arguments alone collide across class instantiations
+        // (Pool<string>.Wrap<int> and Pool<int>.Wrap<int> are different
+        // coroutines) and the first registered body would win every call
+        // site.
+        string rt = null;
+        bool instOwned = false;
+        if (callNode.a != null && callNode.a.kind == AK.MemberAccess()
+                && callNode.a.a != null) {
+            rt = StaticTyOf(callNode.a.a);
+            instOwned = true;
+        } else if (specScanMeth != null && specScanMeth.sval2 != null
+                && specScanMeth.sval2 != "") {
+            rt = specScanMeth.sval2;
+            if (rt.IndexOf("<") > 0) { instOwned = methCls[di] == rt.Substring(0, rt.IndexOf("<")); }
+        }
+        string instTag = null;
+        if (rt != null && instOwned && rt.IndexOf("<") > 0
+                && FindClass(rt.Substring(0, rt.IndexOf("<"))) != null) {
+            instTag = TySymTagNg(rt);
+        } else { rt = null; }
         string mangled = name + "$";
         int mj = 0;
         while (mj < args.Count) {
@@ -6052,6 +6140,7 @@ partial class Ngen {
             mangled = mangled + args[mj];
             mj = mj + 1;
         }
+        if (instTag != null) { mangled = mangled + "$" + instTag; }
         // same-named generic overloads must not share one spec symbol:
         // the first registered body would win every call site regardless
         // of which overload each site resolved to
@@ -6079,17 +6168,9 @@ partial class Ngen {
             }
             spec.sval = mangled;
             SubstTypeNode(spec, tps, args);
-            // the call may sit on an instantiated generic receiver
-            // (`ps.Pair<int>(3)` with ps: Pool<string>): carry that
-            // instantiation on the spec so its `this`-relative field types
-            // resolve (CurField reads sval2), like SpecRegisterClass does
-            if (callNode.a != null && callNode.a.kind == AK.MemberAccess()
-                    && callNode.a.a != null) {
-                string rt = StaticTyOf(callNode.a.a);
-                if (rt != null && rt.IndexOf("<") > 0 && FindClass(rt.Substring(0, rt.IndexOf("<"))) != null) {
-                    spec.sval2 = rt;
-                    RegisterInstCls(rt);
-                }
+            if (instTag != null) {
+                spec.sval2 = rt;
+                RegisterInstCls(rt);
             }
             AddMethNg(spec, methCls[di], methStat[di]);
             specMeth.Add(mangled);
@@ -7103,6 +7184,7 @@ partial class Ngen {
             if (methStat[processed] != 3) {
                 bool inst = methStat[processed] == 0 || methStat[processed] == 2;
                 curCls = methCls[processed];
+                specScanMeth = m;
                 InitLocalsNg();
                 if (inst) {
                     string thisTy = m.sval2 != null && m.sval2 != "" ? m.sval2 : curCls;
@@ -7121,6 +7203,8 @@ partial class Ngen {
             }
             processed = processed + 1;
         }
+        specScanMeth = null;     // emission-time registrations must not see
+                                 // a stale scan context
     }
 
     // ---- enums ----
@@ -7854,6 +7938,12 @@ partial class Ngen {
         if (e.kind == AK.AwaitExpr()) { return AsyncAwaitElemTyNg(e.a) == "string"; }
         if (e.kind == AK.Call() && HostCallRetTy(e) == "string") { return true; }
         if (e.kind == AK.StringLit()) { return true; }
+        // (string)e keeps riding the heap string bits; without this a
+        // cast-typed arg reaches WriteLine's int renderer and prints the
+        // pointer (the reference prints the text)
+        if (e.kind == AK.CastExpr() && e.type != null) {
+            return e.type.sval == "string" || TypeFullName(e.type) == "string";
+        }
         if (e.kind == AK.Binary()) {
             if (e.op == TK.QQ()) { return IsStrExpr(e.a) || IsStrExpr(e.b); }
             return e.op == TK.Plus() && (IsStrExpr(e.a) || IsStrExpr(e.b));
@@ -8097,7 +8187,8 @@ partial class Ngen {
             int op = e.op;
             if (op == TK.Plus() || op == TK.Minus() || op == TK.Star()
                     || op == TK.Slash() || op == TK.Percent()
-                    || op == TK.LessLess() || op == TK.GreaterGreater()) {
+                    || op == TK.LessLess() || op == TK.GreaterGreater()
+                    || op == TK.GreaterGreaterGreater()) {
                 return IsUlongExpr(e.a) || IsUlongExpr(e.b);
             }
             return false;
@@ -11203,6 +11294,12 @@ partial class Ngen {
         StrU(1, 0, 0);                               // state->top = top + 1
         StoreLocal(ehTopLocal, 1);                   // mirror = top + 1
         ehStack.Add(1);
+        if (dbgEh) {
+            E4(0xF81F0FE2);                          // hold buf
+            LoadImm(0, 7000000 + ehStack.Count);
+            BLExtern("_zan_rt_print_int");
+            E4(0xF84107E2);                          // buf back
+        }
         MovRR(0, 2);
         BLExtern("_setjmp");                         // returns 0 (direct) / 1 (thrown)
         EmitCbnz(0, NL());
@@ -11266,6 +11363,12 @@ partial class Ngen {
             // continues
             EmitB(noMatch);
         }
+        // A string throw (site = the str_alloc magic, above every declared
+        // class) is matched by NO typed clause: binding it to
+        // `catch (Exception e)` would read string bytes as an object header
+        // when the handler touches e.Message. Only an untyped `catch { }`
+        // takes it (the reference's A36 rule); the compare loop below already
+        // skips it for every later typed clause by inequality.
         Node cc = s.b;
         bool first = true;
         while (cc != null) {
@@ -11277,7 +11380,7 @@ partial class Ngen {
                 if (first) {
                     LoadImm(3, classes.Count);
                     E4(0xEB03005F);                  // cmp x2, x3
-                    EmitBcond(8, hitL);              // b.hi (string/legacy site)
+                    EmitBcond(8, missL);             // b.hi: string/legacy site misses typed
                     CbzReg(0, hitL);                 // null exception object
                 }
                 List<int> msn = MatchSites(ctname);
@@ -11296,7 +11399,13 @@ partial class Ngen {
                 int ci = DeclSlotNg(cc);
                 if (ci >= 0) { StoreLocal(ci, 0); }
             }
+            int cxSlot = ClauseExcSlotOf(s, cc);
+            if (cxSlot >= 0) {
+                StoreLocal(cxSlot, 0);                   // the clause's own exc
+                clauseExcOpen.Add(cxSlot);
+            }
             GenStmt(cc.a);
+            if (cxSlot >= 0) { clauseExcOpen.RemoveAt(clauseExcOpen.Count - 1); }
             EmitB(doneL);
             first = false;
             if (cc.b != null) { Mark(missL); }
@@ -11325,6 +11434,20 @@ partial class Ngen {
         }
         AddSPImm(32, true);                          // pop saved top + state
         ehStack.RemoveAt(ehStack.Count - 1);
+    }
+
+    // frame slot holding this clause's own exception (-1 when the try never
+    // went through ReserveLocals -- a synthesized try has no clauses anyway)
+    int ClauseExcSlotOf(Node tryN, Node cc) {
+        if (tryN == null || cc == null || clauseExcNodes == null) { return -1; }
+        int baseIx = tryN.ival;
+        if (baseIx < 0 || baseIx >= clauseExcNodes.Count) { return -1; }
+        int i = baseIx;
+        while (i < clauseExcNodes.Count) {
+            if (clauseExcNodes[i] == cc) { return clauseExcSlots[i]; }
+            i = i + 1;
+        }
+        return -1;
     }
 
     // disarm every try this return leaves: the runtime top goes back to the
@@ -11454,9 +11577,16 @@ partial class Ngen {
         if (s.a != null) {
             GenExpr(s.a);
         } else {
-            // bare rethrow: the in-flight exception stays in the state block
-            BLInternal("_zan_rt_eh_state");
-            LdrU(0, 0, 8);
+            // bare rethrow: the owning catch clause's OWN exception (a nested
+            // try inside the clause body overwrote the in-flight global --
+            // the reference keeps the original per clause); with no clause
+            // open, the in-flight exception stays the value
+            if (clauseExcOpen.Count > 0) {
+                LoadLocal(clauseExcOpen[clauseExcOpen.Count - 1], 0);
+            } else {
+                BLInternal("_zan_rt_eh_state");
+                LdrU(0, 0, 8);
+            }
         }
         E4(0xF81F0FE0);                              // push exception value
         // a throw leaves every try whose handler is already disarmed (we
@@ -11481,6 +11611,15 @@ partial class Ngen {
         BLInternal("_zan_rt_eh_state");
         MovRR(1, 0);
         LdrU(2, 1, 0);                               // top
+        if (dbgEh) {
+            E4(0xF81F0FE2);                          // hold top
+            LoadImm(0, 8000000);
+            AddRR(0, 0, 2);                          // tag 8M + top
+            BLExtern("_zan_rt_print_int");
+            E4(0xF84107E2);                          // top back
+            BLInternal("_zan_rt_eh_state");          // print clobbered x1
+            MovRR(1, 0);
+        }
         LoadImm(3, 64);                              // bufs capacity: an
                                                      // overflown top means a
                                                      // disarm leak -- exit

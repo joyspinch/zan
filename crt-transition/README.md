@@ -8,30 +8,50 @@
     cc -c -o zanhost.o  zanhost.c
     cc -o zanc zanc.o zanstubs.o zanhost.o -lSystem
 
-## Zan 运行时第一批（runtime_core.zan）
+## Zan 运行时第一批 + 第二批（runtime_core.zan）
 
-`runtime_core.zan` 用 Zan 重新实现了 zanstubs.c 的第一批符号：
-`zan_monotonic_ns` / `zan_monotonic_us` / `zan_sha256` / `zan_sha512`。
+`runtime_core.zan` 用 Zan 重新实现了 zanstubs.c 的两批符号：
+`zan_monotonic_ns` / `zan_monotonic_us` / `zan_sha256` / `zan_sha512`（第一批）、
+`zan_alloc` / `zan_free` / `zan_crc32`（第二批）。
 它由原生自举编译器（ngen）编译成对象，再用 `localize_syms.py` 把 API 面
 之外的符号本地化——ngen 会把整套运行时帮助函数以全局符号发射进每个
-对象，不本地化则与程序对象撞符号。产出恰好导出这 4 个符号：
+对象，不本地化则与程序对象撞符号。产出恰好导出这 7 个符号：
 
     SEED=/path/to/stage2 bash crt-transition/build_zan_core.sh
 
 链接面（`-DZAN_RT_CORE_ZAN` 把这批符号从 C 侧编出，其余照旧）：
 
     python3 scripts/native_regression.py --seed "$SEED" \
-      --runtime "crt-transition/runtime_core.o crt-transition/zanstubs_rest.o" \
-      tests/selfhost/native_rt_core.zan          # 第一批端到端（FIPS 180-4 已知答案）
+      --runtime "crt-transition/runtime_core.o crt-transition/zanstubs_rest.o crt-transition/zanhost.o" \
+      tests/selfhost/native_rt_core.zan          # 两批端到端（FIPS 180-4 / CRC32 已知答案）
 
-39 项 kernel 回归同样接受 `--runtime "crt-transition/runtime_core.o
-crt-transition/zanstubs_rest.o"`（Zan 对象供 sha/monotonic 符号）。
+39 项 kernel 回归同样接受上述 `--runtime`（Zan 对象供 monotonic/sha/alloc/
+free/crc32 符号）。两个配置都已全量验证：C 基线（`cc -c` 无定义符）与
+Zan 运行时（`-DZAN_RT_CORE_ZAN`）各跑同一套 kernel + 附加 fixture。
+
+第二批的改名机制：stdlib 的 `NativeMemory.Alloc/Free/Crc32` 声明加
+`EntryPoint = "zan_alloc" / "zan_free" / "zan_crc32"`——DllImport 的
+EntryPoint 就是符号改名机制，无需动编译器。C host（LLVM 车道）对这些
+调用直降 libc（`irgen_expr.c`），不受影响。`NativeMemory.Crc32` 的双车道
+oracle 语义是**零扩展成 i64 返回**（"123456789" → 3421780262，
+见 `irgen_expr.c` 的 `nm_crc32_fn` 末尾 ZExt 与 `ngen.zan` 的 Crc32→long
+特例）；fixture 里自带的 `int` 返回 DllImport 变体才打印有符号读数
+（-873187034）——两条都钉在 golden 里。
+
+过渡期遗留别名：旧代 seed 是对着改名前的 stdlib 快照编译的，其 stage1
+产物仍引用 `_Alloc/_Free/_Crc32`。`zanstubs.c` 里这三个转发别名**不加
+守卫**（两个配置都参与链接），等所有钉住的 seed 都晚于本次改名后即可
+删除。注意：native 车道的 stdlib
+查找是**编译器同目录优先**（`main.zan` 回退 `./stdlib`）——seed 旁边的
+历史快照会遮蔽仓库 stdlib，改 stdlib 后必须用新 bootstrap 产出的 seed
+重跑回归，否则改动静默不生效。
 
 约束与已知代价（详见 `runtime_core.zan` 头注）：不 using stdlib（Span 是
 binder 内建，libc 直调）；数值一律 long + `>>>` + 掩码；每次调用为 Span
-视图泄漏 2×16 字节（视图按设计短命不回收）。`Crc32` 仍在 C 侧：导出名
-`_Crc32` 无法由 `_类名_方法名` mangle 表达，需 ngen 侧换名（如
-`_zan_crc32`）后才能收编。
+视图泄漏 1~2×16 字节（视图按设计短命不回收）；公开 ABI 方法名必须与
+libc 导入别名错开（同名会触发重载 mangling 破坏符号契约，如内部的
+`cfree` 别名）。
+
 
 - `zanstubs.c`：Zan 运行时原语（Alloc/Free/Copy/…/Crc32）、
   `zan_monotonic_ns/us`、Win 代码页 API、`zan_audio_*` 桩、

@@ -1,35 +1,52 @@
-// crt-transition/runtime_core.zan — Zan 实现的过渡期运行时(第一批)。
+// crt-transition/runtime_core.zan — Zan 实现的过渡期运行时(第一、二批)。
 //
 // 取代 zanstubs.c 中的(用 -DZAN_RT_CORE_ZAN 从 C 侧编出):
-//   zan_monotonic_ns / zan_monotonic_us / zan_sha256 / zan_sha512
+//   第一批:zan_monotonic_ns / zan_monotonic_us / zan_sha256 / zan_sha512
+//   第二批:zan_alloc / zan_free / zan_crc32(stdlib NativeMemory.Alloc/
+//           Free/Crc32 经 EntryPoint 改名指向这组符号——DllImport 的
+//           EntryPoint 就是改名机制,无需动编译器)
 // 由原生自举编译器(ngen)编译为 arm64 可重定位对象,再经
 // localize_syms.py 把 API 面之外的符号本地化——ngen 会把整套运行时
 // 帮助函数以全局符号发射进每个对象,不本地化则与程序对象撞符号。
 //
 // 语义与 zanstubs.c 逐符号一致(CLOCK_MONOTONIC、FIPS 180-4、
-// len<0 钳 0、大端摘要输出)。SHA 输入经 memcpy 整块搬入暂存缓冲再
-// 调度,与 C 版的逐块指针遍历等价。
+// len<0 钳 0、大端摘要输出、calloc 清零分配、CRC-32 IEEE 反射)。
+// SHA 输入经 memcpy 整块搬入暂存缓冲再调度,与 C 版的逐块指针遍历等价。
 //
-// 已知代价:每次调用为 Span 视图泄漏 2×16 字节(视图按迁就设计
-// 短命、不回收,与 ngen 的 Span 实现一致)。Crc32 仍在 C 侧:其
-// 导出名 `_Crc32` 无法由 `_类名_方法名` 的 mangle 规则表达,需要
-// ngen 侧给它换名(如 _zan_crc32)后才能收编。
+// 已知代价:每次调用为 Span 视图泄漏 1~2×16 字节(视图按迁就设计
+// 短命、不回收,与 ngen 的 Span 实现一致)。
 //
 // 约束:不 using stdlib(Span 是 binder 内建,libc 直调);数值一律
 // long + >>>(恒逻辑右移)+ 掩码,不依赖 uint/ulong 的移位语义;
 // 消息长度限 int 正范围(<2^31),与 ngen 调用方的钳制一致。
+//
+// 命名纪律:libc 导入一律别名(cfree/malloc/…),公开 ABI 方法名
+// (free/alloc/crc32/…)必须与 libc 导入名错开——同类两个方法名会
+// 触发重载 mangling(_zan_free__…),破坏符号契约。
 
 class zan {
     [DllImport("crt", EntryPoint = "malloc")]
     public static extern nint malloc(long size);
+    [DllImport("crt", EntryPoint = "calloc")]
+    public static extern nint calloc(long nmemb, long size);
     [DllImport("crt", EntryPoint = "free")]
-    public static extern void free(nint p);
+    public static extern void cfree(nint p);
     [DllImport("crt", EntryPoint = "memset")]
     public static extern nint memset(nint p, int v, long n);
     [DllImport("crt", EntryPoint = "memcpy")]
     public static extern nint memcpy(nint dst, nint src, long n);
     [DllImport("crt", EntryPoint = "clock_gettime")]
     public static extern int clock_gettime(int clk, nint ts);
+
+    // void *zan_alloc(int size):清零分配,size<=0 退化 1 字节
+    public static nint alloc(int size) {
+        return calloc(1, size > 0 ? size : 1);
+    }
+
+    // void zan_free(void *p):free(0) 为无操作(libc 语义)
+    public static void free(nint p) {
+        cfree(p);
+    }
 
     // long long zan_monotonic_ns(void):macOS CLOCK_MONOTONIC=6
     // (_time.h:159);struct timespec = {long tv_sec; long tv_nsec}。
@@ -280,6 +297,32 @@ class zan {
             i = i + 1;
         }
         free(blk);
+    }
+
+    // long long zan_crc32(const void *p, long long len):IEEE 802.3 反射
+    // CRC32(poly 0xEDB88320),表驱动,返回零扩展的 32 位模式(消费方
+    // 按 int 读即得符号域值,与 C 版逐位一致)。
+    public static long crc32(nint p, long len) {
+        long[] table = new long[256];
+        int i = 0;
+        while (i < 256) {
+            long c = i;
+            int k = 0;
+            while (k < 8) {
+                c = ((c & 1) != 0 ? (0xEDB88320L ^ (c >>> 1)) : (c >>> 1)) & 0xFFFFFFFFL;
+                k = k + 1;
+            }
+            table[i] = c;
+            i = i + 1;
+        }
+        long crc = 0xFFFFFFFFL;
+        Span<byte> b = new Span<byte>(p, (int)len);
+        long j = 0;
+        while (p != 0 && j < len) {
+            crc = table[(int)((crc ^ b[(int)j]) & 255)] ^ (crc >>> 8);
+            j = j + 1;
+        }
+        return crc ^ 0xFFFFFFFFL;
     }
 }
 
