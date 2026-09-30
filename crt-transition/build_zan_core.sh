@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Build the Zan-implemented runtime object (runtime_core.zan, batches 1-8)
+# Build the Zan-implemented runtime object (runtime_core.zan, batches 1-9)
 # with the native bootstrap compiler and localize its non-API symbols.
 #
 #   SEED=/path/to/stage2 bash crt-transition/build_zan_core.sh [out.o]
 #
-# Produces an object exporting exactly the 125 allowlisted zan_* symbols
+# Produces an object exporting exactly the 133 allowlisted zan_* symbols
 # (monotonic/sha256/sha512/alloc/free/crc32 + pkg_fopen/file_*/plat_*/
-# io_* + atomic/audio/monitor/dispatch/eh/shared_table + weakened
-# embed_*). Link it with the -DZAN_RT_CORE_ZAN builds of
+# io_* + atomic/audio/monitor/dispatch/eh/shared_table + io reactor
+# co helpers + weakened embed_*). Link it with the -DZAN_RT_CORE_ZAN builds of
 # zanstubs.c and zanhost.c wherever those symbols are needed:
 #
 #   python3 scripts/native_regression.py --seed "$SEED" \
@@ -72,6 +72,8 @@ python3 crt-transition/localize_syms.py "$OUT" \
   _zan_shared_table_set_string_at _zan_shared_table_get_string_at \
   _zan_shared_table_match_at _zan_shared_table_exists_at \
   _zan_shared_table_delete_at \
+  _zan_io_wait_co _zan_io_recv_co _zan_io_recv_to_co _zan_io_accept_co \
+  _zan_io_poll _zan_io_close_notify _zan_resolve_sa_co _zan_resolve_ipv4_co \
   --weaken \
   _zan_embed_has _zan_embed_read _zan_embed_bytes _zan_embed_list
 cc -DZAN_RT_CORE_ZAN -c -o "$ROOT/crt-transition/zanstubs_rest.o" \

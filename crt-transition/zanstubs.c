@@ -1730,7 +1730,13 @@ int32_t zan_io_socket_alive(intptr_t fd) {
  * mutation happens on the main thread; the DNS worker only fills its own
  * job and hands it over under a mutex via the pipe. zan_co_ready is
  * emitted by the compiler into async programs; non-async links leave it
- * unresolved (weak), where these functions are unreachable anyway. */
+ * unresolved (weak), where these functions are unreachable anyway.
+ * Batch 9: the reactor API (watch helpers, the five co entry points,
+ * io_poll, close_notify, both resolve_co forms) is ported to Zan
+ * (runtime_core.zan); what stays here under -DZAN_RT_CORE_ZAN is the
+ * registration hook plus the three no-indirect-call / thread-body thunks
+ * (zt_io_resume, zt_dns_worker_fn, zt_dns_drain) and the shared self-pipe
+ * state (zt_dns_pipe_rd). */
 /* -DZAN_RT_CORE_ZAN 时下面三个定义已编出(runtime_core.zan 提供),
  * reactor 段/DNS worker 仍引用它们——前向声明。 */
 extern int32_t zan_io_socket_alive(intptr_t fd);
@@ -1746,6 +1752,15 @@ extern int32_t zan_io_resolve_sa(const char *name, int32_t port, void *buf,
  * itself) where no weak-undefined trick is portable across linkers. */
 void (*zan_co_ready_hook)(long long frame, long long step);
 
+/* resume a parked coroutine from C: ngen has no indirect calls, so the Zan
+ * reactor calls this thunk instead of loading the hook pointer itself (same
+ * gap-workaround shape as zan_open_creat). No-op until the emitted async
+ * runtime registers (non-async programs leave it NULL). */
+void zt_io_resume(long long frame, long long step) {
+    if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
+}
+
+#ifndef ZAN_RT_CORE_ZAN
 /* watcher kinds: 1/2 are ReadReady/WriteReady's interest codes, 3-5 the
  * value-yielding forms, 6 the persistent self-pipe watch */
 #define ZT_IO_W 1
@@ -1880,6 +1895,8 @@ void zan_io_accept_co(intptr_t fd, long long frame, long long step,
     if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
 }
 
+#endif /* ZAN_RT_CORE_ZAN */
+
 /* hostname resolution: zan_io_resolve_sa is synchronous (getaddrinfo), so
  * it runs on a detached worker that hands the finished job over under a
  * mutex and signals the self-pipe; the pipe watch drains on the main
@@ -1925,6 +1942,29 @@ static void *zt_dns_worker(void *arg) {
     return NULL;
 }
 
+/* C-side thunks the Zan reactor needs (see zt_io_resume): the thread body's
+ * address for pthread_create, the finished-job list under the mutex, and the
+ * self-pipe read fd after ensuring the pipe (the ensure helper only reports
+ * success). Shared ZtDnsJob layout is a private contract: next@0 name@8
+ * port@16 buf@24 cap@32 outn@40 frame@48 step@56 result@64 v4@68. */
+void *zt_dns_worker_fn(void) {
+    return (void *)(intptr_t)zt_dns_worker;
+}
+
+void *zt_dns_drain(void) {
+    pthread_mutex_lock(&zt_dns_mu);
+    ZtDnsJob *list = zt_dns_done;
+    zt_dns_done = NULL;
+    pthread_mutex_unlock(&zt_dns_mu);
+    return list;
+}
+
+int zt_dns_pipe_rd(void) {
+    if (!zt_dns_pipe_ensure()) return -1;
+    return zt_dns_pipe[0];
+}
+
+#ifndef ZAN_RT_CORE_ZAN
 void zan_resolve_sa_co(const char *name, long long port, char *buf,
                        long long cap, long long frame, long long step,
                        long long *outn) {
@@ -2118,6 +2158,7 @@ void zan_io_close_notify(intptr_t fd) {
             zt_io_deliver(w, w->kind == ZT_IO_ACCEPT ? -1 : 0);
     }
 }
+#endif /* ZAN_RT_CORE_ZAN */
 
 #ifndef ZAN_RT_CORE_ZAN
 int64_t zan_monotonic_us(void) {

@@ -1,4 +1,4 @@
-// crt-transition/runtime_core.zan — Zan 实现的过渡期运行时(第一~五批)。
+// crt-transition/runtime_core.zan — Zan 实现的过渡期运行时(第一~九批)。
 //
 // 取代 zanstubs.c / zanhost.c 中的(用 -DZAN_RT_CORE_ZAN 从 C 侧编出):
 //   第一批:zan_monotonic_ns / zan_monotonic_us / zan_sha256 / zan_sha512
@@ -25,6 +25,13 @@
 //           "stub")、zan_monitor_enter/exit、zan_dispatch_*(CAS 自旋
 //           锁环)、zan_eh_tls_state(pthread key)——线程族
 //           (zan_thread_*)因 naked asm + 函数指针仍留 zanstubs.c。
+//   第九批:native io reactor 8 符号——io_wait_co/io_recv_co/
+//           io_recv_to_co/io_accept_co/io_poll/io_close_notify/
+//           resolve_sa_co/resolve_ipv4_co(watch 表、零超时探测、
+//           DNS 自管道 + 脱离 worker、互斥交棒)。C 侧只留 4 个内部
+//           thunk(hook 全局 + zt_io_resume 间接调用 + zt_dns_worker_fn
+//           线程体地址 + zt_dns_drain 互斥摘链 + zt_dns_pipe_rd),
+//           与 zan_open_creat 同款的缺口绕行。
 // 由原生自举编译器(ngen)编译为 arm64 可重定位对象,再经
 // localize_syms.py 把 API 面之外的符号本地化——ngen 会把整套运行时
 // 帮助函数以全局符号发射进每个对象,不本地化则与程序对象撞符号。
@@ -116,6 +123,21 @@
 // 只断言 != 0。指针算术一律经 st_ptr(long) 两步:((nint)(表达式))
 // 括号强转被解析器当方法调用(见缺口 3 旁注),(nint)标识符才合法。
 //
+// 第九批追加约束:watch 表为私有布局 80B/项(fd/kind/active/buf/len/
+// deadline/frame/step/outn/垫),静态只存 io_ws/io_n/io_cap 三个
+// 指针计数(缺口 2 纪律),grow 用 calloc+memcpy+free(不用 realloc)。
+// co 助手在系统调用前一律先零超时 poll 探测(zt_fd_ready 语义):
+// accept 出的套接字常被调用方留在阻塞态,直接阻塞会冻死单线程引擎。
+// DNS 作业块是与 C worker 的共享契约(72B:next@0 name@8 port@16
+// buf@24 cap@32 outn@40 frame@48 step@56 result@64 v4@68),worker
+// 线程体留在 C(ngen 无函数指针调用,线程体地址经 zt_dns_worker_fn
+// thunk 取),完工链经互斥(zt_dns_drain)+ 自管道(读端 fd 经
+// zt_dns_pipe_rd,非阻塞——排干到 would-block 而不是冻死)交棒,
+// ready 队列仍只被主线程触碰。恢复一律经 zt_io_resume thunk(hook
+// 指针的间接调用,缺口 5);hook==0 的非 async 程序里它是空操作,
+// 语义只经 outn 槽与 poll 返回值观察。byte 事件位拼装按 int 收拾,
+// revents 在 +6 处用两 byte 拼回(短整型 ABI 只保证低字节可靠)。
+//
 // 已发现编译器缺口(ngen,待独立批次处理;本文件全部绕行):
 //   1) 变参调用降级不可用——8 参 DllImport→snprintf 在入口寄存器
 //      逐个验证正确(lldb 断点读 x0..x7 且 x/s 指向正确内容),被调
@@ -141,6 +163,11 @@
 //      的"值"无法跨边界(第八批 fixture 只验行管理语义)。第七批
 //      audio 的 == 0.0 断言只是出口前无调用、scvtf 的 0.0 恰好留在
 //      d0 才通过,不是 ABI 正确;待独立批次定 double 的 ABI。
+//   5) 无间接调用/函数指针:LoadSymRef 可取全局地址,但不能经寄存器
+//      blr。受害形态:协程恢复 hook(zan_co_ready_hook)、线程体
+//      (pthread_create 的 fn)。绕行:C 侧包装 thunk(zan_open_creat
+//      同款)——zt_io_resume(frame,step) 内部判空调 hook;线程体
+//      地址经 zt_dns_worker_fn() 取;互斥下摘链经 zt_dns_drain()。
 //
 // 命名纪律:libc 导入一律别名(cfree/malloc/…),公开 ABI 方法名
 // (free/alloc/crc32/…必须与 libc 导入名错开——同类两个方法名会
@@ -898,6 +925,30 @@ class zan {
     public static extern void cfreeaddrinfo(nint res);
     [DllImport("crt", EntryPoint = "memcmp")]
     public static extern int cmemcmp(nint a, nint b, long n);
+    [DllImport("crt", EntryPoint = "memcmp")]
+    public static extern int cmemcmp(nint a, nint b, long n);
+
+    // ---- 九批:native io reactor 的系统调用面 ----
+    [DllImport("crt", EntryPoint = "accept")]
+    public static extern int caccept(int fd, nint addr, nint addrlen);
+    [DllImport("crt", EntryPoint = "read")]
+    public static extern long cread(int fd, nint buf, long n);
+    [DllImport("crt", EntryPoint = "pthread_create")]
+    public static extern int cpthread_create(nint tidp, nint attr, nint fn, nint arg);
+    [DllImport("crt", EntryPoint = "pthread_detach")]
+    public static extern int cpthread_detach(long tid);
+    // zanstubs.c 的内部 thunk(同 zan_open_creat 的缺口绕行形态):resume
+    // 是间接调用(hook 指针,缺口五:无函数指针调用),worker_fn 给出线程
+    // 体地址,drain 在互斥下摘走完工 DNS 作业链,pipe_rd 建好自管道并给出
+    // 读端 fd(ensure 本身只报成败)
+    [DllImport("crt", EntryPoint = "zt_io_resume")]
+    public static extern void zt_io_resume(long frame, long step);
+    [DllImport("crt", EntryPoint = "zt_dns_worker_fn")]
+    public static extern nint zt_dns_worker_fn();
+    [DllImport("crt", EntryPoint = "zt_dns_drain")]
+    public static extern nint zt_dns_drain();
+    [DllImport("crt", EntryPoint = "zt_dns_pipe_rd")]
+    public static extern int zt_dns_pipe_rd();
 
     // errno 是每线程全局:__error() 返回 int*
     static int err_now() {
@@ -3206,6 +3257,457 @@ class zan {
         }
         st_unlock(t);
         return r != 0 ? 1 : 0;
+    }
+
+    // ---- 第九批:native io reactor(oracle rt_co.c/rt_io.c reactor
+    // loop;语义逐字对齐 zanstubs.c)----
+    // 观察表是本文件私有布局,80B/项(10 longs):
+    // [0]fd [1]kind [2]active [3]buf [4]len [5]deadline_ns [6]frame
+    // [7]step [8]outn [9]垫。kind:1/2 = ReadReady/WriteReady 的
+    // interest,3-5 = 带结果形态,6 = 常驻 DNS 自管道。静态只存数组
+    // 指针/计数/容量,用点取新局部(缺口 2 纪律)。四个 C thunk 之外
+    // 全部 Zan;DNS 作业块布局是与 C worker 的私有契约(72B:
+    // next@0 name@8 port@16 buf@24 cap@32 outn@40 frame@48 step@56
+    // result@64 v4@68),worker 只经互斥 + 自管道交棒,ready 队列仍只
+    // 被主线程触碰。
+    static nint io_ws;
+    static long io_n;
+    static long io_cap;
+
+    static void io_ws_push(int fd, int kind, nint buf, long len,
+            long deadline_ns, long frame, long step, nint outn) {
+        if (io_n == io_cap) {
+            long ncap = io_cap != 0 ? io_cap * 2 : 8;
+            nint nu = calloc(1, ncap * 80);
+            if (nu == 0) { cabort(); }
+            if (io_n != 0) {
+                nint old = io_ws;
+                memcpy(nu, old, io_n * 80);
+                cfree(old);
+            }
+            io_ws = nu;
+            io_cap = ncap;
+        }
+        nint w = st_ptr((long)io_ws + io_n * 80);
+        io_n = io_n + 1;
+        Span<long> wv = new Span<long>(w, 9);
+        wv[0] = (long)fd;
+        wv[1] = (long)kind;
+        wv[2] = 1;
+        wv[3] = (long)buf;
+        wv[4] = len;
+        wv[5] = deadline_ns;
+        wv[6] = frame;
+        wv[7] = step;
+        wv[8] = (long)outn;
+    }
+
+    // 退休观察项并把结果落进恢复 k 重读的槽(frame+32,即入参 outn);
+    // 恢复经 zt_io_resume —— hook 未注册的非 async 程序里是空操作。
+    static void io_deliver(nint w, long result) {
+        Span<long> wv = new Span<long>(w, 9);
+        wv[2] = 0;
+        nint op = (nint)wv[8];
+        if (op != 0) {
+            Span<long> ov = new Span<long>(op, 1);
+            ov[0] = result;
+        }
+        zt_io_resume(wv[6], wv[7]);
+    }
+
+    // 一次非阻塞 recv:>=0 数据/EOF,-2 would-block(再停),-1 其余
+    // (交付后由调用方映成关闭形态)。
+    static long io_recv_try(int fd, nint buf, long len) {
+        if (len <= 0) { return 0; }
+        long n = -1;
+        int done = 0;
+        while (done == 0) {
+            n = crecv(fd, buf, len, 0);
+            if (n >= 0) { done = 1; }
+            else {
+                int e = err_now();
+                if (e == 4) {
+                    // EINTR:重试
+                }
+                else if (e == 35) { n = -2; done = 1; }   // EAGAIN/EWOULDBLOCK
+                else { n = -1; done = 1; }
+            }
+        }
+        return n;
+    }
+
+    // 零超时就绪探测。每个 co 助手在系统调用前都先探一次:accept 出的
+    // 套接字常被调用方留在阻塞态,队列空时直接阻塞会冻死整个单线程
+    // 引擎,而不是只停这一根协程。
+    static int io_fd_ready(int fd, int want) {
+        nint p = calloc(1, 8);
+        Span<int> pv = new Span<int>(p, 1);
+        pv[0] = fd;
+        Span<byte> ev = new Span<byte>(st_ptr((long)p + 4), 2);
+        ev[0] = (byte)(want & 255);
+        ev[1] = 0;
+        int rc = cpoll(p, 1, 0);
+        cfree(p);
+        return rc > 0 ? 1 : 0;
+    }
+
+    public static void io_wait_co(long fd, long interest, long frame,
+            long step) {
+        // 死 fd 快败(oracle io_reject_dead_fd):poll 无视负描述符、
+        // 关了的 fd 永不就绪,停进去就是永远搁浅;就绪探测路径交付 0
+        // 立即恢复。
+        if (io_socket_alive(fd) == 0) {
+            zt_io_resume(frame, step);
+            return;
+        }
+        io_ws_push((int)fd, interest == 2 ? 2 : 1, 0, 0, 0, frame, step, 0);
+    }
+
+    public static void io_recv_co(long fd, nint buf, long len, long frame,
+            long step, nint outn) {
+        long n = -2;
+        if (io_socket_alive(fd) == 0) {
+            n = 0;                                // 死 fd:EOF 形交付
+        }
+        else if (io_fd_ready((int)fd, 1) != 0) {
+            n = io_recv_try((int)fd, buf, len);
+        }
+        if (n == -2) {
+            io_ws_push((int)fd, 3, buf, len, 0, frame, step, outn);
+            return;
+        }
+        Span<long> ov = new Span<long>(outn, 1);
+        ov[0] = n;
+        zt_io_resume(frame, step);
+    }
+
+    public static void io_recv_to_co(long fd, nint buf, long len, long tmo,
+            long frame, long step, nint outn) {
+        long n = -2;
+        if (io_socket_alive(fd) == 0) {
+            n = 0;                                // 死 fd:0 而非超时 -1
+        }
+        else if (io_fd_ready((int)fd, 1) != 0) {
+            n = io_recv_try((int)fd, buf, len);
+        }
+        if (n == -2) {
+            long dl = tmo > 0 ? monotonic_ns() + tmo * 1000000L : 0;
+            io_ws_push((int)fd, 4, buf, len, dl, frame, step, outn);
+            return;
+        }
+        Span<long> ov = new Span<long>(outn, 1);
+        ov[0] = n;
+        zt_io_resume(frame, step);
+    }
+
+    public static void io_accept_co(long fd, long frame, long step,
+            nint outfd) {
+        long c = -2;
+        if (io_socket_alive(fd) == 0) {
+            c = -1;                               // 死 fd:accept 失败形
+        }
+        else if (io_fd_ready((int)fd, 1) != 0) {
+            int go = 1;
+            while (go == 1) {
+                c = caccept((int)fd, 0, 0);
+                if (c >= 0 || err_now() != 4) { go = 0; }
+            }
+            if (c < 0 && err_now() == 35) { c = -2; }
+        }
+        if (c == -2) {
+            io_ws_push((int)fd, 5, 0, 0, 0, frame, step, outfd);
+            return;
+        }
+        Span<long> ov = new Span<long>(outfd, 1);
+        ov[0] = c;
+        zt_io_resume(frame, step);
+    }
+
+    // 主机名解析:resolve 本身同步(getaddrinfo),挂在脱离 worker 上
+    // 跑完经互斥 + 自管道交棒;管道读端在主线程被排干,ready 队列仍只
+    // 被主线程触碰。worker 经 zt_dns_worker_fn() 取地址传给
+    // pthread_create(Zan 侧只传地址,不做函数指针调用)。
+    public static void resolve_sa_co(nint name, long port, nint buf,
+            long cap, long frame, long step, nint outn) {
+        Span<long> ov = new Span<long>(outn, 1);
+        if (name == 0) {
+            ov[0] = 0;                            // 空 name:不劳 worker
+            zt_io_resume(frame, step);
+            return;
+        }
+        Span<byte> n0 = new Span<byte>(name, 1);
+        if (n0[0] == 0) {
+            ov[0] = 0;
+            zt_io_resume(frame, step);
+            return;
+        }
+        // 字面量(AF_INET/AF_INET6):无 DNS、无 worker
+        nint a4 = calloc(1, 16);
+        nint a6 = calloc(1, 16);
+        int lit = 0;
+        if (cinet_pton(2, name, a4) == 1) { lit = 1; }
+        else if (cinet_pton(30, name, a6) == 1) { lit = 1; }
+        cfree(a4);
+        cfree(a6);
+        if (lit == 1) {
+            ov[0] = io_resolve_sa(name, (int)port, buf, (int)cap);
+            zt_io_resume(frame, step);
+            return;
+        }
+        int rdfd = zt_dns_pipe_rd();
+        if (rdfd < 0) {
+            ov[0] = 0;
+            zt_io_resume(frame, step);
+            return;
+        }
+        nint j = calloc(1, 80);
+        if (j != 0) {
+            nint cp = st_strdup(name);
+            Span<long> jw = new Span<long>(j, 10);
+            jw[1] = (long)cp;
+            if (cp == 0) { cfree(j); j = 0; }
+        }
+        if (j == 0) {
+            ov[0] = 0;
+            zt_io_resume(frame, step);
+            return;
+        }
+        Span<long> jv = new Span<long>(j, 10);
+        Span<int> pv = new Span<int>(st_ptr((long)j + 16), 1);
+        pv[0] = (int)port;
+        jv[3] = (long)buf;
+        Span<int> cv = new Span<int>(st_ptr((long)j + 32), 1);
+        cv[0] = (int)cap;
+        jv[5] = (long)outn;
+        jv[6] = frame;
+        jv[7] = step;
+        long havepipe = 0;
+        long i = 0;
+        while (havepipe == 0 && i < io_n) {
+            Span<long> wv = new Span<long>(st_ptr((long)io_ws + i * 80), 9);
+            if (wv[2] != 0 && wv[1] == 6) { havepipe = 1; }
+            else { i = i + 1; }
+        }
+        if (havepipe == 0) {
+            io_ws_push(rdfd, 6, 0, 0, 0, 0, 0, 0);
+        }
+        nint tid = calloc(1, 8);
+        int rc = cpthread_create(tid, 0, zt_dns_worker_fn(), j);
+        if (rc != 0) {
+            // 无线程:降级为内联(阻塞)查询
+            ov[0] = io_resolve_sa((nint)jv[1], (int)port, buf, (int)cap);
+            cfree((nint)jv[1]);
+            cfree(j);
+            cfree(tid);
+            zt_io_resume(frame, step);
+            return;
+        }
+        Span<long> tv = new Span<long>(tid, 1);
+        cpthread_detach(tv[0]);
+        cfree(tid);
+    }
+
+    // 纯 v4 查找(Socket.ResolveAsync):与 sockaddr 变体同形,但
+    // worker 交付 io_resolve_ipv4 的 int;getaddrinfo 自己解析点分
+    // 字面量,无需字面量快路。
+    public static void resolve_ipv4_co(nint name, long frame, long step,
+            nint outn) {
+        Span<long> ov = new Span<long>(outn, 1);
+        if (name == 0) {
+            ov[0] = 0;
+            zt_io_resume(frame, step);
+            return;
+        }
+        Span<byte> n0 = new Span<byte>(name, 1);
+        if (n0[0] == 0) {
+            ov[0] = 0;
+            zt_io_resume(frame, step);
+            return;
+        }
+        int rdfd = zt_dns_pipe_rd();
+        if (rdfd < 0) {
+            ov[0] = 0;
+            zt_io_resume(frame, step);
+            return;
+        }
+        nint j = calloc(1, 80);
+        if (j != 0) {
+            nint cp = st_strdup(name);
+            Span<long> jw = new Span<long>(j, 10);
+            jw[1] = (long)cp;
+            if (cp == 0) { cfree(j); j = 0; }
+        }
+        if (j == 0) {
+            ov[0] = 0;
+            zt_io_resume(frame, step);
+            return;
+        }
+        Span<long> jv = new Span<long>(j, 10);
+        jv[5] = (long)outn;
+        jv[6] = frame;
+        jv[7] = step;
+        Span<int> v4v = new Span<int>(st_ptr((long)j + 68), 1);
+        v4v[0] = 1;
+        long havepipe = 0;
+        long i = 0;
+        while (havepipe == 0 && i < io_n) {
+            Span<long> wv = new Span<long>(st_ptr((long)io_ws + i * 80), 9);
+            if (wv[2] != 0 && wv[1] == 6) { havepipe = 1; }
+            else { i = i + 1; }
+        }
+        if (havepipe == 0) {
+            io_ws_push(rdfd, 6, 0, 0, 0, 0, 0, 0);
+        }
+        nint tid = calloc(1, 8);
+        int rc = cpthread_create(tid, 0, zt_dns_worker_fn(), j);
+        if (rc != 0) {
+            ov[0] = io_resolve_ipv4((nint)jv[1]);
+            cfree((nint)jv[1]);
+            cfree(j);
+            cfree(tid);
+            zt_io_resume(frame, step);
+            return;
+        }
+        Span<long> tv = new Span<long>(tid, 1);
+        cpthread_detach(tv[0]);
+        cfree(tid);
+    }
+
+    // 发射端调度器的泵在 ready 队列见底时调它:poll 停泊的观察项(以
+    // 最早定时器为界),唤醒 fd 就绪者,过期 recv_to 截止。有观察项返回
+    // 1(循环继续),无则 0(调用方回落定时器睡眠)。
+    public static long io_poll(long timer_wait_ns) {
+        // 原地压实 active 观察项(等价 C 的结构体拷贝)
+        long k = 0;
+        long i = 0;
+        while (i < io_n) {
+            nint w = st_ptr((long)io_ws + i * 80);
+            Span<long> wv = new Span<long>(w, 9);
+            if (wv[2] != 0) {
+                if (k != i) {
+                    memcpy(st_ptr((long)io_ws + k * 80), w, 80);
+                }
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        io_n = k;
+        if (k == 0) { return 0; }
+        nint fds = calloc(k, 8);
+        if (fds == 0) { cabort(); }
+        int timeout = -1;                         // 无定时器的观察项:阻塞
+        if (timer_wait_ns >= 0) {
+            long ms = (timer_wait_ns + 999999) / 1000000;
+            if (ms > 2147483647L) { ms = 2147483647L; }
+            timeout = (int)ms;
+        }
+        long fi = 0;
+        while (fi < k) {
+            nint pe = st_ptr((long)fds + fi * 8);
+            Span<long> wv = new Span<long>(st_ptr((long)io_ws + fi * 80), 9);
+            Span<int> pi = new Span<int>(pe, 1);
+            pi[0] = (int)wv[0];
+            Span<byte> pb = new Span<byte>(st_ptr((long)pe + 4), 2);
+            int ev = wv[1] == 2 ? 4 : 1;          // POLLOUT : POLLIN
+            pb[0] = (byte)(ev & 255);
+            pb[1] = 0;
+            fi = fi + 1;
+        }
+        int rc = -1;
+        int pr = 1;
+        while (pr == 1) {
+            rc = cpoll(fds, (int)k, timeout);
+            if (rc >= 0 || err_now() != 4) { pr = 0; }
+        }
+        long now = monotonic_ns();
+        long di = 0;
+        while (di < k) {
+            nint wd = st_ptr((long)io_ws + di * 80);
+            Span<long> wvd = new Span<long>(wd, 9);
+            if (wvd[2] != 0) {
+                nint ped = st_ptr((long)fds + di * 8);
+                Span<byte> rb = new Span<byte>(st_ptr((long)ped + 6), 2);
+                int rev = rb[0] | (rb[1] << 8);
+                if ((rev & 32) != 0) {
+                    // POLLNVAL:fd 没走 close_notify 就死了
+                    io_deliver(wd, wvd[1] == 5 ? -1L : 0L);
+                }
+                else if ((rev & 29) != 0) {       // IN|OUT|ERR|HUP
+                    long n = 0;
+                    long c = -2;
+                    if (wvd[1] == 1 || wvd[1] == 2) {
+                        io_deliver(wd, 0);
+                    }
+                    else if (wvd[1] == 3) {
+                        n = io_recv_try((int)wvd[0], (nint)wvd[3], wvd[4]);
+                        if (n != -2) { io_deliver(wd, n); }  // 假唤醒:继续观察
+                    }
+                    else if (wvd[1] == 4) {
+                        n = io_recv_try((int)wvd[0], (nint)wvd[3], wvd[4]);
+                        if (n == -2) {
+                            if (wvd[5] != 0 && now >= wvd[5]) {
+                                io_deliver(wd, -1L);
+                            }
+                        }
+                        else {
+                            io_deliver(wd, n);    // 数据赢过将过的截止
+                        }
+                    }
+                    else if (wvd[1] == 5) {
+                        int go = 1;
+                        while (go == 1) {
+                            c = caccept((int)wvd[0], 0, 0);
+                            if (c >= 0 || err_now() != 4) { go = 0; }
+                        }
+                        if (c >= 0 || err_now() != 35) { io_deliver(wd, c); }
+                    }
+                    else {
+                        // kind 6:DNS 自管道,排干到 would-block,再在
+                        // 互斥下摘走完工作业链(zt_dns_drain),逐个交付
+                        nint drain = calloc(1, 64);
+                        int dr = 1;
+                        while (dr == 1) {
+                            if (cread((int)wvd[0], drain, 64) <= 0) { dr = 0; }
+                        }
+                        cfree(drain);
+                        nint list = zt_dns_drain();
+                        while (list != 0) {
+                            Span<long> lv = new Span<long>(list, 9);
+                            nint nx = (nint)lv[0];
+                            nint op = (nint)lv[5];
+                            Span<int> rvv = new Span<int>(st_ptr((long)list + 64), 1);
+                            Span<long> ov = new Span<long>(op, 1);
+                            ov[0] = (long)rvv[0];
+                            zt_io_resume(lv[6], lv[7]);
+                            cfree((nint)lv[1]);
+                            cfree(list);
+                            list = nx;
+                        }
+                    }
+                }
+                else if (wvd[1] == 4 && wvd[5] != 0 && now >= wvd[5]) {
+                    io_deliver(wd, -1L);
+                }
+            }
+            di = di + 1;
+        }
+        cfree(fds);
+        return 1;
+    }
+
+    public static void io_close_notify(long fd) {
+        // 在真正 close 之前调(stdlib 的 Socket.Close):唤醒该 fd 上
+        // 全部观察项,让停泊的 accept/recv 失败而非悬挂。recv/recv_to
+        // 以关闭形(0 字节)醒,accept 以 -1 醒。
+        long i = 0;
+        while (i < io_n) {
+            nint w = st_ptr((long)io_ws + i * 80);
+            Span<long> wv = new Span<long>(w, 9);
+            if (wv[2] != 0 && wv[0] == fd) {
+                io_deliver(w, wv[1] == 5 ? -1L : 0L);
+            }
+            i = i + 1;
+        }
     }
 }
 

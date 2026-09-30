@@ -257,6 +257,59 @@ class zanrt {
     [DllImport("crt", EntryPoint = "zan_shared_table_delete_at")]
     public static extern int TableDeleteAt(long h, long kh);
 
+    // ---- 九批:native io reactor。本 fixture 是非 async 程序:
+    // hook 未注册,恢复是空操作,交付只落在 outn/outfd 槽,poll 返回
+    // 值 = 表里是否还有观察项(1 有 0 无),停泊/交付全靠这两样观察。
+    [DllImport("crt", EntryPoint = "zan_io_wait_co")]
+    public static extern void IoWaitCo(long fd, long interest, long frame, long step);
+    [DllImport("crt", EntryPoint = "zan_io_recv_co")]
+    public static extern void IoRecvCo(long fd, nint buf, long len, long frame, long step, nint outn);
+    [DllImport("crt", EntryPoint = "zan_io_recv_to_co")]
+    public static extern void IoRecvToCo(long fd, nint buf, long len, long tmo, long frame, long step, nint outn);
+    [DllImport("crt", EntryPoint = "zan_io_accept_co")]
+    public static extern void IoAcceptCo(long fd, long frame, long step, nint outfd);
+    [DllImport("crt", EntryPoint = "zan_io_poll")]
+    public static extern long IoPoll(long timerWaitNs);
+    [DllImport("crt", EntryPoint = "zan_io_close_notify")]
+    public static extern void IoCloseNotify(long fd);
+    [DllImport("crt", EntryPoint = "zan_resolve_sa_co")]
+    public static extern void ResolveSaCo(string name, long port, nint buf, long cap, long frame, long step, nint outn);
+    [DllImport("crt", EntryPoint = "zan_resolve_sa_co")]
+    public static extern void ResolveSaCoRaw(nint name, long port, nint buf, long cap, long frame, long step, nint outn);
+    [DllImport("crt", EntryPoint = "zan_resolve_ipv4_co")]
+    public static extern void ResolveIpv4Co(string name, long frame, long step, nint outn);
+    [DllImport("crt", EntryPoint = "zan_resolve_ipv4_co")]
+    public static extern void ResolveIpv4CoRaw(nint name, long frame, long step, nint outn);
+    [DllImport("crt", EntryPoint = "socketpair")]
+    public static extern int SocketPair(int domain, int type, int proto, nint sv);
+    [DllImport("crt", EntryPoint = "write")]
+    public static extern long Write(long fd, nint buf, long n);
+    [DllImport("crt", EntryPoint = "close")]
+    public static extern int Close(long fd);
+    // poll(NULL, 0, ms):纯睡眠(nfds=0 不碰描述符)
+    [DllImport("crt", EntryPoint = "poll")]
+    public static extern int SleepMs(nint fds, int nfds, int timeout);
+    [DllImport("crt", EntryPoint = "socket")]
+    public static extern int Socket(int domain, int type, int proto);
+    [DllImport("crt", EntryPoint = "bind")]
+    public static extern int Bind(int fd, nint sa, int len);
+    [DllImport("crt", EntryPoint = "listen")]
+    public static extern int Listen(int fd, int backlog);
+    [DllImport("crt", EntryPoint = "connect")]
+    public static extern int Connect(int fd, nint sa, int len);
+    [DllImport("crt", EntryPoint = "getsockname")]
+    public static extern int GetSockName(int fd, nint sa, nint lenp);
+
+    static void WSlot(nint p, long v) {
+        Span<long> s = new Span<long>(p, 1);
+        s[0] = v;
+    }
+
+    static long RSlot(nint p) {
+        Span<long> s = new Span<long>(p, 1);
+        return s[0];
+    }
+
     static nint V4(int a, int b, int c, int d) {
         nint p = Malloc(16);
         Memset(p, 0, 16);
@@ -843,5 +896,204 @@ class zanrt {
         Console.WriteLine(TableOpen("stb-a") == 0);
         Console.WriteLine(TableSetInt(t1, "c1", "v", 6) == 1);
         Console.WriteLine(TableGetInt(t1, "c1", "v") == 6);
+
+        // ================= 第九批:native io reactor =================
+        // 空表 poll:无观察项 → 0(调用方回落定时器睡眠);-1 超时也
+        // 不会阻塞——表空在碰 timeout 之前就返回。
+        Console.WriteLine(IoPoll(-1) == 0);
+        Console.WriteLine(IoPoll(0) == 0);
+        nint svbuf = malloc(8);
+        nint hi = malloc(8);
+        Span<byte> hv = new Span<byte>(hi, 3);
+        hv[0] = 104;                              // "hi"
+        hv[1] = 105;
+        hv[2] = 121;                              // "hey" 第三字节
+        nint slot = malloc(8);
+        nint slot2 = malloc(8);
+        nint p8 = malloc(8);
+        // 死 fd:三形态都快败交付,不进观察表(poll 仍 0)。
+        WSlot(slot, -999);
+        IoWaitCo(-1, 1, 0, 0);
+        Console.WriteLine(IoPoll(0) == 0);
+        IoRecvCo(-1, svbuf, 16, 0, 0, slot);
+        Console.WriteLine(RSlot(slot) == 0);
+        IoAcceptCo(-1, 0, 0, slot);
+        Console.WriteLine(RSlot(slot) == -1);
+        Console.WriteLine(IoPoll(0) == 0);
+        // recv 停泊 → 写端来数据 → poll 交付 2 字节;退休后 poll 归 0。
+        Console.WriteLine(SocketPair(1, 1, 0, p8) == 0);      // AF_UNIX STREAM
+        Span<int> svm = new Span<int>(p8, 2);
+        long f0 = svm[0];
+        long f1 = svm[1];
+        WSlot(slot, -999);
+        IoRecvCo(f0, svbuf, 16, 0, 0, slot);
+        Console.WriteLine(RSlot(slot) == -999);               // 仍停泊
+        Console.WriteLine(IoPoll(0) == 1);                    // 无事:表非空
+        Console.WriteLine(RSlot(slot) == -999);
+        Console.WriteLine(Write(f1, hi, 2) == 2);
+        Console.WriteLine(IoPoll(0) == 1);                    // 就绪交付
+        Console.WriteLine(RSlot(slot) == 2);
+        Span<byte> rv = new Span<byte>(svbuf, 3);
+        Console.WriteLine(rv[0] == 104 && rv[1] == 105);
+        Console.WriteLine(IoPoll(0) == 0);                    // 观察项已退休
+        // 数据先到:recv_co 直通交付,不进表。
+        Console.WriteLine(Write(f1, hi, 3) == 3);
+        IoRecvCo(f0, svbuf, 16, 0, 0, slot);
+        Console.WriteLine(RSlot(slot) == 3);
+        Console.WriteLine(IoPoll(0) == 0);
+        // EOF:对端 close,recv_co 交付 0(关闭形)。
+        Console.WriteLine(Close(f1) == 0);
+        IoRecvCo(f0, svbuf, 16, 0, 0, slot);
+        Console.WriteLine(RSlot(slot) == 0);
+        Console.WriteLine(IoPoll(0) == 0);
+        Console.WriteLine(Close(f0) == 0);
+        // recv_to:30ms 停泊;5ms poll 未到截止;睡 50ms 后 poll 截止
+        // 交付 -1。
+        Console.WriteLine(SocketPair(1, 1, 0, p8) == 0);
+        WSlot(slot, -999);
+        IoRecvToCo(svm[0], svbuf, 16, 30, 0, 0, slot);
+        Console.WriteLine(RSlot(slot) == -999);
+        Console.WriteLine(IoPoll(5000000) == 1);              // 5ms:未到
+        Console.WriteLine(RSlot(slot) == -999);
+        Console.WriteLine(SleepMs(0, 0, 50) == 0);
+        Console.WriteLine(IoPoll(0) == 1);                    // 截止交付
+        Console.WriteLine(RSlot(slot) == -1);
+        Console.WriteLine(IoPoll(0) == 0);
+        // 数据赢过将过的截止:停泊后来数据,交付 2 而非 -1。
+        WSlot(slot, -999);
+        IoRecvToCo(svm[0], svbuf, 16, 30, 0, 0, slot);
+        Console.WriteLine(RSlot(slot) == -999);
+        Console.WriteLine(Write(svm[1], hi, 2) == 2);
+        Console.WriteLine(IoPoll(0) == 1);
+        Console.WriteLine(RSlot(slot) == 2);
+        Console.WriteLine(Close(svm[1]) == 0);
+        Console.WriteLine(Close(svm[0]) == 0);
+        // close_notify:停泊的 recv 立即以关闭形(0)醒,无需 poll。
+        Console.WriteLine(SocketPair(1, 1, 0, p8) == 0);
+        WSlot(slot, -999);
+        IoRecvCo(svm[0], svbuf, 16, 0, 0, slot);
+        Console.WriteLine(RSlot(slot) == -999);
+        IoCloseNotify(svm[0]);
+        Console.WriteLine(RSlot(slot) == 0);
+        Console.WriteLine(IoPoll(0) == 0);
+        Console.WriteLine(Close(svm[1]) == 0);
+        Console.WriteLine(Close(svm[0]) == 0);
+        // wait_co:读 interest 停泊后来数据交付 0;写 interest 立即就绪。
+        Console.WriteLine(SocketPair(1, 1, 0, p8) == 0);
+        IoWaitCo(svm[0], 1, 0, 0);
+        Console.WriteLine(IoPoll(0) == 1);
+        Console.WriteLine(Write(svm[1], hi, 2) == 2);
+        Console.WriteLine(IoPoll(0) == 1);                    // 交付(kind 无槽)
+        Console.WriteLine(IoPoll(0) == 0);
+        IoWaitCo(svm[0], 2, 0, 0);                            // WOUT:必就绪
+        Console.WriteLine(IoPoll(1000000) == 1);
+        Console.WriteLine(IoPoll(0) == 0);
+        Console.WriteLine(Close(svm[1]) == 0);
+        Console.WriteLine(Close(svm[0]) == 0);
+        // accept_co:先停泊后 connect,poll 交付新 fd;再连一个走直通。
+        nint lsa = V4(127, 0, 0, 1);
+        int lfd = Socket(2, 1, 0);
+        Console.WriteLine(Bind(lfd, lsa, 16) == 0);
+        Console.WriteLine(Listen(lfd, 2) == 0);
+        nint lenp = malloc(4);
+        Span<int> lv = new Span<int>(lenp, 1);
+        lv[0] = 16;
+        Console.WriteLine(GetSockName(lfd, lsa, lenp) == 0);
+        Span<byte> lbv = new Span<byte>(lsa, 16);
+        int port = (lbv[2] << 8) | lbv[3];
+        nint csa = V4(127, 0, 0, 1);
+        Span<byte> cbv = new Span<byte>(csa, 16);
+        cbv[2] = (byte)((port >>> 8) & 255);
+        cbv[3] = (byte)(port & 255);
+        WSlot(slot2, -999);
+        IoAcceptCo(lfd, 0, 0, slot2);
+        Console.WriteLine(RSlot(slot2) == -999);              // 无连接:停泊
+        Console.WriteLine(IoPoll(0) == 1);
+        Console.WriteLine(RSlot(slot2) == -999);
+        int c1 = Socket(2, 1, 0);
+        Console.WriteLine(Connect(c1, csa, 16) == 0);
+        // 交付等待环:快路(fd_ready 命中)立即出环;偶发慢一拍的
+        // 环境里 accept 停泊,首轮 poll 交付。两种交错输出一致。
+        long g = 0;
+        while (RSlot(slot2) == -999 && g < 500) {
+            IoPoll(20000000);
+            g = g + 1;
+        }
+        Console.WriteLine(g < 500);
+        Console.WriteLine(RSlot(slot2) >= 0);
+        Console.WriteLine(Close(RSlot(slot2)) == 0);
+        Console.WriteLine(Close(c1) == 0);
+        int c2 = Socket(2, 1, 0);
+        Console.WriteLine(Connect(c2, csa, 16) == 0);
+        WSlot(slot2, -999);
+        IoAcceptCo(lfd, 0, 0, slot2);                         // 直通,不进表
+        g = 0;
+        while (RSlot(slot2) == -999 && g < 500) {
+            IoPoll(20000000);
+            g = g + 1;
+        }
+        Console.WriteLine(g < 500);
+        Console.WriteLine(RSlot(slot2) >= 0);
+        Console.WriteLine(IoPoll(0) == 0);
+        Console.WriteLine(Close(RSlot(slot2)) == 0);
+        Console.WriteLine(Close(c2) == 0);
+        IoCloseNotify(lfd);
+        Console.WriteLine(Close(lfd) == 0);
+        // resolve_sa_co 字面量:无 DNS 无 worker,同步直通。v4 形 16B,
+        // 端口大端在 [2..3];v6 形 28B。
+        nint abuf = malloc(64);
+        Span<byte> abv = new Span<byte>(abuf, 28);
+        WSlot(slot, -999);
+        ResolveSaCo("127.0.0.1", 80, abuf, 64, 0, 0, slot);
+        Console.WriteLine(RSlot(slot) == 16);
+        Console.WriteLine(abv[1] == 2);
+        Console.WriteLine(abv[2] == 0 && abv[3] == 80);
+        WSlot(slot, -999);
+        ResolveSaCo("::1", 80, abuf, 64, 0, 0, slot);
+        Console.WriteLine(RSlot(slot) == 28);
+        Console.WriteLine(abv[1] == 30);
+        WSlot(slot, -999);
+        ResolveSaCo("", 80, abuf, 64, 0, 0, slot);
+        Console.WriteLine(RSlot(slot) == 0);
+        nint z = 0;
+        WSlot(slot, -999);
+        ResolveSaCoRaw(z, 80, abuf, 64, 0, 0, slot);
+        Console.WriteLine(RSlot(slot) == 0);
+        Console.WriteLine(IoPoll(0) == 0);
+        // resolve worker 路径(自管道 + 脱离线程):管道观察项是常驻,
+        // 从此 poll 恒返回 1,故整段放在最后。guard 上限只防死循环,
+        // 正常一两轮内完工。
+        WSlot(slot, -999);
+        ResolveSaCo("localhost", 80, abuf, 64, 0, 0, slot);
+        long guard = 0;
+        while (RSlot(slot) == -999 && guard < 500) {
+            IoPoll(20000000);
+            guard = guard + 1;
+        }
+        Console.WriteLine(guard < 500);
+        Console.WriteLine(RSlot(slot) > 0);
+        WSlot(slot, -999);
+        ResolveIpv4Co("localhost", 0, 0, slot);
+        guard = 0;
+        while (RSlot(slot) == -999 && guard < 500) {
+            IoPoll(20000000);
+            guard = guard + 1;
+        }
+        Console.WriteLine(guard < 500);
+        // localhost 可能 ::1 在前(v4 形给出 0),只断言交付发生;
+        // 点分字面量的 v4 形才是确定值:s_addr 内存序(LE 读 u32),
+        // 7F 00 00 01 → 0x0100007F = 16777343。
+        Console.WriteLine(RSlot(slot) >= 0);
+        WSlot(slot, -999);
+        ResolveIpv4Co("127.0.0.1", 0, 0, slot);
+        guard = 0;
+        while (RSlot(slot) == -999 && guard < 500) {
+            IoPoll(20000000);
+            guard = guard + 1;
+        }
+        Console.WriteLine(RSlot(slot) == 16777343);
+        WSlot(slot, -999);
+        ResolveIpv4CoRaw(z, 0, 0, slot);
+        Console.WriteLine(RSlot(slot) == 0);
     }
 }

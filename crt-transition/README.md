@@ -8,9 +8,9 @@
     cc -c -o zanhost.o  zanhost.c
     cc -o zanc zanc.o zanstubs.o zanhost.o -lSystem
 
-## Zan 运行时第一批~第八批(runtime_core.zan)
+## Zan 运行时第一批~第九批(runtime_core.zan)
 
-`runtime_core.zan` 用 Zan 重新实现了过渡 C 运行时的八批符号:
+`runtime_core.zan` 用 Zan 重新实现了过渡 C 运行时的九批符号:
 `zan_monotonic_ns` / `zan_monotonic_us` / `zan_sha256` / `zan_sha512`(第一批)、
 `zan_alloc` / `zan_free` / `zan_crc32`(第二批)、
 `zan_pkg_fopen` / `zan_file_fopen` / `remove` / `rename` / `read_path`、
@@ -31,14 +31,18 @@ compare_exchange)——第六批;
 `zan_shared_table_*` 36 符号(命名/匿名表的建开挂删、schema 解析、
 int/float/string 三型列读写、_at 哈希族、hash/exists/count/stat、
 increment/extreme、expire 三件、rate_allow 窗口、lock 租约两件、
-clear/destroy)——第八批。
-注意第五批不是 zanstubs.c 的全部:`#ifndef ZAN_RT_CORE_ZAN` 只编出
-`zan_io_*` 纯函数段,native io reactor(watch 表、close_notify、poll、
-DNS worker)仍留在 C,五个 await 形态等后续批次;`zan_thread_*`
-(naked asm 屏障 + 函数指针调用)仍在 C。
+clear/destroy)——第八批;
+native io reactor 8 符号(io_wait_co/io_recv_co/io_recv_to_co/
+io_accept_co/io_poll/io_close_notify/resolve_sa_co/resolve_ipv4_co:
+watch 表、零超时探测、DNS 自管道 + 脱离 worker 互斥交棒)——第九批。
+至此 `#ifndef ZAN_RT_CORE_ZAN` 编出的 reactor 段在 C 侧只剩 4 个内部
+thunk(zan_co_ready_hook 全局 + zt_io_resume 间接调用 + 
+zt_dns_worker_fn 线程体地址 + zt_dns_drain 互斥摘链,另 zt_dns_pipe_rd
+给出自管道读端)+ gen0 别名/Win 代码页/zan_thread_*/zan_open_creat;
+`zan_thread_*`(naked asm 屏障 + 函数指针调用)仍在 C。
 它由原生自举编译器(ngen)编译成对象,再用 `localize_syms.py` 把 API 面
 之外的符号本地化——ngen 会把整套运行时帮助函数以全局符号发射进每个
-对象,不本地化则与程序对象撞符号。产出恰好导出 125 个强符号 + 4 个弱
+对象,不本地化则与程序对象撞符号。产出恰好导出 133 个强符号 + 4 个弱
 符号(embed 族经 `--weaken` 置 N_WEAK_DEF,带内嵌资源的程序对象自带的
 强定义在链接时获胜):
 
@@ -51,15 +55,18 @@ Zan 配置链接面:
 
     python3 scripts/native_regression.py --seed "$SEED" \
       --runtime "crt-transition/runtime_core.o crt-transition/zanstubs_rest.o crt-transition/zanhost_rest.o" \
-      tests/selfhost/native_rt_core.zan          # 八批端到端(276 行金标)
+      tests/selfhost/native_rt_core.zan          # 九批端到端(359 行金标)
 
 39 项 kernel 回归同样接受上述 `--runtime`。两个配置(A/B)都已全量验证:
-fixture(276 行金标,双配置字节一致)、默认 kernel 套件 39/39、自举固定点
+fixture(359 行金标,双配置字节一致)、默认 kernel 套件 39/39、自举固定点
 (含 stage1.o 引用的全部 24 个文件族符号由 Zan 对象供给;第四批后另含
 net/ping 两符号,第五批后另含 17 个 io 符号,第六批后另含 7 个原子符号,
 第七批后另含 audio/monitor/dispatch/eh 28 个符号,第八批后另含
-shared_table 36 个符号;两路 run.YiwvNk / run.muwNsg 均
-stage2.o == stage3.o)。第四批的 net 文本还与 C oracle
+shared_table 36 个符号,第九批后另含 io reactor 8 个符号;两路
+run.JGPg3t / run.E3RqVN 均 stage2.o == stage3.o)。第九批验证矩阵还
+显式跑了 4 个 async 端到端(native_async_{basic,detach,locals,throw},
+hook!=0 全链:编译器发射的 _zan_co_ready 注册 hook → reactor 停泊 →
+zt_io_resume 恢复),双配置 4/4。第四批的 net 文本还与 C oracle
 做过逐字节 A/B(同一台机器 probe 程序直接 dump zan_plat_net_interfaces
 返回缓冲,两路 diff 为空)。
 
@@ -143,6 +150,24 @@ find-by-key 不可见);lock_acquire 先 purge(传入 now)→ 到期租约
 `(a|b)-(a&b)` 恒等式实现。指针算术一律经 `st_ptr(long)` 两步
 ——`(nint)(表达式)` 括号强转被解析器当方法调用(缺口三的旁证)。
 
+第九批追加:native io reactor 的 watch 表是私有布局 80B/项(fd/kind/
+active/buf/len/deadline/frame/step/outn/垫),静态只存 io_ws/io_n/
+io_cap,grow 用 calloc+memcpy+free。co 助手系统调用前一律先零超时
+poll 探测——accept 出的套接字常被调用方留在阻塞态,直接阻塞会冻死
+单线程引擎而不是只停这一根协程。DNS 与 C worker 的分工:worker 线程
+体留在 C(ngen 无函数指针调用,地址经 `zt_dns_worker_fn()` thunk
+取),作业块 72B 是共享契约(next@0 name@8 port@16 buf@24 cap@32
+outn@40 frame@48 step@56 result@64 v4@68),完工链经互斥
+(`zt_dns_drain()`)+ 自管道(读端 fd 经 `zt_dns_pipe_rd()`,非阻塞)
+交棒,ready 队列只被主线程触碰;恢复经 `zt_io_resume` thunk(hook
+指针的间接调用,缺口五)。fixture 是非 async 程序,hook==0,恢复为
+空操作——reactor 语义只经 outn/outfd 槽与 poll 返回值观察(停泊探针
+-999/交付值/退休后归 0);4 个 async 端到端补 hook!=0 全链。金标里
+accept 交付用"等待环"写法(fd_ready 偶发慢一拍时 accept 停泊、首轮
+poll 交付,两种交错输出一致);ipv4 解析值按 s_addr 内存序(LE 读
+u32:127.0.0.1 → 0x0100007F = 16777343),"localhost" 可能 ::1 在前,
+只断言交付发生不断言族。
+
 **已发现编译器缺口**(ngen,均有探针/反汇编证据,详见
 `runtime_core.zan` 头注,本文件全部绕行):
 1. 变参调用降级不可用——8 参 DllImport→snprintf 入口寄存器逐个验证
@@ -164,15 +189,23 @@ find-by-key 不可见);lock_acquire 先 purge(传入 now)→ 到期租约
    用即污染 d0——set/get_float 的"值"无法跨边界,A/B 只验行管理语义
    (fixture 第八批注明)。第七批 audio 的 `== 0.0` 断言只是出口前无
    调用、scvtf 的 0.0 恰好留在 d0 才通过,不是 ABI 正确。
+5. 无间接调用/函数指针:`LoadSymRef` 能取全局地址,但没有经寄存器的
+   `blr`。受害形态:协程恢复 hook(`zan_co_ready_hook`)、线程体
+   (`pthread_create` 的 fn)。绕行:C 侧包装 thunk(zan_open_creat
+   同款)——`zt_io_resume(frame,step)` 内部判空调 hook,线程体地址
+   经 `zt_dns_worker_fn()` 取,互斥下摘完工链经 `zt_dns_drain()`。
 
 
 - `zanstubs.c`:gen0 主机原语(Alloc/Free/Copy/…/Crc32 legacy 别名)、
   Win 代码页 API、`zan_thread_*`(naked asm 屏障 + 函数指针调用,
   等编译器函数指针特性)、
-  `zan_io_*` 原生 io reactor
-  (watch 表 + close_notify + poll + DNS worker;audio 桩、monitor、
-  dispatch、eh_tls_state 第七批已移入 runtime_core.zan,`-D` 时编出;
-  io 纯函数族第五批同;语义对照 oracle `src/runtime/rt_io.c`:send 的
+  原生 io reactor 的 4 个内部 thunk(zan_co_ready_hook + zt_io_resume
+  + zt_dns_worker_fn + zt_dns_drain;watch 表/close_notify/poll/
+  DNS worker/五个 await 形态第九批已移入 runtime_core.zan,`-D` 时
+  编出;语义对照 oracle `src/runtime/rt_io.c`/`rt_co.c`:零超时探测、
+  recv 的 EINTR/EAGAIN 三态、POLLNVAL/ERR/HUP 交付、recv_to 数据赢
+  过将过的截止、DNS 自管道排干 + 互斥摘链;audio 桩、monitor、
+  dispatch、eh_tls_state 第七批移入,io 纯函数族第五批移入:send 的
   -1/-2 分类与 SIGPIPE 惰性忽略、resolve_sa/resolve_all 的 v4 优先与
   stride-32 去重、sockaddr_is_safe 的内嵌 v4 分类、connect_sa 非阻塞
   +select 截止;close_notify 因车道无 reactor 为 no-op)。第一批~第二
