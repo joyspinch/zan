@@ -1446,3 +1446,21 @@ rcf 17 = oracle 编不过（其中 coll_postfix_init/server_mvc_timezone 是
 oracle 未及的新特性用例，native 输出经 --expected 直证 golden-exact）；
 mne 18 = 两侧同非零 stdout 逐字节一致。剩余非 pass 全部 oracle 侧或
 已归因。
+
+## v18o-14 (2026-09-30) — crossboot 5→13，双车道全绿
+
+- ELF 车道(qemu-system-aarch64 裸机执行)与 PE-COFF 车道(结构校验)各 13/13:
+  kernel8 kernel9 native_extern native_numeric_runtime dict_minimal dict_growth
+  list_string_search native_lexical native_local_frame native_dict_out_address
+  native_string_ops host_args_bounds native_generic_overload_fit
+  (native_float_return_arg 仍排除，列为下批次候选)。
+- 根因四件,全在 scripts/crossboot/stub.c:UNREACHED(strtod) 换成精确
+  decimal→double 引擎(host 上 vs libc strtod 5 万例位级一致);MMU 关闭时一切
+  访问皆 Device 内存、非对齐必炸(DFSC 0x21,与 SCTLR.A 无关)→ stub 编译加
+  -mstrict-align;运行时 double 格式化走 snprintf("%.*e")→ stub 补上精确
+  C %e/%f/%g 引擎(同一 bignum 机制,+%.* 与 %+03d);补 atoi 与
+  setjmp/longjmp(EH)。host 验证:格式化 vs libc snprintf 12 种精度×2 万
+  fuzz 逐字节一致。
+- macOS 车道回归:电池 39/39(stub.c 只进 crossboot)。
+- 旧账核销(本轮 probe 证据):instance async、async 内 for/foreach/finally/
+  switch、f32 存储、LINQ 从 known_open 移除——全部实证已绿,纯记账滞后。

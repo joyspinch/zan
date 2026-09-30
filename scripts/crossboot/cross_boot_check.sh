@@ -14,7 +14,7 @@
 #
 # Usage:
 #   scripts/crossboot/cross_boot_check.sh [fixture-name ...]
-# With no arguments the five verified fixtures run.
+# With no arguments the thirteen verified fixtures run.
 #
 # Environment:
 #   SEED      compiler binary with the native CLI (default: newest
@@ -29,7 +29,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 TESTS="$ROOT/tests/selfhost"
-DEFAULT_FIXTURES="dict_minimal dict_growth native_string_ops list_string_search host_args_bounds"
+DEFAULT_FIXTURES="kernel8 kernel9 native_extern native_numeric_runtime dict_minimal dict_growth list_string_search native_lexical native_local_frame native_dict_out_address native_string_ops host_args_bounds native_generic_overload_fit"
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -74,8 +74,11 @@ cp "$ROOT/scripts/crossboot/stub.c" "$ROOT/scripts/crossboot/stub.ld" "$WORK/"
 printf 'SEED: %s\nclang: %s\nld.lld: %s\nqemu: %s\nwork: %s\n' \
   "$SEED" "$CLANG" "$LLD" "$QEMU" "$WORK"
 
+# -mstrict-align: the MMU is off, so every access is Device memory and
+# an unaligned access faults (Data Abort DFSC 0x21) regardless of
+# SCTLR.A -- forbid the compiler from emitting any.
 "$CLANG" -target aarch64-none-linux-gnu -ffreestanding -fno-builtin \
-  -fno-stack-protector -O1 -std=c11 -c "$WORK/stub.c" -o "$WORK/stub.o"
+  -fno-stack-protector -mstrict-align -O1 -std=c11 -c "$WORK/stub.c" -o "$WORK/stub.o"
 
 boot_one() {
   local name="$1" rc=0
