@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <fcntl.h>
 
 long long zan_monotonic_ns(void);
 void *zan_alloc(int size);
@@ -35,6 +36,14 @@ long long Crc32(void *p, long long len) { return zan_crc32(p, len); }
 void *zan_alloc(int size) { return calloc(1, (size_t)(size > 0 ? size : 1)); }
 void zan_free(void *p) { free(p); }
 #endif /* ZAN_RT_CORE_ZAN */
+
+/* open 在 C 里是变参函数(mode 仅 O_CREAT 时由 va_arg 读出),ngen 的
+ * 变参调用降级缺口(runtime_core.zan 头注 1)让第三参落到寄存器残留
+ * 值:文件以 040/100/200/740 等垃圾模式创建,确定性随链接布局漂移
+ * (file_lock 的 relocked=0 即 0200 布局:有属主写无属主读,二次
+ * O_RDWR 打开 EACCES)。二参非变参调用实证不受影响——收口成这个
+ * 包装,mode 由 C 车道按正确约定传 0644。 */
+int zan_open_creat(const char *path, int flags) { return open(path, flags, 0644); }
 void Copy(void *dst, void *src, int n) { memmove(dst, src, (size_t)n); }
 void Fill(void *p, int v, int n) { memset(p, v, (size_t)n); }
 int Compare(void *a, void *b, int n) { return memcmp(a, b, (size_t)n); }

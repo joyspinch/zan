@@ -4550,6 +4550,19 @@ partial class Ngen {
                 }
                 E4(0xF84107E0);                      // pop copy -> x0
             }
+        } else if (k == AK.CallInit()) {
+            // 工厂调用延续初始化器：先降调用本身，结果（同一个对象）
+            // 压栈应用成员写，原样返回——不做记录式拷贝。
+            string fcls = CallRetTy(e.a);
+            if (fcls == null || FindClass(fcls) == null) {
+                diags.Error("ngen: factory-call initializer on unknown type", e.line, e.col);
+                LoadImm(0, 0);
+            } else {
+                GenExpr(e.a);
+                E4(0xF81F0FE0);                      // push obj
+                GenInitItems(fcls, e, 0);
+                E4(0xF84107E0);                      // pop obj -> x0
+            }
         } else if (k == AK.OutArg()) {
             // an out/ref argument evaluated in expression position yields
             // its storage ADDRESS (gen0's emit_expr of a ref arg)
@@ -4693,53 +4706,58 @@ partial class Ngen {
             BLInternal(ctorSym);
         }
         // field initializers store through the object still on the stack
-        if (e.ival == 2) {
-            int bi = e.op;
-            while (bi < e.kids.Count) {
-                Node it = e.kids[bi];
-                if (it.kind == AK.Assignment() && it.a != null && it.a.kind == AK.Ident()
-                        && it.b != null && it.b.kind == AK.NewExpr() && it.b.ival == 2
-                        && it.b.type == null) {
-                    // `member = { a, b }`: C# member collection initializer
-                    GenMemberCollInit(cls, it);
-                } else if (it.kind == AK.Assignment() && it.a != null && it.a.kind == AK.Ident()) {
-                    Fld initFld = FindField(FindClass(cls), it.a.sval);
-                    if (initFld == null && AccessorInChain(cls, "set_" + it.a.sval) != null) {
-                        // property setter dispatch: an initializer item on a
-                        // property calls the desugared set_Prop accessor
-                        // exactly like an ordinary assignment
-                        Node initSet = AccessorInChain(cls, "set_" + it.a.sval);
-                        string initTy = initSet.type != null ? TypeFullName(initSet.type) : null;
-                        if (initTy == null || !TryGenBindingValue(it.b, initTy)) {
-                            GenExpr(it.b);
-                        }
-                        if (initTy != null && IsDblTy(initTy) && !IsDblExpr(it.b)) { ConvI2D(); }
-                        if (initTy == "float") { NarrowF32(); }
-                        MovRR(1, 0);                     // x1 = value
-                        LdrU(0, 31, 0);                  // x0 = obj (peek: the call
-                        BLInternal(MethSymNg(accOwnerCls, initSet));   // clobbers x0)
-                        // obj stays the stack top for the next item
-                    } else if (initFld == null) {
-                        diags.Error("ngen: unknown field '" + it.a.sval + "' in initializer", it.line, it.col);
-                    } else {
-                        if (!TryGenBindingValue(it.b, initFld.ty)) {
-                            GenExpr(it.b);
-                        }
-                        if (IsDblTy(initFld.ty) && !IsDblExpr(it.b)) { ConvI2D(); }
-                        if (initFld.ty == "float") { NarrowF32(); }
-                        E4(0xF81F0FE0);                  // push value
-                        E4(0xF84107E1);                  // pop value -> x1 (top)
-                        E4(0xF84107E0);                  // pop obj -> x0
-                        StoreFieldNg(1, 0, initFld);     // obj->field = value
-                        E4(0xF81F0FE0);                  // push obj back for the next item
-                    }
-                } else {
-                    diags.Error("ngen: unsupported object initializer item", it.line, it.col);
-                }
-                bi = bi + 1;
-            }
-        }
+        if (e.ival == 2) { GenInitItems(cls, e, e.op); }
         E4(0xF84107E0);                                  // ldr x0, [sp], #16 (obj)
+    }
+
+    // 对象初始化器的成员写序列（GenNew 与 CallInit 共用）：对象压在栈
+    // 上，从 kids[from] 起逐项应用——`member = { a, b }` 集合收养、
+    // 属性走 set_ 访问器、字段直接存。每项结束时对象回到栈顶。
+    void GenInitItems(string cls, Node e, int from) {
+        int bi = from;
+        while (bi < e.kids.Count) {
+            Node it = e.kids[bi];
+            if (it.kind == AK.Assignment() && it.a != null && it.a.kind == AK.Ident()
+                    && it.b != null && it.b.kind == AK.NewExpr() && it.b.ival == 2
+                    && it.b.type == null) {
+                // `member = { a, b }`: C# member collection initializer
+                GenMemberCollInit(cls, it);
+            } else if (it.kind == AK.Assignment() && it.a != null && it.a.kind == AK.Ident()) {
+                Fld initFld = FindField(FindClass(cls), it.a.sval);
+                if (initFld == null && AccessorInChain(cls, "set_" + it.a.sval) != null) {
+                    // property setter dispatch: an initializer item on a
+                    // property calls the desugared set_Prop accessor
+                    // exactly like an ordinary assignment
+                    Node initSet = AccessorInChain(cls, "set_" + it.a.sval);
+                    string initTy = initSet.type != null ? TypeFullName(initSet.type) : null;
+                    if (initTy == null || !TryGenBindingValue(it.b, initTy)) {
+                        GenExpr(it.b);
+                    }
+                    if (initTy != null && IsDblTy(initTy) && !IsDblExpr(it.b)) { ConvI2D(); }
+                    if (initTy == "float") { NarrowF32(); }
+                    MovRR(1, 0);                     // x1 = value
+                    LdrU(0, 31, 0);                  // x0 = obj (peek: the call
+                    BLInternal(MethSymNg(accOwnerCls, initSet));   // clobbers x0)
+                    // obj stays the stack top for the next item
+                } else if (initFld == null) {
+                    diags.Error("ngen: unknown field '" + it.a.sval + "' in initializer", it.line, it.col);
+                } else {
+                    if (!TryGenBindingValue(it.b, initFld.ty)) {
+                        GenExpr(it.b);
+                    }
+                    if (IsDblTy(initFld.ty) && !IsDblExpr(it.b)) { ConvI2D(); }
+                    if (initFld.ty == "float") { NarrowF32(); }
+                    E4(0xF81F0FE0);                  // push value
+                    E4(0xF84107E1);                  // pop value -> x1 (top)
+                    E4(0xF84107E0);                  // pop obj -> x0
+                    StoreFieldNg(1, 0, initFld);     // obj->field = value
+                    E4(0xF81F0FE0);                  // push obj back for the next item
+                }
+            } else {
+                diags.Error("ngen: unsupported object initializer item", it.line, it.col);
+            }
+            bi = bi + 1;
+        }
     }
 
     // `member = { a, b }` inside an object initializer: read the member once
@@ -4767,6 +4785,17 @@ partial class Ngen {
             mty = TypeFullName(g.type);
         }
         bool dict = mty != null && mty.IndexOf("Dict<") == 0;
+        // 门面集合（既不是 List 也不是 Dict 的类类型，如
+        // ControlChildren——Add 是 owner.With(c) 的收养门面）：逐项调用
+        // 它的 Add 方法，而不是把元素裸追加进对象内部布局（那会写穿
+        // 非列表对象）。oracle irgen 的成员集合初始化同样逐个调 Add。
+        string facadeAddSym = null;
+        if (!dict && mty != null && mty.IndexOf("List<") != 0 && mty != "List") {
+            Node am = AccessorInChain(mty, "Add");
+            if (am != null && ParamCount(am) == 1) {
+                facadeAddSym = MethSymNg(accOwnerCls, am);
+            }
+        }
         // strip the declared generic: List<E> -> E, Dict<K,V> -> K / V
         string args2 = "";
         if (mty != null) {
@@ -4820,7 +4849,11 @@ partial class Ngen {
                 GenCloneIfStruct(it.b.kids[ii]);
                 MovRR(1, 0);                             // x1 = item
                 LdrU(0, 31, 0);                          // x0 = coll (peek)
-                ListAppendRaw();
+                if (facadeAddSym != null) {
+                    BLInternal(facadeAddSym);            // facade.Add(item)
+                } else {
+                    ListAppendRaw();
+                }
                 ii = ii + 1;
             }
         }

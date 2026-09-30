@@ -3528,6 +3528,30 @@ class Parser {
                 while (Eat(TK.Comma())) { idx.Add(ParseExpr()); }
                 Expect(TK.RBracket());
                 e = idx;
+            } else if (k == TK.LBrace() && (e.kind == AK.Call()
+                        || e.kind == AK.Ident() || e.kind == AK.MemberAccess())) {
+                // 对象初始化器的大括号延续（oracle parse_postfix）：
+                // `Panel.Row() { X = v }`（工厂延续，保住刚解析的调用，
+                // 成员写作用在返回对象上）、`List<int> { a, b }` /
+                // `Panel { X = v }`（标识符/成员链末端重解释为类型，
+                // 等价 brace-only 的 new）。只有表达式紧跟 `{` 才会进
+                // 这里——`foreach (x in xs) {` 的花括号隔着 `)`，不冲突。
+                if (e.kind == AK.Call()) {
+                    Node ci = new Node(AK.CallInit());
+                    ci.a = e;
+                    ci.line = e.line; ci.col = e.col;
+                    ParseBraceItems(ci);
+                    e = ci;
+                } else {
+                    Node nw = new Node(AK.NewExpr());
+                    nw.ival = 2;
+                    Node ty = new Node(AK.TypeRef());
+                    ty.sval = e.sval;
+                    nw.type = ty;
+                    nw.line = e.line; nw.col = e.col;
+                    ParseBraceItems(nw);
+                    e = nw;
+                }
             } else if (k == TK.PlusPlus() || k == TK.MinusMinus()) {
                 int op = Next().kind;
                 Node pf = new Node(AK.PostfixUnary());
@@ -3909,9 +3933,13 @@ class Parser {
     }
 
     // lookahead for `Name<...> {` (postfix collection initializer): a
-    // balanced angle-bracket run of type-like tokens followed by `{`
+    // balanced angle-bracket run of type-like tokens followed by `{`.
+    // 调用点 pos 停在 Name 上（K1() == Less 已验证），所以扫描从 pos+2
+    // 起、depth 预置 1 记账开括号——与 LooksLikeGenericArgs 以 `<` 为
+    // pos 的约定等价；从 pos+1 起会把同一个 `<` 数两遍，depth 永不
+    // 归零，分支成了死代码。
     bool LooksLikeGenericBrace() {
-        int i = pos + 1;
+        int i = pos + 2;
         int depth = 1;
         while (i < toks.Count && depth > 0) {
             int kk = toks[i].kind;

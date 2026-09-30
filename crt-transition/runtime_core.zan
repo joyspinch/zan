@@ -1,10 +1,18 @@
-// crt-transition/runtime_core.zan — Zan 实现的过渡期运行时(第一、二批)。
+// crt-transition/runtime_core.zan — Zan 实现的过渡期运行时(第一~四批)。
 //
-// 取代 zanstubs.c 中的(用 -DZAN_RT_CORE_ZAN 从 C 侧编出):
+// 取代 zanstubs.c / zanhost.c 中的(用 -DZAN_RT_CORE_ZAN 从 C 侧编出):
 //   第一批:zan_monotonic_ns / zan_monotonic_us / zan_sha256 / zan_sha512
 //   第二批:zan_alloc / zan_free / zan_crc32(stdlib NativeMemory.Alloc/
 //           Free/Crc32 经 EntryPoint 改名指向这组符号——DllImport 的
 //           EntryPoint 就是改名机制,无需动编译器)
+//   第三批:zan_pkg_fopen / zan_file_fopen / remove / rename / read_path、
+//           FileStream 八件套(open/read/write/seek/tell/flush/close/eof)、
+//           FileInfo 五件套(length/attributes/time/set_readonly/set_time)、
+//           try_lock/unlock、zan_embed_*(诚实空集)、zan_mmap_*(诚实桩)
+//   第四批:zan_plat_net_interfaces(getifaddrs 全走查、地址折叠、
+//           if_nametoindex、MAC 大写十六进制)、zan_plat_icmp_ping
+//           (SOCK_DGRAM→SOCK_RAW 回退、poll 状态机、EINTR 重试、
+//           原始模式 IP 头偏移)——至此 zanhost.c 在 -D 下整体清零
 // 由原生自举编译器(ngen)编译为 arm64 可重定位对象,再经
 // localize_syms.py 把 API 面之外的符号本地化——ngen 会把整套运行时
 // 帮助函数以全局符号发射进每个对象,不本地化则与程序对象撞符号。
@@ -20,8 +28,46 @@
 // long + >>>(恒逻辑右移)+ 掩码,不依赖 uint/ulong 的移位语义;
 // 消息长度限 int 正范围(<2^31),与 ngen 调用方的钳制一致。
 //
+// 第三批追加约束:stdlib 声明的 string/byte[] 形参在此一律收 nint——
+// 同一整数槽位,ABI 与 C 实现逐位一致(隐式 string→nint、(long)/(nint)
+// 强转、静态字段惰性初始化均经探针验证)。struct stat 按 macOS arm64
+// 布局硬编码(144 字节:mode@4 atime@32 mtime@48 ctime@64 size@96,
+// 经 offsetof 验证)。embed 族为弱符号(localize_syms.py --weaken,
+// N_WEAK_DEF):ngen 会把 embed 家族连同样子数据烘焙进带内嵌资源的
+// 程序对象(tryget_pinyin/file_embed_*),弱符号让程序自己的强定义
+// 赢;不带资源、只经 DllImport 调 API 的程序(如 native_rt_core 的
+// 诚实空集用例)仍解析到这里。
+// try_lock 代际表为进程内三块 calloc 静态,单线程假设与 C 版一致,锁
+// 本体是 BSD flock。read_path/embed_list 返回 malloc 的 C 串(每次
+// 全新,调用方拥有),与 C 版 strdup 契约一致;该 string 返回 ABI 在
+// 托管侧目前是休眠路径(编译器本体只走 pkg_fopen+fread)。
+//
+// 第四批追加约束:sa_family_t 是 u8(Darwin),offset 1——不能并读
+// offset 2(sockaddr_in 是端口、sockaddr_dl 是 sdl_index,均非零)。
+// freeifaddrs 收链表头(*listp)而非持有者指针,否则持有者被二次
+// 释放。getifaddrs 节点 ifaddrs 为 56 字节:ifa_next@0 ifa_name@8
+// ifa_flags@16 ifa_addr@24。net 行拼装为手工 memcpy(格式字面量、
+// 十进制、'0'/'1'、'\t'、',' 均在 lit_buf 静态区按字节备好),不使
+// 用 snprintf。
+//
+// 已发现编译器缺口(ngen,待独立批次处理;本文件全部绕行):
+//   1) 变参调用降级不可用——8 参 DllImport→snprintf 在入口寄存器
+//      逐个验证正确(lldb 断点读 x0..x7 且 x/s 指向正确内容),被调
+//      方仍读到压栈槽/静态槽地址(4 参、6 参非变参调用 mmap 实证
+//      正常,6 参 sendto/recvfrom 在 ping 路径 fixture 验证正常)。
+//      第二受害者:三参 open——C 里 open 本就是变参函数,mode 由
+//      va_arg 读出,ngen 调用点的 x2 落寄存器残留值,创建的文件随
+//      链接布局拿到 040/100/200/740 等垃圾模式(file_lock 翻车)。
+//      绕行:zanstubs.c 二参包装 zan_open_creat,mode 由 C 车道传
+//      0644;凡变参 libc 函数一律不得从本文件 DllImport;
+//   2) 静态字段持有的指针上做 Span 索引写不可靠(probe_va2:写后
+//      原缓冲仍为零)——net/ping 一律静态存、用点取新局部再 Span;
+//   3) 字符串字面量经数据槽间接寻址,槽由本对象静态初始化填充,
+//      而第二个 ngen 对象的 init 不被调用→槽恒为 0——runtime 内
+//      不得写字面量,libc 的名字/格式串一律 lit_buf 按字节拼。
+//
 // 命名纪律:libc 导入一律别名(cfree/malloc/…),公开 ABI 方法名
-// (free/alloc/crc32/…)必须与 libc 导入名错开——同类两个方法名会
+// (free/alloc/crc32/…必须与 libc 导入名错开——同类两个方法名会
 // 触发重载 mangling(_zan_free__…),破坏符号契约。
 
 class zan {
@@ -323,6 +369,749 @@ class zan {
             j = j + 1;
         }
         return crc ^ 0xFFFFFFFFL;
+    }
+
+    // ------------------------------------------------------------------
+    // 第三批:文件/包/embed/mmap 族(语义对照 zanhost.c 与 oracle
+    // rt_file.c)。libc 导入全部 nint 形参;flock/fcntl 常量内联。
+    // ------------------------------------------------------------------
+
+    [DllImport("crt", EntryPoint = "fopen")]
+    public static extern nint cfopen(nint path, nint mode);
+    [DllImport("crt", EntryPoint = "fclose")]
+    public static extern int cfclose(nint f);
+    [DllImport("crt", EntryPoint = "fread")]
+    public static extern long cfread(nint buf, long sz, long n, nint f);
+    [DllImport("crt", EntryPoint = "fwrite")]
+    public static extern long cfwrite(nint buf, long sz, long n, nint f);
+    [DllImport("crt", EntryPoint = "fseek")]
+    public static extern int cfseek(nint f, long off, int origin);
+    [DllImport("crt", EntryPoint = "ftell")]
+    public static extern long cftell(nint f);
+    [DllImport("crt", EntryPoint = "fflush")]
+    public static extern int cfflush(nint f);
+    [DllImport("crt", EntryPoint = "feof")]
+    public static extern int cfeof(nint f);
+    [DllImport("crt", EntryPoint = "remove")]
+    public static extern int cremove(nint path);
+    [DllImport("crt", EntryPoint = "rename")]
+    public static extern int crename(nint oldp, nint newp);
+    [DllImport("crt", EntryPoint = "stat")]
+    public static extern int cstat(nint path, nint buf);
+    [DllImport("crt", EntryPoint = "access")]
+    public static extern int caccess(nint path, int mode);
+    [DllImport("crt", EntryPoint = "chmod")]
+    public static extern int cchmod(nint path, int mode);
+    [DllImport("crt", EntryPoint = "utimensat")]
+    public static extern int cutimensat(int dirfd, nint path, nint ts, int flags);
+    [DllImport("crt", EntryPoint = "zan_open_creat")]
+    public static extern int copen2(nint path, int flags);
+    [DllImport("crt", EntryPoint = "close")]
+    public static extern int cclose(int fd);
+    [DllImport("crt", EntryPoint = "flock")]
+    public static extern int cflock(int fd, int op);
+    [DllImport("crt", EntryPoint = "strlen")]
+    public static extern long cstrlen(nint s);
+    [DllImport("crt", EntryPoint = "strrchr")]
+    public static extern nint cstrrchr(nint s, int c);
+    [DllImport("crt", EntryPoint = "getenv")]
+    public static extern nint cgetenv(nint name);
+    [DllImport("crt", EntryPoint = "_NSGetExecutablePath")]
+    public static extern int cnsgetpath(nint buf, nint cap);
+
+    // 每次产出全新的、调用方拥有的 ""(对应 C 版 strdup 契约——不能
+    // 返回共享块,托管侧会释放它)
+    static nint empty_str() {
+        nint e = malloc(1);
+        Span<byte> ev = new Span<byte>(e, 1);
+        ev[0] = 0;
+        return e;
+    }
+
+    // FILE *zan_pkg_fopen(...):此车道不烘焙包内资源,等价 fopen
+    public static nint pkg_fopen(nint path, nint mode) {
+        return cfopen(path, mode);
+    }
+
+    public static nint file_fopen(nint path, nint mode) {
+        return cfopen(path, mode);
+    }
+
+    public static int file_remove(nint path) {
+        return cremove(path);
+    }
+
+    public static int file_rename(nint oldp, nint newp) {
+        return crename(oldp, newp);
+    }
+
+    // 只读缓存的可执行文件目录(对照 zanh_app_dir:ZAN_APP_DIR 优先,
+    // 否则 _NSGetExecutablePath 去尾)。内部专用,不交给调用方释放。
+    static nint app_dir_buf;
+    static long app_dir_done;
+
+    // 环境变量名/snprintf 格式串不能写字面量:ngen 的字符串字面量经数
+    // 据槽间接寻址,槽由本对象的静态初始化填充,而 runtime_core.o 作为
+    // 第二个 ngen 对象其 init 不会被调用,槽恒为 0。这里在静态暂存区
+    // 逐字节拼出 "ZAN_APP_DIR"(0..11) "ZAN_PKG_DIR"(12..23) 与
+    // "%s\t%u\t%d\t%s\t%s\n"(32..47)。
+    static nint lit_buf;
+
+    static void lit_init() {
+        if (lit_buf != 0) { return; }
+        lit_buf = calloc(1, 64);
+        Span<byte> lb = new Span<byte>(lit_buf, 64);
+        lb[0] = 90; lb[1] = 65; lb[2] = 78; lb[3] = 95;
+        lb[4] = 65; lb[5] = 80; lb[6] = 80; lb[7] = 95;
+        lb[8] = 68; lb[9] = 73; lb[10] = 82;
+        lb[12] = 90; lb[13] = 65; lb[14] = 78; lb[15] = 95;
+        lb[16] = 80; lb[17] = 75; lb[18] = 71; lb[19] = 95;
+        lb[20] = 68; lb[21] = 73; lb[22] = 82;
+        lb[32] = 37; lb[33] = 115; lb[34] = 9;
+        lb[35] = 37; lb[36] = 117; lb[37] = 9;
+        lb[38] = 37; lb[39] = 100; lb[40] = 9;
+        lb[41] = 37; lb[42] = 115; lb[43] = 9;
+        lb[44] = 37; lb[45] = 115; lb[46] = 10;
+        lb[48] = 48; lb[49] = 49; lb[50] = 44; lb[51] = 9; lb[52] = 10;
+    }
+
+    static nint app_dir() {
+        lit_init();
+        nint env = cgetenv(lit_buf);
+        if (env != 0 && cstrlen(env) != 0 && cstrlen(env) < 4096) { return env; }
+        if (app_dir_done == 0) {
+            app_dir_done = 1;
+            app_dir_buf = calloc(1, 4096);          // C 静态缓冲零初始化
+            nint exe = malloc(4096);
+            nint cap = malloc(8);
+            Span<long> cv = new Span<long>(cap, 1);
+            cv[0] = 4096;
+            if (cnsgetpath(exe, cap) == 0) {
+                nint sep = cstrrchr(exe, 47);
+                if (sep != 0 && sep != exe) {
+                    Span<byte> zv = new Span<byte>(sep, 1);
+                    zv[0] = 0;
+                    long el = cstrlen(exe);
+                    if (el < 4096) { memcpy(app_dir_buf, exe, el + 1); }
+                }
+            }
+            cfree(cap);
+            cfree(exe);
+        }
+        return app_dir_buf;
+    }
+
+    // char *zan_file_read_path(const char *):语义对照 rt_file.c——不是
+    // realpath。工作目录里存在 → "";缺失的相对路径退到 $ZAN_PKG_DIR 或
+    // 可执行文件旁;绝对路径与未命中返回 ""。绝不返回参数本身(托管侧
+    // 会释放一个未保留的托管串)。
+    public static nint file_read_path(nint path) {
+        if (path == 0) { return empty_str(); }
+        long plen = cstrlen(path);
+        nint sb = malloc(144);
+        if (plen != 0 && cstat(path, sb) == 0) { cfree(sb); return empty_str(); }
+        Span<byte> p0 = new Span<byte>(path, 1);
+        int b0 = p0[0];
+        Span<byte> p1 = new Span<byte>(path + 1L, 1);
+        int b1 = p1[0];
+        if (b0 != 47 && b0 != 92 && b1 != 58) {
+            int which = 0;
+            while (which < 2) {
+                lit_init();
+                nint basep = which == 0 ? cgetenv(lit_buf + 12L) : app_dir();
+                if (basep != 0) {
+                    long lb = cstrlen(basep);
+                    if (lb != 0 && lb + plen + 2 <= 4096) {
+                        nint alt = malloc(lb + plen + 2);
+                        memcpy(alt, basep, lb);
+                        Span<byte> sl = new Span<byte>(alt + lb, 1);
+                        sl[0] = 47;
+                        memcpy(alt + lb + 1L, path, plen + 1);
+                        if (cstat(alt, sb) == 0) { cfree(sb); return alt; }
+                        cfree(alt);
+                    }
+                }
+                which = which + 1;
+            }
+        }
+        cfree(sb);
+        return empty_str();
+    }
+
+    // ---- FileStream.zan:FILE* 句柄,0 = 关闭/失败 ----
+    public static long file_open(nint path, nint mode) {
+        nint f = cfopen(path, mode);
+        return (long)f;
+    }
+
+    public static long file_read(long h, nint buf, long count) {
+        if (h == 0) { return -1; }
+        return cfread(buf, 1, count, (nint)h);
+    }
+
+    public static long file_write(long h, nint buf, long count) {
+        if (h == 0) { return -1; }
+        return cfwrite(buf, 1, count, (nint)h);
+    }
+
+    // 返回结果偏移(不是 fseek 成功旗标)——FileStream.Length 以
+    // seek(0, SEEK_END) 读长度
+    public static long file_seek(long h, long off, int origin) {
+        if (h == 0) { return -1; }
+        if (cfseek((nint)h, off, origin) != 0) { return -1; }
+        return cftell((nint)h);
+    }
+
+    public static long file_tell(long h) {
+        if (h == 0) { return -1; }
+        return cftell((nint)h);
+    }
+
+    public static long file_flush(long h) {
+        if (h == 0) { return -1; }
+        return (long)cfflush((nint)h);
+    }
+
+    public static long file_close(long h) {
+        if (h == 0) { return 0; }
+        return (long)cfclose((nint)h);
+    }
+
+    public static long file_eof(long h) {
+        if (h == 0) { return 1; }
+        return cfeof((nint)h) != 0 ? 1L : 0L;
+    }
+
+    // ---- FileInfo.zan / FileInfoEx.zan ----
+    // struct stat(macOS arm64,144 字节,偏移经 offsetof 验证):
+    // mode@4(u16) atime@32 mtime@48 ctime@64 size@96
+    public static long file_length(nint path) {
+        nint sb = malloc(144);
+        long r = -1;
+        if (cstat(path, sb) == 0) {
+            Span<long> lv = new Span<long>(sb, 18);
+            r = lv[12];
+        }
+        cfree(sb);
+        return r;
+    }
+
+    // 位:0 只读(W_OK 失败) 1 隐藏(基名 '.') 2 目录;-1 = stat 失败
+    public static long file_attributes(nint path) {
+        nint sb = malloc(144);
+        if (cstat(path, sb) != 0) { cfree(sb); return -1; }
+        long a = 0;
+        if (caccess(path, 2) != 0) { a |= 1; }
+        nint slash = cstrrchr(path, 47);
+        nint basep = slash == 0 ? path : slash + 1L;
+        Span<byte> bv = new Span<byte>(basep, 1);
+        if (bv[0] == 46) { a |= 2; }
+        Span<byte> mb = new Span<byte>(sb, 144);
+        long modev = mb[4] | (mb[5] << 8);
+        if ((modev & 61440) == 16384) { a |= 4; }
+        cfree(sb);
+        return a;
+    }
+
+    // which: 0=mtime 1=ctime(oracle 语义) 2=atime;缺失/空路径 → 0
+    public static long file_time(nint path, int which) {
+        if (path == 0 || cstrlen(path) == 0) { return 0; }
+        nint sb = malloc(144);
+        if (cstat(path, sb) != 0) { cfree(sb); return 0; }
+        Span<long> lv = new Span<long>(sb, 18);
+        long t = which == 1 ? lv[8] : (which == 2 ? lv[4] : lv[6]);
+        cfree(sb);
+        return t;
+    }
+
+    public static long file_set_readonly(nint path, int on) {
+        nint sb = malloc(144);
+        if (cstat(path, sb) != 0) { cfree(sb); return 0; }
+        Span<byte> mb = new Span<byte>(sb, 144);
+        long modev = mb[4] | (mb[5] << 8);
+        long nm = on != 0 ? (modev & ~146L) : (modev | 146L);   // 0222
+        long r = cchmod(path, (int)nm) == 0 ? 1L : 0L;
+        cfree(sb);
+        return r;
+    }
+
+    // which 0=mtime 2=atime 可设;1=birthtime 诚实拒绝(与 oracle 一致)
+    public static long file_set_time(nint path, int which, long unixSec) {
+        nint sb = malloc(144);
+        if (cstat(path, sb) != 0) { cfree(sb); return 0; }
+        if (which == 1) { cfree(sb); return 0; }
+        nint ts = malloc(32);
+        Span<long> lv = new Span<long>(sb, 18);
+        Span<long> tv = new Span<long>(ts, 4);
+        tv[0] = lv[4]; tv[1] = lv[5];
+        tv[2] = lv[6]; tv[3] = lv[7];
+        if (which == 0) { tv[2] = unixSec; tv[3] = 0; }
+        else { tv[0] = unixSec; tv[1] = 0; }
+        long r = cutimensat(-100, path, ts, 0) == 0 ? 1L : 0L;  // AT_FDCWD
+        cfree(ts);
+        cfree(sb);
+        return r;
+    }
+
+    // ---- File.zan TryLock/Unlock:句柄编码 (gen << 32) | slot 的 32 槽
+    // 表,代际使同一句柄值的第二次 unlock 失败;锁本体是 BSD flock;
+    // 单线程假设与 C 版一致。
+    static nint lk_fd_tbl;
+    static nint lk_used_tbl;
+    static nint lk_gen_tbl;
+
+    static void lk_init() {
+        if (lk_used_tbl != 0) { return; }
+        lk_fd_tbl = calloc(32, 8);
+        lk_used_tbl = calloc(32, 8);
+        lk_gen_tbl = calloc(32, 8);
+    }
+
+    // O_RDWR|O_CREAT|O_CLOEXEC(macOS)= 0x01000202;0644 = 420;
+    // LOCK_EX|LOCK_NB = 6
+    public static long file_try_lock(nint path) {
+        if (path == 0 || cstrlen(path) == 0) { return 0; }
+        lk_init();
+        Span<long> fv = new Span<long>(lk_fd_tbl, 32);
+        Span<long> uv = new Span<long>(lk_used_tbl, 32);
+        Span<long> gv = new Span<long>(lk_gen_tbl, 32);
+        long slot = -1;
+        int i = 0;
+        while (slot < 0 && i < 32) {
+            if (uv[i] == 0) { slot = i; uv[i] = 1; }
+            i = i + 1;
+        }
+        if (slot < 0) { return 0; }
+        // open 在 C 里是变参函数:ngen 的变参调用降级缺口(头注 1)让
+        // 第三参 mode 落到寄存器残留值,文件以 040/100/200/740 等垃圾
+        // 模式创建,确定性随链接布局漂移。此前试过 stat+fchmod 启发式
+        // 守卫(缺属主写位才修),在 mode 恰落 0200 的布局下漏防——
+        // 0o200 有属主写无属主读,O_RDWR 二次打开即 EACCES(file_lock
+        // 的 relocked=0)。zanstubs.c 的二参包装 zan_open_creat 从根上
+        // 绕开变参降级,mode 由 C 车道按正确约定传 0644,与 C 版创建
+        // 语义逐位一致。
+        int fd = copen2(path, 16777730);
+        if (fd < 0) { uv[(int)slot] = 0; return 0; }
+        if (cflock(fd, 6) != 0) { cclose(fd); uv[(int)slot] = 0; return 0; }
+        long next = gv[(int)slot] + 1;
+        if (next == 4294967296L) {              // u32 代际回卷:退役该槽
+            cclose(fd);
+            uv[(int)slot] = 2;
+            return 0;
+        }
+        gv[(int)slot] = next;
+        fv[(int)slot] = fd;
+        return next * 4294967296L + slot;
+    }
+
+    public static long file_unlock(long h) {
+        if (h <= 0) { return 0; }
+        lk_init();
+        long gen = h >>> 32;
+        long slot = h & 0xFFFFFFFFL;
+        if (slot >= 32) { return 0; }
+        int s = (int)slot;
+        Span<long> fv = new Span<long>(lk_fd_tbl, 32);
+        Span<long> uv = new Span<long>(lk_used_tbl, 32);
+        Span<long> gv = new Span<long>(lk_gen_tbl, 32);
+        if (uv[s] == 0 || gv[s] != gen) { return 0; }
+        int fd = (int)fv[s];
+        fv[s] = -1;
+        uv[s] = 0;
+        long ng = gv[s] + 1;
+        if (ng == 4294967296L) { ng = 1; }      // 同一句柄值二次 unlock 失败
+        gv[s] = ng;
+        cclose(fd);
+        return 1;
+    }
+
+    // ---- MemoryMappedFile.zan:自举不练习 mmap,诚实桩(与 C 一致) ----
+    public static long mmap_create(nint name, long size) { return 0; }
+    public static long mmap_open(nint name, long size) { return 0; }
+    public static long mmap_from_file(nint path, long size) { return 0; }
+    public static long mmap_map(long h, long size) { return 0; }
+    public static long mmap_unmap(long p, long size) { return 0; }
+    public static long mmap_flush(long p, long size) { return 0; }
+    public static long mmap_close(long h) { return 0; }
+    public static long mmap_unlink(nint name) { return 0; }
+
+    // ---- embed 族:native 车道无烘焙器,诚实空集。链接期弱符号
+    // (localize_syms.py --weaken)——带内嵌资源的程序对象自带强定义,
+    // 强定义赢;这里的服务对象是只经 DllImport 调 API 的用例。
+    public static int embed_has(nint name) {
+        return 0;
+    }
+
+    public static nint embed_read(nint name) {
+        return 0;
+    }
+
+    public static nint embed_bytes(nint name, nint outLen) {
+        if (outLen != 0) {
+            Span<byte> ov = new Span<byte>(outLen, 4);
+            ov[0] = 0;
+            ov[1] = 0;
+            ov[2] = 0;
+            ov[3] = 0;
+        }
+        return 0;
+    }
+
+    public static nint embed_list(nint prefix) {
+        return empty_str();
+    }
+
+    // ------------------------------------------------------------------
+    // 第四批:network 半边(语义对照 zanhost.c 与 oracle rt_sync.c),
+    // 取代 zanhost.c 最后一段 C——本批之后 zanhost.c 在 -D 下清零。
+    // ------------------------------------------------------------------
+
+    [DllImport("crt", EntryPoint = "getifaddrs")]
+    public static extern int cgetifaddrs(nint list);
+    [DllImport("crt", EntryPoint = "freeifaddrs")]
+    public static extern void cfreeifaddrs(nint list);
+    [DllImport("crt", EntryPoint = "if_nametoindex")]
+    public static extern int cif_nametoindex(nint name);
+    [DllImport("crt", EntryPoint = "strcmp")]
+    public static extern int cstrcmp(nint a, nint b);
+    [DllImport("crt", EntryPoint = "inet_ntop")]
+    public static extern nint cinet_ntop(int af, nint src, nint dst, int size);
+    [DllImport("crt", EntryPoint = "inet_pton")]
+    public static extern int cinet_pton(int af, nint src, nint dst);
+    // 变参 snprintf 无 DllImport:ngen 的变参调用降级传参不可用
+    // (寄存器在入口已验证正确,被调方仍读到压栈槽地址),net 行拼装
+    // 因此改为手工 memcpy,见 udec_into/plat_net_interfaces。
+    [DllImport("crt", EntryPoint = "socket")]
+    public static extern int csocket(int domain, int type, int proto);
+    [DllImport("crt", EntryPoint = "sendto")]
+    public static extern long csendto(int fd, nint buf, long len, int flags, nint addr, int addrlen);
+    [DllImport("crt", EntryPoint = "recvfrom")]
+    public static extern long crecvfrom(int fd, nint buf, long len, int flags, nint addr, nint addrlen);
+    [DllImport("crt", EntryPoint = "poll")]
+    public static extern int cpoll(nint fds, int nfds, int timeout);
+    [DllImport("crt", EntryPoint = "getpid")]
+    public static extern int cgetpid();
+    [DllImport("crt", EntryPoint = "__error")]
+    public static extern nint cerror();
+
+    // errno 是每线程全局:__error() 返回 int*
+    static int err_now() {
+        nint ep = cerror();
+        Span<byte> ev = new Span<byte>(ep, 4);
+        return ev[0] | (ev[1] << 8) | (ev[2] << 16) | (ev[3] << 24);
+    }
+
+    // ICMP 校验和:大端 16 位字累加 + 折叠,返回反码(与 C 版一致)
+    static int icmp_checksum(nint data, int len) {
+        Span<byte> b = new Span<byte>(data, len);
+        long sum = 0;
+        int i = 0;
+        while (i + 1 < len) {
+            sum = sum + ((b[i] << 8) | b[i + 1]);
+            i = i + 2;
+        }
+        if (i < len) { sum = sum + (b[i] << 8); }
+        while (sum >>> 16 != 0) { sum = (sum & 0xFFFFL) + (sum >>> 16); }
+        return (int)(~sum & 0xFFFFL);
+    }
+
+    // AF_LINK sockaddr → "AA:BB:..." 大写十六进制(对照 zan_mac_from_
+    // sockaddr:sdl_nlen@5 sdl_alen@6 LLADDR=data+nlen,alen 限 1..8)
+    static void mac_from_sa(nint sa, nint outp) {
+        Span<byte> sv = new Span<byte>(sa, 32);
+        int fam = sv[1];   // sa_family_t 是 u8;sv[2] 起是 sdl_index,不能并入
+        if (fam != 18) { return; }                  // AF_LINK
+        int nlen = sv[5];
+        int alen = sv[6];
+        if (alen <= 0 || alen > 8) { return; }
+        Span<byte> ov = new Span<byte>(outp, 32);
+        int used = 0;
+        int i = 0;
+        while (i < alen && used + 3 < 32) {
+            int b = sv[8 + nlen + i];
+            int hi = b >>> 4;
+            int lo = b & 15;
+            if (i != 0) { ov[used] = 58; used = used + 1; }
+            ov[used] = (byte)(hi < 10 ? 48 + hi : 55 + hi);
+            ov[used + 1] = (byte)(lo < 10 ? 48 + lo : 55 + lo);
+            used = used + 2;
+            i = i + 1;
+        }
+        ov[used] = 0;
+    }
+
+    // 静态暂存区布局(懒分配一次,与 C 的 static zan_net_text 等价):
+    // net_text@0 (65536) | addrs@65536 (2048) | mac@67584 (32) | ntop@67616 (64)
+    static nint net_buf;
+
+    // 十进制写入 dst(至少 11 字节),返回字节数。只用"临时 malloc +
+    // Span(新局部)"的已证模式。
+    static long udec_into(long v, nint dst) {
+        nint tmp = malloc(24);
+        Span<byte> tv = new Span<byte>(tmp, 24);
+        if (v < 0) { v = 0 - v; }
+        int n = 0;
+        if (v == 0) { tv[0] = 48; n = 1; }
+        while (v > 0) {
+            tv[n] = (byte)(48 + v % 10);
+            n = n + 1;
+            v = v / 10;
+        }
+        int i = 0;
+        while (i < n) {
+            memcpy(dst + i, tmp + (n - 1 - i), 1);
+            i = i + 1;
+        }
+        cfree(tmp);
+        return n;
+    }
+
+    // '\n' 分隔的适配器快照,每行 name \t index \t up(0|1) \t mac \t
+    // addr[,addr...]:getifaddrs 每地址一节点,地址折叠进所属接口行;
+    // 同名首节点才有输出。行拼装全程手工(memcpy + 字面字节):ngen 的
+    // 变参调用(snprintf)与静态字段指针上的 Span 写均已证实不可用,
+    // 见 README"已发现编译器缺口"。
+    public static nint plat_net_interfaces() {
+        if (net_buf == 0) { net_buf = calloc(1, 67680); }
+        lit_init();
+        memset(net_buf, 0, 1);
+        nint listp = malloc(8);
+        Span<long> lv = new Span<long>(listp, 1);
+        if (cgetifaddrs(listp) != 0) { cfree(listp); return net_buf; }
+        long used = 0;
+        long done = 0;
+        nint it = (nint)lv[0];
+        while (it != 0 && done == 0) {
+            Span<long> iv = new Span<long>(it, 7);
+            nint name = (nint)iv[1];
+            if (name != 0) {
+                nint p = (nint)lv[0];
+                long seen = 0;
+                while (p != it && seen == 0) {
+                    Span<long> pv = new Span<long>(p, 7);
+                    nint pname = (nint)pv[1];
+                    if (pname != 0 && cstrcmp(pname, name) == 0) { seen = 1; }
+                    if (seen == 0) { p = (nint)pv[0]; }
+                }
+                if (seen == 0) {
+                    long flags = iv[2] & 0xFFFFFFFFL;
+                    int up = (flags & 1) != 0 && (flags & 64) != 0 ? 1 : 0;
+                    memset(net_buf + 67584L, 0, 1);
+                    memset(net_buf + 65536L, 0, 2048);
+                    long addrUsed = 0;
+                    nint q = (nint)lv[0];
+                    while (q != 0) {
+                        Span<long> qv = new Span<long>(q, 7);
+                        nint qname = (nint)qv[1];
+                        if (qname != 0 && cstrcmp(qname, name) == 0) {
+                            nint sa = (nint)qv[3];
+                            if (sa != 0) {
+                                if (cstrlen(net_buf + 67584L) == 0) {
+                                    mac_from_sa(sa, net_buf + 67584L);
+                                }
+                                Span<byte> sv = new Span<byte>(sa, 3);
+                                int fam = sv[1];  // sa_family_t 是 u8
+                                if (fam == 2 || fam == 30) {
+                                    nint src = fam == 2 ? sa + 4L : sa + 8L;
+                                    nint ntopp = net_buf + 67616L;
+                                    cinet_ntop(fam, src, ntopp, 64);
+                                    long tl = cstrlen(ntopp);
+                                    if (tl != 0 && addrUsed + tl + 2 < 2048) {
+                                        nint addrp = net_buf + 65536L;
+                                        if (addrUsed != 0) {
+                                            memcpy(addrp + addrUsed, lit_buf + 50L, 1);
+                                            addrUsed = addrUsed + 1;
+                                        }
+                                        memcpy(addrp + addrUsed, ntopp, tl + 1);
+                                        addrUsed = addrUsed + tl;
+                                    }
+                                }
+                            }
+                        }
+                        q = (nint)qv[0];
+                    }
+                    long nl = cstrlen(name);
+                    long dg = udec_into(cif_nametoindex(name), net_buf + 67616L);
+                    long ml = cstrlen(net_buf + 67584L);
+                    long al = cstrlen(net_buf + 65536L);
+                    long need = nl + dg + ml + al + 5;
+                    if (used + need >= 65536) { done = 1; }
+                    else {
+                        nint linep = net_buf + used;
+                        long w = 0;
+                        memcpy(linep, name, nl + 1);
+                        w = nl;
+                        memcpy(linep + w, lit_buf + 51L, 1);
+                        w = w + 1;
+                        memcpy(linep + w, net_buf + 67616L, dg);
+                        w = w + dg;
+                        memcpy(linep + w, lit_buf + 51L, 1);
+                        w = w + 1;
+                        memcpy(linep + w, lit_buf + 48L + up, 1);
+                        w = w + 1;
+                        memcpy(linep + w, lit_buf + 51L, 1);
+                        w = w + 1;
+                        if (ml > 0) { memcpy(linep + w, net_buf + 67584L, ml); }
+                        w = w + ml;
+                        memcpy(linep + w, lit_buf + 51L, 1);
+                        w = w + 1;
+                        memcpy(linep + w, net_buf + 65536L, al);
+                        w = w + al;
+                        memcpy(linep + w, lit_buf + 52L, 1);
+                        used = used + w + 1;
+                    }
+                }
+            }
+            it = (nint)iv[0];
+        }
+        // freeifaddrs 要链表头(*listp),不是持有者本身——传错会把
+        // listp 先释放一遍,随后 cfree(listp) 变 double free。
+        cfreeifaddrs((nint)lv[0]);
+        cfree(listp);
+        return net_buf;
+    }
+
+    // 一条 ICMP echo 到 IPv4 字面量,至多 timeout_ms。返回 RTT 毫秒
+    // (>=0),或 -1 超时 / -2 不可达 / -3 socket/权限错误 / -4 地址非法。
+    // 先试 SOCK_DGRAM 的 ICMP ping 套接字,失败退 SOCK_RAW。errno 经
+    // __error() 读取;pollfd={int fd; short events; short revents}。
+    // ping 的缓冲经静态槽保存、每个用点现取新局部:跨 poll 循环存活的
+    // 指针局部量在当前 ngen 下不可靠(见 README"已发现编译器缺口")。
+    static nint ping_dst;
+    static nint ping_packet;
+    static nint ping_pfd;
+    static nint ping_reply;
+    static nint ping_from;
+    static nint ping_fromlen;
+
+    public static int plat_icmp_ping(nint address, int timeoutMs) {
+        if (address == 0) { return -4; }
+        Span<byte> a0 = new Span<byte>(address, 1);
+        if (a0[0] == 0) { return -4; }
+        if (ping_dst != 0) { cfree(ping_dst); }
+        ping_dst = malloc(16);
+        memset(ping_dst, 0, 16);
+        nint dst = ping_dst;
+        Span<byte> dv = new Span<byte>(dst, 16);
+        dv[1] = 2;                                 // sin_family @1 = AF_INET
+        if (cinet_pton(2, address, dst + 4L) != 1) {
+            cfree(ping_dst);
+            ping_dst = 0;
+            return -4;
+        }
+        if (timeoutMs < 0) { timeoutMs = 0; }
+        int fd = csocket(2, 2, 1);                 // SOCK_DGRAM, IPPROTO_ICMP
+        int datagram = fd >= 0 ? 1 : 0;
+        if (fd < 0) { fd = csocket(2, 3, 1); }     // SOCK_RAW
+        if (fd < 0) { cfree(ping_dst); ping_dst = 0; return -3; }
+        if (ping_packet != 0) { cfree(ping_packet); }
+        ping_packet = malloc(16);
+        memset(ping_packet, 0, 16);
+        nint pk = ping_packet;
+        Span<byte> pv = new Span<byte>(pk, 16);
+        pv[0] = 8;                                 // ICMP_ECHO
+        int ident = cgetpid() & 0xFFFF;
+        pv[4] = (byte)(ident >>> 8);
+        pv[5] = (byte)(ident & 255);
+        pv[6] = 0;
+        pv[7] = 1;                                 // sequence
+        // "zan-ping" 载荷按字节写(避免数据槽未初始化的字符串字面量)
+        Span<byte> pl = new Span<byte>(pk + 8L, 8);
+        pl[0] = 122; pl[1] = 97; pl[2] = 110; pl[3] = 45;
+        pl[4] = 112; pl[5] = 105; pl[6] = 110; pl[7] = 103;
+        int sum = icmp_checksum(ping_packet, 16);
+        nint pk2 = ping_packet;
+        Span<byte> pv2 = new Span<byte>(pk2, 16);
+        pv2[2] = (byte)(sum >>> 8);
+        pv2[3] = (byte)(sum & 255);
+        long start = monotonic_us();
+        nint dst2 = ping_dst;
+        if (csendto(fd, pk2, 16, 0, dst2, 16) < 0) {
+            int err = err_now();
+            cclose(fd);
+            cfree(ping_packet); ping_packet = 0;
+            cfree(ping_dst); ping_dst = 0;
+            return err == 65 || err == 51 ? -2 : -3;   // EHOSTUNREACH/ENETUNREACH
+        }
+        if (ping_pfd != 0) { cfree(ping_pfd); }
+        if (ping_reply != 0) { cfree(ping_reply); }
+        if (ping_from != 0) { cfree(ping_from); }
+        if (ping_fromlen != 0) { cfree(ping_fromlen); }
+        ping_pfd = malloc(8);
+        ping_reply = malloc(1024);
+        ping_from = malloc(16);
+        ping_fromlen = malloc(8);
+        int result = -3;
+        long state = 0;
+        while (state == 0) {
+            long elapsed = (monotonic_us() - start) / 1000;
+            int remain = (int)((long)timeoutMs - elapsed);
+            if (remain <= 0) {
+                result = -1;
+                state = 1;
+            }
+            else {
+                nint pfd = ping_pfd;
+                Span<long> plv = new Span<long>(pfd, 1);
+                plv[0] = fd & 0xFFFFFFFFL;             // fd,events/revents 清零
+                Span<byte> pev = new Span<byte>(pfd + 4L, 1);
+                pev[0] = 1;                            // POLLIN
+                int ready = cpoll(pfd, 1, remain);
+                if (ready == 0) {
+                    result = -1;
+                    state = 1;
+                }
+                else if (ready < 0) {
+                    if (err_now() != 4) { result = -3; state = 1; }   // EINTR 重试
+                }
+                else {
+                    nint rp = ping_reply;
+                    nint fm = ping_from;
+                    nint fl = ping_fromlen;
+                    Span<long> flv = new Span<long>(fl, 1);
+                    flv[0] = 16;
+                    long got = crecvfrom(fd, rp, 1024, 0, fm, fl);
+                    if (got < 0) {
+                        if (err_now() != 4) { result = -3; state = 1; }
+                    }
+                    else {
+                        long offset = 0;
+                        long skip = 0;
+                        if (datagram == 0) {
+                            if (got < 20) { skip = 1; }
+                            else {
+                                Span<byte> rv = new Span<byte>(rp, 1024);
+                                offset = (rv[0] & 15) * 4L;
+                                if (got < offset + 8) { skip = 1; }
+                            }
+                        }
+                        else if (got < 8) { skip = 1; }
+                        if (skip == 0) {
+                            Span<byte> rv = new Span<byte>(rp, 1024);
+                            int type = rv[(int)offset];
+                            if (type == 0) {                       // ECHOREPLY
+                                long rtt = (monotonic_us() - start) / 1000;
+                                result = rtt > 2147483647L ? 2147483647 : (int)rtt;
+                                state = 1;
+                            }
+                            else if (type == 3 || type == 11) {    // 不可达/TTL
+                                result = -2;
+                                state = 1;
+                            }
+                            // 其余类型不是应答:继续等
+                        }
+                    }
+                }
+            }
+        }
+        cclose(fd);
+        cfree(ping_pfd); ping_pfd = 0;
+        cfree(ping_reply); ping_reply = 0;
+        cfree(ping_from); ping_from = 0;
+        cfree(ping_fromlen); ping_fromlen = 0;
+        cfree(ping_packet); ping_packet = 0;
+        cfree(ping_dst); ping_dst = 0;
+        return result;
     }
 }
 

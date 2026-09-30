@@ -39,6 +39,8 @@ class ProcessList {
         return ProcessList.WinList();
         #elif LINUX
         return ProcessList.LinuxList();
+        #elif MACOS
+        return ProcessList.MacList();
         #else
         throw new PlatformNotSupportedException(
             "ProcessList.List is not implemented on this platform");
@@ -84,11 +86,13 @@ class ProcessList {
             return AppPath.Pid();
         }
 
-    /// <summary>`pid` 的工作集（Windows）/ 常驻集（Linux），单位为
+    /// <summary>`pid` 的工作集（Windows）/ 常驻集（Linux/macOS），单位为
     /// 字节；不可读时返回 -1。</summary>
     static long MemoryUsage(int pid) {
         #if WINDOWS
         return ProcessList.WinMemory(pid);
+        #elif MACOS
+        return ProcessList.MacMemory(pid);
         #elif LINUX
         return ProcessList.LinuxMemory(pid);
         #else
@@ -100,12 +104,45 @@ class ProcessList {
     static string ExePath(int pid) {
         #if WINDOWS
         return ProcessList.WinExePath(pid);
+        #elif MACOS
+        return ProcessList.MacExePath(pid);
         #elif LINUX
         return ProcessList.LinuxExePath(pid);
         #else
         return "";
         #endif
     }
+
+    #if MACOS
+    [DllImport("crt", EntryPoint = "proc_pidpath")]
+    static extern int MacPidPath(int pid, nint buf, int size);
+
+    [DllImport("crt", EntryPoint = "proc_pid_rusage")]
+    static extern int MacPidRusage(int pid, int flavor, nint buf);
+
+    /// macOS 实现：proc_pidpath 直接给出进程镜像路径（沙箱内查
+    /// 其他进程可能失败，查自己恒可用）。
+    static string MacExePath(int pid) {
+        nint buf = NativeMemory.Alloc(4096);
+        int n = ProcessList.MacPidPath(pid, buf, 4096);
+        string s = "";
+        if (n > 0 && n < 4096) { s = NativeMemory.GetString(buf, 0, n); }
+        NativeMemory.Free(buf);
+        return s;
+    }
+
+    /// macOS 实现：proc_pid_rusage(RUSAGE_INFO_V0) 的 ri_resident_size
+    /// （rusage_info_v0：uuid 16 字节 + 8 个 u64，常驻集在偏移 72）。
+    static long MacMemory(int pid) {
+        nint ru = NativeMemory.Alloc(96);
+        long r = -1;
+        if (ProcessList.MacPidRusage(pid, 0, ru) == 0) {
+            r = new Span<long>(ru, 10)[9];
+        }
+        NativeMemory.Free(ru);
+        return r;
+    }
+    #endif
 
     #if WINDOWS
     [DllImport("kernel32", EntryPoint = "CreateToolhelp32Snapshot")]
@@ -305,6 +342,67 @@ class ProcessList {
         int nul = ProcessList.IndexOf(cmd, "\0", 0);
         if (nul < 0) { return cmd; }
         return cmd.Substring(0, nul);
+    }
+    #endif
+
+    #if MACOS
+    [DllImport("crt", EntryPoint = "sysctl")]
+    static extern int MacSysctl(nint mib, nint namelen, nint oldp,
+                                nint oldlenp, nint newp, nint newlen);
+
+    /// macOS 实现：sysctl(KERN_PROC_ALL) 一次取全部 kinfo_proc。
+    /// 布局按 arm64 Darwin 实测（sizeof 648）：kp_proc.p_pid@40、
+    /// p_comm@243（char[16]，可能不 NUL 结尾）、kp_eproc.e_ppid@560。
+    /// 线程数不在 kinfo_proc 里，留 0；快照与二次读取之间新起的
+    /// 进程用头部余量 + 一次按所需长度重试吸收。
+    static List<ProcessEntry> MacList() {
+        List<ProcessEntry> list = new List<ProcessEntry>();
+        nint mib = NativeMemory.Alloc(12);
+        new Span<int>(mib, 3)[0] = 1;      // CTL_KERN
+        new Span<int>(mib, 3)[1] = 14;     // KERN_PROC
+        new Span<int>(mib, 3)[2] = 0;      // KERN_PROC_ALL
+        nint lenp = NativeMemory.Alloc(8);
+        new Span<long>(lenp, 1)[0] = 0;
+        if (ProcessList.MacSysctl(mib, 3, 0, lenp, 0, 0) != 0) {
+            NativeMemory.Free(mib);
+            NativeMemory.Free(lenp);
+            return list;
+        }
+        long size = new Span<long>(lenp, 1)[0] + 648;  // 快照余量
+        nint buf = 0;
+        int rc = -1;
+        for (int attempt = 0; attempt < 2 && rc != 0; attempt = attempt + 1) {
+            if (buf != 0) { NativeMemory.Free(buf); }
+            buf = NativeMemory.Alloc(size);
+            new Span<long>(lenp, 1)[0] = size;
+            rc = ProcessList.MacSysctl(mib, 3, buf, lenp, 0, 0);
+            if (rc != 0) { size = new Span<long>(lenp, 1)[0] + 648; }
+        }
+        long got = new Span<long>(lenp, 1)[0];   // 先取有效长度，再释放 lenp
+        NativeMemory.Free(mib);
+        NativeMemory.Free(lenp);
+        if (rc == 0) {
+            long n = got / 648;
+            for (int i = 0; i < n; i = i + 1) {
+                nint rec = buf + 648 * i;
+                int pid = new Span<int>(rec + 40, 1)[0];
+                if (pid <= 0) { continue; }
+                ProcessEntry e = new ProcessEntry();
+                e.pid = pid;
+                // p_comm：至多 16 字节，在首个 NUL 处截断
+                int clen = 0;
+                while (clen < 16 && new Span<byte>(rec + 243 + clen, 1)[0] != 0) {
+                    clen = clen + 1;
+                }
+                e.name = NativeMemory.GetString(rec + 243, 0, clen);
+                e.parentPid = new Span<int>(rec + 560, 1)[0];
+                e.exePath = "";
+                e.memoryBytes = -1;
+                list.Add(e);
+            }
+        }
+        if (buf != 0) { NativeMemory.Free(buf); }
+        return list;
     }
     #endif
 

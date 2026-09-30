@@ -1393,3 +1393,56 @@ dictionary_wide_values ref UAF；firebird_wire ref 自家 SRP 握手确定性
 win_tray_screen_smoke 验证）。**验证**：39/39 电池双运行时配置；
 native_rt_core pass；bootstrap 定点 run.z2BtL3。全量 sweep 的每个非
 pass 桶至此都是 oracle 侧或已记录摆针。
+
+## v18o-13 — file_lock 根因收口（变参 open）+ Gui 簇激活 + stdlib/解析器收尾（2026-09-30）
+
+**批次**：(1) **file_lock om 根因破案并根治**。排除法走完（懒绑定：strict/
+flat_namespace/chained-fixups/-bind_at_load 重链全仍炸；绑定目标：间接
+符号表逐项一致；自家代码生成：反汇编证实调用点 x2=420 已就位；umask；
+libgmalloc 无堆损坏）后锁定真凶：**ngen 的 DllImport 调用三参 open——
+open 在 C 里本就是变参函数（mode 由 va_arg 读出），这是已记录的"变参调用
+降级"缺口的第二受害者**（snprintf 是第一受害者）。ngen 调用点的 x2 落在
+寄存器残留值上，O_CREAT 文件按残留值建模式：实证 040/100/140/740/200，
+每二进制确定、随链接布局漂移（exe 路径长度 ~24 字符悬崖、链接旗标、
+DYLD interposer 都会挪动它；clang 对象按正确约定传参免疫；二参 DllImport
+免疫）。第一版修复（stat 建好的文件、缺属主写位就 fchmod 0644 的启发式
+守卫）**不够**：用内嵌踪迹版 runtime 在 harness 自己的 case 目录里按其
+原样命令重链复现——踪迹显示首次 open 建出 0o100200（残留 x2 恰为 0o200：
+有属主写、无属主读，守卫签名放行），二次 open 因 O_RDWR 需要属主读位而
+EACCES(13) → relocked=0/released2=0。**根治**：zanstubs.c 增加
+`int zan_open_creat(const char*,int){return open(path,flags,0644);}`——
+从 ngen 视角是二参非变参调用（二参调用实证无恙），mode 由 C 车道按正确
+约定传 0644；runtime_core.zan 的 file_try_lock 整体撤掉三参 copen 与
+启发式守卫，规则入头注：**ngen 代码一律不得 DllImport 变参 libc 函数**。
+验证：此前必炸的 harness 布局（zcr5ddr3 case 目录原样重链）连跑两次
+golden-exact；六个链接路径长度 17..112 全 golden；native_rt_core pass；
+39/39 电池（Zan 配置）+ 39/39 电池（C 基线 zanstubs_full+zanhost_full）。
+变参降级本身的机制（WHY ngen 会错降）仍列为 ngen 侧待办，绕行面收紧到
+"彻底避开"。(2) **Gui 簇激活**（此前 rcf 17 的主力）：自树 Gui-Hmi 经
+dylib 链接配置激活 13 例——12 例 golden-exact，chart_grid_rect 5/6
+（字体度量环境差：.AppleSystemUIFont 200@12 两侧 18 vs 23，跨机器漂移，
+已记录为环境敏感）；oracle 反而无法严格链接（缺
+zan_gui_draw_text_bold）。(3) **编译器/stdlib 收尾**：coll_postfix_init
+golden（解析器花括号续接 + 门面 Add 收养括号参元素）；server_mvc_timezone
+golden（ZanWeb 内容装进 exe 同胞 package store）；System 树与 ref 的
+增量现为 Enumerable.zan + NativeMemory.zan 之外再加 AppPath.zan、
+Diagnostics/ProcessControl.zan（沙箱 getpriority(1,self) 返回 ESRCH——
+C 对照程序同样复现，故 POSIX who=0 查自身）、Diagnostics/ProcessList.zan
+（oracle 抛 PlatformNotSupportedException，native 出真进程表）、
+Net/Sockets/Socket.zan。(4) 归因落档：ws_client_auth 本批 native
+stdout 与 golden 逐字节一致（10 行含 failures=0），ref 自己在第 8 行
+SIGABRT（exit -6）——oracle 侧墙钟摆针；process_list_smoke em 归因
+oracle 陈旧（native 更优）。
+**验证**：file_lock 六长度 + harness 原样布局×2；39/39 电池双配置；
+native_rt_core。**全量 sweep（修复后 trio）：574/624——新高**（v18o-12
+为 571），native_compile_failed 0；file_lock 本轮 pass，ws_client_auth
+本轮 pass（ref 自己活了下来，与摆针归因一致）。om 1 =
+fileinfoex_mmap（已记录摆针）；em 7 = ref 崩溃四例（closure_mutable_
+capture/struct_arc_lifetime SIGSEGV、dictionary_wide_values UAF、
+firebird_wire SRP 崩溃，native==golden 直证）+ 计时摆针两例
+（http_client_keepalive/mqtt_lwt_retain 定向重跑即过）+
+process_list_smoke（oracle 陈旧，native 更优）；rto 7 = oracle 墙钟；
+rcf 17 = oracle 编不过（其中 coll_postfix_init/server_mvc_timezone 是
+oracle 未及的新特性用例，native 输出经 --expected 直证 golden-exact）；
+mne 18 = 两侧同非零 stdout 逐字节一致。剩余非 pass 全部 oracle 侧或
+已归因。

@@ -1,13 +1,17 @@
-// Zan 运行时第一批+第二批(crt-transition/runtime_core.zan)的端到端回归:
+// Zan 运行时第一批~第三批(crt-transition/runtime_core.zan)的端到端回归:
 // zan_monotonic_ns/us 的单调性与量纲一致,zan_sha256/zan_sha512 的
 // FIPS 180-4 已知答案,含尾块两条路径(56 字节触发 SHA-256 的
 // tail+1>56 双块路径,120 字节触发 SHA-512 的 tail+1>112 路径);
 // zan_crc32 的 IEEE 已知答案("123456789" → 0xCBF43926),以及
 // zan_alloc/zan_free 往返(经 stdlib NativeMemory 的 EntryPoint
 // 改名路径,证明改名机制端到端生效)。
+// 第三批:文件族写读往返/定位/EOF/长度/属性/mtime 设置/read_path/
+// BSD flock 文件锁(代际语义)/embed 诚实空集/mmap 诚实桩/remove。
+// read_path/embed_list 的返回按字节校验——C 串直返的 string ABI 在
+// 托管侧是休眠路径,不能当托管串读长度头。
 //
-// 链接面:fixture.o + runtime_core.o + zanstubs_rest.o + libSystem
-// (+ zanhost.o,stdlib 拉入的 embed 声明需要)。
+// 链接面:fixture.o + runtime_core.o + zanstubs_rest.o + zanhost_rest.o
+// + libSystem(C 基线用 zanstubs_full.o + zanhost_full.o)。
 
 using System;
 
@@ -28,6 +32,52 @@ class zanrt {
     public static extern nint memcpy(nint dst, string src, long n);
     [DllImport("crt", EntryPoint = "zan_crc32")]
     public static extern int Crc32Direct(nint data, int len);
+    [DllImport("crt", EntryPoint = "zan_pkg_fopen")]
+    public static extern nint PkgFOpen(string path, string mode);
+    [DllImport("crt", EntryPoint = "zan_file_fopen")]
+    public static extern nint FileFOpen(string path, string mode);
+    [DllImport("crt", EntryPoint = "zan_file_open")]
+    public static extern long FileOpen(string path, string mode);
+    [DllImport("crt", EntryPoint = "zan_file_read")]
+    public static extern long FileRead(long h, nint buf, long count);
+    [DllImport("crt", EntryPoint = "zan_file_write")]
+    public static extern long FileWrite(long h, nint buf, long count);
+    [DllImport("crt", EntryPoint = "zan_file_seek")]
+    public static extern long FileSeek(long h, long off, int origin);
+    [DllImport("crt", EntryPoint = "zan_file_tell")]
+    public static extern long FileTell(long h);
+    [DllImport("crt", EntryPoint = "zan_file_eof")]
+    public static extern long FileEof(long h);
+    [DllImport("crt", EntryPoint = "zan_file_close")]
+    public static extern long FileClose(long h);
+    [DllImport("crt", EntryPoint = "zan_file_length")]
+    public static extern long FileLength(string path);
+    [DllImport("crt", EntryPoint = "zan_file_attributes")]
+    public static extern long FileAttributes(string path);
+    [DllImport("crt", EntryPoint = "zan_file_time")]
+    public static extern long FileTime(string path, int which);
+    [DllImport("crt", EntryPoint = "zan_file_set_time")]
+    public static extern long FileSetTime(string path, int which, long unixSec);
+    [DllImport("crt", EntryPoint = "zan_file_read_path")]
+    public static extern nint ReadPath(string path);
+    [DllImport("crt", EntryPoint = "zan_file_try_lock")]
+    public static extern long TryLock(string path);
+    [DllImport("crt", EntryPoint = "zan_file_unlock")]
+    public static extern long Unlock(long h);
+    [DllImport("crt", EntryPoint = "zan_embed_has")]
+    public static extern int EmbedHas(string name);
+    [DllImport("crt", EntryPoint = "zan_embed_list")]
+    public static extern nint EmbedList(string prefix);
+    [DllImport("crt", EntryPoint = "zan_mmap_create")]
+    public static extern long MmapCreate(string name, long size);
+    [DllImport("crt", EntryPoint = "zan_file_remove")]
+    public static extern int FileRemove(string path);
+    [DllImport("crt", EntryPoint = "zan_plat_net_interfaces")]
+    public static extern nint NetInterfaces();
+    [DllImport("crt", EntryPoint = "zan_plat_icmp_ping")]
+    public static extern int Ping(string address, int timeoutMs);
+    [DllImport("crt", EntryPoint = "strlen")]
+    public static extern long StrLen(nint s);
 
     static string HexDigit(int n) {
         string digits = "0123456789abcdef";
@@ -105,5 +155,104 @@ class zanrt {
         Console.WriteLine(new Span<byte>(abuf, 16)[0]);
         Console.WriteLine(new Span<byte>(abuf, 16)[1]);
         NativeMemory.Free(abuf);
+        // ---- 第三批:文件族 ----
+        // 写读往返 + 定位/EOF/长度/属性/mtime/read_path/BSD flock 文件锁。
+        string tf = "zan_rt_core_b3.tmp";
+        long fh = FileOpen(tf, "w");
+        Console.WriteLine(FileWrite(fh, "zan-rt-file", 11) == 11);
+        Console.WriteLine(FileClose(fh) == 0);
+        long fr = FileOpen(tf, "r");
+        nint rbuf = malloc(16);
+        Console.WriteLine(FileRead(fr, rbuf, 16) == 11);
+        string expect = "zan-rt-file";
+        Span<byte> rv = new Span<byte>(rbuf, 11);
+        bool same = true;
+        int ci = 0;
+        while (ci < 11) {
+            int cb = expect[ci];
+            if (rv[ci] != (byte)cb) { same = false; }
+            ci = ci + 1;
+        }
+        Console.WriteLine(same);
+        Console.WriteLine(FileEof(fr));
+        Console.WriteLine(FileSeek(fr, 0, 2));
+        Console.WriteLine(FileTell(fr));
+        Console.WriteLine(FileSeek(fr, 0, 0));
+        Console.WriteLine(FileEof(fr));
+        FileClose(fr);
+        free(rbuf);
+        Console.WriteLine(FileLength(tf));
+        Console.WriteLine(FileAttributes(tf));
+        Console.WriteLine(FileTime(tf, 0) > 0);
+        // set_time 的 syscall 在部分受限环境拒绝(相对路径 utimensat)，
+        // 钉"返回值与回读一致"而非具体值:成功则 mtime 必为所设值，
+        // 失败则 mtime 必保持当前时间——任何环境下的正确实现都为 true。
+        // (不用 bool 三元:WriteLine 对三元结果按 int 传递,打印 0/1。)
+        long st = FileSetTime(tf, 0, 1000000000);
+        Console.WriteLine((st == 1 && FileTime(tf, 0) == 1000000000)
+            || (st == 0 && FileTime(tf, 0) != 1000000000));
+        // read_path:工作目录里存在 → "";缺失的相对路径($ZAN_PKG_DIR
+        // 与可执行文件旁都没有)→ ""。
+        nint rp1 = ReadPath(tf);
+        Console.WriteLine(new Span<byte>(rp1, 1)[0] == 0);
+        nint rp2 = ReadPath("zan_rt_core_missing.tmp");
+        Console.WriteLine(new Span<byte>(rp2, 1)[0] == 0);
+        nint pf1 = PkgFOpen(tf, "rb");
+        nint pf2 = FileFOpen(tf, "rb");
+        Console.WriteLine(pf1 != 0 && pf2 != 0);
+        // 文件锁:句柄编码 (gen<<32)|slot;持锁期间二次加锁失败;同一
+        // 句柄值的第二次 unlock 失败(代际);0 句柄失败。
+        long lk = TryLock(tf);
+        Console.WriteLine(lk != 0);
+        Console.WriteLine(TryLock(tf) == 0);
+        Console.WriteLine(Unlock(lk) == 1);
+        Console.WriteLine(Unlock(lk) == 0);
+        // embed 族诚实空集;mmap 诚实桩;remove 后属性 -1。
+        Console.WriteLine(EmbedHas("no-such-embed") == 0);
+        nint el = EmbedList("");
+        Console.WriteLine(new Span<byte>(el, 1)[0] == 0);
+        Console.WriteLine(MmapCreate("no-such-mm", 16) == 0);
+        Console.WriteLine(FileRemove(tf) == 0);
+        Console.WriteLine(FileAttributes(tf) == -1);
+        // ---- 第四批:network 半边 ----
+        // net_interfaces 结构不变量:非空、每行恰 4 个 '\t' 且以 '\n'
+        // 结尾、含 lo0(macOS 回环接口恒在)。
+        nint nit = NetInterfaces();
+        Console.WriteLine(StrLen(nit) > 0);
+        Span<byte> nv = new Span<byte>(nit, 65536);
+        bool niOk = true;
+        bool hasLo0 = false;
+        long ni = 0;
+        long lineTabs = 0;
+        long niDone = 0;
+        while (niDone == 0 && ni < 65536) {
+            int c = nv[(int)ni];
+            if (c == 0) {
+                niDone = 1;
+            }
+            else if (c == 10) {
+                if (lineTabs != 4) { niOk = false; }
+                lineTabs = 0;
+                ni = ni + 1;
+            }
+            else {
+                if (c == 9) { lineTabs = lineTabs + 1; }
+                if (c == 108 && ni + 3 < 65536 && nv[(int)ni + 1] == 111
+                        && nv[(int)ni + 2] == 48 && nv[(int)ni + 3] == 9) {
+                    hasLo0 = true;
+                }
+                ni = ni + 1;
+            }
+        }
+        if (niDone == 0 || lineTabs != 0) { niOk = false; }
+        Console.WriteLine(niOk);
+        Console.WriteLine(hasLo0);
+        // ping:确定性 -4 路径(空地址/非法字面量,不碰套接字)+
+        // loopback 结果一致性(权限受限环境可能 -3,网络异常 -1/-2,
+        // 成功为 0..timeout——任何环境下正确实现都满足)。
+        Console.WriteLine(Ping("", 10) == -4);
+        Console.WriteLine(Ping("999.1.2.3", 10) == -4);
+        long pr = Ping("127.0.0.1", 2000);
+        Console.WriteLine((pr >= 0 && pr <= 2000) || pr == -1 || pr == -2 || pr == -3);
     }
 }

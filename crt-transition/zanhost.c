@@ -19,6 +19,12 @@
 #include <mach-o/dyld.h>
 #endif
 
+/* Batch 3 (package/embed, fopen/remove/rename, read_path, FileStream,
+ * FileInfo, TryLock/Unlock, mmap) moved to runtime_core.zan and is
+ * compiled out here under -DZAN_RT_CORE_ZAN. The zan_plat_* network half
+ * at the bottom stays C in both configurations. */
+#ifndef ZAN_RT_CORE_ZAN
+
 static FILE *h2f(long h) { return (FILE *)(size_t)h; }
 
 /* ---- package + embed: zanc embeds nothing, local files always win ----
@@ -217,8 +223,12 @@ long zan_mmap_unmap(long p, long s) { (void)p; (void)s; return 0; }
 long zan_mmap_flush(long p, long s) { (void)p; (void)s; return 0; }
 long zan_mmap_close(long h) { (void)h; return 0; }
 long zan_mmap_unlink(const char *n) { (void)n; return 0; }
+#endif /* ZAN_RT_CORE_ZAN */
 
-/* ---- Network.zan: adapter snapshot + ICMP echo, ports of rt_sync.c ---- */
+/* ---- Network.zan: adapter snapshot + ICMP echo, ports of rt_sync.c.
+ * Batch 4: moved to runtime_core.zan; under -DZAN_RT_CORE_ZAN this whole
+ * file compiles out (the C side remains for the A/B baseline build). ---- */
+#ifndef ZAN_RT_CORE_ZAN
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -416,3 +426,4 @@ int zan_plat_icmp_ping(const char *address, int timeout_ms) {
         /* anything else is not an answer: keep waiting */
     }
 }
+#endif /* ZAN_RT_CORE_ZAN */
