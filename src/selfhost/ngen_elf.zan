@@ -203,34 +203,53 @@ partial class Ngen {
         while (i < strRefs.Count) {
             StrRef r = strRefs[i];
             int sn = ElfRefSym(r.sym, refIdx, extBase);
-            if (r.got != 0) {
-                ElfAddRelo(rOff, rSym, rTy, rAdd, r.adrpPos, sn, 311, 0); // ADR_GOT_PAGE
-                ElfAddRelo(rOff, rSym, rTy, rAdd, r.addPos, sn, 312, 0);  // LD64_GOT_LO12_NC
-            } else {
-                ElfAddRelo(rOff, rSym, rTy, rAdd, r.adrpPos, sn, 275, 0); // ADR_PREL_PG_HI21
-                ElfAddRelo(rOff, rSym, rTy, rAdd, r.addPos, sn, ElfLo12Reloc(r.addPos), 0);
-            }
+            // got==1 references load through the homemade __nl_symbol_ptr
+            // slot (a plain .data quad); ElfLo12Reloc picks the LDR form
+            // off the opcode, so both shapes share this path
+            ElfAddRelo(rOff, rSym, rTy, rAdd, r.adrpPos, sn, 275, 0); // ADR_PREL_PG_HI21
+            ElfAddRelo(rOff, rSym, rTy, rAdd, r.addPos, sn, ElfLo12Reloc(r.addPos), 0);
             i = i + 1;
         }
         SortReloc4(rOff, rSym, rTy, rAdd);
         int nrel = rOff.Count;
 
+        // homemade __nl_symbol_ptr slots live at the tail of .data; each
+        // quad gets an R_AARCH64_ABS64 in .rela.data so the static link
+        // writes the bound symbol address into it. With no slots the
+        // section collapses and the image is byte-identical to before.
+        int ndrel = nlExts.Count;
+        List<int> rdOff = new List<int>();
+        List<int> rdSym = new List<int>();
+        List<int> rdTy = new List<int>();
+        List<int> rdAdd = new List<int>();
+        i = 0;
+        while (i < dglbs.Count) {
+            if (IsNlSlot(dglbs[i].name) != 0) {
+                ElfAddRelo(rdOff, rdSym, rdTy, rdAdd, dataLen + dglbs[i].off,
+                           ElfRefSym(nlExts[rdOff.Count], refIdx, extBase), 257, 0); // ABS64
+            }
+            i = i + 1;
+        }
+
         // ---- file layout ----
         int textOff = 64;
         int roOff = textOff + textLen;
         int dataOff = AlignTo8(roOff + cstrLen);
-        int relOff = AlignTo8(dataOff + dataLen);
+        int relOff = AlignTo8(dataOff + dataLen + nlLen);
         int relSize = nrel * 24;
-        int symOff = AlignTo8(relOff + relSize);
+        int relDataOff = AlignTo8(relOff + relSize);
+        int relDataSize = rdOff.Count * 24;
+        int symOff = AlignTo8(relDataOff + relDataSize);
         int symSize = nsyms * 24;
         int strTabOff = symOff + symSize;
         int strTabSize = ElfStrTabSize(exts);
         int shstrOff = strTabOff + strTabSize;
         // .shstrtab: "" ".text" ".rodata" ".data" ".rela.text" ".symtab"
-        //            ".strtab" ".shstrtab"
-        int shstrSize = 1 + 6 + 8 + 6 + 11 + 8 + 8 + 10;
+        //            ".strtab" ".shstrtab" [".rela.data"]
+        int shstrSize = 1 + 6 + 8 + 6 + 11 + 8 + 8 + 10 + ((ndrel != 0) ? 11 : 0);
         int shOff = AlignTo8(shstrOff + shstrSize);
-        int fileEnd = shOff + 8 * 64;
+        int shnum = (ndrel != 0) ? 9 : 8;
+        int fileEnd = shOff + shnum * 64;
 
         List<int> img = new List<int>();
         // ---- ELF header ----
@@ -252,7 +271,7 @@ partial class Ngen {
         Put16(img, 0);                   // e_phentsize
         Put16(img, 0);                   // e_phnum
         Put16(img, 64);                  // e_shentsize
-        Put16(img, 8);                   // e_shnum
+        Put16(img, shnum);               // e_shnum
         Put16(img, 7);                   // e_shstrndx
         // ---- payload: .text ----
         Append(img, txt, 0, textLen);
@@ -266,6 +285,8 @@ partial class Ngen {
         while (img.Count < dataOff) { Put8(img, 0); } // pad to .data
         i = 0;
         while (i < dataLen) { Put8(img, 0); i = i + 1; }
+        i = 0;
+        while (i < nlLen) { Put8(img, 0); i = i + 1; } // __nl_symbol_ptr slots
         while (img.Count < relOff) { Put8(img, 0); }
         // .rela.text
         i = 0;
@@ -274,6 +295,16 @@ partial class Ngen {
             Put32(img, rTy[i]);          // r_info low word = type
             Put32(img, rSym[i]);         // r_info high word = symbol index
             Put64(img, rAdd[i]);         // signed addend
+            i = i + 1;
+        }
+        while (img.Count < relDataOff) { Put8(img, 0); }
+        // .rela.data: one ABS64 per __nl_symbol_ptr slot
+        i = 0;
+        while (i < rdOff.Count) {
+            Put64(img, rdOff[i]);
+            Put32(img, rdTy[i]);
+            Put32(img, rdSym[i]);
+            Put64(img, rdAdd[i]);
             i = i + 1;
         }
         while (img.Count < symOff) { Put8(img, 0); }
@@ -317,14 +348,15 @@ partial class Ngen {
             Put64(img, 0);
             i = i + 1;
         }
-        // data global symbols (LOCAL OBJECT in .data)
+        // data global symbols (LOCAL OBJECT in .data; slot globals sit in
+        // the trailing __nl_symbol_ptr part of .data)
         i = 0;
         while (i < dglbs.Count) {
             Put32(img, dglbBase + dgoffs[i]);
             Put8(img, 0x01);             // bind LOCAL (0) << 4 | type OBJECT (1)
             Put8(img, 0);
             Put16(img, 3);               // st_shndx = .data
-            Put64(img, dglbs[i].off);
+            Put64(img, (IsNlSlot(dglbs[i].name) != 0) ? dataLen + dglbs[i].off : dglbs[i].off);
             Put64(img, 0);
             i = i + 1;
         }
@@ -376,17 +408,23 @@ partial class Ngen {
         PutName(img, ".symtab", 8);
         PutName(img, ".strtab", 8);
         PutName(img, ".shstrtab", 10);
+        if (ndrel != 0) { PutName(img, ".rela.data", 11); }
         while (img.Count < shOff) { Put8(img, 0); } // pad before section headers
         // ---- section headers ----
         // 0: SHN_UNDEF null section
         ElfSHeader(img, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         ElfSHeader(img, 1, 1, 6, 0, textOff, textLen, 0, 0, 8);          // .text PROGBITS AX
         ElfSHeader(img, 7, 1, 2, 0, roOff, cstrLen, 0, 0, 1);            // .rodata PROGBITS A
-        ElfSHeader(img, 15, 1, 3, 0, dataOff, dataLen, 0, 0, 8);         // .data PROGBITS WA
+        ElfSHeader(img, 15, 1, 3, 0, dataOff, dataLen + nlLen, 0, 0, 8); // .data PROGBITS WA
         ElfSHeader(img, 21, 4, 0, 5, relOff, relSize, 1, 8, 24);          // .rela.text: link .symtab, info .text
         ElfSHeader(img, 32, 2, 0, 6, symOff, symSize, firstGlobal, 8, 24); // .symtab
         ElfSHeader(img, 40, 3, 0, 0, strTabOff, strTabSize, 0, 0, 0);    // .strtab
         ElfSHeader(img, 48, 3, 0, 0, shstrOff, shstrSize, 0, 0, 0);      // .shstrtab
+        if (ndrel != 0) {
+            // index 8, so the fixed indexes above never shift; link .symtab,
+            // info .data
+            ElfSHeader(img, 58, 4, 0, 5, relDataOff, relDataSize, 3, 3, 24);
+        }
         return img;
     }
 

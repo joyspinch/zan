@@ -122,7 +122,8 @@ class StrRef {
     public int adrpPos;  // text offset of the adrp instruction
     public int addPos;   // text offset of the add/ldr instruction
     public string sym;   // target symbol name (l_.str.N / l_.g.NAME / __stdinp)
-    public int got;      // 1: adrp + ldr through the GOT (dylib data symbols)
+    public int got;      // 1: adrp + ldr through the homemade __nl_symbol_ptr
+                         //    slot (dylib data symbols)
     public StrRef(int a, int b, string s) { adrpPos = a; addPos = b; sym = s; got = 0; }
 }
 
@@ -11880,15 +11881,28 @@ partial class Ngen {
         E4(0x91000000 | (reg << 5) | reg);               // add reg, reg, sym@PAGEOFF
         strRefs.Add(new StrRef(a, txt.Count - 4, sym));
     }
-    // adrp + ldr through the GOT. dylib DATA symbols (__stdinp etc.) cannot
-    // bind through adrp+add: their page offsets are filled at runtime by the
-    // dynamic loader, so the address must come from a GOT slot instead.
+    // dylib DATA symbols (__stdinp etc.) cannot bind through adrp+add: their
+    // page offsets are filled at runtime by the dynamic loader, so the address
+    // must be loaded indirectly. Instead of GOT-load relocations (Mach-O
+    // types 5/6, which trip an assert in older ld-prime), the reference goes
+    // through a homemade __nl_symbol_ptr slot: an 8-byte data word carrying
+    // an UNSIGNED reloc against the symbol that the linker binds at link
+    // time, loaded here with a plain adrp+ldr pair (PAGE21/PAGEOFF12).
+    // ElfRefIdx note: ELF/COFF writers treat got=1 as "ldr not add" so the
+    // lo12 halves pick the right opcode shape; the slot itself is a plain
+    // .data quad there (ABS64 / ADDR64 reloc).
     void LoadSymRefGOT(string sym, int reg) {
-        E4(0x90000000 | reg);                            // adrp reg, sym@GOTPAGE
+        if (IndexOf(nlExts, sym) < 0) {
+            nlExts.Add(sym);
+            dglbs.Add(new DGlob("nl." + sym, 8, nlLen));
+            nlLen = nlLen + 8;
+        }
+        string slot = DGlobalSym("nl." + sym);
+        E4(0x90000000 | reg);                            // adrp reg, slot@PAGE
         int a = txt.Count - 4;
-        E4(0xF9400000 | (reg << 5) | reg);               // ldr reg, [reg, sym@GOTPAGEOFF]
-        StrRef r = new StrRef(a, txt.Count - 4, sym);
-        r.got = 1;
+        E4(0xF9400000 | (reg << 5) | reg);               // ldr reg, [reg, slot@PAGEOFF]
+        StrRef r = new StrRef(a, txt.Count - 4, slot);
+        r.got = 1;                                       // ldr, not add
         strRefs.Add(r);
     }
     void LoadStr(int si, int reg) {

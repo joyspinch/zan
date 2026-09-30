@@ -203,7 +203,8 @@ def main():
                 expect = reloc_shape(rtype)
                 if expect is not None and (word & expect[0]) != expect[1]:
                     errs.append(f"{sec['name']} reloc {j} @{va:#x}: type {REL_NAMES[rtype]} but instruction {word:#010x} does not match opcode shape {expect[1]:#010x} (mask {expect[0]:#010x})")
-                if symidx < len(syms) and syms[symidx].sect == 0 and rtype not in (3, 4, 6, 7):
+                # ADDR64: pointer-sized data slot (homemade __nl_symbol_ptr quads)
+                if symidx < len(syms) and syms[symidx].sect == 0 and rtype not in (3, 4, 6, 7, 0xE):
                     errs.append(f"{sec['name']} reloc {j}: extern symbol with unexpected type {REL_NAMES[rtype]}")
 
     hist = " ".join(f"{REL_NAMES.get(t, hex(t))}={c}" for t, c in sorted(rel_hist.items()))

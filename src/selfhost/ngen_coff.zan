@@ -79,6 +79,13 @@ partial class Ngen {
             if (DefinedSymIdx(defIx, r.sym) == 0 && esIx.Get(r.sym) == null) { es.Add(r.sym); esIx.Add(r.sym, es.Count - 1); }
             i = i + 1;
         }
+        // the underlying externs behind the homemade __nl_symbol_ptr slots
+        // are undefined even though the slot globals themselves are defined
+        i = 0;
+        while (i < nlExts.Count) {
+            if (esIx.Get(nlExts[i]) == null) { es.Add(nlExts[i]); esIx.Add(nlExts[i], es.Count - 1); }
+            i = i + 1;
+        }
         return es;
     }
 
@@ -166,13 +173,28 @@ partial class Ngen {
         int nrel = rAddr.Count;
         if (nrel > 65535) { diags.Error("ngen_coff: more than 65535 relocations in .text$mn", 0, 0); }
 
+        // homemade __nl_symbol_ptr slots ride at the tail of .data; each
+        // quad carries an ADDR64 against the underlying extern
+        List<int> dAddr = new List<int>();
+        List<int> dSym = new List<int>();
+        List<int> dTyp = new List<int>();
+        i = 0;
+        while (i < dglbs.Count) {
+            if (IsNlSlot(dglbs[i].name) != 0) {
+                InsertCoffReloc(dAddr, dSym, dTyp, dataLen + dglbs[i].off,
+                                RefSymNum(nlExts[dAddr.Count], refIdx, symBase + extBase), 14); // ADDR64
+            }
+            i = i + 1;
+        }
+        int ndrel = dAddr.Count;
+
         // file layout: header (20) + section table (120) = 140, then payload
         int textOff = 140;
         int rdataOff = Align8(textOff + textLen);
         int dataOff = Align8(rdataOff + cstrLen);
-        int relocOff = Align8(dataOff + dataLen);
+        int relocOff = Align8(dataOff + dataLen + nlLen);
         int nsyms = symBase + extBase + exts.Count;
-        int symOff = relocOff + nrel * 10;
+        int symOff = relocOff + nrel * 10 + ndrel * 10;
 
         coffStro = 4;
         coffStrTab = new List<int>();
@@ -192,7 +214,7 @@ partial class Ngen {
         // .rdata: CNT_INITIALIZED_DATA | MEM_READ | ALIGN_8BYTES
         CoffSection(img, ".rdata", cstrLen, rdataOff, 0, 0, 0x40400040);
         // .data: CNT_INITIALIZED_DATA | MEM_READ | MEM_WRITE | ALIGN_8BYTES
-        CoffSection(img, ".data", dataLen, dataOff, 0, 0, 0xC0000040);
+        CoffSection(img, ".data", dataLen + nlLen, dataOff, relocOff + nrel * 10, ndrel, 0xC0000040);
         // ---- payload ----
         Append(img, txt, 0, textLen);
         i = 0;
@@ -208,10 +230,20 @@ partial class Ngen {
         i = 0;
         while (i < dataLen) { Put8(img, 0); i = i + 1; }
         i = 0;
+        while (i < nlLen) { Put8(img, 0); i = i + 1; } // __nl_symbol_ptr slots
+        i = 0;
         while (i < nrel) {
             Put32(img, rAddr[i]);        // VirtualAddress (within section)
             Put32(img, rSym[i]);         // SymbolTableIndex
             Put16(img, rTyp[i]);         // Type
+            i = i + 1;
+        }
+        // .data relocations: one ADDR64 per slot
+        i = 0;
+        while (i < ndrel) {
+            Put32(img, dAddr[i]);
+            Put32(img, dSym[i]);
+            Put16(img, dTyp[i]);
             i = i + 1;
         }
         // ---- symbol table ----
@@ -221,7 +253,7 @@ partial class Ngen {
         PutCoffSym(img, ".rdata", 0, 2, 0, 3, 1);
         PutCoffSecAux(img, cstrLen, 0, 2);
         PutCoffSym(img, ".data", 0, 3, 0, 3, 1);
-        PutCoffSecAux(img, dataLen, 0, 3);
+        PutCoffSecAux(img, dataLen + nlLen, ndrel, 3);
         // defined code symbols (EXTERNAL, function type)
         i = 0;
         while (i < syms.Count) {
@@ -235,10 +267,12 @@ partial class Ngen {
             PutCoffSym(img, StrSym(i), coffSoffs[i], 2, 0, 3, 0);
             i = i + 1;
         }
-        // data globals (STATIC, .data)
+        // data globals (STATIC, .data; slot globals sit in the trailing
+        // __nl_symbol_ptr part of .data)
         i = 0;
         while (i < dglbs.Count) {
-            PutCoffSym(img, DGlobalSym(dglbs[i].name), dglbs[i].off, 3, 0, 3, 0);
+            PutCoffSym(img, DGlobalSym(dglbs[i].name),
+                       (IsNlSlot(dglbs[i].name) != 0) ? dataLen + dglbs[i].off : dglbs[i].off, 3, 0, 3, 0);
             i = i + 1;
         }
         // undefined externs (EXTERNAL, section 0 = IMAGE_SYM_UNDEFINED)

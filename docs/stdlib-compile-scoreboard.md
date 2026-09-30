@@ -1494,3 +1494,28 @@ mne 18 = 两侧同非零 stdout 逐字节一致。剩余非 pass 全部 oracle �
 - known_open 仅剩 3:Mach-O ld-prime GOT assert(下一代码批:自制
   __nl_symbol_ptr 槽位,只许 reloc type 0/2/3/4)、Linux 用户态宿主层、
   x86_64 后端。电池复核 39/39。
+
+### v18o-15b 追补(同日,代码批)—— Mach-O GOT assert 修复落地
+
+- LoadSymRefGOT 不再发 GOT-load 对(type 5/6):每个 dylib-data 外部符号
+  在自制 __DATA,__nl_symbol_ptr 段(S_NON_LAZY_SYMBOL_POINTERS)里占一个
+  8 字节槽,槽内容挂 UNSIGNED extern reloc(type 0/length 3),链接期由
+  连接器绑定;取址点改为普通 adrp+ldr(PAGE21 + PAGEOFF12)。PAGEOFF12
+  一律 r_length=2(clang 对 64 位 ldr 也发 2;len=3 会被 ld 拒绝)。
+- ELF 车道:槽跟在 .data 尾部,R_AARCH64_ABS64 进条件性 .rela.data
+  (index 8,sh_info=.data);COFF 车道:槽在 .data,ADDR64(0xE),
+  coffcheck 外部类型白名单加 0xE。无 GOT 引用对象与旧三段布局逐字节一致。
+- bootstrap 链接器逐个揪出的错并复跑:段 cmdsize 312→392;ncmds 恒 2
+  (nl 段在 segment 内);symOff 漏乘 8;TextFileOff 需随 nl 段 +80;
+  .rela.data 的 sh_info 必须是 .data。定点 run.b4j4YF:
+  stage2.o == stage3.o。
+- 形状证据:kernel11.o 的 GOT_LOAD reloc 数 = 0,__nl_symbol_ptr 0x18
+  (___stderrp/mach_task_self_/___stdinp),链接运行 golden-exact。
+- 验收(新种子 /tmp/v18r/bin/zanc):电池 39/39 双配置、native_rt_core
+  276 行金标、crossboot 39 ELF + 39 PE-COFF、全量 sweep 570/624——每个
+  非 pass 都在已归因族内(时序 flapper 成员洗牌:tdengine_pool 入 rto、
+  mqtt_lwt_retain 入 mne)。
+- known_open 只剩 2:Linux 用户态宿主层、x86_64 后端。
+- 环境异常记录:并发会话把在途第九批(io reactor co 助手)写进工作树,
+  已快照至 /tmp/v18q/batch9_wip 并还原 HEAD,上述门禁均在 batch-8 提交态
+  上运行。
