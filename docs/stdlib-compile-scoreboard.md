@@ -1535,3 +1535,25 @@ mne 18 = 两侧同非零 stdout 逐字节一致。剩余非 pass 全部 oracle �
   (无 zig/musl-cross/aarch64-linux-gnu-gcc);无执行载体(qemu linux-user
   不支持 macOS 宿主、brew qemu 无 qemu-aarch64、无 docker/lima/UTM/
   OrbStack)。任一载体到位即可按清单开工。
+
+## v18o-17 (2026-10-01) — 缺口四落地:double ABI 边界 + 字面量直发 + C-ABI 导出垫片
+
+- 本批由并发会话完成主体、本会话验收落地:浮点字面量编译期求位(发射器内
+  strtod,movz/movk 立即数,替代只在一个对象里转换的惰性 dbl.N 槽);
+  每个方法导出名上发叶级 C-ABI 垫片(AAPCS64 v 寄存器重排),方法体改名
+  `_Cls_meth__body` 且全部内部引用(BLInternal/vtable/委托/方法组/反射/
+  async ramp)自动改指;P/Invoke double 返回走 x0、Span<T> 浮点元素读去
+  scvtf 重复转换;字符串字面量改直发初始化 __data blob(strd.N,rc=-1 不朽
+  哨兵 + SNAZ 头),库对象字面量恒非空——runtime 注释里的缺口 3/4 双双
+  关闭,runtime_core.zan 撤掉全部绕行。
+- 本会话 sweep 门禁抓到唯一回归并修复:nullable_value_types 打印 denormal。
+  根因:GenNulWrap 的"double 走 d0"条款一直靠旧 FloatLit 的 strtod d0 副作用
+  无意喂对;立即数化后每个直接来自 GenExpr 的 wrap 点读到陈旧 d0。契约统一
+  为"x0 位型"(唯一真 d0 调用点自己先 fmov),n1.zan 复现 1.5 恢复。
+- 过程发现(已记入 baseline notes):中间迭代的垫片缺 lr 保存会自举死循环、
+  浮点字面量会编译器崩溃——自举定点(源里无浮点)完全测不出,故浮点探针
+  (4 形态 + 双对象 C-ABI 探针 3.5/0.25)纳入本会话落地门禁。
+- 门禁:定点 ×3(run.E8bVwz 写手树 / run.INfswh 修复树);native_rt_core
+  golden(1107 行 fixture,366 行 golden)双 runtime 字节一致;battery
+  39/39 ×2 配置;crossboot 78/78;sweep 572/624 新高(4 个记载 flapper 转
+  pass;唯一新 om 名 async_landing_late_local 单测通过,满载扰动)。
