@@ -1,6 +1,35 @@
 # stdlib 编译通过率记分牌（架构转向后的源驱动工作清单）
 
-日期：2026-09-29 · v18o · 定点见下方 v18o 节
+日期：2026-09-30 · v18o-10 · 定点见下方 v18o-10 节
+
+## v18o-10 阶段边界批（2026-09-30，sweep 520→564，ncf 43→1，检查点 /tmp/v18n/fix/bin/zanc = run.KqvY7o + 38171e5）
+
+反射/枚举器/位运算三簇 + 环境修复，全量 sweep 624 例 **520(live)→564 pass**（另有 20 例
+matching_nonzero_exit 双侧同码退出，合计 584 例对齐）。1. **反射子系统**（新
+ngen_reflect.zan）：oracle 记录布局逐字节对齐（方法/ctor 56 字节、field 32 字节、targs
+NUL 结尾），typeof 数组/nullable/泛型、CreateInstance/Invoke*/Get/SetField 含 object
+接收者；三个硬老师：MUL 的编码是 MADD-with-XZR（Ra=31——Ra=0 是寄存器 x0，静默加错）、
+每个会 blr 的叶子必须自己存 x30（RtPrologue 只存 x29/x30）、方法表扫描 stride 56 vs
+字段表 32（ReflScanName2S 参数化）。2. **foreach 枚举器协议**：sync/async 两条 lane 都
+走 GetEnumerator/MoveNext/Current（集合只求值一次、枚举器放帧槽；indexable 才走旧
+List 布局）——foreach_protocol 双侧绿。3. **ulong 位运算**（& | ^）补进 ngen 的无符号
+lane——win_compression_smoke 绿。4. **包仓库回退**（main.zan PiGlobInto）：stdlib 树已
+提供的命名空间不再拉 installed-package 副本——双副本把 Sdk.* 每个类型注册两次，生成的
+__JsonBind binder 的悬空引用全部死于 "ambiguous type"（sdk_wechat_mp/product_modules、
+win_compression_smoke 因此 rcf→绿）。**已验证 oracle 同病**：把 Sdk 拷进 scratch ref
+stdlib 复现一字不差的报错。环境收口：重复包移出全局 store（AppUpdate/Commercial/
+Industrial 保留，app_update 需要 Zan.AppUpdate）、store 独有的 Game 源并入 stdlib/Game
+（9 个文件）、reference exe-stdlib 补 Game/Platform/Chart 三个 symlink（Sdk 原本就有）
+——两侧单副本同树。剩余清单（下一批起点）：em 10（dictionary_wide_values = ORACLE
+缺陷：Dictionary.Remove/Clear 后 zan_rt_str_release UAF，reference .ips 证实；其余
+closure_mutable_capture/exception_rethrow/firebird_wire/
+generic_class_async_generic_method/generic_deep_close/mqtt_lwt_retain/
+string_throw_dispatch/struct_arc_lifetime/ws_client_auth）、om 3（cast_string_object、
+http_forwarder_stream、http_server_stress）、ncf 1（sqlserver_tls）、rcf 17 全部
+oracle 侧（gui/cef/chart/designer 簇 reference 运行时缺 zan_gui_* 符号；
+namespace_qualified_call oracle 解析器 bug；process_control_smoke oracle 自己解析不了
+Thread.Sleep；server_mvc_timezone ZanWeb 缺仓）、rto 9（oracle 自身超时，按库内
+golden 对齐）。
 
 ## v18 阶段边界批（2026-09-29，sweep 507→518，ncf 55→43，检查点 /tmp/v18n/fix/bin/zanc = run.KqvY7o）
 
