@@ -37,6 +37,7 @@ class Cls {
                              // them, but containers must not adopt pointer
                              // semantics for struct elements: gen0 stores
                              // structs inline with value semantics)
+    public int isIface;      // 1 when declared via `interface` (reflection kind)
     public bool explicitLayout; // explicit byte offsets supplied by struct layout
     public int poly;         // layout tri-state: 0 unknown, 1 polymorphic
                              // (carries a vtable pointer at obj+0, own fields
@@ -83,6 +84,7 @@ partial class Ngen {
     int fmtUnhandledBareIdx;  // "Unhandled exception"
 
     Cls FindClass(string n) {
+        if (n == null) { return null; }
         // instantiated generic names ("Pool<Conn>") resolve to the open
         // class: erasure keeps one layout and one method table
         int lt = n.IndexOf("<");
@@ -321,6 +323,7 @@ partial class Ngen {
         c.baseName = dcl.sval2;
         c.explicitLayout = dcl.layoutExplicit;
         if (dcl.kind == AK.StructDecl()) { c.isStruct = 1; }
+        if (HasMod(dcl, MOD.Iface())) { c.isIface = 1; }
         if (c.explicitLayout && dcl.kind != AK.StructDecl()) {
             diags.Error("ngen: explicit layout is only supported on structs", dcl.line, dcl.col);
             c.explicitLayout = false;
@@ -1564,12 +1567,16 @@ partial class Ngen {
         string valueClass = ClassTyOf(vt);
         Cls vc = null;
         if (valueClass != null) { vc = FindClass(valueClass); }
+        // struct values ride the 8-byte slot as a fresh heap box per store
+        // (ngen boxes structs; copy-on-store/copy-on-read keeps gen0's value
+        // semantics), so the slot kind stays a reference word
+        bool structValue = vc != null && vc.isStruct == 1;
         bool refValue = vt != null && (vt == "string" || vt == "object"
             || vt == "ptr" || (vt.Length > 2 && vt.Substring(vt.Length - 2, 2) == "[]") || vt.IndexOf("List<") == 0
             || vt.IndexOf("Dictionary<") == 0 || (vc != null && vc.isStruct == 0)
             || IsDelegateTyNg(vt));
         if (vt != "int" && vt != "long" && vt != "ulong" && vt != "nint"
-                && vt != "bool" && vt != "double" && !refValue && !IsTypeParamErasedNg(vt)) {
+                && vt != "bool" && vt != "double" && !refValue && !structValue && !IsTypeParamErasedNg(vt)) {
             diags.Error("ngen: unsupported Dictionary value type '" + vt
                 + "'; expected int, long, ulong, nint, bool, double or a reference (struct values are unsupported)", curLine, curCol);
             return false;
@@ -1649,6 +1656,7 @@ partial class Ngen {
                     GenExpr(kv.kids[0]);             // key -> x0
                     E4(0xF81F0FE0);                  // push key
                     GenExpr(kv.kids[1]);             // value -> x0
+                    GenCloneIfStruct(kv.kids[1]);    // struct values: fresh box
                     MovRR(2, 0);                     // x2 = value
                     E4(0xF84107E1);                  // pop key -> x1
                     E4(0xF84107E0);                  // pop dict -> x0

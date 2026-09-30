@@ -1,0 +1,86 @@
+// Zan 运行时第一批(crt-transition/runtime_core.zan)的端到端回归:
+// zan_monotonic_ns/us 的单调性与量纲一致,zan_sha256/zan_sha512 的
+// FIPS 180-4 已知答案,含尾块两条路径(56 字节触发 SHA-256 的
+// tail+1>56 双块路径,120 字节触发 SHA-512 的 tail+1>112 路径)。
+//
+// stdlib-free:运行时符号契约只依赖 crt ABI(程序对象同样不拉
+// stdlib,链接面是 fixture.o + runtime_core.o + zanstubs_rest.o +
+// libSystem)。
+
+class zanrt {
+    [DllImport("crt", EntryPoint = "zan_monotonic_ns")]
+    public static extern long MonoNs();
+    [DllImport("crt", EntryPoint = "zan_monotonic_us")]
+    public static extern long MonoUs();
+    [DllImport("crt", EntryPoint = "zan_sha256")]
+    public static extern void Sha256(nint data, long len, nint md);
+    [DllImport("crt", EntryPoint = "zan_sha512")]
+    public static extern void Sha512(nint data, long len, nint md);
+    [DllImport("crt", EntryPoint = "malloc")]
+    public static extern nint malloc(long size);
+    [DllImport("crt", EntryPoint = "free")]
+    public static extern void free(nint p);
+    [DllImport("crt", EntryPoint = "memcpy")]
+    public static extern nint memcpy(nint dst, string src, long n);
+
+    static string HexDigit(int n) {
+        string digits = "0123456789abcdef";
+        return digits.Substring(n, 1);
+    }
+
+    static string HexMd(nint md, int n) {
+        Span<byte> d = new Span<byte>(md, n);
+        string hex = "";
+        int i = 0;
+        while (i < n) {
+            int b = d[i];
+            hex = hex + HexDigit(b >>> 4) + HexDigit(b & 15);
+            i = i + 1;
+        }
+        return hex;
+    }
+
+    static string Sha256Hex(string msg, int len) {
+        nint buf = malloc(len > 0 ? len : 1);
+        memcpy(buf, msg, len);
+        nint md = malloc(32);
+        Sha256(buf, len, md);
+        string hex = HexMd(md, 32);
+        free(md);
+        free(buf);
+        return hex;
+    }
+
+    static string Sha512Hex(string msg, int len) {
+        nint buf = malloc(len > 0 ? len : 1);
+        memcpy(buf, msg, len);
+        nint md = malloc(64);
+        Sha512(buf, len, md);
+        string hex = HexMd(md, 64);
+        free(md);
+        free(buf);
+        return hex;
+    }
+
+    public static void Main() {
+        // 单调性 + 量纲:ns 单调递增,量级受界;us 与 ns 同源(同一
+        // CLOCK_MONOTONIC 读数取整),后读的 us 不小于先读的 ns/1000。
+        long a = MonoNs();
+        long b = MonoNs();
+        Console.WriteLine(b >= a);
+        Console.WriteLine(b - a < 60000000000L);
+        long u = MonoUs();
+        Console.WriteLine(u >= b / 1000);
+        // FIPS 180-4 已知答案
+        Console.WriteLine(Sha256Hex("aaa", 3));
+        Console.WriteLine(Sha256Hex("aaa", 0));
+        string long56 = "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a"
+            + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a"
+            + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a"
+            + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a";
+        Console.WriteLine(Sha256Hex(long56, 56));
+        Console.WriteLine(Sha512Hex("aaa", 3));
+        string long120 = long56 + long56 + "a" + "a" + "a" + "a" + "a" + "a" + "a" + "a";
+        Console.WriteLine(Sha512Hex(long120, 120));
+    }
+}

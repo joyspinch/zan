@@ -21,12 +21,15 @@
 
 static FILE *h2f(long h) { return (FILE *)(size_t)h; }
 
-/* ---- package + embed: zanc embeds nothing, local files always win ---- */
+/* ---- package + embed: zanc embeds nothing, local files always win ----
+ * Weak definitions: a gen0-style compiler bakes resources and defines its
+ * own zan_embed_* into the program object (embedres.c), and the program's
+ * strong definitions must win the link without a duplicate-symbol error. */
 FILE *zan_pkg_fopen(const char *path, const char *mode) { return fopen(path, mode); }
-int zan_embed_has(const char *name) { (void)name; return 0; }
-const char *zan_embed_read(const char *name) { (void)name; return NULL; }
-void *zan_embed_bytes(const char *name, int *outLen) { (void)name; if (outLen) *outLen = 0; return NULL; }
-const char *zan_embed_list(const char *prefix) { (void)prefix; return ""; }
+__attribute__((weak)) int zan_embed_has(const char *name) { (void)name; return 0; }
+__attribute__((weak)) const char *zan_embed_read(const char *name) { (void)name; return NULL; }
+__attribute__((weak)) void *zan_embed_bytes(const char *name, int *outLen) { (void)name; if (outLen) *outLen = 0; return NULL; }
+__attribute__((weak)) const char *zan_embed_list(const char *prefix) { (void)prefix; return ""; }
 
 /* ---- File.zan fopen/remove/rename (DllImport EntryPoint remaps) ---- */
 FILE *zan_file_fopen(const char *path, const char *mode) { return fopen(path, mode); }

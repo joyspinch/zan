@@ -8,6 +8,31 @@
     cc -c -o zanhost.o  zanhost.c
     cc -o zanc zanc.o zanstubs.o zanhost.o -lSystem
 
+## Zan 运行时第一批（runtime_core.zan）
+
+`runtime_core.zan` 用 Zan 重新实现了 zanstubs.c 的第一批符号：
+`zan_monotonic_ns` / `zan_monotonic_us` / `zan_sha256` / `zan_sha512`。
+它由原生自举编译器（ngen）编译成对象，再用 `localize_syms.py` 把 API 面
+之外的符号本地化——ngen 会把整套运行时帮助函数以全局符号发射进每个
+对象，不本地化则与程序对象撞符号。产出恰好导出这 4 个符号：
+
+    SEED=/path/to/stage2 bash crt-transition/build_zan_core.sh
+
+链接面（`-DZAN_RT_CORE_ZAN` 把这批符号从 C 侧编出，其余照旧）：
+
+    python3 scripts/native_regression.py --seed "$SEED" \
+      --runtime "crt-transition/runtime_core.o crt-transition/zanstubs_rest.o" \
+      tests/selfhost/native_rt_core.zan          # 第一批端到端（FIPS 180-4 已知答案）
+
+39 项 kernel 回归同样接受 `--runtime "crt-transition/runtime_core.o
+crt-transition/zanstubs_rest.o"`（Zan 对象供 sha/monotonic 符号）。
+
+约束与已知代价（详见 `runtime_core.zan` 头注）：不 using stdlib（Span 是
+binder 内建，libc 直调）；数值一律 long + `>>>` + 掩码；每次调用为 Span
+视图泄漏 2×16 字节（视图按设计短命不回收）。`Crc32` 仍在 C 侧：导出名
+`_Crc32` 无法由 `_类名_方法名` mangle 表达，需 ngen 侧换名（如
+`_zan_crc32`）后才能收编。
+
 - `zanstubs.c`：Zan 运行时原语（Alloc/Free/Copy/…/Crc32）、
   `zan_monotonic_ns/us`、Win 代码页 API、`zan_audio_*` 桩、
   `zan_thread_*`/`zan_atomic_int_*`/`zan_shared_table_*` 同步族

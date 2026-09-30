@@ -2,11 +2,19 @@
  * references the gen0 host entry points (NativeMemory.*, audio, Win codepage
  * APIs) that ngen_host maps to BLExtern. Implemented over libc where the
  * semantics are unambiguous; abort() where a call would mean an unported
- * path. */
+ * path.
+ *
+ * Zan runtime handover: symbols already reimplemented in
+ * runtime_core.zan (compiled by the native bootstrap compiler, localized
+ * except for its zan_* exports) are compiled out with -DZAN_RT_CORE_ZAN so
+ * the Zan object supplies them at link time. Batch 1: zan_monotonic_ns/us,
+ * zan_sha256, zan_sha512. */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+
+long long zan_monotonic_ns(void);
 
 void *Alloc(int size) { return calloc(1, (size_t)(size > 0 ? size : 1)); }
 void Free(void *p) { free(p); }
@@ -56,6 +64,7 @@ long long Crc32(void *p, long long len) {
      * int return prints the crc negative from Zan */
     return (long long)(c ^ 0xFFFFFFFFu);
 }
+#ifndef ZAN_RT_CORE_ZAN
 /* void zan_sha512(data, len, md): FIPS 180-4 SHA-512, self-contained — the
  * emitted runtime calls this instead of CC_SHA512, which misbehaved through
  * the chained-fixup stub path (a direct C call in the same binary produced
@@ -219,6 +228,7 @@ long long zan_monotonic_ns(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000000000ll + (long long)ts.tv_nsec;
 }
+#endif /* ZAN_RT_CORE_ZAN */
 int MultiByteToWideChar(unsigned int cp, unsigned long fl, const char *s, int sl, unsigned short *w, int wl) { (void)cp;(void)fl;(void)s;(void)sl;(void)w;(void)wl; return 0; }
 int WideCharToMultiByte(unsigned int cp, unsigned long fl, const unsigned short *w, int wl, char *s, int sl, char *dc, int *du) { (void)cp;(void)fl;(void)w;(void)wl;(void)s;(void)sl;(void)dc;(void)du; return 0; }
 
@@ -2048,7 +2058,9 @@ void zan_io_close_notify(intptr_t fd) {
     }
 }
 
+#ifndef ZAN_RT_CORE_ZAN
 int64_t zan_monotonic_us(void) {
     return zan_monotonic_ns() / 1000;
 }
+#endif /* ZAN_RT_CORE_ZAN */
 

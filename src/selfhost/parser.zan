@@ -13,6 +13,7 @@ class Parser {
     public int lastErrPos;
     public bool attrDll;      // last ParseAttrs saw [DllImport]
     public string attrEntry;  // DllImport EntryPoint override ("" if none)
+    public bool attrVariadic; // DllImport Variadic = true named argument
     public bool attrJsonIgnore; // last ParseAttrs saw [JsonIgnore]
     public bool attrLayoutExplicit;
     public int attrFieldOffset = -1;
@@ -100,6 +101,7 @@ class Parser {
     void ParseAttrs() {
         attrDll = false;
         attrEntry = "";
+        attrVariadic = false;
         attrJsonIgnore = false;
         attrLayoutExplicit = false;
         attrFieldOffset = -1;
@@ -131,6 +133,11 @@ class Parser {
                             Next();
                             Eat(TK.Eq());
                             if (At(TK.StringLit())) { attrEntry = Next().text; }
+                        } else if (At(TK.Ident()) && Cur().text == "Variadic") {
+                            Next();
+                            Eat(TK.Eq());
+                            if (At(TK.True())) { attrVariadic = true; Next(); }
+                            else if (At(TK.Ident()) || At(TK.False())) { Next(); }
                         } else {
                             while (!At(TK.RParen()) && !At(TK.Comma()) && !At(TK.Eof())) { Next(); }
                         }
@@ -1711,7 +1718,7 @@ class Parser {
     Node ParseInterface(int mods) {
         Next(); // interface
         Node cls = new Node(AK.ClassDecl());
-        cls.mods = mods + MOD.Abstract();
+        cls.mods = mods + MOD.Abstract() + MOD.Iface();
         if (At(TK.Ident())) { cls.sval = Next().text; }
         if (At(TK.Less())) { while (!At(TK.Greater()) && !At(TK.Eof())) { Next(); } Expect(TK.Greater()); }
         if (Eat(TK.Colon())) {
@@ -1854,6 +1861,7 @@ class Parser {
     Node ParseMember(string className) {
         ParseAttrs();
         bool wantExtern = attrDll;
+        bool wantVariadic = attrVariadic;
         string entry = attrEntry;
         int fieldOffset = attrFieldOffset;
         string mWeb = AttrWebPack();
@@ -1981,6 +1989,7 @@ class Parser {
             else { Expect(TK.Semicolon()); }
             if ((wantExtern || HasModBit(mods, MOD.Extern())) && member.d == null) {
                 if (!HasModBit(member.mods, MOD.Extern())) { member.mods = member.mods + MOD.Extern(); }
+                if (wantVariadic) { member.mods = member.mods + MOD.Variadic(); }
                 if (entry != "") { member.sval2 = entry; } else { member.sval2 = member.sval; }
             }
             return member;
@@ -3614,13 +3623,16 @@ class Parser {
 
     Node ParsePrimaryInner() {
         int k = K();
-        // typeof(T) folds to the type's display name string.
+        // typeof(T) folds to the type's display name string; the parsed type
+        // node rides in `b` so ngen can build the reflection record (kind,
+        // element type, type arguments) from it
         if (k == TK.Ident() && Cur().text == "typeof" && K1() == TK.LParen()) {
             Next(); Next(); // typeof (
             Node ty = ParseType();
             Expect(TK.RParen());
             Node n = new Node(AK.StringLit());
             n.sval = TypeName(ty);
+            n.b = ty;
             return n;
         }
         // nameof(x) / nameof(a.b.c) folds to the trailing identifier string.
