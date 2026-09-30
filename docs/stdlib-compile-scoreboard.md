@@ -1364,3 +1364,32 @@ ncf（LINQ 簇，已用 38171e5 种子验证为既有缺口非本批回归）。
 **验证**：39/39 电池（两配置）；定向 generic/async/closure 34/35（唯一
 失败即 oracle SIGSEGV）；EH 16/16；dict/linq/event/delegate 17/18；全量
 624 sweep。
+
+## v18o-12 — 配置纠偏：正确拉取 + 过渡运行时组合，ncf 清零（2026-09-30）
+
+**批次**：无编译器改动；v18o-11 的 sweep（573）被我 /tmp/v18q/stdlib → ref
+树的符号链接带偏——harness 在每个 artifact 里把 stdlib 链到
+zan-selfhost/stdlib，而 seed 原地调用时解析的是 exe_dir/../stdlib = 我的
+链接。两个后果：(1) linq_query_clauses ncf 纯属配置错——parser 的查询
+表达式脱糖目标是 With/JoinPairs/JoinInto/GroupBySel，只存在于自树
+Enumerable.zan（v18i 有意的查询脱糖扩展）；用 harness 预期拉取后 linq
+家族 7/7 全 pass（v18o-11 里"38171e5 既有的"结论同因错拉，更正）。
+(2) 自树拉取必须配 crt-transition trio：NativeMemory 的 EntryPoint 改名
+把 Alloc/Free/Crc32 路由到 zan_alloc/zan_free/zan_crc32（runtime_core.o
+定义）；旧 /tmp/rt-new 桩没有这些符号，-undefined dynamic_lookup 留成懒
+绑定，凡调 Alloc 的用例（zandb/ws/http/xlsx/crypto/sdk）首拍即
+SIGSEGV——中间那轮"自树+旧桩"的 sweep 打出 79 个假 em/501 pass，才定位
+运行时这个变量。System 的 .zan 源两侧只有 Enumerable.zan +
+NativeMemory.zan 不同（其余为 drivers/皮肤/Gui-Hmi/Commercial，非 Gui 用
+例拉不到）。**纠偏配置 sweep（自树拉取 + trio）：571/624，
+native_compile_failed 1 → 0——首个零种子侧编译失败的全量 sweep**。
+om 3 = async_try_exit_depth（oracle 饿死摆针）+ http_forwarder_stream/
+http_server_stress（本轮 oracle 自己又坏：全零计数或挂死；native==
+golden 字节一致，v18o-11 直证）。em 6 全部 oracle 侧/已记录摆针
+（closure_mutable_capture、struct_arc_lifetime ref SIGSEGV；
+dictionary_wide_values ref UAF；firebird_wire ref 自家 SRP 握手确定性
+崩溃；http_client_keepalive、mqtt_lwt_retain 计时摆针）。mne 20 = 两侧
+同非零且 stdout 逐字节一致（抽样 chart_force_params/redis_client/
+win_tray_screen_smoke 验证）。**验证**：39/39 电池双运行时配置；
+native_rt_core pass；bootstrap 定点 run.z2BtL3。全量 sweep 的每个非
+pass 桶至此都是 oracle 侧或已记录摆针。
