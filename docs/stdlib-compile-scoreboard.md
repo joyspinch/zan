@@ -1472,3 +1472,25 @@ mne 18 = 两侧同非零 stdout 逐字节一致。剩余非 pass 全部 oracle �
   取消降级 → mach_vm_read_overwrite 按裸机语义诚实实现(无 MMU,字节拷贝
   + KERN_SUCCESS)。首稿 x-x==0.0 把全部有限双精度当"已整数"返回——守卫改
   |x|≥2^53。
+
+## v18o-15 (2026-09-30) — 评估批：flapper 复归因 + 三项 known_open 退役
+
+- 全量 sweep 复测(种子同 v18o-14,零源码变更):570/624,ncf 仍为 0。
+  mne 18 / rcf 17 / rto 7 / em 8 / om 4,桶族与 v18o-13 归因逐一相同。
+- 11 例 em/om 定向重跑:exception_threads 与 mysql_async_nonblocking 当轮
+  转 pass,http_forwarder_stream 转 rto,atomic_shared_table 与
+  http_client_keepalive 在 em/om 间换签名——全部落在已归因 flapper 簇
+  (线程时序/ref UAF/ref 握手崩溃/oracle 陈旧)。稳定态仍 574,±4 为
+  逐轮成员噪声,非编译器回归。
+- probe 证据退役三项 known_open(全部 PROBE-IDENTICAL):
+  (1) stdlib API families——ncf 自 v18o-13 起为 0,"100 簇"是陈旧记账;
+  (2) Int32Kind 字面量提升——i=2000000000 下 i*3 / i+i / j*3 / i*3L /
+  (long)i*3 五形两侧逐字节一致(6000000000 / -294967296 / 1705032704 /
+  6000000000 / 6000000000);
+  (3) open_language_clusters 四簇全实证:块体 lambda+Func/Action、List
+  初始化器、限定 catch 由既有 pass 用例覆盖;Dictionary 成员初始化器
+  本轮新探 byte-exact;"无 select 查询"两侧同报
+  expected 'select' in query expression——oracle 语言本无此特性,属 parity。
+- known_open 仅剩 3:Mach-O ld-prime GOT assert(下一代码批:自制
+  __nl_symbol_ptr 槽位,只许 reloc type 0/2/3/4)、Linux 用户态宿主层、
+  x86_64 后端。电池复核 39/39。
