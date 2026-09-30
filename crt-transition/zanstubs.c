@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 long long zan_monotonic_ns(void);
 void *zan_alloc(int size);
@@ -258,6 +259,9 @@ long long zan_monotonic_ns(void) {
 int MultiByteToWideChar(unsigned int cp, unsigned long fl, const char *s, int sl, unsigned short *w, int wl) { (void)cp;(void)fl;(void)s;(void)sl;(void)w;(void)wl; return 0; }
 int WideCharToMultiByte(unsigned int cp, unsigned long fl, const unsigned short *w, int wl, char *s, int sl, char *dc, int *du) { (void)cp;(void)fl;(void)w;(void)wl;(void)s;(void)sl;(void)dc;(void)du; return 0; }
 
+/* ---- audio honest stubs — 第七批起由 runtime_core.zan 提供,这里 -D 编出 ---- */
+#ifndef ZAN_RT_CORE_ZAN
+
 int zan_audio_open(void) { return 0; }
 void zan_audio_close(void) { }
 int zan_audio_is_open(void) { return 0; }
@@ -280,11 +284,13 @@ int zan_audio_voice_playing(int v) { (void)v; return 0; }
 void zan_audio_voice_stop(int v) { (void)v; }
 void zan_audio_voice_set_gain(int v, double g) { (void)v;(void)g; }
 
+#endif /* ZAN_RT_CORE_ZAN */
+
 /* ---- lock-statement monitor (spec: oracle rt_sync.c zan_monitor_*) ----
  * `lock (obj)` 给每个对象一个监视器；进程级单把锁会让锁无关对象的线程
  * 互相等待，所以按对象地址条纹化：指针折叠哈希选 64 把递归锁之一。
  * 两个对象共享条纹只会过度串行，不丢互斥；递归保证重入合法。 */
-#include <pthread.h>
+#ifndef ZAN_RT_CORE_ZAN
 #define ZT_MONITOR_STRIPES 64
 
 static pthread_mutex_t zt_monitor_mx[ZT_MONITOR_STRIPES];
@@ -315,6 +321,8 @@ void zan_monitor_exit(void *obj) {
     pthread_mutex_unlock(&zt_monitor_mx[zt_monitor_stripe(obj)]);
 }
 
+#endif /* ZAN_RT_CORE_ZAN */
+
 /* ---- threads (spec: oracle src/runtime/rt_sync.c zan_thread_*) ----
  * 本过渡运行时只服务我们自己 ngen 产出的目标码：那边传入的 ThreadStart
  * 委托对象就是 {fn@0, env@8}，调用约定 fn(env)，且目标码不引用
@@ -327,6 +335,7 @@ void zan_monitor_exit(void *obj) {
  * 拥有（{i32 top, ptr exc, 256 x 1024 字节 setjmp 槽}），这里只负责把
  * 存储做成每线程一份：之前状态块指针缓存在进程级全局里，线程会把
  * longjmp 打进别人 armed 的槽（exception_threads 正是抓这个的）。 */
+#ifndef ZAN_RT_CORE_ZAN
 static __thread void *zan_eh_tls;
 void *zan_eh_tls_state(void) {
     if (!zan_eh_tls) {
@@ -335,6 +344,7 @@ void *zan_eh_tls_state(void) {
     }
     return zan_eh_tls;
 }
+#endif /* ZAN_RT_CORE_ZAN */
 
 /* Zan 方法体把 x19-x25 当作跨调用存活的工作寄存器（方法序言只保存
  * x29/x30，Zan 世界内部自洽），但 POSIX 线程入口是 C→Zan 边界：
@@ -391,7 +401,9 @@ int64_t zan_thread_current_id(void) {
  * record's own dtor. Selfhost delegate values are interned process-lifetime
  * blocks (_zan_dlg_intern) that never die, so entries move as plain pointers;
  * all correctness lives in the OS mutex, which workers hit concurrently with
- * the UI thread's drain. Post answers 1 on success -- callers branch on it. */
+ * the UI thread's drain. Post answers 1 on success -- callers branch on it.
+ * 第七批起由 runtime_core.zan 提供(CAS 自旋锁版),这里 -D 编出。 */
+#ifndef ZAN_RT_CORE_ZAN
 #define ZAN_DISPATCH_CAP0 64
 #define ZAN_DISPATCH_CAP_MAX (1u << 20)
 static void *g_dispatch_static[ZAN_DISPATCH_CAP0];
@@ -461,7 +473,12 @@ void zan_dispatch_clear(void) {
     pthread_mutex_unlock(&g_dispatch_mx);
 }
 
-/* ---- atomic int (spec: oracle rt_sync.c zan_atomic_int_*，C11 __atomic) ---- */
+#endif /* ZAN_RT_CORE_ZAN */
+
+/* ---- atomic int (spec: oracle rt_sync.c zan_atomic_int_*，C11 __atomic) ----
+ * 第六批起由 runtime_core.zan 提供,这里 -D 编出(RMW 走 OSAtomic,
+ * 见该文件第六批追加约束)。 */
+#ifndef ZAN_RT_CORE_ZAN
 
 int64_t zan_atomic_int_create(int64_t initial_value) {
     int64_t *p = (int64_t *)malloc(sizeof(int64_t));
@@ -508,6 +525,8 @@ int64_t zan_atomic_int_compare_exchange(
     return seen; /* oracle 语义：返回比较时看到的旧值 */
 }
 
+#endif /* ZAN_RT_CORE_ZAN */
+
 /* ---- shared table（单进程诚实移植，规格：oracle rt_sync.c）----
  * oracle 用跨进程 mmap + 哈希槽；回归测试全是单进程的，这里换成
  * 进程内注册表 + 堆上行式存储，但语义逐条对齐：
@@ -521,7 +540,10 @@ int64_t zan_atomic_int_compare_exchange(
  *   - Destroy 只把名字从注册表摘除（POSIX unlink 语义：既有句柄仍可
  *     读写）；表永不 free，避免悬垂句柄——测试进程即退即收。
  * 跨进程面（OsHandle/Attach）在过渡运行时没有承载物，诚实失败：具名表
- * 按 Oracle 文档本就返回 0，匿名表与 Attach 返回 0（打开失败的表）。 */
+ * 按 Oracle 文档本就返回 0，匿名表与 Attach 返回 0（打开失败的表）。
+ * 第八批起由 runtime_core.zan 提供(块布局自定、自旋锁互斥),这里
+ * -D 编出。 */
+#ifndef ZAN_RT_CORE_ZAN
 
 #define ZT_MAX_COLUMNS 32
 #define ZT_MAX_STRING 65536
@@ -1298,11 +1320,16 @@ int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
     return r != NULL;
 }
 
+#endif /* ZAN_RT_CORE_ZAN */
+
 /* ---- sockets / resolver (spec: oracle src/runtime/rt_io.c zan_io_*) ----
  * stdlib System/Net pulls this family through DllImport EntryPoints; the
  * awaited forms (zan_io_resolve_all_async / zan_io_connect_sa) run inline on
  * the coroutine thread on this lane (no blocking-worker pool), which is the
- * documented recv/accept deviation. POSIX/darwin branches only. */
+ * documented recv/accept deviation. POSIX/darwin branches only.
+ * 第五批起 zan_io_* 纯函数族由 runtime_core.zan 提供,这里 -D 编出;
+ * 下面的 native io reactor 段(watch 表 + close_notify + poll)仍在 C,
+ * 仍需这些头。 */
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -1315,6 +1342,7 @@ int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
 #include <errno.h>
 #include <signal.h>
 
+#ifndef ZAN_RT_CORE_ZAN
 #define ZAN_IO_SA_STRIDE 32
 
 /* The oracle's zan_io_init installs this once: a peer hanging up mid-send
@@ -1688,6 +1716,7 @@ int32_t zan_io_socket_alive(intptr_t fd) {
     if (fd < 0) return 0;
     return fcntl((int)fd, F_GETFD) != -1;
 }
+#endif /* ZAN_RT_CORE_ZAN */
 
 /* ---- native io reactor (spec: oracle rt_co.c/rt_io.c reactor loop) ----
  * The five awaited io helpers (wait_co/recv_co/recv_to_co/accept_co/
@@ -1702,6 +1731,12 @@ int32_t zan_io_socket_alive(intptr_t fd) {
  * job and hands it over under a mutex via the pipe. zan_co_ready is
  * emitted by the compiler into async programs; non-async links leave it
  * unresolved (weak), where these functions are unreachable anyway. */
+/* -DZAN_RT_CORE_ZAN 时下面三个定义已编出(runtime_core.zan 提供),
+ * reactor 段/DNS worker 仍引用它们——前向声明。 */
+extern int32_t zan_io_socket_alive(intptr_t fd);
+extern int32_t zan_io_resolve_ipv4(const char *hostname);
+extern int32_t zan_io_resolve_sa(const char *name, int32_t port, void *buf,
+                                 int32_t cap);
 
 #include <poll.h>
 

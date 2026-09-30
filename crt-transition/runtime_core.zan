@@ -1,4 +1,4 @@
-// crt-transition/runtime_core.zan — Zan 实现的过渡期运行时(第一~四批)。
+// crt-transition/runtime_core.zan — Zan 实现的过渡期运行时(第一~五批)。
 //
 // 取代 zanstubs.c / zanhost.c 中的(用 -DZAN_RT_CORE_ZAN 从 C 侧编出):
 //   第一批:zan_monotonic_ns / zan_monotonic_us / zan_sha256 / zan_sha512
@@ -13,6 +13,18 @@
 //           if_nametoindex、MAC 大写十六进制)、zan_plat_icmp_ping
 //           (SOCK_DGRAM→SOCK_RAW 回退、poll 状态机、EINTR 重试、
 //           原始模式 IP 头偏移)——至此 zanhost.c 在 -D 下整体清零
+//   第五批:zan_io_* 纯函数族 17 符号——socket send/recv/alive/ready/
+//           cleanup、socket_peer_ip(+into)、sockaddr_ip_str(+into)、
+//           sockaddr_family/is_safe、resolve_sa/ipv4/all(+async)、
+//           connect_sa/connect_status。native io reactor(watch 表、
+//           close_notify、poll、DNS worker)仍留 zanstubs.c,五个
+//           await 形态等后续批次。
+//   第六批:zan_atomic_int_* 七符号(create/destroy/load/store/add/
+//           exchange/compare_exchange;RMW 走 OSAtomic,见追加约束)。
+//   第七批:zan_audio_* 21 桩(driver/error 返回 lit_buf[32] 的
+//           "stub")、zan_monitor_enter/exit、zan_dispatch_*(CAS 自旋
+//           锁环)、zan_eh_tls_state(pthread key)——线程族
+//           (zan_thread_*)因 naked asm + 函数指针仍留 zanstubs.c。
 // 由原生自举编译器(ngen)编译为 arm64 可重定位对象,再经
 // localize_syms.py 把 API 面之外的符号本地化——ngen 会把整套运行时
 // 帮助函数以全局符号发射进每个对象,不本地化则与程序对象撞符号。
@@ -49,6 +61,41 @@
 // ifa_flags@16 ifa_addr@24。net 行拼装为手工 memcpy(格式字面量、
 // 十进制、'0'/'1'、'\t'、',' 均在 lit_buf 静态区按字节备好),不使
 // 用 snprintf。
+//
+// 第五批追加约束:公开方法名即导出名(mangling 是 _{Class}_{Method}),
+// stdlib 的 EntryPoint="zan_io_*" 要求方法名本身带 io_ 前缀(io_socket_
+// send…);曾按 socket_send 命名导致导出 _zan_socket_send 被 localize,
+// 37 kept 未涨——导出名与 allowlist 对不上的第一症状就是 kept 计数
+// 不变。addrinfo 节点 48 字节,Span<long>(p,6) 读:family=ph[0]>>>32、
+// socktype=ph[1]&0xFFFFFFFF、addrlen=ph[2]&0xFFFFFFFF、addr=(nint)ph[4]、
+// next=(nint)ph[5];hints 只填 hv[0]=family<<32、hv[1]=SOCK_STREAM。
+// getaddrinfo 的 service 形参收十进制字节串(uderc_into 写数字、调用
+// 方补 NUL——不写 NUL 是它区别于 ip 文本化拷出的契约点)。fd_set 是
+// 128 字节/16 个 long:bit=1L<<(fd%64)、slot=fd/64,select 之后一律
+// 取新 Span 视图重读(跨 DllImport 持有的视图不可靠,同缺口 2 纪律)。
+// v6 逐字节规则里字节取反用 255-x(^ 未验证)。SIGPIPE 惰性忽略:
+// csignal(13,1) 取旧 handler,非 0 则装回——单线程下等价 C 的
+// sigaction 探测+条件安装。
+//
+// 第六批追加约束:RMW 原子性经 libSystem 导出的 OSAtomicAdd64Barrier
+// (恰为 add_fetch)与 OSAtomicCompareAndSwap64Barrier(布尔经 x0,
+// 必须掩 &255 再判);exchange 用 CAS 循环、compare_exchange 失败路径
+// 取 load-after-fail 当"看到的旧值"——本车道单线程两者与 oracle 的
+// __atomic 语义等价,多线程竞争下是文档化偏差(oracle 真 RMW)。load/
+// store 是对齐 8 字节访问(arm64 单拷贝原子);布尔返回值一律声明
+// nint 并掩低字节——小整型 ABI 只保证 w0。
+//
+// 第七批追加约束:lit_buf[32..36] 存 "stub"(lit_init 追加,不影响
+// 既有偏移)。monitor 是条纹计数器而非真锁——本车道单线程,递归
+// 即 entry++/--,重入合法、退出钳 0;条纹折叠用乘法散列(^ 未验证)。
+// dispatch 用 OSAtomic CAS 自旋锁(0 闲 1 忙)替代 pthread mutex:
+// 互斥等价,争用下自旋;环状态在 calloc 控制块(自旋/容量/头/尾/环
+// 指针),静态只存块指针、用点取新局部(缺口 2 纪律),grow 的头尾
+// 迁移与 C 版逐字对齐(head=0、tail=存活数);控制块惰性建立是单
+// 线程假设(与 try_lock 同款)。eh_tls_state 的 __thread 槽位换成
+// pthread specific key(key_create 无析构 + get/setspecific;key_t
+// 是 unsigned long)。double 形参/返回可用:0.0 走 (double)0L 显式
+// 转换,不写字面量。
 //
 // 已发现编译器缺口(ngen,待独立批次处理;本文件全部绕行):
 //   1) 变参调用降级不可用——8 参 DllImport→snprintf 在入口寄存器
@@ -450,29 +497,34 @@ class zan {
     static nint app_dir_buf;
     static long app_dir_done;
 
-    // 环境变量名/snprintf 格式串不能写字面量:ngen 的字符串字面量经数
-    // 据槽间接寻址,槽由本对象的静态初始化填充,而 runtime_core.o 作为
+    // 环境变量名/拼装常量字节不能写字面量:ngen 的字符串字面量经数据
+    // 槽间接寻址,槽由本对象的静态初始化填充,而 runtime_core.o 作为
     // 第二个 ngen 对象其 init 不会被调用,槽恒为 0。这里在静态暂存区
-    // 逐字节拼出 "ZAN_APP_DIR"(0..11) "ZAN_PKG_DIR"(12..23) 与
-    // "%s\t%u\t%d\t%s\t%s\n"(32..47)。
+    // 逐字节备好:"ZAN_APP_DIR"(0..11)"ZAN_PKG_DIR"(12..23)、
+    // '0'(48) '1'(49) ','(50) '\t'(51) '\n'(52)。
     static nint lit_buf;
 
     static void lit_init() {
         if (lit_buf != 0) { return; }
-        lit_buf = calloc(1, 64);
-        Span<byte> lb = new Span<byte>(lit_buf, 64);
+        lit_buf = calloc(1, 128);
+        Span<byte> lb = new Span<byte>(lit_buf, 128);
         lb[0] = 90; lb[1] = 65; lb[2] = 78; lb[3] = 95;
         lb[4] = 65; lb[5] = 80; lb[6] = 80; lb[7] = 95;
         lb[8] = 68; lb[9] = 73; lb[10] = 82;
         lb[12] = 90; lb[13] = 65; lb[14] = 78; lb[15] = 95;
         lb[16] = 80; lb[17] = 75; lb[18] = 71; lb[19] = 95;
         lb[20] = 68; lb[21] = 73; lb[22] = 82;
-        lb[32] = 37; lb[33] = 115; lb[34] = 9;
-        lb[35] = 37; lb[36] = 117; lb[37] = 9;
-        lb[38] = 37; lb[39] = 100; lb[40] = 9;
-        lb[41] = 37; lb[42] = 115; lb[43] = 9;
-        lb[44] = 37; lb[45] = 115; lb[46] = 10;
         lb[48] = 48; lb[49] = 49; lb[50] = 44; lb[51] = 9; lb[52] = 10;
+        lb[32] = 115; lb[33] = 116; lb[34] = 117; lb[35] = 98; lb[36] = 0;
+        // 第八批:rate/lock 的常量列名。
+        lb[38] = 99; lb[39] = 111; lb[40] = 117; lb[41] = 110;
+        lb[42] = 116; lb[43] = 0;
+        lb[64] = 119; lb[65] = 105; lb[66] = 110; lb[67] = 100;
+        lb[68] = 111; lb[69] = 119; lb[70] = 95; lb[71] = 115;
+        lb[72] = 116; lb[73] = 97; lb[74] = 114; lb[75] = 116;
+        lb[76] = 0;
+        lb[80] = 111; lb[81] = 119; lb[82] = 110; lb[83] = 101;
+        lb[84] = 114; lb[85] = 0;
     }
 
     static nint app_dir() {
@@ -793,6 +845,30 @@ class zan {
     public static extern int cgetpid();
     [DllImport("crt", EntryPoint = "__error")]
     public static extern nint cerror();
+    // 第五批:sockets/resolver 全部 ≤6 参非变参(变参 fcntl 在 3 参
+    // 形态下与普通调用同 ABI,fixture 有Alive 断言覆盖)
+    [DllImport("crt", EntryPoint = "send")]
+    public static extern long csend(int fd, nint buf, long len, int flags);
+    [DllImport("crt", EntryPoint = "recv")]
+    public static extern long crecv(int fd, nint buf, long len, int flags);
+    [DllImport("crt", EntryPoint = "signal")]
+    public static extern nint csignal(int sig, nint handler);
+    [DllImport("crt", EntryPoint = "fcntl")]
+    public static extern int cfcntl(int fd, int cmd, int arg);
+    [DllImport("crt", EntryPoint = "connect")]
+    public static extern int cconnect(int fd, nint sa, int len);
+    [DllImport("crt", EntryPoint = "select")]
+    public static extern int cselect(int nfds, nint rfds, nint wfds, nint efds, nint timeout);
+    [DllImport("crt", EntryPoint = "getsockopt")]
+    public static extern int cgetsockopt(int fd, int level, int optname, nint optval, nint optlen);
+    [DllImport("crt", EntryPoint = "getpeername")]
+    public static extern int cgetpeername(int fd, nint sa, nint lenp);
+    [DllImport("crt", EntryPoint = "getaddrinfo")]
+    public static extern int cgetaddrinfo(nint name, nint service, nint hints, nint res);
+    [DllImport("crt", EntryPoint = "freeaddrinfo")]
+    public static extern void cfreeaddrinfo(nint res);
+    [DllImport("crt", EntryPoint = "memcmp")]
+    public static extern int cmemcmp(nint a, nint b, long n);
 
     // errno 是每线程全局:__error() 返回 int*
     static int err_now() {
@@ -1112,6 +1188,1994 @@ class zan {
         cfree(ping_packet); ping_packet = 0;
         cfree(ping_dst); ping_dst = 0;
         return result;
+    }
+
+    // ------------------------------------------------------------------
+    // 第五批:sockets/resolver(语义对照 zanstubs.c 与 oracle rt_io.c),
+    // 取代 zanstubs.c 的 zan_io_* 纯函数族;reactor 段(wait_co/recv_co/
+    // accept_co/poll/close_notify + DNS worker)留 C。常量(offsetof 已
+    // 证):addrinfo 48B flags@0 fam@4 sock@8 addrlen@16 addr@32
+    // next@40;fd_set/sockaddr_storage 128B;timeval{i64,i64};
+    // AF_INET=2 AF_INET6=30;SOCK_STREAM=1;EAGAIN=35 EINTR=4
+    // EINPROGRESS=36 EALREADY=37;O_NONBLOCK=4;F_GETFD=1 F_GETFL=3
+    // F_SETFL=4;SOL_SOCKET=0xffff(65535) SO_ERROR=0x1007(4103);
+    // SIGPIPE=13 SIG_DFL=0 SIG_IGN=1;SA_STRIDE=32;sin=16(sin_addr@4)
+    // sin6=28(sin6_addr@8)。
+    // ------------------------------------------------------------------
+
+    // sockaddr_ip_str 的文本缓冲(C 为 __thread 128B;本车道单线程假设
+    // 一致,契约同为"返回值活到下次调用")。
+    static nint io_addr_buf;
+
+    // SIGPIPE 惰性忽略:rt_io.c 语义是"当前 handler 非 DFL 则不动"。
+    // signal() 版先装 IGN,再按返回值恢复旧 handler——单线程下逐次等价。
+    static void io_ignore_sigpipe() {
+        nint old = csignal(13, 1);
+        if (old != 0) { csignal(13, old); }
+    }
+
+    // rt_io.c:552 拷出:长度不含 NUL;buf 空或 cap<=0 或放不下 → -1。
+    static int io_ip_copy_out(nint text, nint buf, int cap) {
+        if (buf == 0 || cap <= 0) { return -1; }
+        long n = cstrlen(text);
+        if (cap <= n) { return -1; }
+        memcpy(buf, text, n + 1);
+        return (int)n;
+    }
+
+    // rt_io.c:509:v4/v6 文本;其他族或转换失败 → 空串。
+    public static nint io_sockaddr_ip_str(nint sa) {
+        if (io_addr_buf == 0) { io_addr_buf = calloc(1, 128); }
+        nint ab = io_addr_buf;
+        if (sa != 0) {
+            Span<byte> sv = new Span<byte>(sa, 2);
+            int fam = sv[1];                       // sa_family u8
+            if (fam == 2) {
+                if (cinet_ntop(2, sa + 4L, ab, 128) != 0) { return ab; }
+            }
+            else if (fam == 30) {
+                if (cinet_ntop(30, sa + 8L, ab, 128) != 0) { return ab; }
+            }
+        }
+        memset(ab, 0, 1);
+        return ab;
+    }
+
+    public static nint io_socket_peer_ip(long fd) {
+        nint ss = malloc(128);
+        memset(ss, 0, 128);
+        nint lenp = malloc(4);
+        Span<long> lv = new Span<long>(lenp, 1);
+        lv[0] = 128;
+        nint r = 0;
+        if (cgetpeername((int)fd, ss, lenp) != 0) {
+            r = io_sockaddr_ip_str(0);
+        }
+        else {
+            r = io_sockaddr_ip_str(ss);
+        }
+        cfree(lenp);
+        cfree(ss);
+        return r;
+    }
+
+    public static int io_socket_peer_ip_into(long fd, nint buf, int cap) {
+        nint ss = malloc(128);
+        memset(ss, 0, 128);
+        nint lenp = malloc(4);
+        Span<long> lv = new Span<long>(lenp, 1);
+        lv[0] = 128;
+        int r = -1;
+        if (cgetpeername((int)fd, ss, lenp) == 0) {
+            nint txt = io_sockaddr_ip_str(ss);
+            r = io_ip_copy_out(txt, buf, cap);
+        }
+        cfree(lenp);
+        cfree(ss);
+        return r;
+    }
+
+    public static int io_sockaddr_ip_str_into(nint sa, nint buf, int cap) {
+        nint txt = io_sockaddr_ip_str(sa);
+        return io_ip_copy_out(txt, buf, cap);
+    }
+
+    // rt_io.c:615:AF_INET 需 len>=16,AF_INET6 需 len>=28,否则 0。
+    public static int io_sockaddr_family(nint sa, int len) {
+        if (sa == 0 || len < 2) { return 0; }
+        Span<byte> sv = new Span<byte>(sa, 2);
+        int fam = sv[1];                           // sa_family u8
+        if (fam == 2 && len >= 16) { return 2; }
+        if (fam == 30 && len >= 28) { return 30; }
+        return 0;
+    }
+
+    // 主机序 32 位 v4 的可用性规则(rt_io.c:638)。
+    static int v4_safe_bytes(long a, int allowLoopback) {
+        long first = a >>> 24;
+        long second = (a >>> 16) & 255;
+        if (first == 127) { return allowLoopback != 0 ? 1 : 0; }
+        if (first == 0 || first == 10 || first >= 224) { return 0; }
+        if (first == 169 && second == 254) { return 0; }
+        if (first == 172 && second >= 16 && second <= 31) { return 0; }
+        if (first == 192 && second == 168) { return 0; }
+        if (first == 192 && second == 0) { return 0; }
+        long third = (a >>> 8) & 255;
+        if (first == 192 && second == 2) { return 0; }
+        if (first == 192 && second == 88 && third == 99) { return 0; }
+        if (first == 198 && second >= 18 && second <= 19) { return 0; }
+        if (first == 198 && second == 51 && third == 100) { return 0; }
+        if (first == 203 && second == 0 && third == 113) { return 0; }
+        if (first == 100 && second >= 64 && second <= 127) { return 0; }
+        if (a == 4294967295L) { return 0; }
+        return 1;
+    }
+
+    // rt_io.c:638:1 仅当可用公网地址(或显式回环豁免);嵌入 v4 形态
+    // (mapped/Teredo/6to4/NAT64)按 v4 规则判定——v4 判定折进
+    // v4_safe_bytes,无递归。
+    public static int io_sockaddr_is_safe(nint sa, int len, int allowLoopback) {
+        int family = io_sockaddr_family(sa, len);
+        if (family == 2) {
+            Span<byte> sv = new Span<byte>(sa, 8);
+            long a = (sv[4] << 24) | (sv[5] << 16) | (sv[6] << 8) | sv[7];
+            return v4_safe_bytes(a, allowLoopback);
+        }
+        if (family == 30) {
+            Span<byte> bv = new Span<byte>(sa, 24);
+            long zeros = 0;
+            long headZero = 0;
+            int i = 0;
+            while (i < 16) {
+                if (bv[8 + i] != 0) { zeros = 1; }
+                if (i < 15 && bv[8 + i] != 0) { headZero = 1; }
+                i = i + 1;
+            }
+            if (zeros == 0) { return 0; }                       // 未指定 ::
+            if (headZero == 0 && bv[23] == 1) {                 // ::1
+                return allowLoopback != 0 ? 1 : 0;
+            }
+            if ((bv[8] & 254) == 252) { return 0; }             // fc00::/7
+            if ((bv[8] & 254) == 254 && (bv[9] & 192) == 128) { return 0; }  // fe80::/10
+            if (bv[8] == 255) { return 0; }                     // ff00::/8
+            if (bv[8] == 32 && bv[9] == 1 && bv[10] == 13 && bv[11] == 184) { return 0; }  // 2001:db8
+            long mapped = 1;
+            i = 0;
+            while (i < 10) {
+                if (bv[8 + i] != 0) { mapped = 0; }
+                i = i + 1;
+            }
+            if (mapped == 1 && bv[18] == 255 && bv[19] == 255) {
+                long m4 = (bv[20] << 24) | (bv[21] << 16) | (bv[22] << 8) | bv[23];
+                return v4_safe_bytes(m4, allowLoopback);
+            }
+            if (bv[8] == 32 && bv[9] == 1 && bv[10] == 0 && bv[11] == 0) {
+                // Teredo 2001:0000::/32:服务器 v4(b12..15 前四 b4..7)与
+                // 混淆 v4(b12..15 取反)都要过 v4 规则
+                long t4 = (bv[12] << 24) | (bv[13] << 16) | (bv[14] << 8) | bv[15];
+                if (v4_safe_bytes(t4, allowLoopback) == 0) { return 0; }
+                long c4 = ((255 - bv[20]) << 24) | ((255 - bv[21]) << 16) | ((255 - bv[22]) << 8) | (255 - bv[23]);
+                return v4_safe_bytes(c4, allowLoopback);
+            }
+            long v4off = -1L;
+            if (bv[8] == 32 && bv[9] == 2) { v4off = 2L; }      // 6to4
+            else if (bv[8] == 0 && bv[9] == 100 && bv[10] == 255 && bv[11] == 155) { v4off = 12L; }  // NAT64
+            else if (mapped == 1) { v4off = 12L; }
+            if (v4off >= 0) {
+                int o = (int)(8 + v4off);
+                long e4 = (bv[o] << 24) | (bv[o + 1] << 16) | (bv[o + 2] << 8) | bv[o + 3];
+                return v4_safe_bytes(e4, allowLoopback);
+            }
+            return 1;
+        }
+        return 0;
+    }
+
+    // rt_io.c:573:含 ':' 的名字按 v6-or-nothing,其余先 v4、失败回退
+    // AF_UNSPEC。返回长度 16/28 或 0。
+    public static int io_resolve_sa(nint name, int port, nint buf, int cap) {
+        if (name == 0) { return 0; }
+        Span<byte> n0 = new Span<byte>(name, 1);
+        if (n0[0] == 0) { return 0; }
+        lit_init();
+        nint portstr = malloc(16);
+        long d = udec_into(port, portstr);
+        Span<byte> pz = new Span<byte>(portstr + d, 1);
+        pz[0] = 0;
+        nint hints = malloc(48);
+        memset(hints, 0, 48);
+        Span<long> hv = new Span<long>(hints, 6);
+        long fam0 = cstrrchr(name, 58) != 0 ? 0L : 2L;
+        hv[0] = fam0 << 32;                        // ai_flags=0, ai_family
+        hv[1] = 1;                                 // ai_socktype=SOCK_STREAM
+        nint resp = malloc(8);
+        Span<long> rv = new Span<long>(resp, 1);
+        rv[0] = 0;
+        int rc = cgetaddrinfo(name, portstr, hints, resp);
+        if (rc != 0 || rv[0] == 0) {
+            if (fam0 == 2L) {
+                hv[0] = 0;                         // 回退 AF_UNSPEC
+                rv[0] = 0;
+                rc = cgetaddrinfo(name, portstr, hints, resp);
+            }
+            if (rc != 0 || rv[0] == 0) {
+                cfree(resp); cfree(hints); cfree(portstr);
+                return 0;
+            }
+        }
+        nint p = rv[0];
+        Span<long> pv = new Span<long>(p, 6);
+        int fam = (int)(pv[0] >>> 32);
+        long len = fam == 30 ? 28L : fam == 2 ? 16L : 0L;
+        long addrlen = pv[2] & 0xFFFFFFFFL;
+        int r = 0;
+        if (len != 0 && len <= cap && addrlen == len) {
+            nint addr = (nint)pv[4];
+            memcpy(buf, addr, len);
+            r = (int)len;
+        }
+        cfreeaddrinfo(p);
+        cfree(resp); cfree(hints); cfree(portstr);
+        return r;
+    }
+
+    // rt_io.c:607:v4 地址按 s_addr 内存序(LE 读 u32),失败 0。
+    public static int io_resolve_ipv4(nint hostname) {
+        if (hostname == 0) { return 0; }
+        Span<byte> h0 = new Span<byte>(hostname, 1);
+        if (h0[0] == 0) { return 0; }
+        nint hints = malloc(48);
+        memset(hints, 0, 48);
+        Span<long> hv = new Span<long>(hints, 6);
+        hv[0] = 2L << 32;                          // AF_INET
+        hv[1] = 1;                                 // SOCK_STREAM
+        nint resp = malloc(8);
+        Span<long> rv = new Span<long>(resp, 1);
+        rv[0] = 0;
+        if (cgetaddrinfo(hostname, 0, hints, resp) != 0 || rv[0] == 0) {
+            cfree(resp); cfree(hints);
+            return 0;
+        }
+        nint p = rv[0];
+        Span<long> pv = new Span<long>(p, 6);
+        int addr = 0;
+        if ((int)(pv[0] >>> 32) == 2) {
+            nint sa = (nint)pv[4];
+            Span<byte> sv = new Span<byte>(sa, 8);
+            if (sv[1] == 2) {
+                addr = (int)((sv[4] & 255L) | ((sv[5] & 255L) << 8) | ((sv[6] & 255L) << 16) | ((sv[7] & 255L) << 24));
+            }
+        }
+        cfreeaddrinfo(p);
+        cfree(resp); cfree(hints);
+        return addr;
+    }
+
+    // rt_io.c:727:stride-32 去重写入;溢出清空整个缓冲并返回 0。
+    public static int io_resolve_all(nint name, int port, nint buf, int cap) {
+        if (buf == 0 || cap <= 0) { return 0; }
+        long bad = 0;
+        if (name == 0 || cap < 32) { bad = 1; }
+        else {
+            Span<byte> n0 = new Span<byte>(name, 1);
+            if (n0[0] == 0) { bad = 1; }
+        }
+        if (bad == 1) { memset(buf, 0, cap); return 0; }
+        lit_init();
+        nint portstr = malloc(16);
+        long d = udec_into(port, portstr);
+        Span<byte> pz = new Span<byte>(portstr + d, 1);
+        pz[0] = 0;
+        nint hints = malloc(48);
+        memset(hints, 0, 48);
+        Span<long> hv = new Span<long>(hints, 6);
+        hv[1] = 1;                                 // family=AF_UNSPEC 已零
+        nint resp = malloc(8);
+        Span<long> rv = new Span<long>(resp, 1);
+        rv[0] = 0;
+        if (cgetaddrinfo(name, portstr, hints, resp) != 0 || rv[0] == 0) {
+            memset(buf, 0, cap);
+            cfree(resp); cfree(hints); cfree(portstr);
+            return 0;
+        }
+        nint head = rv[0];
+        long capacity = cap / 32;
+        long count = 0;
+        nint p = head;
+        while (p != 0) {
+            Span<long> pv = new Span<long>(p, 6);
+            nint addr = (nint)pv[4];
+            long addrlen = pv[2] & 0xFFFFFFFFL;
+            int fam = io_sockaddr_family(addr, (int)addrlen);
+            long len = fam == 30 ? 28L : fam == 2 ? 16L : 0L;
+            if (len != 0 && addrlen >= len) {
+                long dup = 0;
+                long i = 0;
+                while (i < count && dup == 0) {
+                    nint oldp = buf + i * 32;
+                    if (io_sockaddr_family(oldp, (int)len) == fam && cmemcmp(oldp, addr, len) == 0) { dup = 1; }
+                    i = i + 1;
+                }
+                if (dup == 0) {
+                    if (count >= capacity) {
+                        memset(buf, 0, cap);
+                        cfreeaddrinfo(head);
+                        cfree(resp); cfree(hints); cfree(portstr);
+                        return 0;
+                    }
+                    nint dstp = buf + count * 32;
+                    memset(dstp, 0, 32);
+                    memcpy(dstp, addr, len);
+                    count = count + 1;
+                }
+            }
+            p = (nint)pv[5];
+        }
+        cfreeaddrinfo(head);
+        cfree(resp); cfree(hints); cfree(portstr);
+        return (int)count;
+    }
+
+    public static long io_resolve_all_async(long namePtr, int port, long bufPtr, int cap) {
+        return io_resolve_all((nint)namePtr, port, (nint)bufPtr, cap);
+    }
+
+    static int io_set_nonblocking(long fd) {
+        int flags = cfcntl((int)fd, 3, 0);         // F_GETFL
+        if (flags < 0) { return -1; }
+        return cfcntl((int)fd, 4, flags | 4);      // F_SETFL|O_NONBLOCK
+    }
+
+    // rt_io.c:881:非阻塞 connect;0 已建立,-2 进行中,其余正 errno 或 -1。
+    static int io_connect_sa_start(long fd, nint sa, int salen) {
+        if (sa == 0 || io_sockaddr_family(sa, salen) == 0) { return -1; }
+        if (io_set_nonblocking(fd) != 0) { return -1; }
+        int r = cconnect((int)fd, sa, salen);
+        if (r == 0) { return 0; }
+        int e = err_now();
+        if (e == 36 || e == 35 || e == 37) { return -2; }
+        return e > 0 ? e : -1;
+    }
+
+    // rt_io.c:903:本车道内联执行;0 已建立,正 SO_ERROR,-3 超时,-1 失败。
+    public static long io_connect_sa(long fd, nint sa, int salen, int timeoutMs) {
+        io_ignore_sigpipe();
+        int r = io_connect_sa_start(fd, sa, salen);
+        if (r == 0 || r != -2) { return r; }
+        if (fd < 0 || fd >= 1024) { return -1L; }
+        nint wfds = malloc(128);
+        nint efds = malloc(128);
+        memset(wfds, 0, 128);
+        memset(efds, 0, 128);
+        long bit = 1L << (fd % 64);
+        int slot = (int)(fd / 64);
+        Span<long> wv = new Span<long>(wfds, 16);
+        wv[slot] = wv[slot] | bit;
+        Span<long> evv = new Span<long>(efds, 16);
+        evv[slot] = evv[slot] | bit;
+        nint ptv = 0;
+        nint tv = 0;
+        if (timeoutMs >= 0) {
+            tv = malloc(16);
+            Span<long> tvv = new Span<long>(tv, 2);
+            tvv[0] = timeoutMs / 1000;
+            tvv[1] = (timeoutMs % 1000) * 1000;
+            ptv = tv;
+        }
+        int sr = 0;
+        long state = 0;
+        while (state == 0) {
+            sr = cselect((int)fd + 1, 0, wfds, efds, ptv);
+            if (!(sr < 0 && err_now() == 4)) { state = 1; }   // EINTR 重试
+        }
+        long result = -1L;
+        if (sr <= 0) {
+            result = sr == 0 ? -3L : -1L;
+        }
+        else {
+            nint errp = malloc(8);
+            nint elenp = malloc(8);
+            Span<long> elv = new Span<long>(elenp, 1);
+            elv[0] = 4;
+            if (cgetsockopt((int)fd, 65535, 4103, errp, elenp) != 0) {
+                result = -1L;
+            }
+            else {
+                Span<long> erv = new Span<long>(errp, 1);
+                long ev = erv[0] & 0xFFFFFFFFL;
+                result = ev == 0 ? 0L : ev;
+            }
+            cfree(errp);
+            cfree(elenp);
+        }
+        cfree(tv);
+        cfree(wfds);
+        cfree(efds);
+        return result;
+    }
+
+    // rt_io.c:853:0 已建立,正 SO_ERROR(或 -1),-2 进行中。
+    public static int io_connect_status(long fd) {
+        if (fd < 0 || fd >= 1024) { return -1; }
+        nint wfds = malloc(128);
+        nint efds = malloc(128);
+        memset(wfds, 0, 128);
+        memset(efds, 0, 128);
+        long bit = 1L << (fd % 64);
+        int slot = (int)(fd / 64);
+        Span<long> wv = new Span<long>(wfds, 16);
+        wv[slot] = wv[slot] | bit;
+        Span<long> evv = new Span<long>(efds, 16);
+        evv[slot] = evv[slot] | bit;
+        nint tv = malloc(16);
+        Span<long> tvv = new Span<long>(tv, 2);
+        tvv[0] = 0;
+        tvv[1] = 0;
+        int r = -1;
+        if (cselect((int)fd + 1, 0, wfds, efds, tv) >= 0) {
+            Span<long> wv2 = new Span<long>(wfds, 16);
+            Span<long> evv2 = new Span<long>(efds, 16);
+            long eset = evv2[slot] & bit;
+            long wset = wv2[slot] & bit;
+            nint errp = malloc(8);
+            nint elenp = malloc(8);
+            Span<long> elv = new Span<long>(elenp, 1);
+            elv[0] = 4;
+            if (cgetsockopt((int)fd, 65535, 4103, errp, elenp) != 0) {
+                r = -1;
+            }
+            else {
+                Span<long> erv = new Span<long>(errp, 1);
+                long ev = erv[0] & 0xFFFFFFFFL;
+                if (eset != 0) { r = ev != 0 ? (int)ev : -1; }
+                else if (wset != 0) { r = (int)ev; }
+                else { r = -2; }
+            }
+            cfree(errp);
+            cfree(elenp);
+        }
+        cfree(tv);
+        cfree(wfds);
+        cfree(efds);
+        return r;
+    }
+
+    // rt_io.c:833:select 即时就绪探测。
+    public static int io_socket_ready(long fd, int writeReady) {
+        if (fd < 0 || fd >= 1024) { return -1; }
+        nint fds = malloc(128);
+        memset(fds, 0, 128);
+        long bit = 1L << (fd % 64);
+        int slot = (int)(fd / 64);
+        Span<long> fv = new Span<long>(fds, 16);
+        fv[slot] = fv[slot] | bit;
+        nint tv = malloc(16);
+        Span<long> tvv = new Span<long>(tv, 2);
+        tvv[0] = 0;
+        tvv[1] = 0;
+        int r = cselect((int)fd + 1, writeReady != 0 ? 0 : fds, writeReady != 0 ? fds : 0, 0, tv);
+        cfree(tv);
+        cfree(fds);
+        return r;
+    }
+
+    // rt_io.c:869:F_GETFD 探活。
+    public static int io_socket_alive(long fd) {
+        if (fd < 0) { return 0; }
+        return cfcntl((int)fd, 1, 0) != -1 ? 1 : 0;
+    }
+
+    // rt_io.c:444:>=0 已收字节;-1 会阻塞;-2 致命;SIGPIPE 惰性忽略。
+    public static long io_socket_send(long fd, nint buf, long len, int flags) {
+        io_ignore_sigpipe();
+        if (len <= 0) { return len == 0 ? 0L : -2L; }
+        if (len > 2147483647L) { len = 2147483647L; }
+        long result = -2L;
+        long state = 0;
+        while (state == 0) {
+            long r = csend((int)fd, buf, len, flags);
+            if (r >= 0) { result = r; state = 1; }
+            else {
+                int e = err_now();
+                if (e == 35) { result = -1L; state = 1; }        // EAGAIN
+                else if (e != 4) { result = -2L; state = 1; }    // EINTR 重试
+            }
+        }
+        return result;
+    }
+
+    // rt_io.c:459:负返回值透传(0=对端关闭,-1=错误)。
+    public static long io_socket_recv(long fd, nint buf, long len, int flags) {
+        if (len < 0) { return -2L; }
+        if (len > 2147483647L) { len = 2147483647L; }
+        return crecv((int)fd, buf, len, flags);
+    }
+
+    public static void io_socket_cleanup() {
+    }
+
+    // ---- 第六批:zan_atomic_int_*(spec: oracle rt_sync.c,C11 __atomic)----
+    // RMW 走 libSystem 的 OSAtomicAdd64Barrier / OSAtomicCompareAndSwap64
+    // Barrier(仍在导出表;add 直接等于 add_fetch)。exchange 用 CAS 循环,
+    // compare_exchange 失败路径取 load-after-fail 作"看到的旧值"——本车道
+    // 单线程,循环一过、两次读等值,与 oracle 的 seen 语义一致;多线程
+    // 竞争下这是文档化偏差(oracle 用真 __atomic)。load/store 是对齐 8 字
+    // 节访问(arm64 单拷贝原子);线程族仍在 C,跨线程排序语义未承载。
+    [DllImport("crt", EntryPoint = "OSAtomicAdd64Barrier")]
+    public static extern long osatomic_add(long delta, nint p);
+    [DllImport("crt", EntryPoint = "OSAtomicCompareAndSwap64Barrier")]
+    public static extern nint osatomic_cas(long oldv, long newv, nint p);
+
+    // 返回句柄(指针);0 = 分配失败。创建与 C 版同为普通写(线程内约定)。
+    public static long atomic_int_create(long initial_value) {
+        nint p = calloc(1, 8);
+        if (p == 0) { return 0; }
+        Span<long> v = new Span<long>(p, 1);
+        v[0] = initial_value;
+        return (long)p;
+    }
+
+    public static void atomic_int_destroy(long handle) {
+        cfree((nint)handle);
+    }
+
+    public static long atomic_int_load(long handle) {
+        nint p = (nint)handle;
+        if (p == 0) { return 0; }
+        Span<long> v = new Span<long>(p, 1);
+        return v[0];
+    }
+
+    public static void atomic_int_store(long handle, long new_value) {
+        nint p = (nint)handle;
+        if (p == 0) { return; }
+        Span<long> v = new Span<long>(p, 1);
+        v[0] = new_value;
+    }
+
+    // 返回新值(add_fetch 语义);空句柄 0。
+    public static long atomic_int_add(long handle, long delta) {
+        nint p = (nint)handle;
+        if (p == 0) { return 0; }
+        return osatomic_add(delta, p);
+    }
+
+    // 返回旧值(exchange 语义);CAS 循环,单线程一过。
+    public static long atomic_int_exchange(long handle, long new_value) {
+        nint p = (nint)handle;
+        if (p == 0) { return 0; }
+        long seen = atomic_int_load(handle);
+        long state = 0;
+        while (state == 0) {
+            nint ok = osatomic_cas(seen, new_value, p);
+            if ((ok & 255L) != 0) { state = 1; }
+            else { seen = atomic_int_load(handle); }
+        }
+        return seen;
+    }
+
+    // oracle 语义:无论成败都返回比较时看到的旧值;空句柄 0。
+    public static long atomic_int_compare_exchange(
+            long handle, long expected, long desired) {
+        nint p = (nint)handle;
+        if (p == 0) { return 0; }
+        nint ok = osatomic_cas(expected, desired, p);
+        if ((ok & 255L) != 0) { return expected; }
+        return atomic_int_load(handle);
+    }
+
+    // ---- 第七批:zan_audio_*(诚实桩)/ zan_monitor_* / zan_dispatch_* /
+    // zan_eh_tls_state(spec: oracle rt_sync.c 与编译器 EH ABI)----
+    [DllImport("crt", EntryPoint = "pthread_key_create")]
+    public static extern int cpthread_key_create(nint keyp, nint dtor);
+    [DllImport("crt", EntryPoint = "pthread_getspecific")]
+    public static extern nint cpthread_getspecific(long key);
+    [DllImport("crt", EntryPoint = "pthread_setspecific")]
+    public static extern int cpthread_setspecific(long key, nint v);
+    [DllImport("crt", EntryPoint = "abort")]
+    public static extern void cabort();
+    [DllImport("crt", EntryPoint = "strncmp")]
+    public static extern int cstrncmp(nint a, nint b, long n);
+
+    static nint mon_tbl;
+    static nint d_ctl_s;
+    static long eh_key;
+    static long eh_ready;
+
+    // audio 桩的 "stub" 串在 lit_buf[32..36](lit_init 备好)。
+    static nint audio_stub_str() {
+        lit_init();
+        return lit_buf + 32;
+    }
+
+    public static int audio_open() {
+        return 0;
+    }
+
+    public static void audio_close() {
+    }
+
+    public static int audio_is_open() {
+        return 0;
+    }
+
+    public static nint audio_driver_name() {
+        return audio_stub_str();
+    }
+
+    public static nint audio_last_error() {
+        return audio_stub_str();
+    }
+
+    public static double audio_volume() {
+        return (double)0L;
+    }
+
+    public static void audio_set_volume(double v) {
+    }
+
+    public static int audio_active_voices() {
+        return 0;
+    }
+
+    public static void audio_stop_all() {
+    }
+
+    public static long audio_load_wav(nint d, long n) {
+        return 0;
+    }
+
+    public static long audio_load_ogg(nint d, long n) {
+        return 0;
+    }
+
+    public static long audio_load_wav_mem(nint d, long n) {
+        return 0;
+    }
+
+    public static long audio_load_ogg_mem(nint d, long n) {
+        return 0;
+    }
+
+    public static void audio_free_clip(nint c) {
+    }
+
+    public static double audio_clip_duration_ms(nint c) {
+        return (double)0L;
+    }
+
+    public static int audio_clip_channels(nint c) {
+        return 0;
+    }
+
+    public static int audio_clip_frequency(nint c) {
+        return 0;
+    }
+
+    public static int audio_play(nint c, int loop) {
+        return -1;
+    }
+
+    public static int audio_voice_playing(long v) {
+        return 0;
+    }
+
+    public static void audio_voice_stop(long v) {
+    }
+
+    public static void audio_voice_set_gain(long v, double g) {
+    }
+
+    // lock (obj) 监视器:C 版是 64 条纹递归 pthread 锁;本车道单线程,
+    // 递归即计数——条纹表 entry++/--,重入自然合法,退出钳到 0。
+    // 条纹折叠换成乘法散列(^ 未验证);不同条纹函数只会过度串行,
+    // 不丢互斥。
+    static int mon_stripe(nint obj) {
+        long bits = (long)obj;
+        bits = bits * 6364136223846793005L;
+        return (int)((bits >>> 4) & 63L);
+    }
+
+    public static void monitor_enter(nint obj) {
+        nint t = mon_tbl;
+        if (t == 0) {
+            t = calloc(64, 8);
+            mon_tbl = t;
+        }
+        Span<long> v = new Span<long>(t, 64);
+        int s = mon_stripe(obj);
+        v[s] = v[s] + 1;
+    }
+
+    public static void monitor_exit(nint obj) {
+        nint t = mon_tbl;
+        if (t == 0) { return; }
+        Span<long> v = new Span<long>(t, 64);
+        int s = mon_stripe(obj);
+        if (v[s] > 0) { v[s] = v[s] - 1; }
+    }
+
+    // UI 线程派发环:C 版 pthread mutex → OSAtomic CAS 自旋锁(0 闲 1
+    // 忙,互斥等价,争用下自旋)。环状态在 calloc 控制块([0] 自旋
+    // [1] 容量 [2] 头 [3] 尾 [4] 环指针),静态只存块指针、用点取新
+    // 局部(缺口 2 纪律)。控制块惰性建立是单线程假设(与 try_lock
+    // 代际表同款):两线程同时首用各建一块、后存者胜,先者的插入丢失
+    // ——派发面程序启动即初始化,实际不发生。delegate 值是进程期
+    // intern 块(_zan_dlg_intern),条目按裸指针搬移,C 版注释原样。
+    static nint d_ctl() {
+        nint t = d_ctl_s;
+        if (t == 0) {
+            t = calloc(1, 40);
+            Span<long> v = new Span<long>(t, 5);
+            v[0] = 0;
+            v[1] = 64;
+            v[2] = 0;
+            v[3] = 0;
+            nint r = calloc(64, 8);
+            v[4] = (long)r;
+            d_ctl_s = t;
+        }
+        return d_ctl_s;
+    }
+
+    static void d_lock(nint t) {
+        long state = 0;
+        while (state == 0) {
+            nint ok = osatomic_cas(0, 1, t);
+            if ((ok & 255L) != 0) { state = 1; }
+        }
+    }
+
+    static void d_unlock(nint t) {
+        Span<long> v = new Span<long>(t, 1);
+        v[0] = 0;
+    }
+
+    // 环满翻倍并把存活条目搬到新环(head=0、tail=存活数,与 C 版一致);
+    // 容量到 2^20 或分配失败拒绝,返回 0。调用方持锁。
+    static int d_grow(nint t) {
+        Span<long> v = new Span<long>(t, 5);
+        long cap = v[1];
+        if (cap >= 1048576L) { return 0; }
+        long ncap = cap * 2;
+        nint nring = malloc(ncap * 8);
+        if (nring == 0) { return 0; }
+        long head = v[2];
+        long tail = v[3];
+        nint oring = (nint)v[4];
+        Span<long> ov = new Span<long>(oring, (int)cap);
+        Span<long> nv = new Span<long>(nring, (int)ncap);
+        long count = 0;
+        long i = head;
+        while (i != tail) {
+            nv[(int)count] = ov[(int)i];
+            count = count + 1;
+            i = (i + 1) % cap;
+        }
+        cfree(oring);
+        Span<long> v2 = new Span<long>(t, 5);
+        v2[1] = ncap;
+        v2[2] = 0;
+        v2[3] = count;
+        v2[4] = (long)nring;
+        return 1;
+    }
+
+    public static void dispatch_init() {
+        nint t = d_ctl();
+        d_lock(t);
+        Span<long> v = new Span<long>(t, 5);
+        v[2] = 0;
+        v[3] = 0;
+        d_unlock(t);
+    }
+
+    // 成功 1,调用方按返回值分支(C 版注释原样);null 拒;满环先翻倍。
+    public static int dispatch_post(nint fn) {
+        if (fn == 0) { return 0; }
+        nint t = d_ctl();
+        d_lock(t);
+        int ok = 0;
+        Span<long> v = new Span<long>(t, 5);
+        long cap = v[1];
+        long head = v[2];
+        long tail = v[3];
+        long next = (tail + 1) % cap;
+        if (next == head && d_grow(t) == 1) {
+            Span<long> vg = new Span<long>(t, 5);
+            cap = vg[1];
+            head = vg[2];
+            tail = vg[3];
+            next = (tail + 1) % cap;
+        }
+        if (next != head) {
+            Span<long> vw = new Span<long>(t, 5);
+            nint ring = (nint)vw[4];
+            Span<long> rv = new Span<long>(ring, (int)cap);
+            rv[(int)tail] = (long)fn;
+            vw[3] = next;
+            ok = 1;
+        }
+        d_unlock(t);
+        return ok;
+    }
+
+    public static nint dispatch_take() {
+        nint t = d_ctl();
+        d_lock(t);
+        nint fn = 0;
+        Span<long> v = new Span<long>(t, 5);
+        if (v[2] != v[3]) {
+            long cap = v[1];
+            nint ring = (nint)v[4];
+            Span<long> rv = new Span<long>(ring, (int)cap);
+            fn = (nint)rv[(int)v[2]];
+            v[2] = (v[2] + 1) % cap;
+        }
+        d_unlock(t);
+        return fn;
+    }
+
+    public static void dispatch_clear() {
+        nint t = d_ctl();
+        d_lock(t);
+        Span<long> v = new Span<long>(t, 5);
+        v[2] = 0;
+        v[3] = 0;
+        d_unlock(t);
+    }
+
+    // 每线程 EH 状态块(编译器拥有布局:{i32 top, ptr exc,
+    // 256 x 1024 setjmp 槽},共 16+262144 字节)。__thread 槽位用
+    // pthread specific key 承载(无析构,进程期存活)。
+    public static nint eh_tls_state() {
+        if (eh_ready == 0) {
+            nint kp = malloc(8);
+            cpthread_key_create(kp, 0);
+            Span<long> kv = new Span<long>(kp, 1);
+            eh_key = kv[0];
+            cfree(kp);
+            eh_ready = 1;
+        }
+        nint p = cpthread_getspecific(eh_key);
+        if (p == 0) {
+            p = calloc(1, 262160);
+            if (p == 0) { cabort(); }
+            cpthread_setspecific(eh_key, p);
+        }
+        return p;
+    }
+
+    // ---- 第八批:zan_shared_table_*(单进程诚实移植,spec: oracle
+    // rt_sync.c;C 版的进程内注册表 + 堆行存储形态原样,块布局自定)----
+    // 表块(3152B):[0]名串 [1]容量 [2]键长 [3]列数 [4]行距 [5]行链头
+    // [6]行数 [7]在册 [8]自旋锁,列区从字节 80 起每列 96B(type@0
+    // size@8 offset@16 名@24 共 64B NUL 垫)。行块(48B):[0]next
+    // [1]hash [2]键副本 [3]alive [4]expires_at [5]data。注册表/匿名表
+    // 各 64/256 槽堆数组 + 自旋锁;锁单元与控制块惰性建立均为单线程
+    // 假设(与 try_lock/dispatch 同款)。跨线程互斥本身是诚实的
+    // (OSAtomic CAS 自旋)。
+    // FNV-1a 的 XOR 以 (a|b)-(a&b) 恒等式实现(^ 未验证,数学等价);
+    // s:<n>: 的数字段是 strtoul 的收窄近似(跳空格、可带 +、'-' 一律
+    // 拒——C 无符号回绕后必 >65536,等价)。
+    static nint st_reg_arr;
+    static long st_reg_n;
+    static nint st_reg_lk;
+    static nint st_anon_arr;
+    static long st_anon_n;
+    static nint st_anon_lk;
+    static nint st_empty;
+
+    static long st_rget(long r, int idx) {
+        Span<long> rv = new Span<long>((nint)r, 6);
+        return rv[idx];
+    }
+
+    static void st_rset(long r, int idx, long v) {
+        Span<long> rv = new Span<long>((nint)r, 6);
+        rv[idx] = v;
+    }
+
+    static long st_tget(nint t, int idx) {
+        Span<long> tv = new Span<long>(t, 10);
+        return tv[idx];
+    }
+
+    static void st_tset(nint t, int idx, long v) {
+        Span<long> tv = new Span<long>(t, 10);
+        tv[idx] = v;
+    }
+
+    // 表自旋锁在表块字节 64(槽 [8])。
+    static void st_lock(nint t) {
+        nint sp = st_ptr((long)t + 64);
+        long state = 0;
+        while (state == 0) {
+            nint ok = osatomic_cas(0, 1, sp);
+            if ((ok & 255L) != 0) { state = 1; }
+        }
+    }
+
+    static void st_unlock(nint t) {
+        Span<long> v = new Span<long>(st_ptr((long)t + 64), 1);
+        v[0] = 0;
+    }
+
+    static void st_spin(nint lk) {
+        long state = 0;
+        while (state == 0) {
+            nint ok = osatomic_cas(0, 1, lk);
+            if ((ok & 255L) != 0) { state = 1; }
+        }
+    }
+
+    static void st_unspin(nint lk) {
+        Span<long> v = new Span<long>(lk, 1);
+        v[0] = 0;
+    }
+
+    // (nint)(表达式) 括号强转不被解析器接受(nint 被当方法名,
+    // (int)(…) 却可以)——指针算术一律经本助手两步:(nint)ident 合法。
+    static nint st_ptr(long addr) {
+        return (nint)addr;
+    }
+
+    static nint st_reg_lock() {
+        nint lk = st_reg_lk;
+        if (lk == 0) {
+            lk = calloc(1, 8);
+            st_reg_lk = lk;
+        }
+        return st_reg_lk;
+    }
+
+    static nint st_anon_lock() {
+        nint lk = st_anon_lk;
+        if (lk == 0) {
+            lk = calloc(1, 8);
+            st_anon_lk = lk;
+        }
+        return lk;
+    }
+
+    static long st_coff(long c) {
+        Span<long> cv = new Span<long>((nint)c, 3);
+        return cv[2];
+    }
+
+    static long st_csize(long c) {
+        Span<long> cv = new Span<long>((nint)c, 3);
+        return cv[1];
+    }
+
+    static long st_arr_get(nint arr, long idx) {
+        Span<long> av = new Span<long>(st_ptr((long)arr + idx * 8), 1);
+        return av[0];
+    }
+
+    // "count"/"window_start"/"owner" 常量列名(lit_buf 字节备好)。
+    static nint lit_count_name() {
+        lit_init();
+        return lit_buf + 38;
+    }
+
+    static nint lit_wstart_name() {
+        lit_init();
+        return lit_buf + 64;
+    }
+
+    static nint lit_owner_name() {
+        lit_init();
+        return lit_buf + 80;
+    }
+
+    // CLOCK_REALTIME 毫秒(过期语义同 C 版 wall clock)。
+    static long st_wall() {
+        nint ts = malloc(16);
+        clock_gettime(0, ts);
+        Span<long> v = new Span<long>(ts, 2);
+        long ms = v[0] * 1000 + v[1] / 1000000;
+        cfree(ts);
+        return ms;
+    }
+
+    // FNV-1a 64,强制非零;null 键按空串。
+    static long st_hash(nint v) {
+        nint p = v;
+        if (p == 0) {
+            nint e = st_empty;
+            if (e == 0) {
+                e = calloc(1, 1);
+                st_empty = e;
+            }
+            p = e;
+        }
+        long len = cstrlen(p);
+        long h = 1469598103934665603L;
+        if (len > 0) {
+            Span<byte> sv = new Span<byte>(p, (int)len);
+            long i = 0;
+            while (i < len) {
+                long b = sv[(int)i] & 255L;
+                h = ((h | b) - (h & b)) * 1099511628211L;
+                i = i + 1;
+            }
+        }
+        return h != 0 ? h : 1L;
+    }
+
+    static int st_eq(nint a, nint b) {
+        long la = cstrlen(a);
+        long lb = cstrlen(b);
+        if (la != lb) { return 0; }
+        if (la == 0) { return 1; }
+        return cmemcmp(a, b, la) == 0 ? 1 : 0;
+    }
+
+    static nint st_strdup(nint p) {
+        long len = cstrlen(p);
+        nint cp = malloc(len + 1);
+        if (cp == 0) { return 0; }
+        if (len > 0) { memcpy(cp, p, len); }
+        Span<byte> z = new Span<byte>(st_ptr((long)cp + len), 1);
+        z[0] = 0;
+        return cp;
+    }
+
+    // schema 解析:C 版逐字符走查的等价实现。合法条目 i:name;/
+    // f:name;/s:<n>:name;(名非空且 <64 字节、无重名、n∈1..65536),
+    // 成功回填列数与行距。
+    static int st_parse_schema(nint schema, nint t) {
+        if (schema == 0) { return 0; }
+        long len = cstrlen(schema);
+        if (len == 0) { return 0; }
+        Span<byte> sv = new Span<byte>(schema, (int)(len + 1));
+        long ncol = st_tget(t, 3);
+        long offset = 0;
+        long i = 0;
+        long fail = 0;
+        long done = 0;
+        while (done == 0) {
+            if (sv[(int)i] == 0) {
+                done = 1;
+            }
+            else {
+                long type = -1;
+                long size = 0;
+                int ch = sv[(int)i];
+                if (ch == 105) {
+                    type = 0;
+                    size = 8;
+                    i = i + 1;
+                    if (sv[(int)i] != 58) { fail = 1; }
+                }
+                else if (ch == 102) {
+                    type = 1;
+                    size = 8;
+                    i = i + 1;
+                    if (sv[(int)i] != 58) { fail = 1; }
+                }
+                else if (ch == 115) {
+                    type = 2;
+                    i = i + 1;
+                    if (sv[(int)i] != 58) {
+                        fail = 1;
+                    }
+                    else {
+                        i = i + 1;
+                        while (sv[(int)i] == 32) { i = i + 1; }
+                        if (sv[(int)i] == 43) { i = i + 1; }
+                        if (sv[(int)i] < 48 || sv[(int)i] > 57) {
+                            fail = 1;
+                        }
+                        else {
+                            long n = 0;
+                            long dig = 1;
+                            while (dig == 1) {
+                                int d = sv[(int)i];
+                                if (d < 48 || d > 57) {
+                                    dig = 0;
+                                }
+                                else {
+                                    n = n * 10 + (d - 48);
+                                    if (n > 65536) { fail = 1; dig = 0; }
+                                    else { i = i + 1; }
+                                }
+                            }
+                            if (fail == 0) {
+                                if (n == 0 || sv[(int)i] != 58) { fail = 1; }
+                                else { size = n + 1; i = i + 1; }
+                            }
+                        }
+                    }
+                }
+                else {
+                    fail = 1;
+                }
+                if (fail == 0) {
+                    long start = i;
+                    while (sv[(int)i] != 0 && sv[(int)i] != 59) { i = i + 1; }
+                    long nlen = i - start;
+                    if (sv[(int)i] != 59 || nlen == 0 || nlen >= 64) {
+                        fail = 1;
+                    }
+                    else {
+                        long j = 0;
+                        while (fail == 0 && j < ncol) {
+                            nint pn = st_ptr((long)t + 80 + j * 96 + 24);
+                            if (cmemcmp(pn, st_ptr((long)schema + start),
+                                    nlen) == 0) {
+                                fail = 1;
+                            }
+                            else {
+                                j = j + 1;
+                            }
+                        }
+                        if (fail == 0) {
+                            if (type == 0 || type == 1) {
+                                offset = (offset + 7) & -8L;
+                            }
+                            nint cap = st_ptr((long)t + 80 + ncol * 96);
+                            Span<long> cv = new Span<long>(cap, 3);
+                            cv[0] = type;
+                            cv[1] = size;
+                            cv[2] = offset;
+                            nint nmp = st_ptr((long)cap + 24);
+                            Span<byte> nv = new Span<byte>(nmp, (int)nlen);
+                            long q = 0;
+                            while (q < nlen) {
+                                nv[(int)q] = sv[(int)(start + q)];
+                                q = q + 1;
+                            }
+                            offset = offset + size;
+                            ncol = ncol + 1;
+                            i = i + 1;
+                        }
+                    }
+                }
+                if (fail == 0) {
+                    if (ncol >= 32) { fail = 1; }
+                }
+                else {
+                    done = 1;
+                }
+            }
+        }
+        if (fail != 0) { return 0; }
+        st_tset(t, 3, ncol);
+        st_tset(t, 4, offset);
+        return 1;
+    }
+
+    static long st_find_col(nint t, nint name, int type) {
+        long ncol = st_tget(t, 3);
+        long j = 0;
+        long found = 0;
+        while (found == 0 && j < ncol) {
+            nint cap = st_ptr((long)t + 80 + j * 96);
+            Span<long> cv = new Span<long>(cap, 3);
+            if (cv[0] == (long)type && st_eq(st_ptr((long)cap + 24), name) == 1) {
+                found = (long)cap;
+            }
+            else {
+                j = j + 1;
+            }
+        }
+        return found;
+    }
+
+    static void st_purge(nint t, long now) {
+        Span<long> tv = new Span<long>(t, 7);
+        long r = tv[5];
+        while (r != 0) {
+            Span<long> rv = new Span<long>((nint)r, 6);
+            if (rv[3] != 0 && rv[4] != 0 && rv[4] <= now) {
+                rv[3] = 0;
+                tv[6] = tv[6] - 1;
+            }
+            r = rv[0];
+        }
+    }
+
+    static long st_find_row(nint t, nint key) {
+        long r = st_tget(t, 5);
+        long found = 0;
+        while (found == 0 && r != 0) {
+            if (st_rget(r, 3) != 0 && st_eq((nint)st_rget(r, 2), key) == 1) {
+                found = r;
+            }
+            else {
+                r = st_rget(r, 0);
+            }
+        }
+        return found;
+    }
+
+    static long st_find_row_hash(nint t, long hash) {
+        long r = st_tget(t, 5);
+        long found = 0;
+        while (found == 0 && r != 0) {
+            if (st_rget(r, 3) != 0 && st_rget(r, 1) == hash) {
+                found = r;
+            }
+            else {
+                r = st_rget(r, 0);
+            }
+        }
+        return found;
+    }
+
+    // oracle 载荷因子:7/8 满拒;tombstone 槽优先复用。
+    static long st_row_for(nint t, nint key) {
+        long r = st_find_row(t, key);
+        if (r != 0) { return r; }
+        long count = st_tget(t, 6);
+        long cap = st_tget(t, 1);
+        long stride = st_tget(t, 4);
+        long head = st_tget(t, 5);
+        if (count * 8 >= cap * 7) { return 0; }
+        long cur = head;
+        long reuse = 0;
+        while (reuse == 0 && cur != 0) {
+            if (st_rget(cur, 3) == 0) { reuse = cur; }
+            else { cur = st_rget(cur, 0); }
+        }
+        long hash = st_hash(key);
+        long row = reuse;
+        if (row != 0) {
+            nint data = (nint)st_rget(row, 5);
+            memset(data, 0, stride > 0 ? stride : 1);
+            st_rset(row, 1, hash);
+            st_rset(row, 4, 0);
+            st_rset(row, 3, 1);
+            st_tset(t, 6, count + 1);
+            return row;
+        }
+        nint nr = calloc(1, 48);
+        if (nr == 0) { return 0; }
+        nint kcopy = st_strdup(key);
+        nint data = calloc(1, stride > 0 ? stride : 1);
+        if (kcopy == 0 || data == 0) {
+            cfree(kcopy);
+            cfree(data);
+            cfree(nr);
+            return 0;
+        }
+        Span<long> nv = new Span<long>(nr, 6);
+        nv[0] = head;
+        nv[1] = hash;
+        nv[2] = (long)kcopy;
+        nv[3] = 1;
+        nv[4] = 0;
+        nv[5] = (long)data;
+        st_tset(t, 5, (long)nr);
+        st_tset(t, 6, count + 1);
+        return (long)nr;
+    }
+
+    // _at 建行的占位键 = 哈希的十进制形式(C 版 keybuf 语义)。
+    static nint st_key_from_hash(long h) {
+        nint kb = malloc(32);
+        long n = udec_into(h, kb);
+        Span<byte> z = new Span<byte>(st_ptr((long)kb + n), 1);
+        z[0] = 0;
+        return kb;
+    }
+
+    static int st_anon_has(long handle) {
+        nint t = (nint)handle;
+        if (t == 0) { return 0; }
+        nint lk = st_anon_lock();
+        st_spin(lk);
+        nint arr = st_anon_arr;
+        if (arr == 0) {
+            arr = calloc(256, 8);
+            st_anon_arr = arr;
+        }
+        long n = st_anon_n;
+        long j = 0;
+        long found = 0;
+        while (found == 0 && j < n) {
+            Span<long> av = new Span<long>(st_ptr((long)arr + j * 8), 1);
+            if (av[0] == handle) { found = 1; }
+            else { j = j + 1; }
+        }
+        st_unspin(lk);
+        return found;
+    }
+
+    public static long shared_table_create(
+            nint name, int capacity, int key_size, nint schema) {
+        if (name == 0 || cstrlen(name) == 0 || capacity <= 0
+                || capacity > 1048576 || key_size <= 0 || key_size > 4096) {
+            return 0;
+        }
+        nint t = calloc(1, 3152);
+        if (t == 0) { return 0; }
+        nint namecopy = st_strdup(name);
+        if (namecopy == 0) {
+            cfree(t);
+            return 0;
+        }
+        st_tset(t, 0, (long)namecopy);
+        st_tset(t, 1, capacity);
+        st_tset(t, 2, key_size);
+        if (st_parse_schema(schema, t) == 0) {
+            cfree(namecopy);
+            cfree(t);
+            return 0;
+        }
+        nint lk = st_reg_lock();
+        st_spin(lk);
+        nint arr = st_reg_arr;
+        if (arr == 0) {
+            arr = calloc(64, 8);
+            st_reg_arr = arr;
+        }
+        long n = st_reg_n;
+        int ok = 1;
+        long j = 0;
+        while (ok == 1 && j < n) {
+            long other = st_arr_get(arr, j);
+            if (st_tget((nint)other, 7) != 0
+                    && st_eq((nint)st_tget((nint)other, 0), name) == 1) {
+                ok = 0;
+            }
+            else {
+                j = j + 1;
+            }
+        }
+        if (ok == 1 && n < 64) {
+            st_tset(t, 7, 1);
+            Span<long> sv = new Span<long>(st_ptr((long)arr + n * 8), 1);
+            sv[0] = (long)t;
+            st_reg_n = n + 1;
+        }
+        else {
+            ok = 0;
+        }
+        st_unspin(lk);
+        if (ok == 0) {
+            cfree(namecopy);
+            cfree(t);
+            return 0;
+        }
+        return (long)t;
+    }
+
+    public static long shared_table_create_anon(
+            int capacity, int key_size, nint schema) {
+        if (capacity <= 0 || capacity > 1048576
+                || key_size <= 0 || key_size > 4096) {
+            return 0;
+        }
+        nint t = calloc(1, 3152);
+        if (t == 0) { return 0; }
+        st_tset(t, 1, capacity);
+        st_tset(t, 2, key_size);
+        if (st_parse_schema(schema, t) == 0) {
+            cfree(t);
+            return 0;
+        }
+        nint lk = st_anon_lock();
+        st_spin(lk);
+        nint arr = st_anon_arr;
+        if (arr == 0) {
+            arr = calloc(256, 8);
+            st_anon_arr = arr;
+        }
+        long n = st_anon_n;
+        if (n < 256) {
+            Span<long> sv = new Span<long>(st_ptr((long)arr + n * 8), 1);
+            sv[0] = (long)t;
+            st_anon_n = n + 1;
+        }
+        st_unspin(lk);
+        return (long)t;
+    }
+
+    public static long shared_table_open(nint name) {
+        if (name == 0) { return 0; }
+        nint lk = st_reg_lock();
+        st_spin(lk);
+        long n = st_reg_n;
+        long j = 0;
+        long found = 0;
+        while (found == 0 && j < n) {
+            long other = st_arr_get(st_reg_arr, j);
+            if (st_tget((nint)other, 7) != 0
+                    && st_eq((nint)st_tget((nint)other, 0), name) == 1) {
+                found = other;
+            }
+            else {
+                j = j + 1;
+            }
+        }
+        st_unspin(lk);
+        return found;
+    }
+
+    // 具名表按文档返回 0;匿名表返回可交给 Attach 的句柄本身。
+    public static long shared_table_handle(long handle) {
+        if (st_anon_has(handle) == 0) { return 0; }
+        return handle;
+    }
+
+    public static long shared_table_attach(long os_handle) {
+        if (st_anon_has(os_handle) == 0) { return 0; }
+        return os_handle;
+    }
+
+    public static void shared_table_close(long handle) {
+    }
+
+    public static int shared_table_destroy(long handle) {
+        nint t = (nint)handle;
+        if (t == 0) { return 0; }
+        int was = 0;
+        nint lk = st_reg_lock();
+        st_spin(lk);
+        if (st_tget(t, 7) != 0) {
+            st_tset(t, 7, 0);
+            was = 1;
+        }
+        st_unspin(lk);
+        return was;
+    }
+
+    public static int shared_table_set_int(
+            long handle, nint key, nint column, long value) {
+        nint t = (nint)handle;
+        if (t == 0 || key == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long c = st_find_col(t, column, 0);
+        long r = c != 0 ? st_row_for(t, key) : 0;
+        if (r != 0) {
+            nint slot = st_ptr(st_rget(r, 5) + st_coff(c));
+            Span<long> sv = new Span<long>(slot, 1);
+            sv[0] = value;
+        }
+        st_unlock(t);
+        return r != 0 ? 1 : 0;
+    }
+
+    public static long shared_table_get_int(
+            long handle, nint key, nint column) {
+        nint t = (nint)handle;
+        if (t == 0 || key == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long c = st_find_col(t, column, 0);
+        long r = c != 0 ? st_find_row(t, key) : 0;
+        long v = 0;
+        if (r != 0) {
+            nint slot = st_ptr(st_rget(r, 5) + st_coff(c));
+            Span<long> sv = new Span<long>(slot, 1);
+            v = sv[0];
+        }
+        st_unlock(t);
+        return v;
+    }
+
+    public static int shared_table_set_float(
+            long handle, nint key, nint column, double value) {
+        nint t = (nint)handle;
+        if (t == 0 || key == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long c = st_find_col(t, column, 1);
+        long r = c != 0 ? st_row_for(t, key) : 0;
+        if (r != 0) {
+            nint slot = st_ptr(st_rget(r, 5) + st_coff(c));
+            Span<double> sv = new Span<double>(slot, 1);
+            sv[0] = value;
+        }
+        st_unlock(t);
+        return r != 0 ? 1 : 0;
+    }
+
+    public static double shared_table_get_float(
+            long handle, nint key, nint column) {
+        nint t = (nint)handle;
+        if (t == 0 || key == 0) { return 0.0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long c = st_find_col(t, column, 1);
+        long r = c != 0 ? st_find_row(t, key) : 0;
+        double v = 0.0;
+        if (r != 0) {
+            nint slot = st_ptr(st_rget(r, 5) + st_coff(c));
+            Span<double> sv = new Span<double>(slot, 1);
+            v = sv[0];
+        }
+        st_unlock(t);
+        return v;
+    }
+
+    public static int shared_table_set_string(
+            long handle, nint key, nint column, nint value) {
+        nint t = (nint)handle;
+        if (t == 0 || key == 0 || value == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long c = st_find_col(t, column, 2);
+        long r = 0;
+        if (c != 0 && cstrlen(value) < st_csize(c)) {
+            r = st_row_for(t, key);
+        }
+        if (r != 0) {
+            long len = cstrlen(value);
+            nint dst = st_ptr(st_rget(r, 5) + st_coff(c));
+            memcpy(dst, value, len);
+            Span<byte> z = new Span<byte>(st_ptr((long)dst + len), 1);
+            z[0] = 0;
+        }
+        st_unlock(t);
+        return r != 0 ? 1 : 0;
+    }
+
+    // 缺失 → 空 malloc 串;命中 → 内容的新拷贝,调用方拥有(C strdup 契约)。
+    public static nint shared_table_get_string(
+            long handle, nint key, nint column) {
+        nint result = malloc(1);
+        Span<byte> e0 = new Span<byte>(result, 1);
+        e0[0] = 0;
+        nint t = (nint)handle;
+        if (result == 0 || t == 0 || key == 0) { return result; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long c = st_find_col(t, column, 2);
+        long r = c != 0 ? st_find_row(t, key) : 0;
+        if (r != 0) {
+            long size = st_csize(c);
+            nint src = st_ptr(st_rget(r, 5) + st_coff(c));
+            long len = 0;
+            long bound = size - 1;
+            long sl = cstrlen(src);
+            if (sl < bound) { len = sl; }
+            else { len = bound; }
+            nint copy = malloc(len + 1);
+            if (copy != 0) {
+                if (len > 0) { memcpy(copy, src, len); }
+                Span<byte> z = new Span<byte>(st_ptr((long)copy + len), 1);
+                z[0] = 0;
+                cfree(result);
+                result = copy;
+            }
+        }
+        st_unlock(t);
+        return result;
+    }
+
+    public static long shared_table_increment(
+            long handle, nint key, nint column, long delta) {
+        nint t = (nint)handle;
+        if (t == 0 || key == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long c = st_find_col(t, column, 0);
+        long r = c != 0 ? st_row_for(t, key) : 0;
+        long v = 0;
+        if (r != 0) {
+            nint slot = st_ptr(st_rget(r, 5) + st_coff(c));
+            Span<long> sv = new Span<long>(slot, 1);
+            v = sv[0] + delta;
+            sv[0] = v;
+        }
+        st_unlock(t);
+        return v;
+    }
+
+    public static int shared_table_expire(
+            long handle, nint key, long ttl_ms) {
+        if (ttl_ms < 0) { return 0; }
+        long now = st_wall();
+        if (ttl_ms > 9223372036854775807L - now) { return 0; }
+        return shared_table_expire_at(handle, key, now + ttl_ms);
+    }
+
+    public static int shared_table_expire_at(
+            long handle, nint key, long expires_at_ms) {
+        nint t = (nint)handle;
+        if (t == 0 || key == 0 || expires_at_ms < 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long r = st_find_row(t, key);
+        if (r != 0) { st_rset(r, 4, expires_at_ms); }
+        st_unlock(t);
+        return r != 0 ? 1 : 0;
+    }
+
+    public static long shared_table_expires_at(long handle, nint key) {
+        nint t = (nint)handle;
+        if (t == 0 || key == 0) { return -1; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long r = st_find_row(t, key);
+        long at = r != 0 ? st_rget(r, 4) : -1;
+        st_unlock(t);
+        return at;
+    }
+
+    public static long shared_table_purge_expired(long handle, long now_ms) {
+        nint t = (nint)handle;
+        if (t == 0) { return 0; }
+        if (now_ms < 0) { now_ms = st_wall(); }
+        st_lock(t);
+        long before = st_tget(t, 6);
+        st_purge(t, now_ms);
+        long removed = before - st_tget(t, 6);
+        st_unlock(t);
+        return removed;
+    }
+
+    public static int shared_table_rate_allow(
+            long handle, nint key, long now_ms,
+            long window_ms, long limit) {
+        if (limit <= 0) { return 1; }
+        nint t = (nint)handle;
+        if (t == 0 || key == 0 || window_ms <= 0) { return 0; }
+        if (now_ms < 0) { now_ms = st_wall(); }
+        if (window_ms > 9223372036854775807L - now_ms) { return 0; }
+        st_lock(t);
+        long countc = st_find_col(t, lit_count_name(), 0);
+        long startc = st_find_col(t, lit_wstart_name(), 0);
+        int allowed = 0;
+        if (countc != 0 && startc != 0) {
+            st_purge(t, now_ms);
+            long r = st_find_row(t, key);
+            if (r == 0) { r = st_row_for(t, key); }
+            if (r != 0) {
+                nint d = (nint)st_rget(r, 5);
+                nint cslot = st_ptr(d + st_coff(countc));
+                nint sslot = st_ptr(d + st_coff(startc));
+                Span<long> cv = new Span<long>(cslot, 1);
+                Span<long> sv = new Span<long>(sslot, 1);
+                if (sv[0] <= 0 || now_ms - sv[0] >= window_ms) {
+                    cv[0] = 1;
+                    sv[0] = now_ms;
+                    st_rset(r, 4, now_ms + window_ms);
+                    allowed = 1;
+                }
+                else if (cv[0] < limit) {
+                    cv[0] = cv[0] + 1;
+                    allowed = 1;
+                }
+            }
+        }
+        st_unlock(t);
+        return allowed;
+    }
+
+    public static int shared_table_lock_acquire(
+            long handle, nint key, long owner,
+            long now_ms, long lease_ms) {
+        nint t = (nint)handle;
+        if (t == 0 || key == 0 || owner == 0 || lease_ms <= 0) { return 0; }
+        if (now_ms < 0) { now_ms = st_wall(); }
+        if (lease_ms > 9223372036854775807L - now_ms) { return 0; }
+        st_lock(t);
+        long ownec = st_find_col(t, lit_owner_name(), 0);
+        int acquired = 0;
+        if (ownec != 0) {
+            st_purge(t, now_ms);
+            long r = st_find_row(t, key);
+            if (r == 0) {
+                r = st_row_for(t, key);
+                if (r != 0) {
+                    nint slot = st_ptr(st_rget(r, 5) + st_coff(ownec));
+                    Span<long> sv = new Span<long>(slot, 1);
+                    sv[0] = owner;
+                    st_rset(r, 4, now_ms + lease_ms);
+                    acquired = 1;
+                }
+            }
+        }
+        st_unlock(t);
+        return acquired;
+    }
+
+    public static int shared_table_lock_release(
+            long handle, nint key, long owner) {
+        nint t = (nint)handle;
+        if (t == 0 || key == 0 || owner == 0) { return 0; }
+        st_lock(t);
+        long ownec = st_find_col(t, lit_owner_name(), 0);
+        int released = 0;
+        if (ownec != 0) {
+            st_purge(t, st_wall());
+            long r = st_find_row(t, key);
+            if (r != 0) {
+                nint slot = st_ptr(st_rget(r, 5) + st_coff(ownec));
+                Span<long> sv = new Span<long>(slot, 1);
+                if (sv[0] == owner) {
+                    st_rset(r, 3, 0);
+                    st_tset(t, 6, st_tget(t, 6) - 1);
+                    released = 1;
+                }
+            }
+        }
+        st_unlock(t);
+        return released;
+    }
+
+    public static int shared_table_delete(long handle, nint key) {
+        nint t = (nint)handle;
+        if (t == 0 || key == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long r = st_find_row(t, key);
+        if (r != 0) {
+            st_rset(r, 3, 0);
+            st_tset(t, 6, st_tget(t, 6) - 1);
+        }
+        st_unlock(t);
+        return r != 0 ? 1 : 0;
+    }
+
+    public static int shared_table_exists(long handle, nint key) {
+        nint t = (nint)handle;
+        if (t == 0 || key == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long r = st_find_row(t, key);
+        st_unlock(t);
+        return r != 0 ? 1 : 0;
+    }
+
+    public static long shared_table_count(long handle) {
+        nint t = (nint)handle;
+        if (t == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long n = st_tget(t, 6);
+        st_unlock(t);
+        return n;
+    }
+
+    public static void shared_table_clear(long handle) {
+        nint t = (nint)handle;
+        if (t == 0) { return; }
+        st_lock(t);
+        long r = st_tget(t, 5);
+        while (r != 0) {
+            st_rset(r, 3, 0);
+            r = st_rget(r, 0);
+        }
+        st_tset(t, 6, 0);
+        st_unlock(t);
+    }
+
+    public static long shared_table_hash(nint value) {
+        return st_hash(value);
+    }
+
+    // what:1 RESIDENT 2 CAPACITY 3 COUNT 4 ROW_STRIDE 5 KEY_SIZE
+    // 6 COLUMNS(0 与 1 同值,oracle RESERVED 映射字节数诚实降级)。
+    public static long shared_table_stat(long handle, int what) {
+        nint t = (nint)handle;
+        if (t == 0) { return 0; }
+        if (what == 0 || what == 1) {
+            return st_tget(t, 4) * st_tget(t, 1);
+        }
+        if (what == 2) { return st_tget(t, 1); }
+        if (what == 3) { return st_tget(t, 6); }
+        if (what == 4) { return st_tget(t, 4); }
+        if (what == 5) { return st_tget(t, 2); }
+        if (what == 6) { return st_tget(t, 3); }
+        return 0;
+    }
+
+    public static int shared_table_set_int_at(
+            long handle, long key_hash, nint column, long value) {
+        nint t = (nint)handle;
+        if (t == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long c = st_find_col(t, column, 0);
+        long r = 0;
+        if (c != 0) {
+            r = st_find_row_hash(t, key_hash);
+            if (r == 0) {
+                nint kb = st_key_from_hash(key_hash);
+                r = st_row_for(t, kb);
+                cfree(kb);
+                if (r != 0) { st_rset(r, 1, key_hash); }
+            }
+            if (r != 0) {
+                nint slot = st_ptr(st_rget(r, 5) + st_coff(c));
+                Span<long> sv = new Span<long>(slot, 1);
+                sv[0] = value;
+            }
+        }
+        st_unlock(t);
+        return r != 0 ? 1 : 0;
+    }
+
+    public static long shared_table_get_int_at(
+            long handle, long key_hash, nint column) {
+        nint t = (nint)handle;
+        if (t == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long c = st_find_col(t, column, 0);
+        long r = c != 0 ? st_find_row_hash(t, key_hash) : 0;
+        long v = 0;
+        if (r != 0) {
+            nint slot = st_ptr(st_rget(r, 5) + st_coff(c));
+            Span<long> sv = new Span<long>(slot, 1);
+            v = sv[0];
+        }
+        st_unlock(t);
+        return v;
+    }
+
+    public static long shared_table_increment_at(
+            long handle, long key_hash, nint column, long delta) {
+        nint t = (nint)handle;
+        if (t == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long c = st_find_col(t, column, 0);
+        long r = 0;
+        long v = 0;
+        if (c != 0) {
+            r = st_find_row_hash(t, key_hash);
+            if (r == 0) {
+                nint kb = st_key_from_hash(key_hash);
+                r = st_row_for(t, kb);
+                cfree(kb);
+                if (r != 0) { st_rset(r, 1, key_hash); }
+            }
+            if (r != 0) {
+                nint slot = st_ptr(st_rget(r, 5) + st_coff(c));
+                Span<long> sv = new Span<long>(slot, 1);
+                v = sv[0] + delta;
+                sv[0] = v;
+            }
+        }
+        st_unlock(t);
+        return v;
+    }
+
+    public static long shared_table_extreme_at(
+            long handle, long key_hash, nint column, long value,
+            long keep_larger) {
+        nint t = (nint)handle;
+        if (t == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long c = st_find_col(t, column, 0);
+        long r = 0;
+        long stored = 0;
+        if (c != 0) {
+            r = st_find_row_hash(t, key_hash);
+            if (r == 0) {
+                nint kb = st_key_from_hash(key_hash);
+                r = st_row_for(t, kb);
+                cfree(kb);
+                if (r != 0) { st_rset(r, 1, key_hash); }
+            }
+            if (r != 0) {
+                nint slot = st_ptr(st_rget(r, 5) + st_coff(c));
+                Span<long> sv = new Span<long>(slot, 1);
+                stored = sv[0];
+                int replace = 0;
+                if (keep_larger != 0) {
+                    if (value > stored) { replace = 1; }
+                }
+                else {
+                    if (stored == 0 || value < stored) { replace = 1; }
+                }
+                if (replace == 1) {
+                    sv[0] = value;
+                    stored = value;
+                }
+            }
+        }
+        st_unlock(t);
+        return stored;
+    }
+
+    public static int shared_table_set_string_at(
+            long handle, long key_hash, nint column, nint value) {
+        nint t = (nint)handle;
+        if (t == 0 || value == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long c = st_find_col(t, column, 2);
+        long r = 0;
+        if (c != 0 && cstrlen(value) < st_csize(c)) {
+            r = st_find_row_hash(t, key_hash);
+            if (r == 0) {
+                nint kb = st_key_from_hash(key_hash);
+                r = st_row_for(t, kb);
+                cfree(kb);
+                if (r != 0) { st_rset(r, 1, key_hash); }
+            }
+            if (r != 0) {
+                long len = cstrlen(value);
+                nint dst = st_ptr(st_rget(r, 5) + st_coff(c));
+                memcpy(dst, value, len);
+                Span<byte> z = new Span<byte>(st_ptr((long)dst + len), 1);
+                z[0] = 0;
+            }
+        }
+        st_unlock(t);
+        return r != 0 ? 1 : 0;
+    }
+
+    public static nint shared_table_get_string_at(
+            long handle, long key_hash, nint column) {
+        nint result = malloc(1);
+        Span<byte> e0 = new Span<byte>(result, 1);
+        e0[0] = 0;
+        nint t = (nint)handle;
+        if (result == 0 || t == 0) { return result; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long c = st_find_col(t, column, 2);
+        long r = c != 0 ? st_find_row_hash(t, key_hash) : 0;
+        if (r != 0) {
+            long size = st_csize(c);
+            nint src = st_ptr(st_rget(r, 5) + st_coff(c));
+            long bound = size - 1;
+            long sl = cstrlen(src);
+            long len = sl < bound ? sl : bound;
+            nint copy = malloc(len + 1);
+            if (copy != 0) {
+                if (len > 0) { memcpy(copy, src, len); }
+                Span<byte> z = new Span<byte>(st_ptr((long)copy + len), 1);
+                z[0] = 0;
+                cfree(result);
+                result = copy;
+            }
+        }
+        st_unlock(t);
+        return result;
+    }
+
+    public static int shared_table_match_at(
+            long handle, long key_hash, nint column, nint text) {
+        nint t = (nint)handle;
+        if (t == 0 || text == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long c = st_find_col(t, column, 2);
+        long r = c != 0 ? st_find_row_hash(t, key_hash) : 0;
+        int equal = 0;
+        if (r != 0) {
+            nint src = st_ptr(st_rget(r, 5) + st_coff(c));
+            long size = st_csize(c);
+            equal = cstrncmp(src, text, size) == 0 ? 1 : 0;
+        }
+        st_unlock(t);
+        return equal;
+    }
+
+    public static int shared_table_exists_at(long handle, long key_hash) {
+        nint t = (nint)handle;
+        if (t == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long r = st_find_row_hash(t, key_hash);
+        st_unlock(t);
+        return r != 0 ? 1 : 0;
+    }
+
+    public static int shared_table_delete_at(long handle, long key_hash) {
+        nint t = (nint)handle;
+        if (t == 0) { return 0; }
+        st_lock(t);
+        st_purge(t, st_wall());
+        long r = st_find_row_hash(t, key_hash);
+        if (r != 0) {
+            st_rset(r, 3, 0);
+            st_tset(t, 6, st_tget(t, 6) - 1);
+        }
+        st_unlock(t);
+        return r != 0 ? 1 : 0;
     }
 }
 
