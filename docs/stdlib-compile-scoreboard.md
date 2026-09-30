@@ -1464,3 +1464,11 @@ mne 18 = 两侧同非零 stdout 逐字节一致。剩余非 pass 全部 oracle �
 - macOS 车道回归:电池 39/39(stub.c 只进 crossboot)。
 - 旧账核销(本轮 probe 证据):instance async、async 内 for/foreach/finally/
   switch、f32 存储、LINQ 从 known_open 移除——全部实证已绿,纯记账滞后。
+- 追补(同日):车道集扩到整个电池 —— 39/39 ELF + 39/39 PE-COFF,exit 0
+  (DEFAULT_FIXTURES=39;native_float_return_arg 在 float printf 落地后收编)。
+  新增 stub 面:round/pow(整数指数精确平方求幂、先正幂后取倒)、精确
+  fabs/floor/ceil/fmax/fmin、sqrt 走硬件 fsqrt、sin/cos Cody-Waite+Taylor;
+  kernel11 的 stdin+fgets(semihosting :tt);ngen_guard 因诚实 fopen 而
+  取消降级 → mach_vm_read_overwrite 按裸机语义诚实实现(无 MMU,字节拷贝
+  + KERN_SUCCESS)。首稿 x-x==0.0 把全部有限双精度当"已整数"返回——守卫改
+  |x|≥2^53。

@@ -449,7 +449,6 @@ UNREACHED(dlerror)
 UNREACHED(getcwd)
 UNREACHED(glob)
 UNREACHED(globfree)
-UNREACHED(mach_vm_read_overwrite)
 UNREACHED(opendir)
 UNREACHED(readdir)
 UNREACHED(realpath)
@@ -699,6 +698,40 @@ int fgetc(void *f) {
 }
 
 void rewind(void *f) { fseek(f, 0, 0); }
+
+/* stdin over semihosting: ":tt" opens the console for reading. The
+ * binding is lazy (first fgets), so a fixture that never reads stdin
+ * pays nothing. With no console input (</dev/null under the crossboot
+ * runner) SYS_READ transfers nothing and fgets reports EOF, which is
+ * exactly the Console.ReadLine("") path the fixture golden pins. */
+static shfile sh_stdin_slot;
+void *stdin = &sh_stdin_slot;
+
+char *fgets(char *buf, int n, void *f) {
+    shfile *sf = (shfile *)f;
+    int i = 0;
+    if (n <= 0) { return 0; }
+    if (sf->sh == 0) {
+        struct { const char *path; const char *mode; int len; } pb = {
+            ":tt", "r", 1
+        };
+        long h = semi_syscall(SH_OPEN, (void *)&pb);
+        if (h <= 0) { return 0; }
+        sf->sh = (int)h;
+        sf->pos = 0;
+        sf->tmp = 0;
+    }
+    while (i < n - 1) {
+        char c;
+        struct { long sh; void *buf; long len; } pb = { sf->sh, &c, 1 };
+        if (semi_syscall(SH_READ, (void *)&pb) == 1) { break; } /* EOF */
+        buf[i++] = c;
+        if (c == '\n') { break; }
+    }
+    if (i == 0) { return 0; }
+    buf[i] = 0;
+    return buf;
+}
 
 /* ---- abs/labs/atol/atoi ---- */
 
@@ -1574,6 +1607,209 @@ static int zan_fmt_double(char *out, double v, int prec, char style) {
 /* libc-name wrapper: the emitted runtime's double.Parse lowers to strtod. */
 double strtod(const char *s, char **end) {
     return strtod_full(s, (const char **)end);
+}
+
+/* Math.Round / Math.Round(x, digits) lower to libm round+pow. */
+double round(double x) {
+    double a = x < 0.0 ? -x : x;
+    if (x != x || a >= 9007199254740992.0) { return x; } /* NaN, Inf, integral */
+    return (double)(i64)(x + (x >= 0.0 ? 0.5 : -0.5));
+}
+
+double pow(double x, double y) {
+    if (y == 0.0) { return 1.0; }
+    {
+        /* Integral exponents: exact repeated squaring. This is the case
+         * the emitted runtime needs (Math.Round(x, d) -> pow(10, d)),
+         * and it must be bit-exact, not libm-approximate. */
+        i64 n = (i64)y;
+        if ((double)n == y && n >= -512 && n <= 512) {
+            double acc = 1.0;
+            double base = x;
+            int inv = 0;
+            if (n < 0) {
+                inv = 1;
+                n = -n;
+            }
+            while (n != 0) {
+                if ((n & 1) != 0) { acc = acc * base; }
+                n = n >> 1;
+                if (n != 0) { base = base * base; }
+            }
+            /* reciprocal of the exact power: one correctly-rounded
+             * division (1/100 == the literal 0.01's double) */
+            return inv ? 1.0 / acc : acc;
+        }
+    }
+    /* Fractional exponent: exp(y*ln x) with atanh-series log and
+     * Taylor exp, ~1-2 ulp -- honest bare-metal approximation, not
+     * libm-identical; no fixture path reaches it. */
+    {
+        double lx, k, r, s, term;
+        int i;
+        int esign = 1;
+        if (x < 0.0) { return 0.0 / 0.0; }
+        if (x == 0.0) { return 0.0; }
+        lx = x;
+        k = 0.0;
+        while (lx > 1.4142135623730951) { lx = lx * 0.5; k = k + 1.0; }
+        while (lx < 0.7071067811865476) { lx = lx * 2.0; k = k - 1.0; }
+        {
+            double z = (lx - 1.0) / (lx + 1.0);
+            double z2 = z * z;
+            double acc = 0.0;
+            double zp = z;
+            for (i = 1; i <= 19; i = i + 2) {
+                acc += zp / (double)i;
+                zp *= z2;
+            }
+            lx = 2.0 * acc + k * 0.693147180559945309417232121458;
+        }
+        s = y * lx;
+        if (s < 0.0) { s = -s; esign = 0; }
+        if (s > 709.0) { return esign ? 1.0 / 0.0 : 0.0; }
+        k = (double)(i64)(s / 0.693147180559945309417232121458);
+        r = s - k * 0.693147180559945309417232121458;
+        term = 1.0;
+        {
+            double acc = 1.0;
+            for (i = 1; i <= 14; i = i + 1) {
+                term = term * r / (double)i;
+                acc += term;
+            }
+            while (k > 0) { acc = acc * 2.0; k = k - 1.0; }
+            while (k < 0) { acc = acc * 0.5; k = k + 1.0; }
+            return esign ? acc : 1.0 / acc;
+        }
+    }
+}
+
+/* Exact math family (Math.* lowering). fmax/fmin/fabs/floor/ceil are
+ * exact by construction; sqrt rides the hardware fsqrt (IEEE correctly
+ * rounded on aarch64, so bit-identical to libm); sin/cos are
+ * Cody-Waite-reduced Taylor series (~1 ulp, not libm-identical in
+ * general -- the fixtures only need sin(0)/cos(0), which are exact). */
+double fabs(double x) {
+    u64 b = __builtin_bit_cast(u64, x);
+    return __builtin_bit_cast(double, b & ~((u64)1 << 63));
+}
+
+double floor(double x) {
+    double a = x < 0.0 ? -x : x;
+    if (x != x || a >= 9007199254740992.0) { return x; }
+    {
+        i64 t = (i64)x;
+        if (x < 0.0 && (double)t != x) { t = t - 1; }
+        return (double)t;
+    }
+}
+
+double ceil(double x) {
+    double a = x < 0.0 ? -x : x;
+    if (x != x || a >= 9007199254740992.0) { return x; }
+    {
+        i64 t = (i64)x;
+        if (x > 0.0 && (double)t != x) { t = t + 1; }
+        return (double)t;
+    }
+}
+
+double fmax(double a, double b) {
+    if (a != a) { return b; }
+    if (b != b) { return a; }
+    return a > b ? a : b;
+}
+
+double fmin(double a, double b) {
+    if (a != a) { return b; }
+    if (b != b) { return a; }
+    return a < b ? a : b;
+}
+
+double sqrt(double x) {
+    double r;
+    if (x < 0.0) { return 0.0 / 0.0; }
+    __asm__ volatile("fsqrt %d0, %d1" : "=w"(r) : "w"(x));
+    return r;
+}
+
+/* pi/2 split across three doubles: Cody-Waite reduction. */
+static const double d_pi2_hi = 1.5707963267948965580e+00;
+static const double d_pi2_mid = 6.1232339957367660359e-17;
+static const double d_pi2_lo = 2.1493883850835724090e-33;
+
+static double d_sin_core(double r) {
+    double x2 = r * r;
+    double t = r;
+    double acc = r;
+    int i;
+    for (i = 1; i <= 12; i = i + 1) {
+        t = t * x2 / (double)((2 * i) * (2 * i + 1));
+        acc = (i & 1) ? acc - t : acc + t;
+        if (acc == acc + t * 0.25) { break; }
+    }
+    return acc;
+}
+
+static double d_cos_core(double r) {
+    double x2 = r * r;
+    double t = 1.0;
+    double acc = 1.0;
+    int i;
+    for (i = 1; i <= 13; i = i + 1) {
+        t = t * x2 / (double)((2 * i - 1) * (2 * i));
+        acc = (i & 1) ? acc - t : acc + t;
+        if (acc == acc + t * 0.25) { break; }
+    }
+    return acc;
+}
+
+double sin(double x) {
+    if (x != x) { return x; }
+    if (x == 0.0) { return x; } /* keeps -0.0 honest */
+    {
+        double k = __builtin_round(x / d_pi2_hi);
+        double r = ((x - k * d_pi2_hi) - k * d_pi2_mid) - k * d_pi2_lo;
+        long q = (long)k;
+        switch (q & 3) {
+        case 0: return d_sin_core(r);
+        case 1: return d_cos_core(r);
+        case 2: return -d_sin_core(r);
+        default: return -d_cos_core(r);
+        }
+    }
+}
+
+double cos(double x) {
+    if (x != x) { return x; }
+    {
+        double k = __builtin_round(x / d_pi2_hi);
+        double r = ((x - k * d_pi2_hi) - k * d_pi2_mid) - k * d_pi2_lo;
+        long q = (long)k;
+        switch (q & 3) {
+        case 0: return d_cos_core(r);
+        case 1: return -d_sin_core(r);
+        case 2: return -d_cos_core(r);
+        default: return d_sin_core(r);
+        }
+    }
+}
+
+/* ngen_guard's OOB probe: with the honest file ABI live (real fopen),
+ * the guard no longer degrades on bare metal and runs its full check,
+ * which reads guest memory through this Mach primitive. No MMU maps
+ * guest memory, so any in-range address reads: copy and report
+ * success (KERN_SUCCESS, out_size = requested). */
+long mach_vm_read_overwrite(long target, unsigned long long address,
+                            unsigned long long size,
+                            unsigned long long dst,
+                            unsigned long long *out_size) {
+    char *s = (char *)(unsigned long)address;
+    char *d = (char *)(unsigned long)dst;
+    unsigned long long i;
+    for (i = 0; i < size; i = i + 1) { d[i] = s[i]; }
+    if (out_size != 0) { *out_size = size; }
+    return 0;
 }
 
 /* Single-threaded bare metal: an uncontended lock is exactly a no-op,
