@@ -1584,3 +1584,33 @@ mne 18 = 两侧同非零 stdout 逐字节一致。剩余非 pass 全部 oracle �
   ×2 配置;crossboot 78/78;卸载 sweep 570/624,非 pass 名单全部落在记载
   族内(flapper 带 569–572;mqtt_lwt_retain/http_server_stress/
   tdengine_pool 随载出入,无新名)。
+
+## v18o-19 (2026-10-01) — 缺口一/二落地:变参 P/Invoke 双 ABI + qemu ELF 车道 + 静态 Span 视图
+
+- 本批由并发会话完成主体、本会话验收落地(编译器半边随 33bee55 先行出库,
+  本批落 runtime/金标半边并补全程记录)。缺口一变参调用:[DllImport(
+  Variadic=true)] 机器早就在但零文档零覆盖,ELF 车道更整段错——尾参一律
+  按 Apple 式落栈,而 aarch64-linux 实测定案按自然类型续常规分配(int 尾
+  续 w 序、double 入 d 序、float 提升为 double)。ngen CallStaticNg 三处
+  修复:ELF 自然类尾参分配循环(fp 续 cf<8→d 序否则溢出槽,其余续
+  ci<8→x 序;新增读回段把暂存搬进寄存器/溢出槽);Apple 尾参基址
+  8*sres→8*cs(奇数个定长溢出参经 16 对齐垫把变参区推后 8 字节,
+  probe9 修复前 1058≠2160、修复后双车道 2160)。
+- 永久金标:native_varargs(macOS 车道:变参 open 尾参 mode 经 stat 回读
+  33188=S_IFREG|0644、snprintf 5/8 尾参、fcntl;纯声明负效不钉)与
+  native_varargs_elf(混合类 5 尾参、8 int 尾参寄存器耗尽+溢出、
+  double/float 提升尾参、类交错、定长-only 返回计数)入电池(42)与
+  crossboot 默认清单——ELF 车道在 qemu-system-aarch64 -M virt 下真实
+  执行,双车道输出逐字节一致。绕行件退役:runtime_core 直接三参变参
+  open(mode 0644 尾参),zanstubs.c 删 zan_open_creat,锁定 C 符号账面
+  21→20。缺口二:静态字段 Span<T> 视图(SpanContainerTy 补静态两分支)
+  关掉最后一个响亮编译错面;缺口账 1/2/3/4 全修,5(间接调用)仍开放。
+- 门禁(终树 zanc_v19=run.8y0BZ8 定点):gate_probes 全绿;battery 42/42
+  ×2 配置;async 4/4 ×2;crossboot 80/80(qemu ELF 变参引导含内);sweep
+  570/624 与上批同数:http_server_stress 本轮转 pass,async_try_exit_depth
+  翻入 om——独立复跑两遍定性:一遍参考端空输出、一遍参考端复现与本端
+  逐字节同(18003000/17969988 闭式和),系 oracle 6000 轮 async 循环压着
+  60s 超时界的参考端 flapper,非本端回归。
+- 过程教训:一次 crossboot 启动静默回退到批中迭代编译器(zanc_fin),ELF
+  变参引导空输出——该迭代缺的正是最后的 ELF 尾参读回段。定点迭代编译器
+  在车道间不可互换,门禁必须显式钉死种子。
