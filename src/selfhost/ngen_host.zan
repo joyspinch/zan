@@ -29,7 +29,7 @@ namespace Zan;
 // no new ARC/destructor protocol is invented here.
 // File I/O failures and OOM fail closed via puts/exit(1), never success with
 // partial data. Exists is a readable-file probe, matching IR fopen semantics.
-// ExeDir uses libSystem _NSGetExecutablePath + realpath (not Linux /proc).
+// ExeDir uses the runtime zan_exe_path face + realpath (libSystem or /proc/self/exe).
 // Directory.ListNames uses libSystem glob/globfree/strrchr. Its 65536-byte,
 // newline-separated basename/truncation contract matches the existing IR shim.
 // No zan_exe_dir_into/zan_dir_list_into or other C shim is required here.
@@ -1467,10 +1467,10 @@ partial class Ngen {
         HostBegin("_zan_host_exedir");
         // Query required uint32 capacity, then retry with an allocated buffer.
         LoadImm(0, 0); HostSave(0, 0); AddImm(1, 31, 0);
-        BLExtern("__NSGetExecutablePath");
+        BLExtern("_zan_exe_path");
         E4(0xB94003E0); // ldr w0, [sp] (size is uint32)
         HostNonzero(0, "exedir.query_size"); BLExtern("_malloc"); HostNonzero(0, "exedir.path.malloc"); HostSave(0, 1);
-        AddImm(1, 31, 0); BLExtern("__NSGetExecutablePath"); HostZero32("exedir.get_path");
+        AddImm(1, 31, 0); BLExtern("_zan_exe_path"); HostZero32("exedir.get_path");
         HostLoad(0, 1); LoadImm(1, 0); BLExtern("_realpath"); HostNonzero(0, "exedir.realpath"); HostSave(0, 2);
         HostLoad(0, 1); BLExtern("_free");
         HostLoad(0, 2); LoadImm(1, 47); BLExtern("_strrchr"); HostNonzero(0, "exedir.dirname");
@@ -4415,7 +4415,7 @@ partial class Ngen {
         MovRR(9, 0);
         MovRR(0, 9);
         LoadImm(1, 16);
-        BLExtern("_arc4random_buf");
+        BLExtern("_zan_urandom");
         HostLoad(9, 0);                        // buf (reloaded post-call)
         ExtLdrbImm(0, 9, 6);
         ExtUbfmLo(0, 0, 3);                    // & 0x0F
@@ -4950,14 +4950,15 @@ partial class Ngen {
     }
 
     // x0 = msg string, x1 = len -> byte[] digest (len clamped to the string).
-    // CommonCrypto is re-exported by libSystem, so -lSystem resolves it.
+    // All digests live in runtime_core.zan (target-agnostic zan_* face), so
+    // the emitted code no longer leans on CommonCrypto/libSystem exports.
     void HostEmitDigests() {
         HostBegin("_zan_ext_sha256");
         HostSave(0, 0); HostSave(1, 1);
         HostLoad(9, 0); ExtLenOf(9, 9);
         HostLoad(0, 1); ExtMov(1, 9); ExtClampLen(); HostSave(0, 2);
         HostLoad(0, 0); HostLoad(1, 2); AddImm(2, 31, 64);
-        BLExtern("_CC_SHA256");
+        BLExtern("_zan_sha256");
         LoadImm(0, 32); BLInternal("_zan_ext_arr_new"); HostSave(0, 3);
         HostLoad(0, 3); AddImm(1, 31, 64); LoadImm(2, 32);
         BLInternal("_zan_ext_slot_copy");
@@ -4969,7 +4970,7 @@ partial class Ngen {
         HostLoad(9, 0); ExtLenOf(9, 9);
         HostLoad(0, 1); ExtMov(1, 9); ExtClampLen(); HostSave(0, 2);
         HostLoad(0, 0); HostLoad(1, 2); AddImm(2, 31, 64);
-        BLExtern("_CC_SHA1");
+        BLExtern("_zan_sha1");
         LoadImm(0, 20); BLInternal("_zan_ext_arr_new"); HostSave(0, 3);
         HostLoad(0, 3); AddImm(1, 31, 64); LoadImm(2, 20);
         BLInternal("_zan_ext_slot_copy");
@@ -4981,7 +4982,7 @@ partial class Ngen {
         HostLoad(9, 0); ExtLenOf(9, 9);
         HostLoad(0, 1); ExtMov(1, 9); ExtClampLen(); HostSave(0, 2);
         HostLoad(0, 0); HostLoad(1, 2); AddImm(2, 31, 64);
-        BLExtern("_CC_MD5");
+        BLExtern("_zan_md5");
         LoadImm(0, 16); BLInternal("_zan_ext_arr_new"); HostSave(0, 3);
         HostLoad(0, 3); AddImm(1, 31, 64); LoadImm(2, 16);
         BLInternal("_zan_ext_slot_copy");
@@ -5007,10 +5008,9 @@ partial class Ngen {
         HostLoad(0, 1); ExtMov(1, 9); ExtClampLen(); HostSave(0, 4);
         HostLoad(4, 2); ExtLenOf(4, 9);
         HostLoad(0, 3); ExtMov(1, 9); ExtClampLen(); HostSave(0, 5);
-        LoadImm(0, 2);                          // kCCHmacAlgSHA256
-        HostLoad(1, 0); HostLoad(2, 4); HostLoad(3, 2); HostLoad(4, 5);
-        AddImm(5, 31, 64);
-        BLExtern("_CCHmac");
+        HostLoad(0, 0); HostLoad(1, 4); HostLoad(2, 2); HostLoad(3, 5);
+        AddImm(4, 31, 64);
+        BLExtern("_zan_hmac_sha256");
         LoadImm(0, 32); BLInternal("_zan_ext_arr_new"); HostSave(0, 6);
         HostLoad(0, 6); AddImm(1, 31, 64); LoadImm(2, 32);
         BLInternal("_zan_ext_slot_copy");
@@ -5383,7 +5383,7 @@ partial class Ngen {
         int nmPos = NL(); EmitBcond(10, nmPos); LoadImm(0, 0);
         Mark(nmPos); HostSave(0, 1);
         HostLoad(0, 0); HostLoad(1, 1); AddImm(2, 31, 128);
-        BLExtern("_CC_SHA256");
+        BLExtern("_zan_sha256");
         LoadImm(0, 33); BLInternal("_zan_rt_str_alloc"); HostSave(0, 2);
         HostLoad(0, 2); AddImm(1, 31, 128); LoadImm(2, 32);
         BLExtern("_memcpy");
@@ -5403,12 +5403,10 @@ partial class Ngen {
         LoadImm(0, 0);
         E4(0xD65F03C0);                        // ret (pthread start routine)
 
-        // per-thread id: pthread_threadid_np(pthread_self(), &id)
+        // per-thread id: the runtime face (gettid on Linux,
+        // pthread_threadid_np behind the same symbol on darwin)
         HostBegin("_zan_host_thread_id");
-        BLExtern("_pthread_self");
-        AddImm(1, 31, 0);                      // &slot
-        BLExtern("_pthread_threadid_np");
-        LdrU(0, 31, 0);
+        BLExtern("_zan_thread_current_id");
         HostEnd();
     }
 }

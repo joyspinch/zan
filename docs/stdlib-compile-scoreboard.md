@@ -1821,3 +1821,62 @@ mne 18 = 两侧同非零 stdout 逐字节一致。剩余非 pass 全部 oracle �
   非法字节 FFFD=2、截断序列 FFFD=1、空指针卫 0/0,16 行精确)入电池
   45→46,双车道同金标。fixture 源一度被误写覆盖(编译器输出当输出路径),
   自链接对象反汇编 + 冻结金标完整重建,双车道逐字复核。
+
+## v18o-26 (2026-10-02) — 第十四批:目标无关面,linux 车道零项目 C
+
+- runtime_core 第十四批:发射面消费的 macOS 符号全部目标无关化——
+  新增 zan_md5/zan_sha1/zan_hmac_sha256(RFC 1321/3174/4231 官方向量
+  全对,含 million-'a' 流式与 million-byte key 的 key-hash 路径)、
+  zan_urandom(getentropy 256B 分块,/dev/urandom 回退——getrandom
+  在 libSystem 无导出)、zan_vm_read(darwin task_self_trap+
+  mach_vm_read_overwrite,Linux process_vm_readv 双 iovec)、
+  zan_lock_enter/exit([AtomicCas] casal 0→1 自旋,64 次后
+  sched_yield,stlr 释放)、zan_exe_path(两平台同一"预设容量、单发
+  调用"契约:darwin _NSGetExecutablePath 直通,Linux /proc/self/exe
+  readlink 补 NUL)。既有面条件化:__error/__errno_location、
+  PTHREAD_MUTEX_RECURSIVE(1/2)、struct stat 双布局(musl 128B:
+  mode@16 size@48 mtim@88;darwin 144B)、六处自旋点改 rt_cas_lock/
+  unlock 帮助函数(OSAtomic DllImport 删除,atomic_int_add 换 CAS
+  fetch-add 循环)。
+- 发射器改面(编译器):ngen_host digests/hmac(_CCHmac 六参 →
+  zan_hmac_sha256 五参)/nm_sha256/guid(_arc4random_buf→
+  _zan_urandom)/exedir(__NSGetExecutablePath→_zan_exe_path,两段
+  查询协议不变)/thread_id(pthread_self+pthread_threadid_np 塌缩成
+  _zan_thread_current_id 单调);ngen_string 跨页 header 快照
+  (mach_task_self_+mach_vm_read_overwrite → _zan_vm_read,返回值
+  即成败,尺寸校验随之退役);ngen_guard 日志锁(os_unfair_lock_* →
+  zan_lock_enter/exit)。定点 stage2.o 的未定义符号恰为十个 zan_* 面,
+  CC_/mach/OSAtomic 零残留。
+- stdlib:AppPath 双轨(LINUX readlink + MACOS _NSGetExecutablePath)
+  塌缩成 zan_exe_path 单面;ProcessHost 死导入删除。linux_vehicle.sh
+  退役三对象(zanstubs_rest/zanhost_rest/zanlinuxshims)——ELF 链接
+  只剩 runtime_core.elf.o + musl libc.a + libgcc.a,即 **linux 车道
+  零项目 C 里程碑**;zanlinuxshims.c(558 行)整目录退役保留史档。
+- C 基线同批:zanstubs.c 增 zan_md5/sha1/hmac_sha256(CC_* 直通)/
+  urandom/vm_read/lock/exe_path 别名(__APPLE__ 收口,mach-o/dyld、
+  os/lock、mach/mach_vm 头补齐),A/B 两车道同金标可链。
+- 永久金标:native_digests(26 行:MD5×8 含 million-'a'、SHA-1×4、
+  SHA-256×2、SHA-512×2(该面首条金标)、HMAC-SHA256×4(RFC 4231
+  cases 1/2/4/6,含 131×0xaa 与 10^6×0xaa key)、锁计数 1000/0、
+  Guid 36/4/1/1)入电池,双车道 + Linux guest 三车道逐字节同输出。
+- 本批排障志(有教育意义):SHA-1 四向量全错的根因**不是算法**——
+  80 轮逐轮对拍全对,错在 `new long[]{0xefcdab89,…}` 裸十六进制
+  字面量按 int 语义取值、宽化为 long 时符号扩展(C#/Java 同款);
+  sha1 独有 rotl30(b) 直接旋转被符号扩展的状态字,sha256 侥幸免疫
+  (其 rot 对象 rot32(a)/rot32(e) 恰为 <2^31 干净值,且全部赋值点
+  带掩码)。四张 K/h 表(sha256 K/h、md5 K/h)全量补 L 后缀,
+  审计脚本确认零残留。fixture 三处 HMAC 向量亦勘误(RFC 4231
+  case1 key=0x0b×20 非 0×20;case4=131×0xaa 非 25 字节;case6
+  密钥为 0xaa 非 'a');验收方再勘误一处:million-key 向量注释
+  9b09ffa7 实为 RFC 4231 case7 值,该输入对(key=0xaa×10^6 ×
+  case6 数据串)真值 3f0656e1,注释已改(金标本钉真值)。
+- 定点与门禁(写手侧:暂存种子一次过 run.DTx5Ud;验收侧独立链:
+  zanc_v25=lexer 批闭包 × 本树 → run.xUYGAz 定点一次过 stage2.o==
+  stage3.o,zanc_v26;v26 重建 trio → run.72Dku9 闭包定点,zanc_v27;
+  stage2.o 未定义符号 nm 实测全为 zan_* 面 + libc,CC_/mach/
+  OSAtomic/_NSGetExecutablePath/os_unfair 零残留):
+  battery 48/48 ×2(Zan 车道单对象 + C 基线双对象);crossboot
+  40 夹具 80 PASS/0 FAIL(stub.c 哨兵/实现同步换 zan_* 面);
+  linux_vehicle 7/7 guest(默认五 + native_digests + native_memwide
+  新入默认集),**零 C 链接下全绿**;负测 native_unresolved_internal
+  诊断逐字;runtime 与 fixture 对象级确定性逐字节。

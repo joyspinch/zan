@@ -514,6 +514,109 @@ int64_t zan_thread_current_id(void) {
 }
 #endif /* ZAN_RT_CORE_ZAN */
 
+/* ---- 第十四批 zan_ 别名:编译器发射面(digests/guid/exedir/threadid/
+ * string_header/guard)与 stdlib AppPath 已改指 runtime_core.zan 的
+ * 目标无关符号;C 基线车道(-UZAN_RT_CORE_ZAN)用同语义平台实现补齐,
+ * 保证 A/B 对拍在两条车道都可链。mach/CommonCrypto 部分按 __APPLE__ 收口。 */
+#ifndef ZAN_RT_CORE_ZAN
+
+#include <stdint.h>
+#ifdef __APPLE__
+#include <CommonCrypto/CommonCrypto.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <mach-o/dyld.h>
+#include <os/lock.h>
+#else
+#include <unistd.h>
+#endif
+
+void zan_md5(const void *data, long long len, unsigned char *md) {
+#ifdef __APPLE__
+    CC_MD5(data, (CC_LONG)len, md);
+#else
+    (void)data; (void)len; (void)md;
+#endif
+}
+
+void zan_sha1(const void *data, long long len, unsigned char *md) {
+#ifdef __APPLE__
+    CC_SHA1(data, (CC_LONG)len, md);
+#else
+    (void)data; (void)len; (void)md;
+#endif
+}
+
+void zan_hmac_sha256(const void *key, long long klen,
+                     const void *data, long long dlen, unsigned char *mac) {
+#ifdef __APPLE__
+    CCHmac(kCCHmacAlgSHA256, key, (size_t)klen, data, (size_t)dlen, mac);
+#else
+    (void)key; (void)klen; (void)data; (void)dlen; (void)mac;
+#endif
+}
+
+void zan_urandom(void *buf, long long len) {
+#ifdef __APPLE__
+    arc4random_buf(buf, (size_t)len);
+#else
+    (void)buf; (void)len;
+#endif
+}
+
+int zan_vm_read(void *dst, void *addr, long long len) {
+#ifdef __APPLE__
+    mach_vm_size_t outsize = 0;
+    return mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(uintptr_t)addr,
+                                  (mach_vm_size_t)len, (mach_vm_address_t)(uintptr_t)dst,
+                                  &outsize);
+#else
+    (void)dst; (void)addr; (void)len;
+    return -1;
+#endif
+}
+
+/* 发射器 guard 串行化:地址即锁的 8 字节零初始化槽。os_unfair_lock 的
+ * 文档初始化态就是全零,直接落在调用方槽位上,与 Zan 实现的槽布局一致。 */
+int zan_lock_enter(void *p) {
+#ifdef __APPLE__
+    if (!p) return 22;
+    os_unfair_lock_lock((os_unfair_lock_t)p);
+    return 0;
+#else
+    (void)p; return 22;
+#endif
+}
+
+int zan_lock_exit(void *p) {
+#ifdef __APPLE__
+    if (!p) return 22;
+    os_unfair_lock_unlock((os_unfair_lock_t)p);
+    return 0;
+#else
+    (void)p; return 22;
+#endif
+}
+
+int zan_exe_path(void *buf, void *capp) {
+#ifdef __APPLE__
+    return _NSGetExecutablePath((char *)buf, (uint32_t *)capp);
+#else
+    if (!buf || !capp) return -1;
+    long cap = *(long *)capp;
+    if (cap <= 0) return -1;
+    long n = readlink("/proc/self/exe", (char *)buf, (size_t)cap - 1);
+    if (n < 0 || n >= cap - 1) {
+        if (n >= cap - 1) *(long *)capp = n + 1;
+        return -1;
+    }
+    ((char *)buf)[n] = 0;
+    return 0;
+#endif
+}
+
+#endif /* ZAN_RT_CORE_ZAN */
+
 /* ---- UI-thread dispatch queue (spec: oracle rt_sync.c zan_dispatch_*) ----
  * The oracle ring retains a posted closure and releases on take/clear via the
  * record's own dtor. Selfhost delegate values are interned process-lifetime

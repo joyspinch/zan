@@ -35,6 +35,7 @@ def main():
         ROOT / 'tests/selfhost/native_varargs.zan', ROOT / 'tests/selfhost/native_varargs_elf.zan',
         ROOT / 'tests/selfhost/native_fnptr.zan', ROOT / 'tests/selfhost/native_sync.zan',
         ROOT / 'tests/selfhost/native_spans.zan', ROOT / 'tests/selfhost/native_memwide.zan',
+        ROOT / 'tests/selfhost/native_digests.zan',
         ROOT / 'tests/selfhost/native_retarget.zan']
     failed = 0
     for i, fixture in enumerate(fixtures):

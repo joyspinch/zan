@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Build the Zan-implemented runtime object (runtime_core.zan, batches 1-13)
+# Build the Zan-implemented runtime object (runtime_core.zan, batches 1-14)
 # with the native bootstrap compiler and localize its non-API symbols.
 #
 #   SEED=/path/to/stage2 bash crt-transition/build_zan_core.sh [out.o]
 #
-# Produces an object exporting exactly the 144 allowlisted zan_* symbols
+# Produces an object exporting exactly the 152 allowlisted zan_* symbols
 # (monotonic/sha256/sha512/alloc/free/crc32 + pkg_fopen/file_*/plat_*/
 # io_* + atomic/audio/monitor/dispatch/eh/shared_table + io reactor
 # co helpers + set_ready_hook/thread_start/thread_current_id + mem ops
 # copy/fill/compare/find/get_string/put_string + UTF-16 text converters
-# multi_byte_to_wide_char/wide_char_to_multi_byte + weakened embed_*).
+# multi_byte_to_wide_char/wide_char_to_multi_byte + weakened embed_*;
+# batch 14 adds md5/sha1/hmac_sha256/urandom/vm_read/lock_enter/
+# lock_exit/exe_path — the target-agnostic faces the compiler's
+# emitters and stdlib AppPath now call).
 # Since batch 13 this object ALONE is the whole darwin-lane runtime (the
 # -DZAN_RT_CORE_ZAN builds of zanstubs.c/zanhost.c are empty and kept
 # only as the recorded C remainder):
@@ -82,6 +85,8 @@ python3 crt-transition/localize_syms.py "$OUT" \
   _zan_copy _zan_fill _zan_compare _zan_find \
   _zan_get_string _zan_put_string \
   _zan_multi_byte_to_wide_char _zan_wide_char_to_multi_byte \
+  _zan_md5 _zan_sha1 _zan_hmac_sha256 _zan_urandom _zan_vm_read \
+  _zan_lock_enter _zan_lock_exit _zan_exe_path \
   --weaken \
   _zan_embed_has _zan_embed_read _zan_embed_bytes _zan_embed_list
 cc -DZAN_RT_CORE_ZAN -c -o "$ROOT/crt-transition/zanstubs_rest.o" \

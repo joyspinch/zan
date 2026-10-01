@@ -214,10 +214,11 @@ partial class Ngen {
     // Darwin arm64 VM pages are >=4K. If payload and header are in the SAME
     // 4K block, readable payload implies readable header (page protections
     // cannot split that block). This keeps ordinary managed Length O(1).
-    // At a boundary use mach_vm_read_overwrite into our own stack: an unmapped
-    // or PROT_NONE preceding page returns a kernel error, not SIGSEGV. Consume
-    // the COPIED bytes only; no probe-then-dereference race on that slow path.
-    // As with strlen, caller must keep the payload alive during the operation.
+    // At a boundary use the runtime zan_vm_read face into our own stack: an
+    // unmapped or PROT_NONE preceding page makes the copy fail (nonzero
+    // return) instead of SIGSEGV. Consume the COPIED bytes only; no
+    // probe-then-dereference race on that slow path. As with strlen, caller
+    // must keep the payload alive during the operation.
     void StringEmitHeader() {
         StringFrame("_zan_string_header", 48);
         int fail = NL(); int slow = NL(); int ready = NL();
@@ -228,14 +229,10 @@ partial class Ngen {
         E4(0xF85F0002); // ldur x2,[x0,#-16], same readable page
         EmitB(ready);
         Mark(slow);
-        SubImm(1, 0, 16);
-        LoadSymRefGOT("_mach_task_self_", 9);
-        E4(0xB9400120); // ldr w0,[x9] (mach_port_t, NOT an 8-byte load)
-        LoadImm(2, 16); AddImm(3, 31, 0); AddImm(4, 31, 16);
-        StrU(31, 31, 16);
-        BLExtern("_mach_vm_read_overwrite");
-        E4(0x7100001F); EmitBcond(1, fail); // kern_return_t is w0
-        LdrU(9, 31, 16); LoadImm(10, 16); StringCmp(9, 10); EmitBcond(1, fail);
+        SubImm(1, 0, 16);                  // x1 = payload-16 (before x0 is clobbered)
+        LoadImm(2, 16); AddImm(0, 31, 0);  // x0 = dst = sp, x2 = len 16
+        BLExtern("_zan_vm_read");
+        E4(0x7100001F); EmitBcond(1, fail); // w0 != 0 -> unreadable
         LdrU(1, 31, 8); LdrU(2, 31, 0);
         Mark(ready); LoadImm(0, 1); StringReturn(48);
         Mark(fail); LoadImm(0, 0); LoadImm(1, 0); LoadImm(2, 0); StringReturn(48);

@@ -1,4 +1,4 @@
-// crt-transition/runtime_core.zan — Zan 实现的过渡期运行时(第一~十三批)。
+// crt-transition/runtime_core.zan — Zan 实现的过渡期运行时(第一~十四批)。
 //
 // 取代 zanstubs.c / zanhost.c 中的(用 -DZAN_RT_CORE_ZAN 从 C 侧编出):
 //   第一批:zan_monotonic_ns / zan_monotonic_us / zan_sha256 / zan_sha512
@@ -68,6 +68,19 @@
 //           Wide 面),从此 darwin 车道链接只需 runtime_core.o——
 //           自举定点 run.B34Of5 即零项目 C 链接,zanstubs_rest.o
 //           清零(裸名遗留面只存于 C 基线 zanstubs_full 供 A/B)。
+//   第十四批:目标无关面落地,linux 车道同样零项目 C——发射器
+//           (ngen_host 的 digests/hmac/nm_sha/guid/exedir/threadid、
+//           ngen_string 的跨页 header 快照、ngen_guard 的日志锁)与
+//           stdlib AppPath 改调本文件的 md5/sha1/hmac_sha256/
+//           sha256/urandom/vm_read/lock_enter/lock_exit/exe_path/
+//           thread_current_id,CommonCrypto/mach/os_unfair_lock/
+//           _NSGetExecutablePath/pthread_threadid_np 从发射面退役;
+//           exe_path 按"预设容量、单发调用"契约双平台统一(darwin
+//           _NSGetExecutablePath 直通,Linux /proc/self/exe readlink
+//           补 NUL);stat/errno/mutexattr/自旋族按 MACOS/LINUX 条件
+//           化(OSAtomic CAS 退役,atomic_cas_raw 自旋 + stlr 释放);
+//           zanlinuxshims.c(558 行 Darwin 面模拟)就此退役,
+//           linux_vehicle 链接只剩 runtime_core.elf.o + musl。
 // 由原生自举编译器(ngen)编译为 arm64 可重定位对象,再经
 // localize_syms.py 把 API 面之外的符号本地化——ngen 会把整套运行时
 // 帮助函数以全局符号发射进每个对象,不本地化则与程序对象撞符号。
@@ -126,13 +139,16 @@
 // [AtomicCas]/[AtomicLoad]/[AtomicStore] 内建(casal/ldar/stlr,与
 // clang 对 C11 __atomic SEQ_CST 的 arm64 降码同款,LSE 全系支持)——
 // compare_exchange 无论成败都返回比较时刻看到的旧值,第六批的
-// load-after-fail 文档化偏差就此退役。osatomic_cas(旧)仍供各处自旋
-// 锁使用:布尔经 x0,必须掩 &255 再判——小整型 ABI 只保证 w0。
+// load-after-fail 文档化偏差就此退役。add 改 casal 环 fetch-add、
+// 各处自旋锁统一 rt_cas_lock/rt_cas_unlock(casal CAS 0→1 acquire +
+// stlr store 0 release)——OSAtomic 两符号第十四批退役。
 //
 // 第七批追加约束:lit_buf[32..36] 存 "stub"(lit_init 追加,不影响
 // 既有偏移)。monitor 第十一批换真 64 条纹递归 pthread 锁(条纹折叠
 // 与 oracle 逐字同款,第七批的乘法散列退役);dispatch 保持 OSAtomic
 // CAS 自旋锁(0 闲 1 忙)替代 pthread mutex:互斥等价,争用下自旋;
+// dispatch 保持 CAS 自旋锁(0 闲 1 忙;原 OSAtomic,第十四批起
+// rt_cas_lock 内建环)替代 pthread mutex:互斥等价,争用下自旋;
 // 环状态在 calloc 控制块(自旋/容量/头/尾/环
 // 指针),静态只存块指针、用点取新局部(缺口 2 纪律),grow 的头尾
 // 迁移与 C 版逐字对齐(head=0、tail=存活数)。eh_tls_state 的
@@ -417,27 +433,15 @@ class zan {
     static void sched256(long[] w, Span<byte> b) {
         int j = 0;
         while (j < 16) {
-            w[j] = (b[j * 4] << 24) | (b[j * 4 + 1] << 16) | (b[j * 4 + 2] << 8) | b[j * 4 + 3];
+            w[j] = ((b[j * 4] << 24) | (b[j * 4 + 1] << 16) | (b[j * 4 + 2] << 8) | b[j * 4 + 3]) & 0xFFFFFFFFL;
             j = j + 1;
         }
     }
 
     // void zan_sha256(const void *data, long long len, unsigned char *md)
     public static void sha256(nint data, long len, nint md) {
-        long[] K = new long[] {
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-        };
-        long[] h = new long[] {
-            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
-        };
+        long[] K = new long[] { 0x428a2f98, 0x71374491, 0xb5c0fbcfL, 0xe9b5dba5L, 0x3956c25b, 0x59f111f1, 0x923f82a4L, 0xab1c5ed5L, 0xd807aa98L, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1feL, 0x9bdc06a7L, 0xc19bf174L, 0xe49b69c1L, 0xefbe4786L, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152L, 0xa831c66dL, 0xb00327c8L, 0xbf597fc7L, 0xc6e00bf3L, 0xd5a79147L, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92eL, 0x92722c85L, 0xa2bfe8a1L, 0xa81a664bL, 0xc24b8b70L, 0xc76c51a3L, 0xd192e819L, 0xd6990624L, 0xf40e3585L, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814L, 0x8cc70208L, 0x90befffaL, 0xa4506cebL, 0xbef9a3f7L, 0xc67178f2L };
+        long[] h = new long[] { 0x6a09e667, 0xbb67ae85L, 0x3c6ef372, 0xa54ff53aL, 0x510e527f, 0x9b05688cL, 0x1f83d9ab, 0x5be0cd19 };
         long total = len > 0 ? len : 0;
         long off = 0;
         nint blk = malloc(64);
@@ -533,32 +537,8 @@ class zan {
 
     // void zan_sha512(const void *data, long long len, unsigned char *md)
     public static void sha512(nint data, long len, nint md) {
-        long[] K = new long[] {
-            0x428a2f98d728ae22L, 0x7137449123ef65cdL, 0xb5c0fbcfec4d3b2fL, 0xe9b5dba58189dbbcL,
-            0x3956c25bf348b538L, 0x59f111f1b605d019L, 0x923f82a4af194f9bL, 0xab1c5ed5da6d8118L,
-            0xd807aa98a3030242L, 0x12835b0145706fbeL, 0x243185be4ee4b28cL, 0x550c7dc3d5ffb4e2L,
-            0x72be5d74f27b896fL, 0x80deb1fe3b1696b1L, 0x9bdc06a725c71235L, 0xc19bf174cf692694L,
-            0xe49b69c19ef14ad2L, 0xefbe4786384f25e3L, 0x0fc19dc68b8cd5b5L, 0x240ca1cc77ac9c65L,
-            0x2de92c6f592b0275L, 0x4a7484aa6ea6e483L, 0x5cb0a9dcbd41fbd4L, 0x76f988da831153b5L,
-            0x983e5152ee66dfabL, 0xa831c66d2db43210L, 0xb00327c898fb213fL, 0xbf597fc7beef0ee4L,
-            0xc6e00bf33da88fc2L, 0xd5a79147930aa725L, 0x06ca6351e003826fL, 0x142929670a0e6e70L,
-            0x27b70a8546d22ffcL, 0x2e1b21385c26c926L, 0x4d2c6dfc5ac42aedL, 0x53380d139d95b3dfL,
-            0x650a73548baf63deL, 0x766a0abb3c77b2a8L, 0x81c2c92e47edaee6L, 0x92722c851482353bL,
-            0xa2bfe8a14cf10364L, 0xa81a664bbc423001L, 0xc24b8b70d0f89791L, 0xc76c51a30654be30L,
-            0xd192e819d6ef5218L, 0xd69906245565a910L, 0xf40e35855771202aL, 0x106aa07032bbd1b8L,
-            0x19a4c116b8d2d0c8L, 0x1e376c085141ab53L, 0x2748774cdf8eeb99L, 0x34b0bcb5e19b48a8L,
-            0x391c0cb3c5c95a63L, 0x4ed8aa4ae3418acbL, 0x5b9cca4f7763e373L, 0x682e6ff3d6b2b8a3L,
-            0x748f82ee5defb2fcL, 0x78a5636f43172f60L, 0x84c87814a1f0ab72L, 0x8cc702081a6439ecL,
-            0x90befffa23631e28L, 0xa4506cebde82bde9L, 0xbef9a3f7b2c67915L, 0xc67178f2e372532bL,
-            0xca273eceea26619cL, 0xd186b8c721c0c207L, 0xeada7dd6cde0eb1eL, 0xf57d4f7fee6ed178L,
-            0x06f067aa72176fbaL, 0x0a637dc5a2c898a6L, 0x113f9804bef90daeL, 0x1b710b35131c471bL,
-            0x28db77f523047d84L, 0x32caab7b40c72493L, 0x3c9ebe0a15c9bebcL, 0x431d67c49c100d4cL,
-            0x4cc5d4becb3e42b6L, 0x597f299cfc657e2aL, 0x5fcb6fab3ad6faecL, 0x6c44198c4a475817L
-        };
-        long[] h = new long[] {
-            0x6a09e667f3bcc908L, 0xbb67ae8584caa73bL, 0x3c6ef372fe94f82bL, 0xa54ff53a5f1d36f1L,
-            0x510e527fade682d1L, 0x9b05688c2b3e6c1fL, 0x1f83d9abfb41bd6bL, 0x5be0cd19137e2179L
-        };
+        long[] K = new long[] { 0x428a2f98d728ae22L, 0x7137449123ef65cdL, 0xb5c0fbcfec4d3b2fL, 0xe9b5dba58189dbbcL, 0x3956c25bf348b538L, 0x59f111f1b605d019L, 0x923f82a4af194f9bL, 0xab1c5ed5da6d8118L, 0xd807aa98a3030242L, 0x12835b0145706fbeL, 0x243185be4ee4b28cL, 0x550c7dc3d5ffb4e2L, 0x72be5d74f27b896fL, 0x80deb1fe3b1696b1L, 0x9bdc06a725c71235L, 0xc19bf174cf692694L, 0xe49b69c19ef14ad2L, 0xefbe4786384f25e3L, 0x0fc19dc68b8cd5b5L, 0x240ca1cc77ac9c65L, 0x2de92c6f592b0275L, 0x4a7484aa6ea6e483L, 0x5cb0a9dcbd41fbd4L, 0x76f988da831153b5L, 0x983e5152ee66dfabL, 0xa831c66d2db43210L, 0xb00327c898fb213fL, 0xbf597fc7beef0ee4L, 0xc6e00bf33da88fc2L, 0xd5a79147930aa725L, 0x06ca6351e003826fL, 0x142929670a0e6e70L, 0x27b70a8546d22ffcL, 0x2e1b21385c26c926L, 0x4d2c6dfc5ac42aedL, 0x53380d139d95b3dfL, 0x650a73548baf63deL, 0x766a0abb3c77b2a8L, 0x81c2c92e47edaee6L, 0x92722c851482353bL, 0xa2bfe8a14cf10364L, 0xa81a664bbc423001L, 0xc24b8b70d0f89791L, 0xc76c51a30654be30L, 0xd192e819d6ef5218L, 0xd69906245565a910L, 0xf40e35855771202aL, 0x106aa07032bbd1b8L, 0x19a4c116b8d2d0c8L, 0x1e376c085141ab53L, 0x2748774cdf8eeb99L, 0x34b0bcb5e19b48a8L, 0x391c0cb3c5c95a63L, 0x4ed8aa4ae3418acbL, 0x5b9cca4f7763e373L, 0x682e6ff3d6b2b8a3L, 0x748f82ee5defb2fcL, 0x78a5636f43172f60L, 0x84c87814a1f0ab72L, 0x8cc702081a6439ecL, 0x90befffa23631e28L, 0xa4506cebde82bde9L, 0xbef9a3f7b2c67915L, 0xc67178f2e372532bL, 0xca273eceea26619cL, 0xd186b8c721c0c207L, 0xeada7dd6cde0eb1eL, 0xf57d4f7fee6ed178L, 0x06f067aa72176fbaL, 0x0a637dc5a2c898a6L, 0x113f9804bef90daeL, 0x1b710b35131c471bL, 0x28db77f523047d84L, 0x32caab7b40c72493L, 0x3c9ebe0a15c9bebcL, 0x431d67c49c100d4cL, 0x4cc5d4becb3e42b6L, 0x597f299cfc657e2aL, 0x5fcb6fab3ad6faecL, 0x6c44198c4a475817L };
+        long[] h = new long[] { 0x6a09e667f3bcc908L, 0xbb67ae8584caa73bL, 0x3c6ef372fe94f82bL, 0xa54ff53a5f1d36f1L, 0x510e527fade682d1L, 0x9b05688c2b3e6c1fL, 0x1f83d9abfb41bd6bL, 0x5be0cd19137e2179L };
         long total = len > 0 ? len : 0;
         long off = 0;
         nint blk = malloc(128);
@@ -673,8 +653,40 @@ class zan {
     public static extern nint cstrrchr(nint s, int c);
     [DllImport("crt", EntryPoint = "getenv")]
     public static extern nint cgetenv(nint name);
+    // exe_path(buf, capPtr):_NSGetExecutablePath 契约的两平台统一面——
+    // 成功 0(buf 内路径 NUL 结尾);缓冲不足 -1 且 *capPtr=所需总长
+    // (含 NUL)。darwin 直呼 libSystem;LINUX 用 readlink("/proc/self/exe")
+    // 模拟同契约(NULL,0 查长度、截断按 -1+needed)。本文件 app_dir 与
+    // 编译器发射的 _zan_host_exedir 共用(第十四批起垫片退役)。
+#if MACOS
     [DllImport("crt", EntryPoint = "_NSGetExecutablePath")]
     public static extern int cnsgetpath(nint buf, nint cap);
+    public static int exe_path(nint buf, nint cap) {
+        return cnsgetpath(buf, cap);
+    }
+#else
+    [DllImport("crt", EntryPoint = "readlink")]
+    public static extern long creadlink(string path, nint buf, long cap);
+    public static int exe_path(nint buf, nint cap) {
+        if (cap == 0) { return -1; }
+        Span<long> cv = new Span<long>(cap, 1);
+        if (buf == 0) {
+            long n = creadlink("/proc/self/exe", 0, 0);
+            if (n < 0) { return -1; }
+            cv[0] = n + 1;
+            return -1;
+        }
+        long capv = cv[0];
+        long n2 = creadlink("/proc/self/exe", buf, capv);
+        if (n2 < 0 || n2 >= capv) {
+            if (n2 >= capv) { cv[0] = n2 + 1; }
+            return -1;
+        }
+        Span<byte> zv = new Span<byte>(buf + n2, 1);
+        zv[0] = 0;
+        return 0;
+    }
+#endif
 
     // 每次产出全新的、调用方拥有的 ""(对应 C 版 strdup 契约——不能
     // 返回共享块,托管侧会释放它)
@@ -761,7 +773,7 @@ class zan {
                 nint cap = malloc(8);
                 Span<long> cv = new Span<long>(cap, 1);
                 cv[0] = 4096;
-                if (cnsgetpath(exe, cap) == 0) {
+                if (exe_path(exe, cap) == 0) {
                     nint sep = cstrrchr(exe, 47);
                     if (sep != 0 && sep != exe) {
                         Span<byte> zv = new Span<byte>(sep, 1);
@@ -861,8 +873,11 @@ class zan {
     }
 
     // ---- FileInfo.zan / FileInfoEx.zan ----
-    // struct stat(macOS arm64,144 字节,偏移经 offsetof 验证):
-    // mode@4(u16) atime@32 mtime@48 ctime@64 size@96
+    // struct stat 双布局(第十四批起按目标,#if 选臂;偏移经 offsetof
+    // 验证):macOS arm64 144 字节 mode@4 atim@32 mtim@48 ctim@64
+    // size@96;musl aarch64 128 字节 mode@16 size@48 atim@72 mtim@88
+    // ctim@104。
+#if MACOS
     public static long file_length(nint path) {
         nint sb = malloc(144);
         long r = -1;
@@ -873,9 +888,22 @@ class zan {
         cfree(sb);
         return r;
     }
+#else
+    public static long file_length(nint path) {
+        nint sb = malloc(128);
+        long r = -1;
+        if (cstat(path, sb) == 0) {
+            Span<long> lv = new Span<long>(sb, 16);
+            r = lv[6];
+        }
+        cfree(sb);
+        return r;
+    }
+#endif
 
     // 位:0 只读(W_OK 失败) 1 隐藏(基名 '.') 2 目录;-1 = stat 失败
     public static long file_attributes(nint path) {
+#if MACOS
         nint sb = malloc(144);
         if (cstat(path, sb) != 0) { cfree(sb); return -1; }
         long a = 0;
@@ -889,24 +917,55 @@ class zan {
         if ((modev & 61440) == 16384) { a |= 4; }
         cfree(sb);
         return a;
+#else
+        nint sb = malloc(128);
+        if (cstat(path, sb) != 0) { cfree(sb); return -1; }
+        long a = 0;
+        if (caccess(path, 2) != 0) { a |= 1; }
+        nint slash = cstrrchr(path, 47);
+        nint basep = slash == 0 ? path : slash + 1L;
+        Span<byte> bv = new Span<byte>(basep, 1);
+        if (bv[0] == 46) { a |= 2; }
+        Span<byte> mb = new Span<byte>(sb, 128);
+        long modev = mb[16] | (mb[17] << 8);
+        if ((modev & 61440) == 16384) { a |= 4; }
+        cfree(sb);
+        return a;
+#endif
     }
 
     // which: 0=mtime 1=ctime(oracle 语义) 2=atime;缺失/空路径 → 0
     public static long file_time(nint path, int which) {
         if (path == 0 || cstrlen(path) == 0) { return 0; }
+#if MACOS
         nint sb = malloc(144);
         if (cstat(path, sb) != 0) { cfree(sb); return 0; }
         Span<long> lv = new Span<long>(sb, 18);
         long t = which == 1 ? lv[8] : (which == 2 ? lv[4] : lv[6]);
         cfree(sb);
         return t;
+#else
+        nint sb = malloc(128);
+        if (cstat(path, sb) != 0) { cfree(sb); return 0; }
+        Span<long> lv = new Span<long>(sb, 16);
+        long t = which == 1 ? lv[13] : (which == 2 ? lv[9] : lv[11]);
+        cfree(sb);
+        return t;
+#endif
     }
 
     public static long file_set_readonly(nint path, int on) {
+#if MACOS
         nint sb = malloc(144);
         if (cstat(path, sb) != 0) { cfree(sb); return 0; }
         Span<byte> mb = new Span<byte>(sb, 144);
         long modev = mb[4] | (mb[5] << 8);
+#else
+        nint sb = malloc(128);
+        if (cstat(path, sb) != 0) { cfree(sb); return 0; }
+        Span<byte> mb = new Span<byte>(sb, 128);
+        long modev = mb[16] | (mb[17] << 8);
+#endif
         long nm = on != 0 ? (modev & ~146L) : (modev | 146L);   // 0222
         long r = cchmod(path, (int)nm) == 0 ? 1L : 0L;
         cfree(sb);
@@ -915,6 +974,7 @@ class zan {
 
     // which 0=mtime 2=atime 可设;1=birthtime 诚实拒绝(与 oracle 一致)
     public static long file_set_time(nint path, int which, long unixSec) {
+#if MACOS
         nint sb = malloc(144);
         if (cstat(path, sb) != 0) { cfree(sb); return 0; }
         if (which == 1) { cfree(sb); return 0; }
@@ -925,6 +985,18 @@ class zan {
         tv[2] = lv[6]; tv[3] = lv[7];
         if (which == 0) { tv[2] = unixSec; tv[3] = 0; }
         else { tv[0] = unixSec; tv[1] = 0; }
+#else
+        nint sb = malloc(128);
+        if (cstat(path, sb) != 0) { cfree(sb); return 0; }
+        if (which == 1) { cfree(sb); return 0; }
+        nint ts = malloc(32);
+        Span<long> lv = new Span<long>(sb, 16);
+        Span<long> tv = new Span<long>(ts, 4);
+        tv[0] = lv[9]; tv[1] = lv[10];
+        tv[2] = lv[11]; tv[3] = lv[12];
+        if (which == 0) { tv[2] = unixSec; tv[3] = 0; }
+        else { tv[0] = unixSec; tv[1] = 0; }
+#endif
         long r = cutimensat(-100, path, ts, 0) == 0 ? 1L : 0L;  // AT_FDCWD
         cfree(ts);
         cfree(sb);
@@ -1074,7 +1146,13 @@ class zan {
     public static extern int cpoll(nint fds, int nfds, int timeout);
     [DllImport("crt", EntryPoint = "getpid")]
     public static extern int cgetpid();
+    // errno 是每线程 int;darwin 经 __error(),musl 经 __errno_location()
+    // ——两臂同返回 int*(第十四批起按目标二选一,垫片退役)。
+#if MACOS
     [DllImport("crt", EntryPoint = "__error")]
+#else
+    [DllImport("crt", EntryPoint = "__errno_location")]
+#endif
     public static extern nint cerror();
     // 第五批:sockets/resolver 全部 ≤6 参非变参(变参 fcntl 在 3 参
     // 形态下与普通调用同 ABI,fixture 有Alive 断言覆盖)
@@ -1131,8 +1209,21 @@ class zan {
     public static extern int cpthread_mutex_lock(nint mu);
     [DllImport("crt", EntryPoint = "pthread_mutex_unlock")]
     public static extern int cpthread_mutex_unlock(nint mu);
+    // 线程 id:darwin pthread_threadid_np;musl 直接给 gettid(1.1.24+)。
+    // 兼容面保持 (tidp, outp)->int 供 zan_thread_current_id 与发射器复用。
+#if MACOS
     [DllImport("crt", EntryPoint = "pthread_threadid_np")]
     public static extern int cpthread_threadid_np(nint tidp, nint outp);
+#else
+    [DllImport("crt", EntryPoint = "gettid")]
+    public static extern long cgettid();
+    public static int cpthread_threadid_np(nint tidp, nint outp) {
+        if (outp == 0) { return 22; }
+        Span<long> tv = new Span<long>(outp, 1);
+        tv[0] = cgettid();
+        return 0;
+    }
+#endif
 
     // ---- 缺口五:裸代码指针委托值(hook / 线程体) ----
     // (Action<...>)nint 转换把运行期解析的地址变成"裸代码指针委托值"
@@ -1657,14 +1748,10 @@ class zan {
 
     static void io_ignore_sigpipe() {
         nint lk = sigpipe_lk_addr();
-        long state = 0;
-        while (state == 0) {
-            nint ok = osatomic_cas(0, 1, lk);
-            if ((ok & 255L) != 0) { state = 1; }
-        }
+        rt_cas_lock(lk);
         nint old = csignal(13, 1);
         if (old != 0) { csignal(13, old); }
-        osatomic_add(-1, lk);
+        rt_cas_unlock(lk);
     }
 
     // rt_io.c:552 拷出:长度不含 NUL;buf 空或 cap<=0 或放不下 → -1。
@@ -2165,16 +2252,11 @@ class zan {
     }
 
     static void rt_lock() {
-        nint lk = rt_init_lk_addr();
-        long state = 0;
-        while (state == 0) {
-            nint ok = osatomic_cas(0, 1, lk);
-            if ((ok & 255L) != 0) { state = 1; }
-        }
+        rt_cas_lock(rt_init_lk_addr());
     }
 
     static void rt_unlock() {
-        osatomic_add(-1, rt_init_lk_addr());
+        rt_cas_unlock(rt_init_lk_addr());
     }
 
     // 双检锁 ensure 的统一形态(十一批):`if (X == 0) { rt_lock();
@@ -2201,13 +2283,23 @@ class zan {
     }
 
     // ---- 第六批:zan_atomic_int_*(spec: oracle rt_sync.c,C11 __atomic)----
-    // add 走 OSAtomicAdd64Barrier(= fetch-add 全屏障;clang 的 ldaddal
-    // 等价);exchange 改 casal 环(每次迭代拿见证值,精确);load/store
-    // 走 ldar/stlr(SEQ_CST),不再是对齐平铺访问。
-    [DllImport("crt", EntryPoint = "OSAtomicAdd64Barrier")]
-    public static extern long osatomic_add(long delta, nint p);
-    [DllImport("crt", EntryPoint = "OSAtomicCompareAndSwap64Barrier")]
-    public static extern nint osatomic_cas(long oldv, long newv, nint p);
+    // 第十四批起 OSAtomic 退役:add 改 casal 环 fetch-add(线性化与
+    // 全屏障 fetch-add 等价),exchange 保持 casal 环(每次迭代拿见证
+    // 值,精确);load/store 走 ldar/stlr(SEQ_CST)。
+    // 自旋锁帮助体:acquire = casal CAS 环(0→1),release = stlr 平铺
+    // store 0(十一批结论:平铺无屏障 store 缺 happens-before 边)。
+    // rt_init_lk / sigpipe / dispatch 环 / shared_table 六处共用。
+    static void rt_cas_lock(nint lk) {
+        long state = 0;
+        while (state == 0) {
+            long w = atomic_cas_raw(lk, 0, 1);
+            if (w == 0) { state = 1; }
+        }
+    }
+
+    static void rt_cas_unlock(nint lk) {
+        atomic_stlr_raw(lk, 0);
+    }
 
     // 返回句柄(指针);0 = 分配失败。创建与 C 版同为普通写(线程内约定)。
     public static long atomic_int_create(long initial_value) {
@@ -2234,11 +2326,17 @@ class zan {
         atomic_stlr_raw(p, new_value);
     }
 
-    // 返回新值(add_fetch 语义);空句柄 0。
+    // 返回新值(add_fetch 语义;casal 环,与全屏障 fetch-add 线性化
+    // 等价);空句柄 0。
     public static long atomic_int_add(long handle, long delta) {
         nint p = (nint)handle;
         if (p == 0) { return 0; }
-        return osatomic_add(delta, p);
+        long seen = atomic_ldar_raw(p);
+        while (true) {
+            long w = atomic_cas_raw(p, seen, seen + delta);
+            if (w == seen) { return seen + delta; }
+            seen = w;
+        }
     }
 
     // 返回旧值(exchange 语义);casal 环,每次失败的见证值直接当下一轮
@@ -2398,7 +2496,11 @@ class zan {
             nint ap = calloc(1, 16);
             if (t != 0 && ap != 0) {
                 cpthread_mutexattr_init(ap);
-                cpthread_mutexattr_settype(ap, 2);
+#if MACOS
+                cpthread_mutexattr_settype(ap, 2);   // Darwin PTHREAD_MUTEX_RECURSIVE
+#else
+                cpthread_mutexattr_settype(ap, 1);   // musl 的 RECURSIVE 是 1(2 是 ERRORCHECK)
+#endif
                 int i = 0;
                 while (i < 64) {
                     cpthread_mutex_init(st_ptr((long)t + i * 64), ap);
@@ -2456,17 +2558,13 @@ class zan {
     }
 
     static void d_lock(nint t) {
-        long state = 0;
-        while (state == 0) {
-            nint ok = osatomic_cas(0, 1, t);
-            if ((ok & 255L) != 0) { state = 1; }
-        }
+        rt_cas_lock(t);
     }
 
     static void d_unlock(nint t) {
         // release 屏障解锁(十一批):平铺 store 0 没有 happens-before
         // 边,持锁方的环写入可能对后到的持锁方不可见
-        osatomic_add(-1, t);
+        rt_cas_unlock(t);
     }
 
     // 环满翻倍并把存活条目搬到新环(head=0、tail=存活数,与 C 版一致);
@@ -2633,28 +2731,19 @@ class zan {
     // 表自旋锁在表块字节 64(槽 [8]);解锁用 barrier 变体取反(十一批
     // release 修复:平铺 store 0 没有 happens-before 边)。
     static void st_lock(nint t) {
-        nint sp = st_ptr((long)t + 64);
-        long state = 0;
-        while (state == 0) {
-            nint ok = osatomic_cas(0, 1, sp);
-            if ((ok & 255L) != 0) { state = 1; }
-        }
+        rt_cas_lock(st_ptr((long)t + 64));
     }
 
     static void st_unlock(nint t) {
-        osatomic_add(-1, st_ptr((long)t + 64));
+        rt_cas_unlock(st_ptr((long)t + 64));
     }
 
     static void st_spin(nint lk) {
-        long state = 0;
-        while (state == 0) {
-            nint ok = osatomic_cas(0, 1, lk);
-            if ((ok & 255L) != 0) { state = 1; }
-        }
+        rt_cas_lock(lk);
     }
 
     static void st_unspin(nint lk) {
-        osatomic_add(-1, lk);
+        rt_cas_unlock(lk);
     }
 
     // (nint)(表达式) 括号强转不被解析器接受(nint 被当方法名,
@@ -4207,6 +4296,306 @@ class zan {
             i = i + 1;
         }
     }
+
+// —— 第十四批:发射器依赖面收编(linux 车道垫片清算)——
+// 编译器无条件发射的帮助体此前直呼 Darwin 专属符号(CommonCrypto、
+// arc4random_buf、os_unfair_lock、mach_vm_read_overwrite、
+// _NSGetExecutablePath、pthread_threadid_np),ELF 车道靠
+// zanlinuxshims.c 558 行垫片供面。本批把这一面收进运行时:
+// 发射器改呼下列 zan_* 符号,两车道同一拼法;
+// zanlinuxshims.c 退役。
+
+// void zan_md5(const void *data, long long len, unsigned char *md)
+// RFC 1321,小端状态输出。数值纪律同 sha256:long + >>> + 掩码。
+static void md5_rounds(long[] h, long[] x) {
+    long[] r = new long[] { 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21 };
+    long[] k = new long[] { 0xd76aa478L, 0xe8c7b756L, 0x242070db, 0xc1bdceeeL, 0xf57c0fafL, 0x4787c62a, 0xa8304613L, 0xfd469501L, 0x698098d8, 0x8b44f7afL, 0xffff5bb1L, 0x895cd7beL, 0x6b901122, 0xfd987193L, 0xa679438eL, 0x49b40821, 0xf61e2562L, 0xc040b340L, 0x265e5a51, 0xe9b6c7aaL, 0xd62f105dL, 0x02441453, 0xd8a1e681L, 0xe7d3fbc8L, 0x21e1cde6, 0xc33707d6L, 0xf4d50d87L, 0x455a14ed, 0xa9e3e905L, 0xfcefa3f8L, 0x676f02d9, 0x8d2a4c8aL, 0xfffa3942L, 0x8771f681L, 0x6d9d6122, 0xfde5380cL, 0xa4beea44L, 0x4bdecfa9, 0xf6bb4b60L, 0xbebfbc70L, 0x289b7ec6, 0xeaa127faL, 0xd4ef3085L, 0x04881d05, 0xd9d4d039L, 0xe6db99e5L, 0x1fa27cf8, 0xc4ac5665L, 0xf4292244L, 0x432aff97, 0xab9423a7L, 0xfc93a039L, 0x655b59c3, 0x8f0ccc92L, 0xffeff47dL, 0x85845dd1L, 0x6fa87e4f, 0xfe2ce6e0L, 0xa3014314L, 0x4e0811a1, 0xf7537e82L, 0xbd3af235L, 0x2ad7d2bb, 0xeb86d391L };
+    long a = h[0]; long b = h[1]; long c = h[2]; long d = h[3];
+    int i = 0;
+    while (i < 64) {
+        long f; int g;
+        if (i < 16) { f = (b & c) | (~b & d); g = i; }
+        else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) & 15; }
+        else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) & 15; }
+        else { f = c ^ (b | ~d); g = (7 * i) & 15; }
+        long v = (a + (f & 0xFFFFFFFFL) + k[i] + x[g]) & 0xFFFFFFFFL;
+        long rot = ((v << r[i]) | (v >>> (32 - r[i]))) & 0xFFFFFFFFL;
+        long t = d;
+        d = c;
+        c = b;
+        b = (b + rot) & 0xFFFFFFFFL;
+        a = t;
+        i = i + 1;
+    }
+    h[0] = (h[0] + a) & 0xFFFFFFFFL;
+    h[1] = (h[1] + b) & 0xFFFFFFFFL;
+    h[2] = (h[2] + c) & 0xFFFFFFFFL;
+    h[3] = (h[3] + d) & 0xFFFFFFFFL;
+}
+
+public static void md5(nint data, long len, nint md) {
+    long[] h = new long[] { 0x67452301, 0xefcdab89L, 0x98badcfeL, 0x10325476 };
+    long total = len > 0 ? len : 0;
+    nint blk = malloc(64);
+    Span<byte> b = new Span<byte>(blk, 64);
+    long off = 0;
+    while (off + 64 <= total) {
+        memcpy(blk, data + off, 64);
+        long[] x = new long[16];
+        int j = 0;
+        while (j < 16) {
+            x[j] = (b[j * 4] | (b[j * 4 + 1] << 8) | (b[j * 4 + 2] << 16) | (b[j * 4 + 3] << 24)) & 0xFFFFFFFFL;
+            j = j + 1;
+        }
+        md5_rounds(h, x);
+        off = off + 64;
+    }
+    memset(blk, 0, 64);                      // 块前清零(同 sha256;尾块残留字节会致块对齐输入摘要错)
+    int t = (int)(total - off);
+    memcpy(blk, data + off, t);
+    b[t] = 0x80;
+    if (t + 1 > 56) {
+        long[] x = new long[16];
+        int j = 0;
+        while (j < 16) {
+            x[j] = (b[j * 4] | (b[j * 4 + 1] << 8) | (b[j * 4 + 2] << 16) | (b[j * 4 + 3] << 24)) & 0xFFFFFFFFL;
+            j = j + 1;
+        }
+        md5_rounds(h, x);
+        memset(blk, 0, 64);
+    }
+    long bits = total * 8;
+    int i8 = 0;
+    while (i8 < 8) {
+        b[56 + i8] = (byte)((bits >>> (8 * i8)) & 255);
+        i8 = i8 + 1;
+    }
+    long[] xf = new long[16];
+    int jf = 0;
+    while (jf < 16) {
+        xf[jf] = (b[jf * 4] | (b[jf * 4 + 1] << 8) | (b[jf * 4 + 2] << 16) | (b[jf * 4 + 3] << 24)) & 0xFFFFFFFFL;
+        jf = jf + 1;
+    }
+    md5_rounds(h, xf);
+    Span<byte> outv = new Span<byte>(md, 16);
+    int i = 0;
+    while (i < 4) {
+        outv[i * 4] = (byte)(h[i] & 255);
+        outv[i * 4 + 1] = (byte)((h[i] >>> 8) & 255);
+        outv[i * 4 + 2] = (byte)((h[i] >>> 16) & 255);
+        outv[i * 4 + 3] = (byte)((h[i] >>> 24) & 255);
+        i = i + 1;
+    }
+    free(blk);
+}
+
+// void zan_sha1(const void *data, long long len, unsigned char *md)
+// FIPS 180-4 SHA-1(80 轮,大端输出)。
+static void sha1_rounds(long[] h, long[] w) {
+    int i = 16;
+    while (i < 80) {
+        long x = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
+        w[i] = ((x << 1) | (x >>> 31)) & 0xFFFFFFFFL;
+        i = i + 1;
+    }
+    long a = h[0]; long b = h[1]; long c = h[2]; long d = h[3]; long e = h[4];
+    i = 0;
+    while (i < 80) {
+        long f; long k;
+        if (i < 20) { f = (b & c) | (~b & d); k = 0x5a827999L; }
+        else if (i < 40) { f = b ^ c ^ d; k = 0x6ed9eba1L; }
+        else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdcL; }
+        else { f = b ^ c ^ d; k = 0xca62c1d6L; }
+        long v = ((((a << 5) | (a >>> 27)) & 0xFFFFFFFFL) + (f & 0xFFFFFFFFL) + k + w[i] + e) & 0xFFFFFFFFL;
+        long t = d;
+        d = c;
+        long crot = ((b << 30) | (b >>> 2)) & 0xFFFFFFFFL;
+        c = crot;
+        b = a;
+        a = v;
+        e = t;
+        i = i + 1;
+    }
+    h[0] = (h[0] + a) & 0xFFFFFFFFL;
+    h[1] = (h[1] + b) & 0xFFFFFFFFL;
+    h[2] = (h[2] + c) & 0xFFFFFFFFL;
+    h[3] = (h[3] + d) & 0xFFFFFFFFL;
+    h[4] = (h[4] + e) & 0xFFFFFFFFL;
+}
+
+public static void sha1(nint data, long len, nint md) {
+    long[] h = new long[] { 0x67452301L, 0xefcdab89L, 0x98badcfeL, 0x10325476L, 0xc3d2e1f0L };
+    long total = len > 0 ? len : 0;
+    nint blk = malloc(64);
+    Span<byte> b = new Span<byte>(blk, 64);
+    long off = 0;
+    while (off + 64 <= total) {
+        memcpy(blk, data + off, 64);
+        long[] w = new long[80];
+        int j = 0;
+        while (j < 16) {
+            w[j] = ((b[j * 4] << 24) | (b[j * 4 + 1] << 16) | (b[j * 4 + 2] << 8) | b[j * 4 + 3]) & 0xFFFFFFFFL;
+            j = j + 1;
+        }
+        sha1_rounds(h, w);
+        off = off + 64;
+    }
+    memset(blk, 0, 64);
+    int t = (int)(total - off);
+    memcpy(blk, data + off, t);
+    b[t] = 0x80;
+    if (t + 1 > 56) {
+        long[] w = new long[80];
+        int j = 0;
+        while (j < 16) {
+            w[j] = ((b[j * 4] << 24) | (b[j * 4 + 1] << 16) | (b[j * 4 + 2] << 8) | b[j * 4 + 3]) & 0xFFFFFFFFL;
+            j = j + 1;
+        }
+        sha1_rounds(h, w);
+        memset(blk, 0, 64);
+    }
+    long bits = total * 8;
+    int i8 = 0;
+    while (i8 < 8) {
+        b[56 + i8] = (byte)((bits >>> (56 - 8 * i8)) & 255);
+        i8 = i8 + 1;
+    }
+    long[] wf = new long[80];
+    int jf = 0;
+    while (jf < 16) {
+        wf[jf] = ((b[jf * 4] << 24) | (b[jf * 4 + 1] << 16) | (b[jf * 4 + 2] << 8) | b[jf * 4 + 3]) & 0xFFFFFFFFL;
+        jf = jf + 1;
+    }
+    sha1_rounds(h, wf);
+    Span<byte> outv = new Span<byte>(md, 20);
+    int i = 0;
+    while (i < 5) {
+        outv[i * 4] = (byte)(h[i] >>> 24);
+        outv[i * 4 + 1] = (byte)((h[i] >>> 16) & 255);
+        outv[i * 4 + 2] = (byte)((h[i] >>> 8) & 255);
+        outv[i * 4 + 3] = (byte)(h[i] & 255);
+        i = i + 1;
+    }
+    free(blk);
+}
+
+// void zan_hmac_sha256(const void *key, long long klen, const void *data,
+//                      long long dlen, unsigned char *mac)
+// RFC 2104 HMAC over zan_sha256:块 64,密钥长于块先哈希,ipad/opad
+// 0x36/0x5c。一次性拼接 ipad||data 与 opad||inner(sha256 单发无增量面)。
+public static void hmac_sha256(nint key, long klen, nint data, long dlen, nint mac) {
+    long kl = klen > 0 ? klen : 0;
+    long dl = dlen > 0 ? dlen : 0;
+    nint k0 = malloc(64);
+    memset(k0, 0, 64);
+    if (kl > 64) {
+        sha256(key, kl, k0);
+    } else if (kl > 0) {
+        memcpy(k0, key, (int)kl);
+    }
+    nint ip = malloc(64 + dl);
+    nint op = malloc(96);
+    Span<byte> kb = new Span<byte>(k0, 64);
+    Span<byte> iv = new Span<byte>(ip, 64);
+    Span<byte> ov = new Span<byte>(op, 64);
+    int i = 0;
+    while (i < 64) {
+        iv[i] = (byte)(kb[i] ^ 0x36);
+        ov[i] = (byte)(kb[i] ^ 0x5c);
+        i = i + 1;
+    }
+    if (dl > 0) { memcpy(ip + 64, data, (int)dl); }
+    nint inner = malloc(32);
+    sha256(ip, 64 + dl, inner);
+    memcpy(op + 64, inner, 32);
+    sha256(op, 96, mac);
+    free(inner);
+    free(op);
+    free(ip);
+    free(k0);
+}
+
+// void zan_urandom(void *buf, long long len):内核熵源两平台同名
+// getentropy(3)(darwin 10.12+ libsystem_kernel / musl 都有;注意
+// darwin 不导出 getrandom),256 字节分片(POSIX 上限),EINTR 重试;
+// /dev/urandom 读兜底;全部失败零填(与 arc4random 永不失败契约对齐
+// 的最后手段)。发射器 _zan_ext_guid_new 的唯一用户。
+[DllImport("crt", EntryPoint = "getentropy")]
+public static extern int cgetentropy(nint buf, long n);
+public static void urandom(nint buf, long len) {
+    if (buf == 0 || len <= 0) { return; }
+    long done = 0;
+    while (done < len) {
+        long want = len - done;
+        if (want > 256) { want = 256; }
+        int r = cgetentropy(buf + done, want);
+        if (r == 0) { done = done + want; continue; }
+        nint f = cfopen("/dev/urandom", "rb");
+        if (f != 0) {
+            long g = cfread(buf + done, 1, want, f);
+            cfclose(f);
+            if (g > 0) { done = done + g; continue; }
+        }
+        memset(buf + done, 0, (int)want);
+        done = done + want;
+    }
+}
+
+// int zan_vm_read(void *dst, void *addr, long long len):跨页安全读探针
+// ——地址无效返回非 0 而非 SIGSEGV。darwin:mach_vm_read_overwrite(
+// task port 经 task_self_trap(), mach_task_self_ 数据符号 Zan 侧无法
+// 直取);LINUX:process_vm_readv(getpid(),...)。发射器
+// _zan_string_header 的慢路径(跨 4K 页界的 16 字节头部快照)唯一用户。
+#if MACOS
+[DllImport("crt", EntryPoint = "task_self_trap")]
+public static extern int ctask_self_trap();
+[DllImport("crt", EntryPoint = "mach_vm_read_overwrite")]
+public static extern int cmach_vm_read(nint target, long addr, long size, nint outbuf, nint outsize);
+public static int vm_read(nint dst, nint addr, long len) {
+    if (dst == 0 || addr == 0 || len <= 0) { return 1; }
+    nint osz = malloc(8);
+    int r = cmach_vm_read((nint)ctask_self_trap(), addr, len, dst, osz);
+    cfree(osz);
+    return r;
+}
+#else
+[DllImport("crt", EntryPoint = "process_vm_readv")]
+public static extern long cproc_vm_readv(long pid, nint liov, long liocnt, nint riov, long riocnt, long flags);
+public static int vm_read(nint dst, nint addr, long len) {
+    if (dst == 0 || addr == 0 || len <= 0) { return 1; }
+    nint io = malloc(32);
+    Span<long> iv = new Span<long>(io, 4);
+    iv[0] = (long)dst; iv[1] = len;
+    iv[2] = (long)addr; iv[3] = len;
+    long r = cproc_vm_readv(cgetpid(), io, 1, io + 16, 1, 0);
+    cfree(io);
+    return r == len ? 0 : 1;
+}
+#endif
+
+// int zan_lock_enter(void *p) / zan_lock_exit(void *p):发射器 guard
+// 运行时(ngen_guard 的 log/cache 串行化,8 字节零初始化槽)的锁面。
+// 语义与 os_unfair_lock 对齐:非递归、地址即锁;casal CAS 0→1 自旋
+// (首批 64 次纯自旋,其后 sched_yield 让步),stlr store 0 释放。
+// 两平台同一 Zan 实现,无需 OS 符号。
+[DllImport("crt", EntryPoint = "sched_yield")]
+public static extern int csched_yield();
+public static int lock_enter(nint p) {
+    if (p == 0) { return 22; }
+    long state = 0;
+    int spins = 0;
+    while (state == 0) {
+        long w = atomic_cas_raw(p, 0, 1);
+        if (w == 0) { state = 1; break; }
+        if (spins >= 64) { csched_yield(); } else { spins = spins + 1; }
+    }
+    return 0;
+}
+public static int lock_exit(nint p) {
+    if (p == 0) { return 22; }
+    atomic_stlr_raw(p, 0);
+    return 0;
+}
 
 // —— 第十三批:NativeMemory mem 族 + Win32 宽文本对(最后一族 C)——
 // stdlib 的 EntryPoint 改名指向这里(zan_copy/…);C 基线同语义别名在

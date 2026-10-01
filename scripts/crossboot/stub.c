@@ -433,7 +433,6 @@ void exit(int code) {
  */
 
 void *stderr = 0;
-unsigned int mach_task_self_ = 0;
 
 #define UNREACHED(name) \
     void name(void) { \
@@ -1797,33 +1796,28 @@ double cos(double x) {
 
 /* ngen_guard's OOB probe: with the honest file ABI live (real fopen),
  * the guard no longer degrades on bare metal and runs its full check,
- * which reads guest memory through this Mach primitive. No MMU maps
- * guest memory, so any in-range address reads: copy and report
- * success (KERN_SUCCESS, out_size = requested). */
-long mach_vm_read_overwrite(long target, unsigned long long address,
-                            unsigned long long size,
-                            unsigned long long dst,
-                            unsigned long long *out_size) {
-    char *s = (char *)(unsigned long)address;
-    char *d = (char *)(unsigned long)dst;
-    unsigned long long i;
-    for (i = 0; i < size; i = i + 1) { d[i] = s[i]; }
-    if (out_size != 0) { *out_size = size; }
+ * which reads guest memory through the runtime zan_vm_read face. No MMU
+ * maps guest memory, so any in-range address reads: copy, report success. */
+int zan_vm_read(void *dst, void *addr, long long len) {
+    char *s = (char *)addr;
+    char *d = (char *)dst;
+    long long i;
+    for (i = 0; i < len; i = i + 1) { d[i] = s[i]; }
     return 0;
 }
 
 /* Single-threaded bare metal: an uncontended lock is exactly a no-op,
- * and the emitted runtime's interning path really calls these. */
-int os_unfair_lock_lock(void *lock) { (void)lock; return 0; }
-int os_unfair_lock_unlock(void *lock) { (void)lock; return 0; }
+ * and the emitted runtime's guard path really calls these. */
+int zan_lock_enter(void *p) { (void)p; return 0; }
+int zan_lock_exit(void *p) { (void)p; return 0; }
 
-UNREACHED(CC_MD5)
-UNREACHED(CC_SHA1)
-UNREACHED(CC_SHA256)
-UNREACHED(CCHmac)
+UNREACHED(zan_md5)
+UNREACHED(zan_sha1)
+UNREACHED(zan_sha256)
+UNREACHED(zan_hmac_sha256)
 UNREACHED(zan_sha512)
-UNREACHED(_NSGetExecutablePath)
-UNREACHED(pthread_threadid_np)
+UNREACHED(zan_exe_path)
+UNREACHED(zan_thread_current_id)
 
 /* Plausibly reachable even in minimal programs: real (small) behavior. */
 const char *getenv(const char *name) {
@@ -1857,7 +1851,7 @@ char *strstr(const char *h, const char *n) {
     return 0;
 }
 
-void arc4random_buf(void *buf, u64 n) {
+void zan_urandom(void *buf, long long n) {
     u64 x = 0x9E3779B97F4A7C15ul;
     unsigned char *p = buf;
     for (u64 i = 0; i < n; i = i + 1) {

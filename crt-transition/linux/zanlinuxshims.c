@@ -1,16 +1,21 @@
-/* Linux userspace shims for the macOS-only surface the Zan runtime emits.
+/* RETIRED (第十四批). This file used to shim the macOS-only surface the
+ * Zan runtime emitted (CommonCrypto digests, OSAtomic, os_unfair_lock,
+ * mach task ports, musl-missing libc spellings) so the ELF lane could link
+ * and behave identically in a Linux guest. Batch 14 made the runtime and
+ * the compiler's emitters target-agnostic instead: digests/hmac/urandom/
+ * vm_read/locks/exe_path now live in runtime_core.zan behind zan_* faces
+ * with per-platform implementations inside (#if MACOS / musl direct), so
+ * nothing here is referenced anymore and linux_vehicle.sh links the ELF
+ * with runtime_core.elf.o + musl ONLY — zero project C. The musl-side
+ * struct stat/errno/mutexattr/readlink knowledge this file embodied moved
+ * into runtime_core.zan's #if !MACOS arms; digest vectors are pinned in
+ * tests/selfhost/native_digests (RFC 1321/3174/4231, FIPS 180-4) and run
+ * through the guest lane as a default fixture. Kept as a historical
+ * record; do not extend.
  *
- * The Zan lane's runtime objects (runtime_core.o compiled with
- * ZAN_TARGET=aarch64-linux, plus the -DZAN_RT_CORE_ZAN C remainder) are
- * macOS-source artifacts: they reference CommonCrypto digests, OSAtomic,
- * os_unfair_lock, mach task ports and a handful of libc spellings that
- * musl does not provide. This file supplies macOS-compatible definitions
- * on top of POSIX/C11 so the objects link and behave identically in a
- * Linux guest. Digest vectors are pinned in zanlinuxshims_test.c.
- *
- * Also see compat/net/if_dl.h (shadow header for the reactor includes)
- * and the -include zanlinux_prelude.h used when compiling zanstubs.c for
- * the target. Nothing here is referenced on the macOS lane. */
+ * Also see compat/net/if_dl.h (shadow header for the reactor includes) —
+ * likewise no longer referenced, since zanstubs.c no longer compiles for
+ * the ELF lane. Nothing here was ever referenced on the macOS lane. */
 
 #include <stdint.h>
 #include <stddef.h>

@@ -375,21 +375,24 @@ init,payload stderr 剥离后串口线即程序 stdout 原字节)。宿主侧
 ELF 对象 → `scripts/elf_localize.py`(ELF 版 localize:局部化非 API
 全局、重排 symtab 使局部符号先于非局部并重映射 .rela 索引,ld.lld 严
 查 sh_info)→ 与 ELF 版 runtime(runtime_core.elf.o 定点编译器重编 +
-localize;zanstubs/zanhost 余量与 shims 以 musl sysroot 交叉编译)+
-musl libc.a + Alpine libgcc.a 静态链接 → guest 引导 → 串口输出对
-.out 金标逐字节 diff。验收(默认五夹具):kernel1、native_extern、
-native_string_ops、native_float_shapes、native_varargs_elf 全绿——
-变参 ELF 车道金标在真 Linux 用户态复现。
+localize)+ musl libc.a + Alpine libgcc.a 静态链接 → guest 引导 → 串口
+输出对 .out 金标逐字节 diff。第十四批起链接里**零项目 C**
+(zanstubs/zanhost 余量与 zanlinuxshims.c 全部退役,见下)。验收(默认
+七夹具):kernel1、native_extern、native_string_ops、
+native_float_shapes、native_varargs_elf、native_digests、
+native_memwide 全绿——变参 ELF 车道金标与摘要/内存宽面金标都在真
+Linux 用户态复现。
 
-crt-transition/linux/ 新增(macOS 车道零引用):
-- zanlinuxshims.c:runtime 所引 macOS 面的 musl 侧同型定义——
-  __error、arc4random_buf(getrandom)、pthread_threadid_np(gettid)、
-  _NSGetExecutablePath(/proc/self/exe)、OSAtomicAdd64Barrier/
-  CompareAndSwap64Barrier(C11 原子)、os_unfair_lock_*(4 字节
-  test-and-set 自旋锁,保持内嵌槽布局)、mach_task_self_(数据符号,
-  恒 0)、mach_vm_read_overwrite(自进程 memcpy)、CommonCrypto 四件
-  (CC_MD5/CC_SHA1/CC_SHA256/CCHmac,标准算法,向量在
-  zanlinuxshims_test.c 对 RFC 1321/2202/4231 与 FIPS 180 全过)。
+crt-transition/linux/(第十四批起整目录退役,macOS 车道素来零引用):
+- zanlinuxshims.c(558 行,已退役):曾垫 runtime 所引 macOS 面——
+  __error、arc4random_buf、pthread_threadid_np、_NSGetExecutablePath、
+  OSAtomic 原子、os_unfair_lock_*、mach_task_self_、
+  mach_vm_read_overwrite、CommonCrypto 四件。第十四批把这张面整个
+  搬进 runtime_core.zan 的 zan_* 目标无关符号(平台实现在 #if 内:
+  musl 直调 gettid/getentropy/process_vm_readv/readlink,CAS 自旋锁
+  走 [AtomicCas] 内建),发射器与 stdlib 同批改调,ELF 链接自此零
+  项目 C。文件保留作史档,勿再扩展;摘要向量金标迁至
+  tests/selfhost/native_digests(电池 + guest 默认夹具)。
 - zanlinux_prelude.h:-include 注入的原型(zanstubs.c 的
   pthread_threadid_np 隐式声明在 musl 下是错误)。
 - compat/net/if_dl.h:shadow <net/if_dl.h>(-I 优先)——musl 无
@@ -525,3 +528,18 @@ fnptr/spans/memwide guest 逐字节(native_sync 仍 10/12,try_lock 臂 =
 fileinfoex_mmap + http_forwarder_stream + tdengine_pool,后两者定向
 重跑即 pass,均 oracle 侧计时 flapper),见
 docs/native-parity-baseline.json v18o-24 记录。
+
+独立验收(本仓库门禁,zanc_v25 = 闭包定点编译器):自举定点
+run.DTx5Ud(种子暂存法:run.B34Of5 stage2 + 现行 stdlib 拷贝件,
+stage2.o == stage3.o 逐字节一次过);定点 stage2.o 未定义符号 nm 实测
+恰为十个 zan_* 面(zan_md5/sha1/sha256/hmac_sha256/urandom/vm_read/
+lock_enter/lock_exit/exe_path/thread_current_id),CC_/mach/OSAtomic/
+_NSGetExecutablePath/pthread_threadid_np 零残留;默认电池 48/48 × 双
+配置(Zan 单对象 + C 基线双对象,C 基线带同语义 zan_* 别名);
+crossboot 80/80(stub.c 哨兵与实现同步换 zan_* 面,mach_task_self_
+数据符号退役);linux_vehicle **零项目 C 链接**(zanstubs_rest/
+zanhost_rest/zanlinuxshims 三对象自编链段删除)7/7 guest 逐字节
+(默认五 + native_digests + native_memwide 新入默认集);负例诊断
+逐字;runtime/fixture 对象级确定性逐字节。至此 darwin 与 linux 双
+车道链接均为零项目 C:过渡期 C 运行时只剩 C 基线车道(A/B oracle)
+与史档(zanstubs.c -U 面、zanlinuxshims.c)。

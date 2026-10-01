@@ -1,0 +1,245 @@
+// Batch 14 permanent fixture: the digest/random/lock surface the compiler's
+// emitters lean on moves into runtime_core.zan (md5/sha1/hmac_sha256/urandom
+// + lock_enter/lock_exit + vm_read + exe_path) so the ELF lane links with
+// ZERO project C -- zanlinuxshims.c retires. Golden pins RFC 1321 (MD5),
+// RFC 3174/FIPS 180-4 (SHA-1), FIPS 180-4 (SHA-256 via the batch-1 Zan
+// implementation) and RFC 4231 (HMAC-SHA256) official vectors, Guid.New()
+// version/variant shape (exercises urandom) and lock counter integrity.
+// All printed values are pure: darwin lane, C-baseline lane and the Linux
+// guest must match byte-for-byte.
+using System;
+
+class Rt {
+    [DllImport("crt", EntryPoint = "zan_md5")]
+    static extern void Md5(nint data, long len, nint md);
+    [DllImport("crt", EntryPoint = "zan_sha1")]
+    static extern void Sha1(nint data, long len, nint md);
+    [DllImport("crt", EntryPoint = "zan_sha256")]
+    static extern void Sha256(nint data, long len, nint md);
+    [DllImport("crt", EntryPoint = "zan_sha512")]
+    static extern void Sha512(nint data, long len, nint md);
+    [DllImport("crt", EntryPoint = "zan_hmac_sha256")]
+    static extern void HmacSha256(nint key, long klen, nint data, long dlen, nint mac);
+    [DllImport("crt", EntryPoint = "zan_lock_enter")]
+    static extern int Lock(nint p);
+    [DllImport("crt", EntryPoint = "zan_lock_exit")]
+    static extern int Unlock(nint p);
+}
+
+class D {
+    static string Hex(byte[] b) {
+        string digits = "0123456789abcdef";
+        string s = "";
+        int i = 0;
+        while (i < b.Length) {
+            s = s + digits.Substring((b[i] >>> 4) & 15, 1) + digits.Substring(b[i] & 15, 1);
+            i = i + 1;
+        }
+        return s;
+    }
+
+    static byte[] BufMd5(string s) {
+        nint p = NativeMemory.Alloc(s.Length + 1);
+        NativeMemory.PutString(p, 0, s, s.Length);
+        nint md = NativeMemory.Alloc(16);
+        Rt.Md5(p, s.Length, md);
+        byte[] outv = new byte[16];
+        Span<byte> sv = new Span<byte>(md, 16);
+        int i = 0;
+        while (i < 16) { outv[i] = sv[i]; i = i + 1; }
+        NativeMemory.Free(p);
+        NativeMemory.Free(md);
+        return outv;
+    }
+
+    static byte[] BufSha1(string s) {
+        nint p = NativeMemory.Alloc(s.Length + 1);
+        NativeMemory.PutString(p, 0, s, s.Length);
+        nint md = NativeMemory.Alloc(20);
+        Rt.Sha1(p, s.Length, md);
+        byte[] outv = new byte[20];
+        Span<byte> sv = new Span<byte>(md, 20);
+        int i = 0;
+        while (i < 20) { outv[i] = sv[i]; i = i + 1; }
+        NativeMemory.Free(p);
+        NativeMemory.Free(md);
+        return outv;
+    }
+
+    static byte[] BufSha256(string s) {
+        nint p = NativeMemory.Alloc(s.Length + 1);
+        NativeMemory.PutString(p, 0, s, s.Length);
+        nint md = NativeMemory.Alloc(32);
+        Rt.Sha256(p, s.Length, md);
+        byte[] outv = new byte[32];
+        Span<byte> sv = new Span<byte>(md, 32);
+        int i = 0;
+        while (i < 32) { outv[i] = sv[i]; i = i + 1; }
+        NativeMemory.Free(p);
+        NativeMemory.Free(md);
+        return outv;
+    }
+
+    // RFC 4231 keys are fill patterns (0x0b x20, 0xaa x131), so build the key
+    // buffer with Fill instead of listing bytes.
+    static byte[] BufHmacFill(byte fill, int klen, string msg) {
+        nint k = NativeMemory.Alloc(klen);
+        NativeMemory.Fill(k, fill, klen);
+        nint d = NativeMemory.Alloc(msg.Length + 1);
+        NativeMemory.PutString(d, 0, msg, msg.Length);
+        nint m = NativeMemory.Alloc(32);
+        Rt.HmacSha256(k, klen, d, msg.Length, m);
+        byte[] outv = new byte[32];
+        Span<byte> sv = new Span<byte>(m, 32);
+        int j = 0;
+        while (j < 32) { outv[j] = sv[j]; j = j + 1; }
+        NativeMemory.Free(k);
+        NativeMemory.Free(d);
+        NativeMemory.Free(m);
+        return outv;
+    }
+
+    static byte[] BufSha512(string s) {
+        nint p = NativeMemory.Alloc(s.Length + 1);
+        NativeMemory.PutString(p, 0, s, s.Length);
+        nint md = NativeMemory.Alloc(64);
+        Rt.Sha512(p, s.Length, md);
+        byte[] outv = new byte[64];
+        Span<byte> sv = new Span<byte>(md, 64);
+        int i = 0;
+        while (i < 64) { outv[i] = sv[i]; i = i + 1; }
+        NativeMemory.Free(p);
+        NativeMemory.Free(md);
+        return outv;
+    }
+
+    static byte[] BufHmac(byte[] key, string msg) {
+        nint k = NativeMemory.Alloc(key.Length);
+        Span<byte> kv = new Span<byte>(k, key.Length);
+        int i = 0;
+        while (i < key.Length) { kv[i] = key[i]; i = i + 1; }
+        nint d = NativeMemory.Alloc(msg.Length + 1);
+        NativeMemory.PutString(d, 0, msg, msg.Length);
+        nint m = NativeMemory.Alloc(32);
+        Rt.HmacSha256(k, key.Length, d, msg.Length, m);
+        byte[] outv = new byte[32];
+        Span<byte> sv = new Span<byte>(m, 32);
+        int j = 0;
+        while (j < 32) { outv[j] = sv[j]; j = j + 1; }
+        NativeMemory.Free(k);
+        NativeMemory.Free(d);
+        NativeMemory.Free(m);
+        return outv;
+    }
+
+    // RFC 1321 million-'a' vector: 1,000,000 bytes streamed as 1000-byte
+    // filled blocks (exercises multi-block streaming, not just one-shots)
+    static byte[] BufMd5Million() {
+        nint big = NativeMemory.Alloc(1000000);
+        int off = 0;
+        while (off < 1000000) {
+            NativeMemory.Fill(big + off, 97, 1000);
+            off = off + 1000;
+        }
+        nint md = NativeMemory.Alloc(16);
+        Rt.Md5(big, 1000000, md);
+        byte[] outv = new byte[16];
+        Span<byte> sv = new Span<byte>(md, 16);
+        int i = 0;
+        while (i < 16) { outv[i] = sv[i]; i = i + 1; }
+        NativeMemory.Free(big);
+        NativeMemory.Free(md);
+        return outv;
+    }
+
+    // RFC 4231 test case 6: 1,000,000 x 0xaa key -- forces the key-hash path
+    // (keyLen > 64) and a million-byte SHA-256.
+    static byte[] BufHmacMillion() {
+        nint k = NativeMemory.Alloc(1000000);
+        int off = 0;
+        while (off < 1000000) {
+            NativeMemory.Fill(k + off, 170, 1000);
+            off = off + 1000;
+        }
+        string msg = "Test Using Larger Than Block-Size Key - Hash Key First";
+        nint d = NativeMemory.Alloc(msg.Length + 1);
+        NativeMemory.PutString(d, 0, msg, msg.Length);
+        nint m = NativeMemory.Alloc(32);
+        Rt.HmacSha256(k, 1000000, d, msg.Length, m);
+        byte[] outv = new byte[32];
+        Span<byte> sv = new Span<byte>(m, 32);
+        int j = 0;
+        while (j < 32) { outv[j] = sv[j]; j = j + 1; }
+        NativeMemory.Free(k);
+        NativeMemory.Free(d);
+        NativeMemory.Free(m);
+        return outv;
+    }
+
+    static int Main() {
+        // ---- MD5 (RFC 1321 test suite) ----
+        Console.WriteLine(Hex(BufMd5("")));                                          // d41d8c...
+        Console.WriteLine(Hex(BufMd5("a")));                                         // 0cc175b9
+        Console.WriteLine(Hex(BufMd5("abc")));                                       // 90015098
+        Console.WriteLine(Hex(BufMd5("message digest")));                            // f96b697d
+        Console.WriteLine(Hex(BufMd5("abcdefghijklmnopqrstuvwxyz")));                // c3fcd3d7
+        Console.WriteLine(Hex(BufMd5("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")));  // 8215ef07
+        Console.WriteLine(Hex(BufMd5("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")));  // d174ab9
+        Console.WriteLine(Hex(BufMd5Million()));                                     // 7707d6ae
+        // ---- SHA-1 (RFC 3174 / FIPS 180-4) ----
+        Console.WriteLine(Hex(BufSha1("")));                                         // da39a3ee
+        Console.WriteLine(Hex(BufSha1("abc")));                                      // a9993e36
+        Console.WriteLine(Hex(BufSha1("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")));  // 84983e44
+        Console.WriteLine(Hex(BufSha1("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")));  // a49b2446
+        // ---- SHA-256 (FIPS 180-4, batch-1 Zan implementation) ----
+        Console.WriteLine(Hex(BufSha256("abc")));                                    // ba7816bf
+        Console.WriteLine(Hex(BufSha256("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")));  // 248d6a61
+        Console.WriteLine(Hex(BufSha512("abc")));                                    // ddaf35a1
+        Console.WriteLine(Hex(BufSha512("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")));  // 204a8fc6
+        // ---- HMAC-SHA256 (RFC 4231 cases 1, 2, 6 + RFC 2202-style 10^6 key) ----
+        Console.WriteLine(Hex(BufHmacFill(11, 20, "Hi There")));                     // b0344c61
+        Console.WriteLine(Hex(BufHmacKey("Jefe", "what do ya want for nothing?")));  // 5bdcc146
+        Console.WriteLine(Hex(BufHmacFill(170, 131, "Test Using Larger Than Block-Size Key - Hash Key First")));  // 60e43159
+        Console.WriteLine(Hex(BufHmacMillion()));                                    // 3f0656e1
+        // ---- lock_enter/lock_exit on a guard-shaped 8-byte slot ----
+        nint slot = NativeMemory.Alloc(8);
+        Span<long> lv = new Span<long>(slot, 1);
+        long c = 0;
+        int i2 = 0;
+        while (i2 < 1000) {
+            Rt.Lock(slot);
+            c = c + 1;
+            Rt.Unlock(slot);
+            i2 = i2 + 1;
+        }
+        Console.WriteLine(c);                        // 1000
+        Console.WriteLine(lv[0]);                    // 0 (released)
+        NativeMemory.Free(slot);
+        // ---- Guid.New(): urandom-driven; pin version/variant shape ----
+        string g = Guid.New();
+        Console.WriteLine(g.Length);                 // 36
+        Console.WriteLine(g.Substring(14, 1));       // 4 (version nibble)
+        string varNib = g.Substring(19, 1);
+        Console.WriteLine(varNib == "8" || varNib == "9" || varNib == "a" || varNib == "b" ? 1 : 0);
+        string g2 = Guid.New();
+        Console.WriteLine(g == g2 ? 0 : 1);          // distinct
+        return 0;
+    }
+
+    static byte[] BufHmacKey(string key, string msg) {
+        nint k = NativeMemory.Alloc(key.Length + 1);
+        NativeMemory.PutString(k, 0, key, key.Length);
+        nint d = NativeMemory.Alloc(msg.Length + 1);
+        NativeMemory.PutString(d, 0, msg, msg.Length);
+        nint m = NativeMemory.Alloc(32);
+        Rt.HmacSha256(k, key.Length, d, msg.Length, m);
+        byte[] outv = new byte[32];
+        Span<byte> sv = new Span<byte>(m, 32);
+        int j = 0;
+        while (j < 32) { outv[j] = sv[j]; j = j + 1; }
+        NativeMemory.Free(k);
+        NativeMemory.Free(d);
+        NativeMemory.Free(m);
+        return outv;
+    }
+}

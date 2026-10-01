@@ -5,12 +5,13 @@
 #
 # Default fixtures: kernel1 native_extern native_string_ops
 #                   native_float_shapes native_varargs_elf
+#                   native_digests native_memwide
 #
 # Pipeline per fixture: zanc (ZAN_TARGET=aarch64-linux) -> ELF object ->
-# ld.lld static link with the localized Zan runtime (ELF), the -D
-# ZAN_RT_CORE_ZAN C remainder (clang, musl sysroot), the macOS-surface
-# shims (crt-transition/linux/zanlinuxshims.c) and musl libgcc -> a
-# custom Alpine initramfs -> qemu-system-aarch64 -M virt boot -> serial
+# ld.lld static link with the localized Zan runtime (ELF) and musl
+# libgcc — ZERO project C since 第十四批 retired zanlinuxshims.c (the
+# -D ZAN_RT_CORE_ZAN remainder objects are empty and no longer linked) ->
+# a custom Alpine initramfs -> qemu-system-aarch64 -M virt boot -> serial
 # output compared byte-for-byte with tests/selfhost/<fixture>.out.
 #
 # Downloads (Alpine kernel, minirootfs, musl, gcc for libgcc.a) are
@@ -25,14 +26,14 @@ DL="$BUILD/dl"
 SYSROOT="$BUILD/sysroot"
 WORK="$BUILD/work"
 TESTS="$ROOT/tests/selfhost"
-LINUXDIR="$ROOT/crt-transition/linux"
 ALPINE="https://dl-cdn.alpinelinux.org/alpine/v3.20"
 REL="$ALPINE/releases/aarch64"
 MUSL_VER="1.2.5-r3"
 GCC_VER="13.2.1_git20240309-r1"
 FIXTURES=("$@")
 if (( ${#FIXTURES[@]} == 0 )); then
-  FIXTURES=(kernel1 native_extern native_string_ops native_float_shapes native_varargs_elf)
+  FIXTURES=(kernel1 native_extern native_string_ops native_float_shapes
+            native_varargs_elf native_digests native_memwide)
 fi
 
 # Fixtures pinned to macOS byte layouts, excluded from the guest lane:
@@ -126,13 +127,6 @@ PY
 )"
   python3 "$ROOT/scripts/elf_localize.py" "$O/runtime_core.elf.o" $KEEPS \
     --weaken zan_embed_has zan_embed_read zan_embed_bytes zan_embed_list
-  CFLAGS=(-target aarch64-none-linux-gnu --sysroot "$SYSROOT"
-          -DZAN_RT_CORE_ZAN -I"$LINUXDIR/compat" -include "$LINUXDIR/zanlinux_prelude.h")
-  "$CLANG" "${CFLAGS[@]}" -c "$ROOT/crt-transition/zanstubs.c" -o "$O/zanstubs_rest.elf.o"
-  "$CLANG" "${CFLAGS[@]}" -c "$ROOT/crt-transition/zanhost.c" -o "$O/zanhost_rest.elf.o"
-  "$CLANG" -target aarch64-none-linux-gnu --sysroot "$SYSROOT" \
-    -I"$LINUXDIR/compat" -include "$LINUXDIR/zanlinux_prelude.h" \
-    -c "$LINUXDIR/zanlinuxshims.c" -o "$O/zanlinuxshims.elf.o"
   touch "$WORK/$RTTAG.stamp"
 else
   O="$WORK/$RTTAG"
@@ -150,8 +144,7 @@ run_one() {
   ZAN_TARGET=aarch64-linux "$SEED" "$WORK/$name.elf.o" "$TESTS/$name.zan" ||
     { echo 'FAIL (compile)'; return 1; }
   "$LLD" -m aarch64linux -static "$SYSROOT/usr/lib/crt1.o" \
-    "$WORK/$name.elf.o" "$O/runtime_core.elf.o" "$O/zanstubs_rest.elf.o" \
-    "$O/zanhost_rest.elf.o" "$O/zanlinuxshims.elf.o" \
+    "$WORK/$name.elf.o" "$O/runtime_core.elf.o" \
     -L"$SYSROOT/usr/lib" -L"$GCCDIR" -lc -lgcc \
     -o "$WORK/$name.elf" || { echo 'FAIL (link)'; return 1; }
 

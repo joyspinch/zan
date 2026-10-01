@@ -19,13 +19,12 @@ class AppPath {
     [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
     static extern int GetCurrentProcessId();
     #endif
-    #if !WINDOWS
-    [DllImport("crt")]
-    static extern int readlink(string path, byte[] buf, int size);
-    #endif
-    #if MACOS
-    [DllImport("crt", EntryPoint = "_NSGetExecutablePath")]
-    static extern int NSGetExecutablePath(nint buf, nint size);
+    #if !WINDOWS && !WASM32
+    // 目标无关的可执行文件路径面(runtime_core 的 zan_exe_path:
+    // darwin 走 _NSGetExecutablePath,Linux 走 /proc/self/exe readlink),
+    // 两平台同一"预设容量、单发调用"契约。
+    [DllImport("crt", EntryPoint = "zan_exe_path")]
+    static extern int ExePath(nint buf, nint size);
     #endif
 
     /// <summary>正在运行的可执行文件的绝对路径；无法确定时返回 ""。
@@ -39,28 +38,24 @@ class AppPath {
         if (n > 0 && n < 4096) { exe = Wide.Read(buf); }
         NativeMemory.Free(buf);
         return exe;
-        #elif LINUX
-        byte[] buf = new byte[4097];
-        int n = readlink("/proc/self/exe", buf, 4096);
-        if (n <= 0 || n > 4096) { return ""; }
-        return buf.ToStr(0, n);
-        #elif MACOS
+        #elif WASM32
+        return "";
+        #else
         nint sizeBuf = NativeMemory.Alloc(4);
         new Span<int>(sizeBuf, 1)[0] = 4096;
         nint pathBuf = NativeMemory.Alloc(4096);
         NativeMemory.Fill(pathBuf, 0, 4096);
-        int ok = NSGetExecutablePath(pathBuf, sizeBuf);
+        int ok = ExePath(pathBuf, sizeBuf);
         string exe = "";
         if (ok == 0) {
-            // 成功时 _NSGetExecutablePath 不更新 *bufsize，实际长度按 NUL 查找。
+            // 长度按 NUL 查找(darwin 成功时不更新 *bufsize;Linux 侧
+            // readlink 结果由运行时补 NUL)。
             int len = NativeMemory.Find(pathBuf, 0, 0, 4096);
             if (len >= 0 && len < 4096) { exe = NativeMemory.GetString(pathBuf, 0, len); }
         }
         NativeMemory.Free(pathBuf);
         NativeMemory.Free(sizeBuf);
         return exe;
-        #else
-        return "";
         #endif
     }
 
