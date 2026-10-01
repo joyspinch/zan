@@ -35,6 +35,12 @@ if (( ${#FIXTURES[@]} == 0 )); then
   FIXTURES=(kernel1 native_extern native_string_ops native_float_shapes native_varargs_elf)
 fi
 
+# Fixtures pinned to macOS byte layouts, excluded from the guest lane:
+#   native_varargs -- reads raw struct stat bytes (st_mode at the macOS
+#   offset) and raw fcntl flag bits; musl's struct stat layout differs.
+#   The ABI-focused golden native_varargs_elf covers the guest lane.
+SKIP=(native_varargs)
+
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] ||
   fail 'linux_vehicle requires macOS arm64 (qemu runs aarch64 guests).'
@@ -92,7 +98,7 @@ GCCDIR="$SYSROOT/usr/lib/gcc/aarch64-alpine-linux-musl/13.2.1"
 /bin/busybox mount -t proc proc /proc 2>/dev/null
 /bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
 /bin/busybox stty -onlcr 2>/dev/null
-/prog 2>/dev/null
+/prog </dev/null 2>/dev/null
 echo "prog exit=$?"
 /bin/busybox poweroff -f
 EOF
@@ -179,6 +185,12 @@ run_one() {
 
 echo 'Linux userspace lane (compile -> localize/link -> guest boot -> diff):'
 for name in "${FIXTURES[@]}"; do
+  skip=0
+  for s in "${SKIP[@]}"; do [[ "$name" == "$s" ]] && skip=1; done
+  if (( skip )); then
+    echo "$name: SKIP (macOS-layout fixture, see SKIP list)"
+    continue
+  fi
   run_one "$name" || failures=$((failures + 1))
 done
 if (( failures > 0 )); then

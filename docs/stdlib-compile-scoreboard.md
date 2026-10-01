@@ -1641,3 +1641,15 @@ mne 18 = 两侧同非零 stdout 逐字节一致。剩余非 pass 全部 oracle �
   ELF 车道金标在真 Linux 用户态复现。macOS 车道零改动,sweep 记录与
   v18o-19 同(570/624)。余下:全电池 guest 化、plat_net_interfaces
   MAC 字段保真。
+
+### v18o-20b 追补 — 全电池 guest 化:41/42 逐字节全绿
+
+- 42 项默认电池全量过 Linux guest:native_varargs 一项 SKIP(读裸
+  struct stat 字节/macOS 布局偏移与裸 fcntl 标志位;musl 布局不同,
+  记入 vehicle SKIP 名单;ABI 金标 native_varargs_elf 已覆盖 guest
+  车道)。其余 41 项(含 socket/线程/mmap/dict/float/可空/变参全族)
+  guest 内输出与 .out 金标逐字节一致。
+- vehicle 修正一处:payload 的 stdin 显式接 /dev/null——init 原样继承
+  串口控制台,kernel11 的 Console.ReadLine 在无数据控制台上阻塞(宿主
+  侧 </dev/null 只关掉 qemu 输入端,不等价于 guest 内 EOF),挂满 120s
+  看门狗;显式 EOF 后即按"EOF 读回空串"语义通过。
