@@ -31,7 +31,8 @@
 //           DNS 自管道 + 脱离 worker、互斥交棒)。C 侧只留 4 个内部
 //           thunk(hook 全局 + zt_io_resume 间接调用 + zt_dns_worker_fn
 //           线程体地址 + zt_dns_drain 互斥摘链 + zt_dns_pipe_rd),
-//           与 zan_open_creat 同款的缺口绕行。
+//           同属缺口绕行形态(缺口五,函数指针;缺口一的 zan_open_creat
+//           同款绕行已在缺口一批次随变参降级修复退役)。
 // 由原生自举编译器(ngen)编译为 arm64 可重定位对象,再经
 // localize_syms.py 把 API 面之外的符号本地化——ngen 会把整套运行时
 // 帮助函数以全局符号发射进每个对象,不本地化则与程序对象撞符号。
@@ -138,19 +139,51 @@
 // 语义只经 outn 槽与 poll 返回值观察。byte 事件位拼装按 int 收拾,
 // revents 在 +6 处用两 byte 拼回(短整型 ABI 只保证低字节可靠)。
 //
-// 已发现编译器缺口(ngen;本文件全部绕行;缺口 3/4 已分别在缺口三/
-// 缺口四批次修复,其余仍开放):
-//   1) 变参调用降级不可用——8 参 DllImport→snprintf 在入口寄存器
-//      逐个验证正确(lldb 断点读 x0..x7 且 x/s 指向正确内容),被调
-//      方仍读到压栈槽/静态槽地址(4 参、6 参非变参调用 mmap 实证
-//      正常,6 参 sendto/recvfrom 在 ping 路径 fixture 验证正常)。
-//      第二受害者:三参 open——C 里 open 本就是变参函数,mode 由
-//      va_arg 读出,ngen 调用点的 x2 落寄存器残留值,创建的文件随
-//      链接布局拿到 040/100/200/740 等垃圾模式(file_lock 翻车)。
-//      绕行:zanstubs.c 二参包装 zan_open_creat,mode 由 C 车道传
-//      0644;凡变参 libc 函数一律不得从本文件 DllImport;
-//   2) 静态字段持有的指针上做 Span 索引写不可靠(probe_va2:写后
-//      原缓冲仍为零)——net/ping 一律静态存、用点取新局部再 Span;
+// 已发现编译器缺口(ngen;本文件全部绕行;缺口 1/2/3/4 已分别在缺口一/
+// 二/三/四批次修复,其余仍开放):
+//   1) 变参调用降级【缺口一,已修】——原状:[DllImport(Variadic=true)]
+//      机器全在(ast 属性/parser MOD/ngen PushCallArgs 与 CallStaticNg)
+//      且 Apple 车道实测可用,但零文档零覆盖,ELF 车道更错:ngen 的
+//      尾参一律按 Apple arm64 落栈变参区,而 aarch64-linux(实测定案,
+//      clang -target aarch64-none-linux-gnu 反汇编 oracle)变参按自然
+//      类型继续常规分配(int 尾参续 w 序、double 直接入 d 序、float 按
+//      C 默认提升为 double),Apple 式落栈在 ELF 上被被调方按寄存器读
+//      →垃圾。第二受害面:三参 open——C 里 open 本就是变参函数,mode
+//      由 va_arg 读出;纯声明调用点把 mode 放寄存器、被调方读栈,拿到
+//      040/100/200/740 等链接布局垃圾(file_lock 翻车根源)。修复
+//      (ngen CallStaticNg 三处):(a) ELF 车道(dllVar 且
+//      ZAN_TARGET=aarch64-linux)尾参进尾参分配循环:fp 类(IsDblExpr
+//      或 float 型)续 cf<8→d 序否则溢出槽,其余续 ci<8→x 序否则溢出
+//      槽,sres 计入尾参溢出;求值仍写 8*sres+8*vk 暂存槽,新增 ELF
+//      读回段把暂存搬进寄存器/溢出槽(fmov dN,x10 / str 双字,无单精
+//      窄化——提升已保证 double 位型)。(b) Apple 车道尾参基址由
+//      8*sres 改 8*cs(未填充溢出数):va_list 从具名栈参之后开始,
+//      奇数个定长溢出参时 16 对齐垫会把尾参整体推后 8 字节(companion
+//      C 探针 probe9=9 定长 int+尾参实测 1058≠2160,修复后 2160)。
+//      (c) 永久金标:tests/selfhost/native_varargs.zan(open 尾参
+//      mode→stat 回读 33188=S_IFREG|0644、snprintf 5/8 尾参、fcntl
+//      F_GETFL)入默认电池;tests/selfhost/native_varargs_elf.zan
+//      (snprintf/printf:混合类 5 尾参、8 int 尾参寄存器耗尽+溢出、
+//      double/float 提升尾参、类交错、定长-only)入电池与 crossboot
+//      默认清单(qemu 执行,与 macOS 车道输出字节一致);对抗探针
+//      probe9(定长溢出+尾参混排)/probef(d0..d7 耗尽+double 尾参溢出
+//      +int 尾参 x0)双车道 2160/1020.0 一致。变参 libc 函数现已可从
+//      本文件 DllImport;缺口一绕行件 zan_open_creat 随之退役(本文件
+//      copen2 改直接 [DllImport(Variadic=true)] open 三参调用,
+//      zanstubs.c 包装定义删除,零 C 程序链接的锁定 C 符号账面
+//      21→20)。
+//   2) 静态字段上的 Span 视图【缺口二,已修】——残面是 Span<T> 类型
+//      的静态字段(裸名与类限定)读写全部落"unsupported (assignment|
+//      index) target"编译错:SpanContainerTy 只认局部与实例字段,
+//      读/写/Length/IsDblExpr/Slice 六个消费点一并漏静态。修复:对齐
+//      ArrContainerTy 补静态两分支。注意当年 probe_va2 的"静默错写"
+//      与"跨 DllImport 持视图"症状已被既往批次顺带治好(探针实测
+//      DirectStatic=421422、跨导入 99098 全对),本批只剩响亮编译错
+//      面。本文件"静态只存块指针、用点取新局部"的写法保留(大面积
+//      改写零收益,风格保守),但 Span 类型静态字段现已可用;async 方
+//      法内的 Span 存储是独立既有局限(await 穿越臂从未支持任何
+//      Span 存储,连局部视图也不支持),未在本批打开。`this.静态` 全
+//      车道不支持(普通静态同报错),非 Span 特有。
 //   3) 字符串字面量经数据槽间接寻址【缺口三,已修】——原状:LoadStr
 //      读 l_.g.strp.N 槽,槽由 _zan_rt_strpool_init 在启动垫片里盖章
 //      (分配堆串+memcpy+盖 SNAZ|len 头),而该 init 只在持有 Main 的
@@ -187,9 +220,10 @@
 //      一致);第七批 audio 断言经垫片后成为真 ABI 返回验证。
 //   5) 无间接调用/函数指针:LoadSymRef 可取全局地址,但不能经寄存器
 //      blr。受害形态:协程恢复 hook(zan_co_ready_hook)、线程体
-//      (pthread_create 的 fn)。绕行:C 侧包装 thunk(zan_open_creat
-//      同款)——zt_io_resume(frame,step) 内部判空调 hook;线程体
-//      地址经 zt_dns_worker_fn() 取;互斥下摘链经 zt_dns_drain()。
+//      (pthread_create 的 fn)。绕行:C 侧包装 thunk(与已退役的
+//      zan_open_creat 同形态,属缺口五)——zt_io_resume(frame,step)
+//      内部判空调 hook;线程体地址经 zt_dns_worker_fn() 取;互斥下摘
+//      链经 zt_dns_drain()。
 //
 // 命名纪律:libc 导入一律别名(cfree/malloc/…),公开 ABI 方法名
 // (free/alloc/crc32/…必须与 libc 导入名错开——同类两个方法名会
@@ -529,7 +563,7 @@ class zan {
     public static extern int cchmod(nint path, int mode);
     [DllImport("crt", EntryPoint = "utimensat")]
     public static extern int cutimensat(int dirfd, nint path, nint ts, int flags);
-    [DllImport("crt", EntryPoint = "zan_open_creat")]
+    [DllImport("crt", EntryPoint = "open", Variadic = true)]
     public static extern int copen2(nint path, int flags);
     [DllImport("crt", EntryPoint = "close")]
     public static extern int cclose(int fd);
@@ -812,15 +846,16 @@ class zan {
             i = i + 1;
         }
         if (slot < 0) { return 0; }
-        // open 在 C 里是变参函数:ngen 的变参调用降级缺口(头注 1)让
-        // 第三参 mode 落到寄存器残留值,文件以 040/100/200/740 等垃圾
-        // 模式创建,确定性随链接布局漂移。此前试过 stat+fchmod 启发式
-        // 守卫(缺属主写位才修),在 mode 恰落 0200 的布局下漏防——
-        // 0o200 有属主写无属主读,O_RDWR 二次打开即 EACCES(file_lock
-        // 的 relocked=0)。zanstubs.c 的二参包装 zan_open_creat 从根上
-        // 绕开变参降级,mode 由 C 车道按正确约定传 0644,与 C 版创建
-        // 语义逐位一致。
-        int fd = copen2(path, 16777730);
+        // open 在 C 里是变参函数:缺口一之前 ngen 的第三参落寄存器残留
+        // 值,文件以 040/100/200/740 等垃圾模式创建,确定性随链接布局
+        // 漂移,当时的绕行是 zanstubs.c 二参包装 zan_open_creat(缺属主
+        // 写位的 stat+fchmod 启发式在 0200 布局漏防,0o200 有属主写无
+        // 属主读,O_RDWR 二次打开即 EACCES,即 file_lock 的
+        // relocked=0)。缺口一批次修好变参降级后包装退役:直接三参
+        // 变参调用,mode 0644 经 ELF 寄存器/Apple 栈两条 ABI 车道金标
+        // (native_varargs*,vamode=33188=S_IFREG|0644)验证,与 C 版
+        // 创建语义逐位一致。
+        int fd = copen2(path, 16777730, 420);
         if (fd < 0) { uv[(int)slot] = 0; return 0; }
         if (cflock(fd, 6) != 0) { cclose(fd); uv[(int)slot] = 0; return 0; }
         long next = gv[(int)slot] + 1;
@@ -959,7 +994,8 @@ class zan {
     public static extern int cpthread_create(nint tidp, nint attr, nint fn, nint arg);
     [DllImport("crt", EntryPoint = "pthread_detach")]
     public static extern int cpthread_detach(long tid);
-    // zanstubs.c 的内部 thunk(同 zan_open_creat 的缺口绕行形态):resume
+    // zanstubs.c 的内部 thunk(缺口五绕行,与已退役的 zan_open_creat 同
+    // 形态):resume
     // 是间接调用(hook 指针,缺口五:无函数指针调用),worker_fn 给出线程
     // 体地址,drain 在互斥下摘走完工 DNS 作业链,pipe_rd 建好自管道并给出
     // 读端 fd(ensure 本身只报成败)

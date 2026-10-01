@@ -29,7 +29,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 TESTS="$ROOT/tests/selfhost"
-DEFAULT_FIXTURES="kernel1 kernel2 kernel3 kernel4 kernel5 kernel6 kernel7 kernel8 kernel9 kernel10 kernel11 kernel12 kernel13 kernel14 kernel15 kernel16 kernel17 kernel18 kernel19 kernel20 kernel21 kernel22 kernel23 kernel24 kernel25 kernel26 kernel27 dict_minimal dict_growth native_extern native_numeric_runtime native_float_return_arg list_string_search native_lexical native_local_frame native_dict_out_address native_string_ops host_args_bounds native_generic_overload_fit"
+DEFAULT_FIXTURES="kernel1 kernel2 kernel3 kernel4 kernel5 kernel6 kernel7 kernel8 kernel9 kernel10 kernel11 kernel12 kernel13 kernel14 kernel15 kernel16 kernel17 kernel18 kernel19 kernel20 kernel21 kernel22 kernel23 kernel24 kernel25 kernel26 kernel27 dict_minimal dict_growth native_extern native_numeric_runtime native_float_return_arg list_string_search native_lexical native_local_frame native_dict_out_address native_string_ops host_args_bounds native_generic_overload_fit native_varargs_elf"
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 

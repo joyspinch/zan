@@ -38,8 +38,10 @@ watch 表、零超时探测、DNS 自管道 + 脱离 worker 互斥交棒)——�
 至此 `#ifndef ZAN_RT_CORE_ZAN` 编出的 reactor 段在 C 侧只剩 4 个内部
 thunk(zan_co_ready_hook 全局 + zt_io_resume 间接调用 + 
 zt_dns_worker_fn 线程体地址 + zt_dns_drain 互斥摘链,另 zt_dns_pipe_rd
-给出自管道读端)+ gen0 别名/Win 代码页/zan_thread_*/zan_open_creat;
-`zan_thread_*`(naked asm 屏障 + 函数指针调用)仍在 C。
+给出自管道读端)+ gen0 别名/Win 代码页/zan_thread_*;
+`zan_thread_*`(naked asm 屏障 + 函数指针调用)仍在 C。缺口一的
+zan_open_creat 包装已在缺口一批次随变参降级修复退役(锁定 C 符号账面
+21→20,缺口一批次详见下文)。
 它由原生自举编译器(ngen)编译成对象,再用 `localize_syms.py` 把 API 面
 之外的符号本地化——ngen 会把整套运行时帮助函数以全局符号发射进每个
 对象,不本地化则与程序对象撞符号。产出恰好导出 133 个强符号 + 4 个弱
@@ -57,8 +59,10 @@ Zan 配置链接面:
       --runtime "crt-transition/runtime_core.o crt-transition/zanstubs_rest.o crt-transition/zanhost_rest.o" \
       tests/selfhost/native_rt_core.zan          # 九批端到端(366 行金标)
 
-39 项 kernel 回归同样接受上述 `--runtime`。两个配置(A/B)都已全量验证:
-fixture(366 行金标,双配置字节一致)、默认 kernel 套件 39/39、自举固定点
+42 项默认电池(kernel 27 + 指定 15,含缺口四批次加入的 native_float_shapes
+与缺口一批次加入的 native_varargs / native_varargs_elf)同样接受上述
+`--runtime`。两个配置(A/B)都已全量验证:fixture(366 行金标,双配置字节一致)、
+默认电池 42/42、自举固定点
 (含 stage1.o 引用的全部 24 个文件族符号由 Zan 对象供给;第四批后另含
 net/ping 两符号,第五批后另含 17 个 io 符号,第六批后另含 7 个原子符号,
 第七批后另含 audio/monitor/dispatch/eh 28 个符号,第八批后另含
@@ -69,6 +73,66 @@ hook!=0 全链:编译器发射的 _zan_co_ready 注册 hook → reactor 停泊 �
 zt_io_resume 恢复),双配置 4/4。第四批的 net 文本还与 C oracle
 做过逐字节 A/B(同一台机器 probe 程序直接 dump zan_plat_net_interfaces
 返回缓冲,两路 diff 为空)。
+
+缺口一批次(ngen 变参调用降级,目标感知;顺带退役缺口一绕行件,
+锁定 C 符号账面 21→20):考古定案——`[DllImport(Variadic = true)]`
+机器四站俱全(ast 属性/parser MOD/ngen PushCallArgs 宽 arity 与
+CallStaticNg Apple 栈式尾参),macOS 车道端到端可用但零文档零用户
+(纯声明调变参函数拿到寄存器垃圾,file_lock 的 open 翻车即此);ELF
+车道则整段错误——ngen 无视目标一律按 Apple arm64 把尾参落栈变参区,
+而 aarch64-linux 实测定案(clang -target aarch64-none-linux-gnu 编
+companion C 反汇编为 oracle):变参按自然类型继续常规分配,int 尾参
+续 w 序、double 直接入 d 序、float 按 C 默认提升为 double,Apple 式
+落栈在 ELF 上被被调方按寄存器读→垃圾。修复(ngen CallStaticNg 三处,
+Apple 车道既有代码形状不动):(a) ELF 车道(dllVar 且
+ZAN_TARGET=aarch64-linux)尾参进自然类分配循环:fp 类(IsDblExpr 或
+float 型)续 cf<8→d 序否则溢出槽,其余续 ci<8→x 序否则溢出槽,sres
+计入尾参溢出;求值仍写 8*sres+8*vk 暂存槽(Apple 同槽即 ABI 变参区,
+ELF 仅暂存),新增 ELF 读回段把暂存搬进寄存器/溢出槽(fmov dN,x10 /
+str 双字;无单精准化——提升已保证 double 位型)。(b) Apple 车道尾参
+基址 8*sres→8*cs(未填充溢出数):va_list 从具名栈参之后开始,奇数个
+定长溢出参时 16 对齐垫把尾参整体推后 8 字节——对抗探针 probe9
+(9 定长 int + 尾参)修复前 macOS 1058≠2160,修复后双车道 2160;
+现有 fixture 全是零溢出变参调用故从未暴露。(c) 金标:金标化
+tests/selfhost/native_varargs.zan(变参 open 尾参 mode→stat 回读
+33188=S_IFREG|0644、snprintf 5/8 尾参、fcntl F_GETFL;纯声明 open
+负效不钉——结果按定义非确定)入默认电池;新增
+tests/selfhost/native_varargs_elf.zan(snprintf/printf:混合类 5 尾参、
+8 int 尾参寄存器耗尽+3 溢出槽、double/float 提升尾参、类交错、
+定长-only 返回值)入电池与 crossboot 默认清单(qemu 执行,与 macOS
+车道逐字节一致);对抗探针 probe9/probef(d0..d7 耗尽 + double 尾参
+溢出 + int 尾参 x0)双车道 2160/1020.0 一致。绕行件退役:runtime_core
+的 copen2 改 [DllImport(Variadic=true)] open 三参调用(mode 0644 尾参,
+vamode=33188 经 file_lock fixture 间接验证),zanstubs.c 的
+zan_open_creat 定义删除。全矩阵:fixture 366 行双车道字节一致、电池
+42/42 × 双配置、async 4/4 × 双配置、负例诊断文本原样、crossboot
+40 fixture(39 + native_varargs_elf)全绿;双收尾固定点
+run.Tlt11M(Zan 道)/ run.UPw8Fy(C 基线道)均 stage2.o == stage3.o,
+且涵盖最终头注与退役件;收尾 stage2.o 与全矩阵所用编译器对象逐字节
+同一(cmp 验证,矩阵结果对收尾编译器原样成立)。
+
+缺口二批次(ngen 静态 Span 视图,不改 runtime 符号面):残余面是
+`Span<T>` 类型的**静态字段**(裸名与类限定)——读写、`Length`、
+`Slice`、IsDblExpr 六个消费点全部漏静态(`SpanContainerTy` 只认局部
+与实例字段),一律落 "unsupported (assignment|index) target" 编译
+错。修复:`SpanContainerTy` 对齐 `ArrContainerTy` 补静态两分支(类
+限定接收者沿用写路径的"接收者必须命名类"守卫)。考古:当年
+probe_va2 的"静默错写"(写后原缓冲为零)与"跨 DllImport 持视图不可
+靠"症状已被既往批次顺带治好——探针实测静态直入 Span ctor 写读
+421422、视图跨两次 DllImport 持有 99098 全对,本批只剩响亮的编译错
+面。探针 A/B:同源三形态在旧编译器 6 个编译错,新编译器
+421422/7/99098 全对;扩展形(裸名读写、类限定、`Length`、
+`Slice(5,2)` 写、越界守卫照数组同款触发)全绿。边界:`this.静态`
+全车道不支持(普通静态同报错,一贯口径);async 方法内的 Span 存储
+是独立既有局限(await 穿越臂从未支持任何 Span 存储,连局部视图也
+不),本批未打开。runtime_core.zan 的"静态只存块指针、用点取新局
+部"写法保留(大面积改写零收益),头注缺口 2 已改已修。全矩阵:
+fixture 366 行双车道字节一致、默认电池 40/40 × 双配置(电池本批起
+含 native_float_shapes——缺口四 FloatLit 形态守护,覆盖字面量立即
+数/可空装箱 GenNulWrap 各站/float 窄化/内部 double 形参返回)、
+async 4/4 × 双配置、crossboot 39 fixture 双道 78 PASS、自举固定点
+run.jdFH6P(Zan 道)/ run.FmBUg7(C 基线道)均 stage2.o == stage3.o,
+且收尾 stage2 与全矩阵所用字节同一(cmp 验证)。
 
 缺口三批次(ngen 字面量直接物化,不改 runtime 符号面):原状 LoadStr
 经 `l_.g.strp.N` 数据槽间接寻址,槽由 `_zan_rt_strpool_init` 在启动垫
@@ -90,7 +154,8 @@ KeyNotFoundException"→"ndled exception: NotFoundException")——快照
 早于 rc 扩 8 字节的修正,12 字节头与 blob+16 载荷指针错位 4 字节,
 每串打印从头跳 4;16 字节头(/rc qword + /头 qword)对齐后全绿。
 blob 磁盘布局经 otool+nm 直读验证(rc/len/magic/字节逐一对)。
-全矩阵:fixture 366 行双车道字节一致、39/39 × 双配置、async 4/4 ×
+全矩阵:fixture 366 行双车道字节一致、39/39 × 双配置(本批当时电池
+口径;native_float_shapes 加入后为 40 项)、async 4/4 ×
 双配置、自举固定点 run.LIgI93(Zan 道)/ run.E8bVwz(C 基线道)均
 stage2.o == stage3.o(收尾轮,含最终头注;Zan 道过程轮为
 run.SbZmUP,基线道过程轮 run.jUjjFl);ELF/COFF 车道由 crossboot
@@ -116,7 +181,7 @@ run.SbZmUP,基线道过程轮 run.jUjjFl);ELF/COFF 车道由 crossboot
 fmin/fabs/fmod 5/5。runtime 对象以新编译器重建后导出面不变(133 强
 + 4 弱,411 本地化——多出的 78 个即 `__body` 符号)。第八批 fixture
 的 float 段升级为逐位值往返(1.5/0.1/-0.75/π,359→366 行金标,双
-配置字节一致)。全矩阵:39/39 × 双配置、async 4/4 × 双配置、自举
+配置字节一致)。全矩阵:40/40 × 双配置、async 4/4 × 双配置、自举
 固定点 run.Ct1l0a(Zan 道)/ run.j0eAnc(C 基线道)均
 stage2.o == stage3.o(收尾轮,含最终头注;Zan 道过程轮为
 run.ZZM9QN / run.wuA9Cs,基线道过程轮 run.9EyNuC)。
@@ -221,12 +286,15 @@ u32:127.0.0.1 → 0x0100007F = 16777343),"localhost" 可能 ::1 在前,
 
 **已发现编译器缺口**(ngen,均有探针/反汇编证据,详见
 `runtime_core.zan` 头注,本文件全部绕行):
-1. 变参调用降级不可用——8 参 DllImport→snprintf 入口寄存器逐个验证
-   正确、被调方仍读到压栈槽地址(4/6 参非变参 mmap 实证正常);第二受害
-   者是三参 open(open 本是变参函数,mode 由 va_arg 读出):x2 落寄存器
-   残留值,创建文件拿到随布局漂移的垃圾模式(file_lock 翻车根因,v18o-13
-   根治)——绕行:zanstubs.c 的二参包装 zan_open_creat,变参 libc 函数
-   一律不得从 ngen 代码 DllImport;
+1. 【缺口一,已修】变参调用降级——原状:`[DllImport(Variadic=true)]`
+   机器全在(ast/parser/ngen)且 Apple 车道实测可用,但零文档零覆盖;
+   ELF 车道错把尾参按 Apple arm64 落栈变参区(aarch64-linux 实测定案:
+   变参按自然类型继续常规分配,int 续 w 序、double 入 d 序、float 提升为
+   double)。第二受害者是三参 open(open 本是变参函数,mode 由 va_arg
+   读出):x2 落寄存器残留值,创建文件拿到随布局漂移的垃圾模式
+   (file_lock 翻车根因,v18o-13 根治)——绕行 zanstubs.c 二参包装
+   zan_open_creat,并要求变参 libc 函数一律不得从 ngen 代码 DllImport。
+   修复见下"缺口一批次"节;绕行件已退役,变参 libc 现可直接 DllImport。
 2. 静态字段持有的指针上 Span 索引写不可靠(probe_va2 写后原缓冲
    仍为零)——模式一律"静态存、用点取新局部";
 3. 字符串字面量经数据槽间接寻址、槽由本对象静态初始化填充,第二个
@@ -241,8 +309,9 @@ u32:127.0.0.1 → 0x0100007F = 16777343),"localhost" 可能 ::1 在前,
    `(double)0L` 写法保留(无害)。
 5. 无间接调用/函数指针:`LoadSymRef` 能取全局地址,但没有经寄存器的
    `blr`。受害形态:协程恢复 hook(`zan_co_ready_hook`)、线程体
-   (`pthread_create` 的 fn)。绕行:C 侧包装 thunk(zan_open_creat
-   同款)——`zt_io_resume(frame,step)` 内部判空调 hook,线程体地址
+   (`pthread_create` 的 fn)。绕行:C 侧包装 thunk(与已退役的
+   zan_open_creat 同形态,属缺口五)——`zt_io_resume(frame,step)` 内部
+   判空调 hook,线程体地址
    经 `zt_dns_worker_fn()` 取,互斥下摘完工链经 `zt_dns_drain()`。
 
 
@@ -268,7 +337,7 @@ u32:127.0.0.1 → 0x0100007F = 16777343),"localhost" 可能 ::1 在前,
   runtime_core.zan,network 半边第四批移入);无定义符的
   `zanhost_full.o` 仍是 A/B 对照的 C oracle。注意:本文件
   是 2026-09-17 /tmp 清空后按符号需求重建的,与更早的失传版本不保证
-  逐行一致;功能以 39/39 回归 + bootstrap 定点 + parity sweep 为准。
+  逐行一致;功能以 42/42 回归 + bootstrap 定点 + parity sweep 为准。
 
 由本编译器产出的程序另引用 `_zan_ext_*`/`_zan_dt_*`/`_zan_dir_*` 帮助
 函数族（见 src/selfhost/ngen_host.zan）——那些由 ngen_host 直接生成

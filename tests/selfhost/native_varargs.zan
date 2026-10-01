@@ -1,0 +1,61 @@
+using System;
+
+// [DllImport(..., Variadic = true)]: the declared parameters are the fixed
+// prefix of a C varargs callee; extra call arguments ride the ... tail.
+// Apple arm64 passes variadic arguments on the STACK (not in x0-x7), which
+// is why a plain 3-arg open() declaration hands the mode register to a
+// callee that reads the stack varargs area and gets link-layout garbage
+// (observed 0o040/0o100/0o200/0o740/0o240 across layouts) -- the Variadic
+// form places 420 (0o644) in the tail and stat reads back exactly
+// S_IFREG|0644 = 33188. The plain-declaration negative is NOT pinned: its
+// result is nondeterministic by design.
+class Native {
+    [DllImport("crt", EntryPoint="snprintf", Variadic = true)]
+    public static extern int Snprintf(nint buf, long size, string fmt);
+    [DllImport("crt", EntryPoint="open", Variadic = true)]
+    public static extern int OpenV(string path, int flags);
+    [DllImport("crt", EntryPoint="close")]
+    public static extern int Close(int fd);
+    [DllImport("crt", EntryPoint="remove")]
+    public static extern int Remove(string path);
+    [DllImport("crt", EntryPoint="stat")]
+    public static extern int Stat(string path, nint buf);
+    [DllImport("crt", EntryPoint="fcntl", Variadic = true)]
+    public static extern int Fcntl(int fd, int cmd);
+    [DllImport("crt", EntryPoint="printf", Variadic = true)]
+    public static extern int Printf(string fmt);
+
+    static long ModeOf(string path) {
+        nint sb = Malloc(144);
+        int rc = Stat(path, sb);
+        if (rc != 0) { return -1; }
+        Span<byte> b = new Span<byte>(sb, 144);
+        return (long)(b[4] + b[5] * 256);
+    }
+
+    [DllImport("crt")]
+    public static extern nint malloc(long size);
+
+    static nint Malloc(long n) { return malloc(n); }
+
+    public static void Main() {
+        // five tail arguments of mixed promoted classes
+        nint buf = malloc(256);
+        Snprintf(buf, 256, "i=%d j=%d s=%s L=%ld d=%.2f", 42, -7, "mid", 123456789012L, 2.5);
+        Printf("one:[%s]\n", buf);
+        // eight tail arguments: a deeper stack varargs area
+        Snprintf(buf, 256, "%d|%d|%d|%d|%d|%d|%d|%d", 1, 2, 3, 4, 5, 6, 7, 8);
+        Printf("two:[%s]\n", buf);
+        // variadic open: the mode is the ... tail; O_WRONLY|O_CREAT|O_TRUNC
+        Remove("/tmp/zan_va_mode.txt");
+        int fd = OpenV("/tmp/zan_va_mode.txt", 0x0601, 420);
+        Close(fd);
+        Printf("mode=%d\n", ModeOf("/tmp/zan_va_mode.txt"));
+        // fixed-only variadic call (F_GETFL): O_WRONLY access bits
+        int fd2 = OpenV("/tmp/zan_va_mode.txt", 0x0601, 420);
+        Printf("acc=%d\n", Fcntl(fd2, 3) & 3);
+        Close(fd2);
+        // mixed classes straight to stdout
+        Printf("five:%d %s %.1f %ld\n", 7, "str", 1.5, 99L);
+    }
+}
