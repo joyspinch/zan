@@ -342,3 +342,38 @@ u32:127.0.0.1 → 0x0100007F = 16777343),"localhost" 可能 ::1 在前,
 由本编译器产出的程序另引用 `_zan_ext_*`/`_zan_dt_*`/`_zan_dir_*` 帮助
 函数族（见 src/selfhost/ngen_host.zan）——那些由 ngen_host 直接生成
 机器码到目标文件里，不在这里。
+
+## Linux 用户态车道(v18o-20 打开)
+
+执行载体:qemu-system-aarch64 -M virt + Alpine v3.20 aarch64 内核
+(netboot vmlinuz-virt)+ 自组 initramfs(minirootfs + stty -onlcr 的
+init,payload stderr 剥离后串口线即程序 stdout 原字节)。宿主侧
+`scripts/linux_vehicle.sh` 全流程:zanc(ZAN_TARGET=aarch64-linux)→
+ELF 对象 → `scripts/elf_localize.py`(ELF 版 localize:局部化非 API
+全局、重排 symtab 使局部符号先于非局部并重映射 .rela 索引,ld.lld 严
+查 sh_info)→ 与 ELF 版 runtime(runtime_core.elf.o 定点编译器重编 +
+localize;zanstubs/zanhost 余量与 shims 以 musl sysroot 交叉编译)+
+musl libc.a + Alpine libgcc.a 静态链接 → guest 引导 → 串口输出对
+.out 金标逐字节 diff。验收(默认五夹具):kernel1、native_extern、
+native_string_ops、native_float_shapes、native_varargs_elf 全绿——
+变参 ELF 车道金标在真 Linux 用户态复现。
+
+crt-transition/linux/ 新增(macOS 车道零引用):
+- zanlinuxshims.c:runtime 所引 macOS 面的 musl 侧同型定义——
+  __error、arc4random_buf(getrandom)、pthread_threadid_np(gettid)、
+  _NSGetExecutablePath(/proc/self/exe)、OSAtomicAdd64Barrier/
+  CompareAndSwap64Barrier(C11 原子)、os_unfair_lock_*(4 字节
+  test-and-set 自旋锁,保持内嵌槽布局)、mach_task_self_(数据符号,
+  恒 0)、mach_vm_read_overwrite(自进程 memcpy)、CommonCrypto 四件
+  (CC_MD5/CC_SHA1/CC_SHA256/CCHmac,标准算法,向量在
+  zanlinuxshims_test.c 对 RFC 1321/2202/4231 与 FIPS 180 全过)。
+- zanlinux_prelude.h:-include 注入的原型(zanstubs.c 的
+  pthread_threadid_np 隐式声明在 musl 下是错误)。
+- compat/net/if_dl.h:shadow <net/if_dl.h>(-I 优先)——musl 无
+  AF_LINK,以字节精确的 sockaddr_ll 视图给 LLADDR/sdl_alen。
+- zanstubs.c 引用的 `_zan_thread_trampoline_body`(下划线约定)在
+  ELF 目标由 ngen 发无前缀名,链接期 `--defsym` 别名补齐。
+- 每夹具 guest 引导 ~7s;下载缓存于 build/linux-vehicle/dl(需网络,
+  首次 ~60MB)。known_open 第一项(Linux 用户态宿主层)自此解锁,
+  余下是覆盖面扩展(全电池 guest 化、plat_net_interfaces 的 MAC
+  字段保真)。
