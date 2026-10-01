@@ -123,7 +123,7 @@ class MethIndex {
 
 class Fixup {
     public int pos;    // text offset of the patched instruction
-    public int kind;   // 0=B 1=CBZ 2=Bcond 3=BL-internal 4=BL-extern
+    public int kind;   // 0=B 1=CBZ 2=Bcond 3=BL-internal 4=BL-extern 5=TBZ/TBNZ
     public int lbl;    // label id (kinds 0-2)
     public int cond;   // cond code (kind 2)
     public string sym; // target symbol (kinds 3-4)
@@ -193,6 +193,9 @@ partial class Ngen {
     List<bool> locRef;      // by-ref slots (out/ref params): the slot holds an address
     List<int> locBoxed;     // lambda-written slots: the slot holds a shared heap
                             // cell (A33-2b), reads and writes go through it
+    List<Node> spanSites;   // view-construction sites (batch 12): each owns a
+                            // private 16-byte frame box for its {base,len} pair
+    List<int> spanSiteOff;  // frame offset of each site's box (parallel list)
     List<string> boxNames;  // names any nested lambda assigns (per method)
     List<string> boxCaptured; // names any nested lambda reads (per method)
     List<string> boxOuterWrote; // names the method body itself assigns
@@ -257,6 +260,8 @@ partial class Ngen {
     string mainCls;
     bool mainAsync;     // Main is async: the shim ramps + pumps instead of calling it
     Node curMeth;           // method being emitted (spec sval2 = this type)
+    int curThreadEntryNg;   // current method is [ThreadEntry]: x19-x28 saved
+    int tentFrame;          // its total sp reservation (frame + 96 save bytes)
     Node specScanMeth;      // method RunSpecPipeline is scanning: a bare
                             // generic call inside a scanned spec body
                             // inherits the body's receiver instantiation
@@ -401,6 +406,15 @@ partial class Ngen {
         EmitMainShim();
         int mi = 0;
         while (mi < methNodes.Count) {
+            // batch 12: a view cannot be RETURNED -- the site's frame box
+            // dies at return and the caller would hold a dangling address.
+            // (Parameters are fine: a caller frame outlives any synchronous
+            // callee, so the pass-down box stays valid for the whole call --
+            // runtime_core's sched256/sched512 pass views this way.)
+            Node sm = methNodes[mi];
+            if (sm.type != null && SpanTyNg(TypeFullName(sm.type))) {
+                diags.Error("ngen: a Span view cannot be a return type (its frame box dies at return); return the backing array and build a local view", 0, 0);
+            }
             // generic declarations are templates: only their
             // specializations carry bodies (RunSpecPipeline built them)
             if (!HasTypeParams(methNodes[mi]) && !HasMod(methNodes[mi], MOD.Extern())) {
@@ -416,8 +430,30 @@ partial class Ngen {
         }
         ci = 0;
         while (ci < classes.Count) {
+            // batch 12: no Span fields (the C# ref-struct rule) -- a view
+            // stored in an object would outlive its method's frame
+            int fsi = 0;
+            while (fsi < classes[ci].flds.Count) {
+                if (SpanTyNg(classes[ci].flds[fsi].ty)) {
+                    diags.Error("ngen: a Span view cannot be a field (ref-struct shape); keep views in locals", 0, 0);
+                }
+                fsi = fsi + 1;
+            }
             if (classes[ci].poly == 1) { EmitVtInit(classes[ci]); }
             ci = ci + 1;
+        }
+        // batch 12: no Span-typed statics either (C# CS8345: a ref struct
+        // cannot be a field). The old heap-box representation made them
+        // merely immortal; frame boxes would make them dangling, and the
+        // ref-struct shape is the language rule either way. The 缺口二
+        // read/write capability retires with this diagnostic; the codebase
+        // never used it (runtime_core's 静态只存块指针 style predates it).
+        int sfi = 0;
+        while (sfi < sfTy.Count) {
+            if (SpanTyNg(sfTy[sfi])) {
+                diags.Error("ngen: a Span view cannot be a static field (ref-struct shape); store the backing block and build a local view at each use", 0, 0);
+            }
+            sfi = sfi + 1;
         }
         EmitDelegateThunks();
         EmitBindingAccessors();
@@ -496,12 +532,89 @@ partial class Ngen {
     // Span<T> raw-memory view (binder builtin generic; gen0
     // irgen_expr.c emit_struct_elem_ptr span path): `new Span<T>(base, len)`
     // holds a raw pointer and element i sits at base + i*esz, bounds-checked
-    // against the view length. The value representation is the base pointer;
-    // the length expression is re-read at each indexed access (stdlib views
-    // are built from pure pointer arithmetic).
+    // against the view length. A view VALUE is a {base, len} pair. Batch 12:
+    // every construction materializes the pair in a private 16-byte FRAME
+    // box (one per construction site, reserved in the prologue) instead of
+    // the old malloc'd heap box, and a store into a declared Span local
+    // copies the pair (value semantics -- the C# ref-struct shape: no
+    // fields, no captures, no heap escape, no per-call leak).
     bool IsSpanNew(Node e) {
         return e != null && e.kind == AK.NewExpr() && e.type != null
             && e.type.sval == "Span" && e.kids != null && e.kids.Count == 2;
+    }
+
+    // the generation-side dispatch for a view-construction expression. Must
+    // mirror GenNew's Span branch and the two GenSpanView call guards in
+    // GenCall (recv = the member-access receiver) exactly, or a site's box
+    // lookup desyncs from its reserved slot. The collector runs BEFORE
+    // codegen opens any scope, so a local receiver resolves through the
+    // whole slot table (NamedSlotTy), not the scope chain: over-collecting
+    // a site only wastes a slot, missing one is a hard error at generation.
+    bool SpanViewSite(Node e) {
+        if (e == null) { return false; }
+        if (IsSpanNew(e)) { return true; }
+        if (e.kind != AK.Call() || e.a == null
+                || e.a.kind != AK.MemberAccess()) { return false; }
+        Node rv = e.a.a;
+        if (rv == null) { return false; }
+        bool isAs = e.a.sval == "AsSpan" && e.kids.Count <= 2;
+        bool isSl = e.a.sval == "Slice" && e.kids.Count >= 1
+            && e.kids.Count <= 2;
+        if (!isAs && !isSl) { return false; }
+        if (rv.kind == AK.Ident()) {
+            string nt = NamedSlotTy(rv.sval);
+            if (nt != null) {
+                if (isAs && IsArrTy(nt)) { return true; }
+                if (isSl && nt.IndexOf("Span<") == 0) { return true; }
+                return false;
+            }
+        }
+        if (isAs && ArrContainerTy(rv) != null) { return true; }
+        if (isSl && SpanContainerTy(rv) != null) { return true; }
+        return false;
+    }
+
+    // pre-order collection of the method's view-construction sites. Lambda
+    // bodies are separate frames: the delegate prologue runs its own
+    // collection pass over the body.
+    void CollectSpanViews(Node n) {
+        if (n == null || n.kind == AK.Lambda()) { return; }
+        if (SpanViewSite(n)) { spanSites.Add(n); spanSiteOff.Add(0); }
+        int i = 0;
+        while (i < n.kids.Count) { CollectSpanViews(n.kids[i]); i = i + 1; }
+        CollectSpanViews(n.a); CollectSpanViews(n.b);
+        CollectSpanViews(n.c); CollectSpanViews(n.d);
+    }
+
+    // reserve one 16-byte frame box per collected site; called after every
+    // named local and the EH slots are in, before the frame size commits
+    void ReserveSpanBoxes() {
+        int i = 0;
+        while (i < spanSites.Count) {
+            AddLoc(".spansite" + i, "long", false);
+            spanSiteOff[i] = locOff[nloc - 1];
+            i = i + 1;
+        }
+    }
+
+    // x0 = the construction site's private frame box
+    void SpanSiteBox(Node e) {
+        int si = 0;
+        while (si < spanSites.Count) {
+            if (spanSites[si] == e) { break; }
+            si = si + 1;
+        }
+        if (si >= spanSites.Count) {
+            diags.Error("ngen: span view site missing from the frame map", curLine, curCol);
+            LoadImm(0, 0);
+            return;
+        }
+        LoadImm(0, LocFpOff(spanSiteOff[si]));
+        AddRR(0, 29, 0);
+    }
+
+    bool SpanTyNg(string t) {
+        return t != null && t.IndexOf("Span<") == 0;
     }
 
     string SpanElemTy(Node sn) {
@@ -652,7 +765,8 @@ partial class Ngen {
     // The oracle's window check + safe clamp (irgen_generics.c): a negative
     // start/window, a start past the end, or a window past the remaining
     // elements reports "span range out of bounds" and folds to the EMPTY
-    // view (start 0, len 0). x0 = the new box on return.
+    // view (start 0, len 0). x0 = this site's private frame box on return
+    // (batch 12: a frame slot, not a heap allocation).
     void GenSpanView(Node e, Node recv, string contTy, bool isSlice) {
         int esz = isSlice ? SpanTyElemSize(contTy) : ArrElemSize(contTy);
         GenExpr(recv);                           // x0 = arr (element ptr) / box
@@ -715,8 +829,7 @@ partial class Ngen {
         E4(0x8B060064);                          // add x4, x3, x6 (newbase)
         E4(0xF81F0FE0);                          // keep window
         E4(0xF81F0FE4);                          // keep newbase
-        LoadImm(0, 16);
-        BLExtern("_malloc");
+        SpanSiteBox(e);                          // x0 = frame box (batch 12)
         E4(0xF84107E1);                          // pop newbase -> x1
         E4(0xF84107E2);                          // pop window -> x2
         StrU(1, 0, 0);                           // [box] = base
@@ -2132,10 +2245,39 @@ partial class Ngen {
             ehBaseLocal = nloc - 2;
             ehBrkLocal = nloc - 1;
         }
+        CollectSpanViews(m.d);
+        ReserveSpanBoxes();
         frame = 16 * nloc;
+        // [ThreadEntry]: POSIX calls this body directly from libpthread's
+        // start routine, which keeps its own state in callee-saved x19-x28
+        // (Zan bodies use x19-x25 as working registers). Extend the frame by
+        // six pair slots and store the registers below the locals -- locals
+        // are x29-relative, so the body is untouched. Restore happens in
+        // Epilogue, which every return path funnels through.
+        curThreadEntryNg = HasMod(m, MOD.ThreadEntry()) ? 1 : 0;
+        if (curThreadEntryNg == 1 && HasMod(m, MOD.Async())) {
+            // an async body's state machine emits nested runtime helpers
+            // that share Epilogue; a thread entry must stay synchronous
+            diags.Error("ngen: [ThreadEntry] cannot be combined with async", m.line, m.col);
+            curThreadEntryNg = 0;
+        }
+        tentFrame = frame;
+        if (curThreadEntryNg == 1) {
+            tentFrame = frame + 96;
+            if (tentFrame > 504) {
+                diags.Error("ngen: [ThreadEntry] frame exceeds the ldp/stp immediate range", m.line, m.col);
+            }
+        }
         E4(0xA9BF7BFD);                                  // stp x29, x30, [sp, #-16]!
         E4(0x910003FD);                                  // mov x29, sp
-        if (frame > 0) { AddSPImm(frame, false); }       // sub sp, sp, #frame
+        if (tentFrame > 0) { AddSPImm(tentFrame, false); }        // sub sp, sp, #frame
+        if (curThreadEntryNg == 1) {
+            E4(0xA90053F3);                              // stp x19, x20, [sp]
+            E4(0xA9015BF5);                              // stp x21, x22, [sp, #16]
+            E4(0xA90263F7);                              // stp x23, x24, [sp, #32]
+            E4(0xA9036BF9);                              // stp x25, x26, [sp, #48]
+            E4(0xA90473FB);                              // stp x27, x28, [sp, #64]
+        }
         pi = 0;
         int argReg = 0;
         if (inst) {
@@ -2157,6 +2299,32 @@ partial class Ngen {
                 argReg = argReg + 1;
             }
             pi = pi + 1;
+        }
+        // batch 12: normalize Span parameters to the uniform pair-in-slot
+        // representation. The incoming word is the CALLER's frame box
+        // address (a caller frame outlives any synchronous callee); copying
+        // the {base,len} pair into the callee's own slot makes the parameter
+        // a by-value view, exactly C#'s ref-struct argument semantics. All
+        // incoming registers are already stored, so x0-x3 are free here.
+        // A ref/out Span parameter has no by-value shape to normalize --
+        // rejected loudly rather than silently aliased.
+        int psp = 0;
+        while (psp < paramSlotsNg.Count) {
+            int pli = paramSlotsNg[psp];
+            if (SpanTyNg(locTy[pli])) {
+                if (locRef[pli]) {
+                    diags.Error("ngen: a ref/out parameter cannot be a Span view (its frame box is by-value); pass the array and build a local view", 0, 0);
+                } else {
+                    LoadLocal(pli, 0);                       // x0 = caller box
+                    LdrU(1, 0, 0);
+                    LdrU(2, 0, 8);
+                    LoadImm(3, LocFpOff(locOff[pli]));
+                    AddRR(3, 29, 3);
+                    StrU(1, 3, 0);
+                    StrU(2, 3, 8);
+                }
+            }
+            psp = psp + 1;
         }
         if (curHasTry) {
             BLInternal("_zan_rt_eh_state");              // x0 = state
@@ -2248,9 +2416,59 @@ partial class Ngen {
                 fi2 = fi2 + 1;
             }
         }
+        // [AtomicCas]/[AtomicLoad]/[AtomicStore]/[StaticAddr]: the Zan body
+        // is a placeholder -- the emission IS the implementation. These are
+        // the runtime's atomic/synchronization nexus: casal/ldar/stlr give
+        // the C oracle's __atomic SEQ_CST semantics on the same instructions
+        // clang emits, and the data-global address lets runtime code point
+        // OSAtomic/pthread primitives at static cells (spin locks, once
+        // gates) that plain static loads/stores cannot address.
+        if (HasMod(m, MOD.AtomicCas())) {
+            LoadLocal(0, 0);                                 // x0 = cell
+            LoadLocal(1, 1);                                 // x1 = expected
+            LoadLocal(2, 2);                                 // x2 = desired
+            E4(0xC8E1FC02);                                  // casal x1, x2, [x0]
+            E4(0xAA0103E0);                                  // mov x0, x1 (witnessed old)
+            Epilogue();
+            curThreadEntryNg = 0;
+            tentFrame = 0;
+            return;
+        }
+        if (HasMod(m, MOD.AtomicLoad())) {
+            LoadLocal(0, 0);                                 // x0 = cell
+            E4(0xC8DFFC00);                                  // ldar x0, [x0]
+            Epilogue();
+            curThreadEntryNg = 0;
+            tentFrame = 0;
+            return;
+        }
+        if (HasMod(m, MOD.AtomicStore())) {
+            LoadLocal(0, 0);                                 // x0 = cell
+            LoadLocal(1, 1);                                 // x1 = value
+            E4(0xC89FFC01);                                  // stlr x1, [x0]
+            Epilogue();
+            curThreadEntryNg = 0;
+            tentFrame = 0;
+            return;
+        }
+        if (HasMod(m, MOD.StaticAddr())) {
+            string sasym = FindStaticSym(curCls, m.attrStaticAddr);
+            if (sasym == null) {
+                diags.Error("ngen: [StaticAddr] target '" + m.attrStaticAddr
+                    + "' is not a static field of this class", m.line, m.col);
+            } else {
+                LoadSymRef(sasym, 0);                        // adrp x0, sym@PAGE + add
+            }
+            Epilogue();
+            curThreadEntryNg = 0;
+            tentFrame = 0;
+            return;
+        }
         if (m.d != null) { GenStmt(m.d); }
         E4(0xD2800000);                                  // movz x0, #0 (fallthrough)
         Epilogue();
+        curThreadEntryNg = 0;
+        tentFrame = 0;
     }
 
     // does this statement subtree contain a try anywhere (clauses chain
@@ -2281,6 +2499,7 @@ partial class Ngen {
         locOpaq = new List<int>();
         locBoxed = new List<int>();
         boxNames = new List<string>();
+        spanSites = new List<Node>(); spanSiteOff = new List<int>();
         paramSlotsNg = new List<int>();
         envNodes = new List<Node>(); envHeads = new List<int>();
         patStamped = new List<Node>();
@@ -2554,6 +2773,9 @@ partial class Ngen {
             // boxing a never-captured local changes no observable behavior.
             if (depth > 0 && write && IndexOf(bound, n.sval) < 0
                     && IndexOf(locName, n.sval) >= 0 && IndexOf(boxNames, n.sval) < 0) {
+                if (SpanTyNg(NamedSlotTy(n.sval))) {
+                    diags.Error("ngen: a lambda cannot capture a Span view (ref-struct shape); rebuild the view inside the lambda", n.line, n.col);
+                }
                 boxNames.Add(n.sval);
             }
             // reads at depth > 0 make the name a capture candidate; a depth-0
@@ -2562,6 +2784,9 @@ partial class Ngen {
             // even though no lambda ever assigns it.
             if (depth > 0 && IndexOf(bound, n.sval) < 0
                     && IndexOf(locName, n.sval) >= 0 && IndexOf(boxCaptured, n.sval) < 0) {
+                if (SpanTyNg(NamedSlotTy(n.sval))) {
+                    diags.Error("ngen: a lambda cannot capture a Span view (ref-struct shape); rebuild the view inside the lambda", n.line, n.col);
+                }
                 boxCaptured.Add(n.sval);
             }
             if (depth == 0 && write && IndexOf(bound, n.sval) < 0
@@ -2627,14 +2852,32 @@ partial class Ngen {
         return li >= 0 && li < locBoxed.Count && locBoxed[li] != 0;
     }
 
-    // the local's VALUE: a boxed slot dereferences its cell
+    // the local's VALUE: a boxed slot dereferences its cell; a Span local's
+    // value IS its own frame box (the slot holds the {base,len} pair), so
+    // the box address is x29 + slot offset (batch 12)
     void LoadLocalVal(int li, int reg) {
+        if (SpanTyNg(locTy[li])) {
+            LoadImm(reg, LocFpOff(locOff[li]));
+            AddRR(reg, 29, reg);
+            return;
+        }
         LoadLocal(li, reg);
         if (LocBoxedNg(li)) { LdrU(reg, reg, 0); }
     }
 
-    // write the local's VALUE: a boxed slot stores through its cell
+    // write the local's VALUE: a boxed slot stores through its cell; a Span
+    // local takes a PAIR COPY from the source box (value semantics -- the
+    // written view never aliases the source slot; x16/x17 are scratch)
     void StoreLocalVal(int li, int reg) {
+        if (SpanTyNg(locTy[li])) {
+            LdrU(16, reg, 0);                        // src base
+            LdrU(17, reg, 8);                        // src len
+            LoadImm(reg, LocFpOff(locOff[li]));
+            AddRR(reg, 29, reg);
+            StrU(16, reg, 0);
+            StrU(17, reg, 8);
+            return;
+        }
         if (LocBoxedNg(li)) {
             int scr = reg == 9 ? 10 : 9;
             LoadLocal(li, scr);                      // x_scr = cell
@@ -2645,9 +2888,21 @@ partial class Ngen {
     }
 
     // a declaration's initializing store: a boxed local allocates its shared
-    // cell here (x0 = value on entry) and keeps the cell pointer in the slot
+    // cell here (x0 = value on entry) and keeps the cell pointer in the slot;
+    // a Span local pair-copies the source box into its frame slot
     void StoreDeclValNg(Node d) {
         int li = DeclSlotNg(d);
+        if (SpanTyNg(locTy[li])) {
+            E4(0xF81F0FE0);                          // push src box
+            E4(0xF84107E1);                          // x1 = src box
+            LoadImm(0, LocFpOff(locOff[li]));
+            AddRR(0, 29, 0);                         // x0 = the slot
+            LdrU(2, 1, 0);
+            LdrU(3, 1, 8);
+            StrU(2, 0, 0);
+            StrU(3, 0, 8);
+            return;
+        }
         if (LocBoxedNg(li)) {
             E4(0xF81F0FE0);                          // push value
             LoadImm(0, 8);
@@ -2663,9 +2918,19 @@ partial class Ngen {
 
     // `T x;` without an initializer: only a boxed local needs anything (its
     // cell must exist before any lambda can run); _zan_rt_alloc zeroes, so
-    // the cell's value starts at default(T)'s word pattern
+    // the cell's value starts at default(T)'s word pattern. A Span local
+    // zeroes its frame box: base=0/len=0 routes any early index into the
+    // bounds guard's soft path instead of a wild deref (batch 12)
     void StoreDeclZeroCellNg(Node d) {
         int li = DeclSlotNg(d);
+        if (SpanTyNg(locTy[li])) {
+            LoadImm(0, 0);
+            StoreLocal(li, 0);                       // base = 0
+            LoadImm(1, LocFpOff(locOff[li]));
+            AddRR(1, 29, 1);
+            StrU(0, 1, 8);                           // len = 0 (slot slack word)
+            return;
+        }
         if (!LocBoxedNg(li)) { return; }
         LoadImm(0, 8);
         LoadImm(1, 0);
@@ -3092,6 +3357,24 @@ partial class Ngen {
     }
 
     void Epilogue() {
+        if (curThreadEntryNg == 1) {
+            // [ThreadEntry]: reload x19-x28 from the slots below the locals.
+            // sp resets from x29 first (a return from inside a switch/loop
+            // can leave temporaries pushed); the slots sit at
+            // [x29 - tentFrame, x29 - tentFrame + 96).
+            E4(0x910003BF);                              // mov sp, x29
+            int pr = 0;
+            while (pr < 6) {
+                int off = -tentFrame + pr * 16;
+                int imm7 = (off / 8) & 127;
+                int rt = 19 + pr * 2;
+                E4(0xA9400000 | (imm7 << 15) | (31 << 5) | rt | ((rt + 1) << 10));
+                pr = pr + 1;
+            }
+            E4(0xA8C17BFD);                              // ldp x29, x30, [sp], #16
+            E4(0xD65F03C0);                              // ret
+            return;
+        }
         // reset sp from the frame pointer first: a `return` from inside a
         // switch/loop construct can leave its stack temporaries (e.g. the
         // switch discriminant) still pushed, and `add sp, sp, #frame` alone
@@ -4218,6 +4501,14 @@ partial class Ngen {
                 int rawMg = StaticGroupCastIdxNg(e);
                 if (rawMg >= 0) { LoadSymRef(MethSymNg(methCls[rawMg], methNodes[rawMg]), 0); }
                 else { GenExpr(e.b); }               // int<->ulong (and dbl->dbl): bits unchanged
+                // (DelegateTy)nintExpr: a runtime-resolved address becomes a
+                // bare code pointer (the oracle's `(WndProc)addr`, its
+                // int->ptr cast). Bit 0 tags "call directly with the declared
+                // signature, no env"; interned delegate pairs are even, so
+                // the invoke branch never confuses the two shapes.
+                if (IsDelegateTyNg(TypeFullName(e.type)) && !IsDelegateTyNg(StaticTyOf(e.b))) {
+                    E4(0xB2400000);                  // orr x0, x0, #1
+                }
                 // narrow casts wrap at the declared width, like gen0's
                 // truncating integer conversions
                 if (ty == "int") { E4(0x93407C00); }             // sbfm #31
@@ -4795,14 +5086,14 @@ partial class Ngen {
         if (cls == "List") { GenListNew(e); return; }
         if (cls == "Dict" || cls == "Dictionary") { GenDictNew(e); return; }
         if (cls == "Span") {
-            // boxed {base, len} view (the oracle's 2-field value struct):
-            // [box]=base, [box+8]=len; indexing derefs the box
+            // the view's {base, len} pair lands in this site's private
+            // frame box (batch 12): [box]=base, [box+8]=len; indexing
+            // derefs the box. No heap allocation, no per-call leak.
             GenExpr(e.kids[0]);                      // base -> x0
             E4(0xF81F0FE0);                          // push base
             GenExpr(e.kids[1]);                      // len -> x0
             E4(0xF81F0FE0);                          // push len
-            LoadImm(0, 16);
-            BLExtern("_malloc");
+            SpanSiteBox(e);                          // x0 = frame box
             E4(0xF84107E2);                          // pop len -> x2
             E4(0xF84107E1);                          // pop base -> x1
             StrU(1, 0, 0);                           // [box] = base
@@ -12099,6 +12390,11 @@ partial class Ngen {
         E4(0xB5000000 | reg);
         fixups.Add(new Fixup(txt.Count - 4, 1, label, 0, null));
     }
+    void EmitTbnz(int reg, int bit, int label) {
+        // test-bit-and-branch-if-nonzero: imm14 at bits 18..5, bit at 23:19
+        E4(0x37000000 | (bit << 19) | reg);
+        fixups.Add(new Fixup(txt.Count - 4, 5, label, 0, null));
+    }
     void BLInternal(string sym) { E4(0x94000000); fixups.Add(new Fixup(txt.Count - 4, 3, 0, 0, sym)); }
     void BLExtern(string sym) { E4(0x94000000); fixups.Add(new Fixup(txt.Count - 4, 4, 0, 0, sym)); }
 
@@ -12187,6 +12483,13 @@ partial class Ngen {
                 word = (ByteAt(word, 3) << 24) | (ByteAt(word, 2) << 16)
                      | (ModLow(imm, 19) << 5)
                      | lo;
+            } else if (f.kind == 5) {
+                // TBZ/TBNZ: imm14 at bits 18..5; opcode, bit (23:19) and Rt
+                // stay as emitted.
+                int imm = (lblPos[f.lbl] - f.pos) / 4;
+                word = (ByteAt(word, 3) << 24) | (ByteAt(word, 2) << 16)
+                     | (ModLow(imm, 14) << 5)
+                     | ByteAt(word, 0);
             } else if (f.kind == 3) {
                 // Missing internal symbols must not silently branch to text
                 // offset zero. Unlike externs, no linker relocation can fix it.

@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# Build the Zan-implemented runtime object (runtime_core.zan, batches 1-9)
+# Build the Zan-implemented runtime object (runtime_core.zan, batches 1-13)
 # with the native bootstrap compiler and localize its non-API symbols.
 #
 #   SEED=/path/to/stage2 bash crt-transition/build_zan_core.sh [out.o]
 #
-# Produces an object exporting exactly the 133 allowlisted zan_* symbols
+# Produces an object exporting exactly the 144 allowlisted zan_* symbols
 # (monotonic/sha256/sha512/alloc/free/crc32 + pkg_fopen/file_*/plat_*/
 # io_* + atomic/audio/monitor/dispatch/eh/shared_table + io reactor
-# co helpers + weakened embed_*). Link it with the -DZAN_RT_CORE_ZAN builds of
-# zanstubs.c and zanhost.c wherever those symbols are needed:
+# co helpers + set_ready_hook/thread_start/thread_current_id + mem ops
+# copy/fill/compare/find/get_string/put_string + UTF-16 text converters
+# multi_byte_to_wide_char/wide_char_to_multi_byte + weakened embed_*).
+# Since batch 13 this object ALONE is the whole darwin-lane runtime (the
+# -DZAN_RT_CORE_ZAN builds of zanstubs.c/zanhost.c are empty and kept
+# only as the recorded C remainder):
 #
 #   python3 scripts/native_regression.py --seed "$SEED" \
-#     --runtime "crt-transition/runtime_core.o crt-transition/zanstubs_rest.o crt-transition/zanhost_rest.o" \
+#     --runtime "crt-transition/runtime_core.o" \
 #     tests/selfhost/native_rt_core.zan
 #
 # The pure-C baseline for A/B regression is built alongside:
@@ -74,6 +78,10 @@ python3 crt-transition/localize_syms.py "$OUT" \
   _zan_shared_table_delete_at \
   _zan_io_wait_co _zan_io_recv_co _zan_io_recv_to_co _zan_io_accept_co \
   _zan_io_poll _zan_io_close_notify _zan_resolve_sa_co _zan_resolve_ipv4_co \
+  _zan_set_ready_hook _zan_thread_start _zan_thread_current_id \
+  _zan_copy _zan_fill _zan_compare _zan_find \
+  _zan_get_string _zan_put_string \
+  _zan_multi_byte_to_wide_char _zan_wide_char_to_multi_byte \
   --weaken \
   _zan_embed_has _zan_embed_read _zan_embed_bytes _zan_embed_list
 cc -DZAN_RT_CORE_ZAN -c -o "$ROOT/crt-transition/zanstubs_rest.o" \

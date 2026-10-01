@@ -308,8 +308,23 @@ partial class Ngen {
         int live = NL(); EmitCbnz(0, live);
         LoadImm(0, 1); BLExtern("_exit"); // null invocation fails closed
         Mark(live);
+        // bit 0 is the bare-code tag set by `(DelegateTy)nint` casts (缺口五:
+        // calling a runtime-resolved address, oracle `(WndProc)addr` + its
+        // two-shape emit_delegate_invoke). Tagged: clear the bit and blr the
+        // raw address with the declared signature (args shift x1.. down to
+        // x0.., no env). Even values are interned {thunk, env} pairs.
+        int bare = NL(); EmitTbnz(0, 0, bare);
         LdrU(9, 0, 0); LdrU(0, 0, 8);
         E4(0xD63F0120); // blr x9
+        int join = NL(); EmitB(join);
+        Mark(bare);
+        // strip the tag while x0 still holds the delegate value; the raw
+        // address parks in x9 (untouched by the arg shift below)
+        E4(0x927FF809); // and x9, x0, #~1
+        int si = 0;
+        while (si < e.kids.Count) { MovRR(si, si + 1); si = si + 1; }
+        E4(0xD63F0120); // blr x9
+        Mark(join);
         return true;
     }
 
@@ -768,6 +783,10 @@ partial class Ngen {
 
     void EmitDelegateThunks() {
         if (delegateThunks == null) { return; }
+        // thunks emit after every method: a trailing [ThreadEntry] body must
+        // not leave its x19-x28-restore flag set for the thunk epilogues
+        curThreadEntryNg = 0;
+        tentFrame = 0;
         EmitDlgInternNg();
         int id = 0;
         while (id < delegateThunks.Count) {
@@ -813,6 +832,10 @@ partial class Ngen {
                     ehBaseLocal = nloc - 2;
                     ehBrkLocal = nloc - 1;
                 }
+                // batch 12: a lambda body is its own frame, so its view
+                // constructions get their private boxes reserved here too
+                CollectSpanViews(m.d);
+                ReserveSpanBoxes();
                 frame = 16 * nloc;
                 if (frame >= 4096) { diags.Error("ngen delegate: lambda frame exceeds native immediate limit", m.line, m.col); }
                 RtPrologue(); if (frame > 0) { AddSPImm(frame, false); }
@@ -825,6 +848,26 @@ partial class Ngen {
                         StoreLocal(i, 0);
                     }
                     i = i + 1;
+                }
+                // batch 12: normalize Span parameters to the pair-in-slot
+                // representation, exactly like EmitMethod's prologue pass
+                int psp = 0;
+                while (psp < paramSlotsNg.Count) {
+                    int pli = paramSlotsNg[psp];
+                    if (SpanTyNg(locTy[pli])) {
+                        if (locRef[pli]) {
+                            diags.Error("ngen: a ref/out parameter cannot be a Span view (its frame box is by-value); pass the array and build a local view", m.line, m.col);
+                        } else {
+                            LoadLocal(pli, 0);                   // x0 = caller box
+                            LdrU(1, 0, 0);
+                            LdrU(2, 0, 8);
+                            LoadImm(3, LocFpOff(locOff[pli]));
+                            AddRR(3, 29, 3);
+                            StrU(1, 3, 0);
+                            StrU(2, 3, 8);
+                        }
+                    }
+                    psp = psp + 1;
                 }
                 if (curHasTry) {
                     // start the top mirror exactly as EmitMethod does, or the

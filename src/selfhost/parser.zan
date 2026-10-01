@@ -14,6 +14,11 @@ class Parser {
     public bool attrDll;      // last ParseAttrs saw [DllImport]
     public string attrEntry;  // DllImport EntryPoint override ("" if none)
     public bool attrVariadic; // DllImport Variadic = true named argument
+    public bool attrThreadEntry; // [ThreadEntry]: safe pthread entry (saves x19-x28)
+    public bool attrAtomicCas;   // [AtomicCas]: body emitted as casal
+    public bool attrAtomicLoad;  // [AtomicLoad]: body emitted as ldar
+    public bool attrAtomicStore; // [AtomicStore]: body emitted as stlr
+    public string attrStaticAddr; // [StaticAddr("fld")]: static whose address the method returns
     public bool attrJsonIgnore; // last ParseAttrs saw [JsonIgnore]
     public bool attrLayoutExplicit;
     public int attrFieldOffset = -1;
@@ -59,7 +64,7 @@ class Parser {
     int evKind;
     string evVal;
 
-    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; attrJsonIgnore = false; curClsNode = null; synthUsing = 0; curNs = ""; curFile = -1; fileStarts = null; curFileUsings = new List<string>(); genDbSrc = null; attrRoute = ""; attrVerb = ""; attrDesc = ""; attrTx = false; attrApiController = false; attrNonAction = false; attrOpts = null; attrMeta = null; genAttrSrc = null; }
+    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; attrJsonIgnore = false; curClsNode = null; synthUsing = 0; curNs = ""; curFile = -1; fileStarts = null; curFileUsings = new List<string>(); genDbSrc = null; attrRoute = ""; attrVerb = ""; attrDesc = ""; attrTx = false; attrApiController = false; attrNonAction = false; attrOpts = null; attrMeta = null; genAttrSrc = null; attrStaticAddr = ""; }
 
     // main.zan knows where each input file starts in the concatenated source
     // (1-based line numbers); with it the parser can give every declaration
@@ -102,6 +107,11 @@ class Parser {
         attrDll = false;
         attrEntry = "";
         attrVariadic = false;
+        attrThreadEntry = false;
+        attrAtomicCas = false;
+        attrAtomicLoad = false;
+        attrAtomicStore = false;
+        attrStaticAddr = "";
         attrJsonIgnore = false;
         attrLayoutExplicit = false;
         attrFieldOffset = -1;
@@ -144,6 +154,33 @@ class Parser {
                     }
                     Expect(TK.RParen());
                 }
+            } else if (At(TK.Ident()) && Cur().text == "ThreadEntry") {
+                // POSIX thread entry: the prologue/epilogue additionally
+                // save/restore x19-x28 (libpthread's start routine keeps
+                // its own state in callee-saved registers)
+                attrThreadEntry = true;
+                Next();
+            } else if (At(TK.Ident()) && Cur().text == "AtomicCas") {
+                // body replaced by `casal x1, x2, [x0]`: seq_cst
+                // compare-exchange whose return is the value seen at the
+                // comparison (the oracle __atomic semantics)
+                attrAtomicCas = true;
+                Next();
+            } else if (At(TK.Ident()) && Cur().text == "AtomicLoad") {
+                attrAtomicLoad = true;
+                Next();
+            } else if (At(TK.Ident()) && Cur().text == "AtomicStore") {
+                attrAtomicStore = true;
+                Next();
+            } else if (At(TK.Ident()) && Cur().text == "StaticAddr") {
+                // body replaced by `adrp+add` of the named static data
+                // global: lets runtime code pass the address of a static
+                // cell to OSAtomic/pthread (spin locks, once controls)
+                Next();
+                Expect(TK.LParen());
+                if (At(TK.StringLit())) { attrStaticAddr = Next().text; }
+                while (!At(TK.RParen()) && !At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
+                Expect(TK.RParen());
             } else if (At(TK.Ident()) && Cur().text == "StructLayout") {
                 Next();
                 if (Eat(TK.LParen())) {
@@ -461,6 +498,42 @@ class Parser {
         if (k == TK.CharLit()) { return true; }
         if (k == TK.This()) { return true; }
         if (k == TK.New()) { return true; }
+        return false;
+    }
+    // `(Name<...>)operand` — cast to a generic named type (Func<...>/
+    // Action<...>/user delegate instantiations), 缺口五. Same unambiguity
+    // rule as IsNamedCast: the balanced `>` must be followed by ')' and
+    // then a token that can only start an operand ('(' included — a
+    // parenthesised expression is never itself called in Zan, so
+    // `(Func<long, long, long>)(nint)Add` chains without ambiguity).
+    bool IsGenericCast() {
+        if (K() != TK.LParen()) { return false; }
+        if (K1() != TK.Ident()) { return false; }
+        if (K2() != TK.Less()) { return false; }
+        int depth = 0;
+        int i = pos + 2;
+        while (i < toks.Count) {
+            int k = toks[i].kind;
+            if (k == TK.Less()) { depth = depth + 1; }
+            else if (k == TK.Greater()) {
+                depth = depth - 1;
+                if (depth == 0) { break; }
+            }
+            else if (k == TK.Eof() || k == TK.Semicolon() || k == TK.LBrace()
+                     || k == TK.RBrace()) { return false; }
+            i = i + 1;
+        }
+        if (i + 2 >= toks.Count) { return false; }
+        if (toks[i + 1].kind != TK.RParen()) { return false; }
+        int n = toks[i + 2].kind;
+        if (n == TK.Ident()) { return true; }
+        if (n == TK.IntLit()) { return true; }
+        if (n == TK.FloatLit()) { return true; }
+        if (n == TK.StringLit()) { return true; }
+        if (n == TK.CharLit()) { return true; }
+        if (n == TK.This()) { return true; }
+        if (n == TK.New()) { return true; }
+        if (n == TK.LParen()) { return true; }
         return false;
     }
     // adjacency between the tokens at pos+i and pos+i+1.
@@ -1867,6 +1940,11 @@ class Parser {
         string mWeb = AttrWebPack();
         int mods = ParseMods();
         if (attrJsonIgnore) { mods = mods + MOD.JsonIgnore(); }
+        if (attrThreadEntry) { mods = mods + MOD.ThreadEntry(); }
+        if (attrAtomicCas) { mods = mods + MOD.AtomicCas(); }
+        if (attrAtomicLoad) { mods = mods + MOD.AtomicLoad(); }
+        if (attrAtomicStore) { mods = mods + MOD.AtomicStore(); }
+        if (attrStaticAddr != "") { mods = mods + MOD.StaticAddr(); }
         // `event` is contextual: a field modifier only when introducing an
         // event field (`event D E;`), so identifiers named `event` still work.
         if (At(TK.Ident()) && Cur().text == "event" && K1() == TK.Ident()) { Next(); mods = mods + MOD.Event(); }
@@ -1928,6 +2006,7 @@ class Parser {
         member.mods = mods;
         member.type = type;
         member.fieldOffset = fieldOffset;
+        member.attrStaticAddr = attrStaticAddr;
         // [Column(...)] capture for dbgen: name|primary|identity|nullable|len
         // with -1 standing for an unset bool flag ("" when no [Column]).
         if (attrColName.Length > 0 || attrColPrimary >= 0 || attrColIdentity >= 0
@@ -3364,8 +3443,9 @@ class Parser {
             n.op = op; n.a = ParseUnary();
             return n;
         }
-        // cast: '(' typeKeyword ')' unary, or '(' TypeName ')' unary
-        if (k == TK.LParen() && (IsTypeKeyword(K1()) || IsNamedCast())) {
+        // cast: '(' typeKeyword ')' unary, '(' TypeName ')' unary,
+        // or '(' Name<...> ')' unary (缺口五 generic delegate casts)
+        if (k == TK.LParen() && (IsTypeKeyword(K1()) || IsGenericCast() || IsNamedCast())) {
             int save = pos;
             Next(); // (
             Node ty = ParseType();

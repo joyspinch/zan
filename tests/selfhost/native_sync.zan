@@ -1,0 +1,147 @@
+using System;
+using System.IO;
+using System.Threading;
+
+// 第十一批:真锁 monitor + casal 原子 + 惰性静态串行化的用户面回归。
+// 全部断言都是调度无关的精确总数:lock 提供互斥(W0/W1 同锁各累 2500)、
+// CompareExchange 见证协议的 CAS 环精确、worker 线程的 EH 状态块隔离
+// (每线程独立 setjmp 槽)、try_lock 代际表并发首用无损、线程 id 互异。
+// 第十批之前的条纹计数器"monitor"在 W0/W1 并发下必然丢计数,本夹具
+// 就是它的负回归;compare_exchange 的 load-after-fail 旧语义在 Main 的
+// 单线程语义段被逐字钉住(失败见证必须是比较时刻的当前值)。
+class Pad {
+    long pad;
+}
+
+class Boom {
+    string msg;
+    Boom(string m) { this.msg = m; }
+}
+
+class NativeSync {
+    static Pad pa = new Pad();
+    static Pad pb = new Pad();
+    static long c1;
+    static long c2;
+    static long w0lk;
+    static AtomicInt done = new AtomicInt(0);
+    static AtomicInt casv = new AtomicInt(0);
+    static AtomicInt ehv = new AtomicInt(0);
+    static AtomicInt lkv = new AtomicInt(0);
+    static AtomicInt id0 = new AtomicInt(0);
+    static AtomicInt id1 = new AtomicInt(0);
+    static AtomicInt id2 = new AtomicInt(0);
+    static AtomicInt id3 = new AtomicInt(0);
+
+    static void W0() {
+        // try_lock 代际表与 W3 并发首用:同路径反复 try/unlock,代际表
+        // 分裂(两线程各建一套、后存者胜)时 unlock 找不到自己的 fd,
+        // 第二次起 try_lock 必败,w0lk 就不再是 10
+        long k = 0;
+        while (k < 10) {
+            long h = File.TryLock("native_sync_w0.tmp");
+            if (h != 0) { File.Unlock(h); w0lk = w0lk + 1; }
+            k = k + 1;
+        }
+        long i = 0;
+        while (i < 2500) {
+            lock (pa) {
+                lock (pa) { c1 = c1 + 1; }          // 递归重入合法
+            }
+            i = i + 1;
+        }
+        long j = 0;
+        while (j < 2500) {
+            lock (pb) { c2 = c2 + 1; }              // 换条纹:与 pa 互不阻塞
+            j = j + 1;
+        }
+        id0.Exchange(Thread.CurrentId());
+        done.Add(1);
+    }
+
+    static void W1() {
+        long i = 0;
+        while (i < 2500) {
+            // 见证协议 CAS 环:失败返回值就是比较时刻的当前值,直接当
+            // 下一轮 expected——load-after-fail 旧语义下结果同样精确,
+            // 精确性由 Main 的单线程语义段另行钉住
+            long seen = casv.Load();
+            if (casv.CompareExchange(seen, seen + 1) == seen) { i = i + 1; }
+        }
+        long j = 0;
+        while (j < 2500) {
+            lock (pa) { c1 = c1 + 1; }              // 与 W0 同锁竞争
+            j = j + 1;
+        }
+        id1.Exchange(Thread.CurrentId());
+        done.Add(1);
+    }
+
+    static void W2() {
+        // 每线程 EH 状态块隔离:worker 线程里反复 throw/catch,武装的
+        // setjmp 槽不能落到主线程或别的线程的块里
+        long i = 0;
+        while (i < 500) {
+            try { throw new Boom("w"); } catch (Boom e) { ehv.Add(1); }
+            i = i + 1;
+        }
+        id2.Exchange(Thread.CurrentId());
+        done.Add(1);
+    }
+
+    static void W3() {
+        long i = 0;
+        while (i < 250) {
+            long h = File.TryLock("native_sync_w3.tmp");
+            if (h != 0) { lkv.Add(1); File.Unlock(h); }
+            i = i + 1;
+        }
+        id3.Exchange(Thread.CurrentId());
+        done.Add(1);
+    }
+
+    static int Main() {
+        // 单线程语义段:casal/ldar/stlr 经 AtomicInt 的逐字契约
+        casv.Store(5);
+        Console.WriteLine(casv.CompareExchange(5, 9));   // 5:成功,现值 9
+        Console.WriteLine(casv.CompareExchange(5, 7));   // 9:失败见证=当前值(非 expected 5)
+        Console.WriteLine(casv.Exchange(3));             // 9:换入 3,返回旧值
+        Console.WriteLine(casv.Load());                  // 3
+        casv.Store(0);
+
+        Thread.Start(W0);
+        Thread.Start(W1);
+        Thread.Start(W2);
+        Thread.Start(W3);
+        long guard = 0;
+        while (guard < 60000) {
+            guard = guard + 1;
+            if (done.Load() == 4) { guard = 60000; }
+            else { Thread.Sleep(1); }
+        }
+        Console.WriteLine(c1);              // 5000:同锁两写方,互斥无损
+        Console.WriteLine(c2);              // 2500
+        Console.WriteLine(casv.Load());     // 2500:CAS 环无丢失
+        Console.WriteLine(ehv.Load());      // 500
+        Console.WriteLine(lkv.Load());      // 250
+        Console.WriteLine(w0lk);            // 10:代际表并发首用无损
+        long a = id0.Load();
+        long b = id1.Load();
+        long c = id2.Load();
+        long d = id3.Load();
+        long pairs = 0;
+        if (a != b) { pairs = pairs + 1; }
+        if (a != c) { pairs = pairs + 1; }
+        if (a != d) { pairs = pairs + 1; }
+        if (b != c) { pairs = pairs + 1; }
+        if (b != d) { pairs = pairs + 1; }
+        if (c != d) { pairs = pairs + 1; }
+        Console.WriteLine(pairs);           // 6:四线程 id 两两互异
+        long nz = 0;
+        if (a != 0 && b != 0 && c != 0 && d != 0) { nz = 1; }
+        Console.WriteLine(nz);              // 1:id 全部非零
+        File.Delete("native_sync_w0.tmp");
+        File.Delete("native_sync_w3.tmp");
+        return 0;
+    }
+}

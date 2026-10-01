@@ -1653,3 +1653,171 @@ mne 18 = 两侧同非零 stdout 逐字节一致。剩余非 pass 全部 oracle �
   串口控制台,kernel11 的 Console.ReadLine 在无数据控制台上阻塞(宿主
   侧 </dev/null 只关掉 qemu 输入端,不等价于 guest 内 EOF),挂满 120s
   看门狗;显式 EOF 后即按"EOF 读回空串"语义通过。
+
+## v18o-21 (2026-10-01) — 缺口五落地:语言级函数指针 + [ThreadEntry] + C thunk 清算
+
+- 编译器半边:委托值 bit0 定形态(oracle 双形态考古定案)——`(委托类型)nint`
+  转换打 |1 裸标记(orr x0,x0,#1;方法组 `(nint)Static` 本就发裸代码地址,
+  even),调用点 tbnz x0,#0 分岔:裸形态 and x9,x0,#~1 取址(args x1..x7 下移
+  x0..x6 后 blr x9,无 env)、even 走 interned 成对读取([x9]=thunk、x0=env),
+  两形态同一调用点。泛型 cast 解析:parser 新增 IsGenericCast(`(Ident<…>)`
+  仅当配平 `>` 后是 `)`+操作数头才认作 cast——`(Func<long, long, long>)(nint)Add`
+  此前整串退化成比较链(unknown identifier 'Func')。[ThreadEntry] 方法属性
+  (parser/ast MOD 524288):序言帧 +96 成对保存 x19-x28(libpthread 在被调者
+  保存寄存器放线程自指针,线程入口是 C→Zan 边界;局部全 x29 相对,帧扩展对
+  方法体透明),收尾 mov sp,x29 逐对恢复;与 Async 同用报错。async 注册改
+  BL _zan_set_ready_hook(原直接存 C 数据符号)。
+- 过程抓到首版降级 bug:裸形态的 and x9,x0,#~1 排在移参之后——mov x0,x1
+  先毁掉 x0 里的委托值,blr 跳到 arg0&~1,SIGSEGV(native_fnptr 首跑即抓);
+  修为剥 tag 先于移参,x9 全程不被移参触碰。
+- 运行时半边(runtime_core.zan 第十批):set_ready_hook/io_resume(裸调
+  hook,签名字面等价 _zan_co_ready,非 async 程序空操作)、
+  [ThreadEntry] thread_trampoline(box={fn,env},fn|1 强制裸路径——stdlib 传
+  的 interned 对里 thunk 是裸代码地址,取 interned 路径会把 [thunk+0] 当
+  指针)、thread_start/thread_current_id(pthread_threadid_np)、
+  dns_worker_job/dns_pipe_ensure(F_SETFL 非阻塞,O_NONBLOCK=0x4 Darwin
+  常数)/dns_mu_ensure 全部 Zan 实现;zt_io_resume/zt_dns_worker_fn/
+  zt_dns_drain/zt_dns_pipe_rd 四个 C thunk 与 naked asm trampoline 退役。
+  zanstubs.c:C 基线车道保留原样(hook 全局+zan_set_ready_hook 垫片、C DNS
+  worker/pipe、C 线程族全在卫内);Zan 车道 zanstubs_rest.o 这一族清零。
+  锁定 C 符号账面不变(zt_* 本就不在 Zan 侧导出面),runtime_core keep
+  133→136(+_zan_set_ready_hook/_zan_thread_start/_zan_thread_current_id)。
+- 车道衔接三课:(1) macOS C 名加一前缀——C 函数须名 zan_set_ready_hook
+  (符号 _zan_set_ready_hook),名 _zan_set_ready_hook 会发出双下划线符号
+  (首两次自举 link 失败根因);(2) 旧发射的 stage1 仍直接存数据符号
+  _zan_co_ready_hook,C 基线全局保留到旧编译器退出自举圈为止;(3)
+  linux_vehicle 的 --defsym=_zan_thread_trampoline_body 别名随 C 线程族
+  入卫成死悬空(ld.lld symbol not found),删除。
+- 永久金标:native_fnptr(裸往返、interned lambda 同点交错、越方法边界、
+  Action<nint> 形状)入电池 42→43。
+- native_rt_core(1107 行全家族 fixture)在 Zan 车道首跑抓到两个本批
+  运行时 bug,均修复后全绿:(1) 静态字段初始化器(-1)在库对象里不生效
+  ——初始化器经启动垫片写运行期存量,只对持有 Main 的对象生效,库对象
+  数据段恒零(缺口三 strpool init 同族教训);dns_pipe_r 被零化后
+  dns_pipe_ensure 返回 fd 0,管道观察项挂上 stdin(恒可读),IoPoll 每
+  轮秒回、自管道唤醒永不达——本文件新增静态一律零值哨兵(fd 用 0)。
+  (2) fcntl 第三参必须 Variadic=true(缺口一的"三参 open"同款):纯
+  声明把 arg 放寄存器、被调方 va_arg 读栈拿到垃圾,F_SETFL"成功"设错
+  标志,排干 blocking read 冻死主线程(sample 实证 io_poll__body 卡
+  read);io_socket_ready 的同款旧声明一并修正,C 车道一直正确,此项
+  使 A/B 首次逐位一致。排查路径备注:lldb 断点证 getaddrinfo 未达,
+  sample 证卡点在读,静态初值 nm+数据段转储证零化——管线运行间字节
+  确定(两次重建逐位同),跨"注释移动"的差异是行号敏感的发射(仅
+  __text 立即数位翻转,符号面与行为不变)。
+- 门禁(终树 zanc_v21=run.FAPKgl C 车道定点 + Zan 车道定点 run.v3RxRL(RT_OBJS=本批终态 runtime,编译器即自此再自举)):
+  battery 43/43 ×2 配置;native_rt_core 双车道显式绿;async 4/4(电池
+  内含);crossboot 40 夹具双车道(qemu ELF + COFF 结构)exit 0;
+  linux_vehicle 5/5 guest 逐字节;负测 native_unresolved_internal 诊断
+  逐字不变;裸调探针 native_fnptr 新编译器首跑即绿。
+
+## v18o-22 (2026-10-01) — 第十一批:多线程正确性清算(真锁 + 真 RMW + 惰性初始化串行化)
+
+- 编译器半边(四个 body 替换式内建,占位体即文档,ast MOD 四位 + parser
+  ParseAttrs + ngen GenMethod 分支):[AtomicCas] → 单条 casal x1,x2,[x0]
+  (armv8.1 LSE,与 clang 对 C11 __atomic SEQ_CST 的 arm64 降码同款;返回
+  比较时刻看到的旧值,oracle 的 seen 语义逐位对齐,第六批 load-after-fail
+  文档化偏差退役)、[AtomicLoad] → ldar、[AtomicStore] → stlr(读写从此
+  真 SEQ_CST,不再是对齐平铺访问)、[StaticAddr("fld")] → adrp+add 取本类
+  静态数据全局地址(自旋锁能落在静态单元的前提——普通表达式取不到静态
+  地址;libSystem 无带旧值返回的 CAS 符号,nm 实证)。
+- 运行时半边(runtime_core.zan 第十一批):(1) monitor 从条纹计数器(第七
+  批"单线程假设")换真 64 条纹递归 pthread 锁——缺口五起 DNS worker 真在
+  跑,计数器不提供互斥,lock 语句契约已被打破;条纹折叠与 C oracle 逐字
+  同款(^ 已验证,乘法散列退役);Darwin 实测 RECURSIVE=2、mutexattr_t=
+  16B、mutex_t=64B。(2) rt_init_lk 唯一串行化点,双检锁(CAS acquire +
+  OSAtomicAdd64Barrier(-1) release,calloc 失败保持 0 自然重试)盖住九处
+  惰性静态:lit/app_dir/monitor 表/dispatch 控制块/try_lock 三表/dns_mu/
+  dns_pipe/eh key/shared_table 锁单元与空串单例——旧代码两线程并发首用
+  各建一块、后存者胜,先者状态分裂。(3) 三处既有自旋解锁(st_unlock/
+  st_unspin/d_unlock)平铺 store 0 → barrier 减一:平铺 store 没有
+  happens-before 边,后到的持锁方可能看不到锁内写入。(4) atomic load/
+  store/CX 走内建,exchange 改 casal 环(每轮拿见证值);(5) SIGPIPE 探测
+  +条件装回入 sigpipe_lk 自旋锁;(6) sockaddr 文本(128B,C 为 __thread)
+  与网卡快照(67680B,每次调用重建)合并为 rt_tls 每线程刮擦块(专用
+  pthread key)。keep 账面不变(136),io reactor watch 表维持主线程属主
+  模型(与 oracle 同,设计约束非假设)。
+- 排查一课(自伤):探针把见证 CAS 按旧布尔掩码 (ok&255)!=0 判获取——
+  casal 成功返回旧值 0 反被判失败、被占返回 1 反被判获取,两线程 525 次
+  撕花后双双卡死,同二进制首跑 2000 全对纯属时序运气;sample+bt all 定位
+  后修正为 ==0 判成功。运行时各锁点全部用布尔版 osatomic_cas,无一混淆;
+  见证语义的正确获取判式是 返回值==expected。
+- 永久金标:native_sync(同锁两写方 5000 精确=条纹计数器负回归、递归重入、
+  跨条纹独立、CAS 环 2500 精确、worker EH 500、try_lock 代际表并发首用、
+  线程 id 两两互异、CAS/EXCHANGE 单线程语义逐字)入电池 43→44;新编译器
+  首跑即绿(12 行精确总数,0.25s)。
+- 门禁(终树 zanc_v22=run.9DCQOc C 车道定点 + Zan 车道定点 run.YAieUC
+  (RT_OBJS=本批终态 runtime,编译器即自此再自举)):battery 44/44 ×2
+  配置;native_rt_core 双车道显式绿(旧金标逐字不动);async 4/4(电池
+  内含);crossboot 40 夹具双车道 exit 0(各 80 PASS/0 FAIL);linux_vehicle
+  5/5 guest 逐字节;负测 native_unresolved_internal 诊断逐字不变。
+
+## v18o-23 (2026-10-01) — 第十二批:内存管理清算(Span 视图零堆分配)
+- 编译器半(ngen 三装箱点 → 帧槽):`new Span<T>(b,n)`(GenNew)、`arr.AsSpan(...)`
+  与 `span.Slice(...)`(GenSpanView)的 `malloc(16)` {base,len} 堆箱全部退役——
+  每个构造点在 ReserveSpanBoxes 预序预留私有 16B 帧槽(与局部同 16B 步距,
+  帧提交前入账,prologue 即定型),发射点 `SpanSiteBox` 按节点身份查表取
+  `x29±off`。同夹具 `_malloc` 重定位 33→18(calloc 22 恒定):消失的 15 处
+  全是视图箱,长跑程序的每次求值 16B 无界泄漏账面清零。收集器
+  (CollectSpanViews)与生成派发逐条件镜像,Ident 接收者按 NamedSlotTy
+  全表解析(收集时点 locHead 链只达参数——首批探针 Main 全收集为 0 的
+  根因;超收只费槽、漏收是响亮编译错);Lambda 体是独立帧,thunk prologue
+  自跑同款收集。
+- 值语义与参数:赋值进 Span 局部按 {base,len} 对拷贝(StoreLocalVal/
+  StoreDeclValNg 帧箱分支;不可变对别名 ≡ 拷贝,与 C# 结构拷贝一致);
+  Span 形参进序归一化——入口把调用方箱的对拷入形参槽(调用方帧活过同步
+  被调,下传健全;by-value,重绑不出 callee)。LoadLocalVal 对 Span 局部
+  即取槽址(槽即箱)。无初值 Span 声明清零槽对(早索引落软钳制而非野解引用)。
+- 逃逸禁令(六处响亮诊断,C# ref-struct 规则):返回(箱随帧死)、实例/
+  静态字段(CS8345 同款;缺口二的读写能力随之退役,全库零用量,
+  runtime_core 的"静态只存块指针"风格早已自守)、Lambda 捕获、List/Dict
+  元素、ref/out 形参。参数(非 ref)合法且实测:sched256/sched512 的
+  `Span<byte> b` 下传全对(旧注释"不能作形参"已失实,随批改写)。
+- runtime_core 半:零源码行为改动即受益——183 处 `new Span` 站点重编译后
+  落帧槽;头部账面更新(第一~十二批),sched256 注释修正,"已知代价"仅存
+  自管块一条;build_zan_core.sh 头注 1-12。
+- 永久金标:native_spans(拷贝语义 4040、形参下传+被调内重绑 3408、热循环
+  双站点复用 5,000,000、三元视图两臂 20/50、inline new-Span 读写 1、窗口
+  越界软钳 111、int 窄元 -7+9=2)入电池 44→45,双车道同金标。
+- 门禁(终树 zanc_v23=run.3lcbYa C 车道未动 + Zan 车道定点 run.3lcbYa
+  (RT_OBJS=本批终态 runtime,含注释改写后重编译)):battery 45/45 ×2;
+  native_rt_core+async 4 显式双车道 5/5;crossboot 40 夹具 exit 0(80
+  PASS/0 FAIL);linux_vehicle 5/5 guest 逐字节;负测
+  native_unresolved_internal 诊断逐字不变。
+
+## v18o-24 (2026-10-01) — 第十三批:最后一个 C 族清算(darwin 车道零项目 C)
+- C 余件考古收口:zanstubs_rest.o(Zan 配置)定义面只剩 11 个裸名符号——
+  mem 六件(Copy=memmove/Fill=memset/Compare=memcmp/Find=memchr)、ARC 串
+  两件(GetString 按 [rc:8][0x5A414E53|len:8][data][NUL] 手搓、PutString)、
+  Win32 文本两件(MultiByteToWideChar/WideCharToMultiByte——原样是
+  return-0 空桩,即 Wide.Of 只能产空串的"阉割"账),外加无引用的
+  Alloc/Free/Crc32 遗留;zanhost_rest.o 已空。
+- runtime_core 第十三批(11→0):mem 六件落 class zan(libc 走 zmemmove/
+  zmemcmp/zmemchr 别名,避开 ABI 撞名;copy 免重叠自转、fill/compare/find
+  带 n<=0 与空指针卫);GetString/PutString 真实现(布局与编译器内联展开
+  逐位一致);文本两件按 Win32 CP_UTF8(65001)语义:flags=0、非法序列替
+  U+FFFD(合法 FFFD 不误替——内部 -1 哨兵区分"无效"与"本身就是 FFFD")、
+  sl/wl<0 计 NUL、零缓冲查尺寸、缓冲不足返 0、其他代码页返 0;宽侧代理对
+  拆合、未配对代理替 U+FFFD、du!=0 回写 0。C 基线(zanstubs.c)同批实现
+  同语义作 oracle(zan_* 别名仅供 -U 车道)。
+- EntryPoint 改名面收账:NativeMemory 六件(Copy/Fill/Compare/Find/
+  GetString/PutString→zan_*)早在批内完成;本批补齐 Interop.Wide、
+  Process、Directory、Pinyin(#if WINDOWS 块,darwin 不活但账面归零)的
+  Win 文本四处——全库自此不再声明任何裸名 C 导入。
+- 自举机制入账(重要):自举 SEED 优先用二进制旁的 stdlib 快照——旧定点
+  (run.3lcbYa)旁是改名前快照,其 stage1 引用裸名、零 C 链接必炸。解法:
+  老种子 + 现行 stdlib 拷贝件作 SEED(seed13/seedF 暂存目录),一次自举后
+  新定点的快照即含全部改名。zanstubs.c 头注的裸名桥(为改名前工件保留
+  的非卫裸名面)按其自述 prophecy 退役:裸名面收进 -U 守卫,zanstubs_rest.o
+  全局符号清零(纯 C 余量为空,物保留作账面);C 基线 zanstubs_full 双面
+  (裸名 + zan_*)原样。
+- 定点与门禁(终树 zanc_v24=run.B34Of5——RT_OBJS 只有 runtime_core.o 的
+  自举定点,stage2==stage3 逐字节,即 darwin 车道零项目 C 里程碑;种子
+  暂存法经 run.MrSWND 先行验证):battery 46/46 ×2(zero-C 车道
+  --runtime=runtime_core.o 单对象 + C 基线双对象);crossboot 40 夹具
+  80 PASS/0 FAIL;linux_vehicle 5/5 guest;负测 native_unresolved_internal
+  诊断逐字;native_memwide 对象级确定性 10/10 同一 sha。
+- 永久金标:native_memwide(重叠 memmove=7、回拷比较 0/4、memchr 命中/
+  脱靶/偏移=12/-1/13、ARC 串长 4/0、Slice 视图读 2、宽往返 5/10/0、
+  非法字节 FFFD=2、截断序列 FFFD=1、空指针卫 0/0,16 行精确)入电池
+  45→46,双车道同金标。fixture 源一度被误写覆盖(编译器输出当输出路径),
+  自链接对象反汇编 + 冻结金标完整重建,双车道逐字复核。

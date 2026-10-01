@@ -1,4 +1,4 @@
-// crt-transition/runtime_core.zan — Zan 实现的过渡期运行时(第一~九批)。
+// crt-transition/runtime_core.zan — Zan 实现的过渡期运行时(第一~十三批)。
 //
 // 取代 zanstubs.c / zanhost.c 中的(用 -DZAN_RT_CORE_ZAN 从 C 侧编出):
 //   第一批:zan_monotonic_ns / zan_monotonic_us / zan_sha256 / zan_sha512
@@ -24,15 +24,50 @@
 //   第七批:zan_audio_* 21 桩(driver/error 返回 lit_buf[32] 的
 //           "stub")、zan_monitor_enter/exit、zan_dispatch_*(CAS 自旋
 //           锁环)、zan_eh_tls_state(pthread key)——线程族
-//           (zan_thread_*)因 naked asm + 函数指针仍留 zanstubs.c。
+//           (zan_thread_*)当时因 naked asm + 函数指针仍留 zanstubs.c,
+//           第十批收回。
 //   第九批:native io reactor 8 符号——io_wait_co/io_recv_co/
 //           io_recv_to_co/io_accept_co/io_poll/io_close_notify/
 //           resolve_sa_co/resolve_ipv4_co(watch 表、零超时探测、
-//           DNS 自管道 + 脱离 worker、互斥交棒)。C 侧只留 4 个内部
-//           thunk(hook 全局 + zt_io_resume 间接调用 + zt_dns_worker_fn
-//           线程体地址 + zt_dns_drain 互斥摘链 + zt_dns_pipe_rd),
-//           同属缺口绕行形态(缺口五,函数指针;缺口一的 zan_open_creat
-//           同款绕行已在缺口一批次随变参降级修复退役)。
+//           DNS 自管道 + 脱离 worker、互斥交棒)。当时 C 侧还留 4 个
+//           内部 thunk(见第十批)。
+//   第十批(缺口五):语言级函数指针落地后的 C thunk 清算——
+//           zan_set_ready_hook(编译器发射的 _zan_co_ready 自注册)、
+//           zan_thread_start / zan_thread_current_id(原 C zan_thread_*)、
+//           [ThreadEntry] zan_thread_trampoline(x19-x28 序言/收尾,替
+//           代 zanstubs.c 的 naked asm 屏障;pthread_create 的 start
+//           routine 与 Zan 方法体之间的被调者保存寄存器边界)、DNS
+//           worker 体(dns_worker_job,经 trampoline 的 fn(env) 裸调
+//           进入)+ 自管道(dns_pipe_ensure,F_SETFL 非阻塞)+ 互斥摘链
+//           (dns_mu/dns_done)全部改本文件实现。zt_io_resume/
+//           zt_dns_worker_fn/zt_dns_drain/zt_dns_pipe_rd 四个 C thunk
+//           与 naked trampoline 一并退役;C 基线车道(zanstubs_full)
+//           保留原样供 A/B,zan 车道的 zanstubs_rest.o 里这一族清零。
+//   第十一批:多线程正确性清算——monitor 换真 64 条纹递归 pthread 锁
+//           (第七批的条纹计数器退役),原子族换 [AtomicCas]/
+//           [AtomicLoad]/[AtomicStore] 内建(casal/ldar/stlr,与 clang
+//           对 SEQ_CST __atomic 的降码同款),全部惰性静态过 rt_init_lk
+//           双检锁,st/d 三处自旋解锁补 release 屏障,sockaddr 文本/
+//           网卡快照缓冲每线程一块(rt_tls)。
+//   第十二批:内存管理清算——Span 视图的每次堆分配退役(编译器侧,
+//           本文件零改动即受益):视图构造(new Span<T>/AsSpan/Slice)
+//           落每构造点私有 16B 帧槽,赋值进 Span 局部按 {base,len} 对
+//           拷贝(值语义),形参进序归一化为槽内对(by-value 下传)。
+//           逃逸面按 C# ref-struct 规则响亮拒绝:返回/字段/静态/
+//           捕获/List/Dict 元素、ref 形参(见 ngen 六处诊断)。
+//   第十三批:最后一个 C 族清算——裸名 mem 六件(Copy/Fill/Compare/
+//           Find/GetString/PutString)与 Win32 文本两件
+//           (MultiByteToWideChar/WideCharToMultiByte,原 C 侧是
+//           return-0 空桩、Wide.Of 只能产空串)全部改本文件真实现:
+//           mem 系走别名 libc(zmemmove/zmemcmp/zmemchr),GetString
+//           按 ARC 布局手搓([rc:8][0x5A414E53|len:8][data][NUL]),
+//           文本转换按 Win32 CP_UTF8 65001 语义(flags=0、
+//           非法序列替 U+FFFD、-1 计 NUL、零缓冲查尺寸、缓冲不足
+//           返 0、其他代码页返 0)。stdlib 四处 EntryPoint 同批改名
+//           (NativeMemory 六件 + Interop/Process/Directory/Pinyin 的
+//           Wide 面),从此 darwin 车道链接只需 runtime_core.o——
+//           自举定点 run.B34Of5 即零项目 C 链接,zanstubs_rest.o
+//           清零(裸名遗留面只存于 C 基线 zanstubs_full 供 A/B)。
 // 由原生自举编译器(ngen)编译为 arm64 可重定位对象,再经
 // localize_syms.py 把 API 面之外的符号本地化——ngen 会把整套运行时
 // 帮助函数以全局符号发射进每个对象,不本地化则与程序对象撞符号。
@@ -41,8 +76,9 @@
 // len<0 钳 0、大端摘要输出、calloc 清零分配、CRC-32 IEEE 反射)。
 // SHA 输入经 memcpy 整块搬入暂存缓冲再调度,与 C 版的逐块指针遍历等价。
 //
-// 已知代价:每次调用为 Span 视图泄漏 1~2×16 字节(视图按迁就设计
-// 短命、不回收,与 ngen 的 Span 实现一致)。
+// 已知代价(第十二批清算后仅存其一):本文件自管的块(malloc/calloc
+// 暂存)仍按"用点即弃"分配;Span 视图自第十二批起是编译器帧槽,零堆
+// 分配、零泄漏——同对象旧版每次视图求值泄漏 16B 的账面随之清零。
 //
 // 约束:不 using stdlib(Span 是 binder 内建,libc 直调);数值一律
 // long + >>>(恒逻辑右移)+ 掩码,不依赖 uint/ulong 的移位语义;
@@ -82,28 +118,27 @@
 // 128 字节/16 个 long:bit=1L<<(fd%64)、slot=fd/64,select 之后一律
 // 取新 Span 视图重读(跨 DllImport 持有的视图不可靠,同缺口 2 纪律)。
 // v6 逐字节规则里字节取反用 255-x(^ 未验证)。SIGPIPE 惰性忽略:
-// csignal(13,1) 取旧 handler,非 0 则装回——单线程下等价 C 的
-// sigaction 探测+条件安装。
+// csignal(13,1) 取旧 handler,非 0 则装回;第十一批起探测+条件装回
+// 在 sigpipe_lk 自旋锁内串行,并发首用 socket 不互覆。
 //
-// 第六批追加约束:RMW 原子性经 libSystem 导出的 OSAtomicAdd64Barrier
-// (恰为 add_fetch)与 OSAtomicCompareAndSwap64Barrier(布尔经 x0,
-// 必须掩 &255 再判);exchange 用 CAS 循环、compare_exchange 失败路径
-// 取 load-after-fail 当"看到的旧值"——本车道单线程两者与 oracle 的
-// __atomic 语义等价,多线程竞争下是文档化偏差(oracle 真 RMW)。load/
-// store 是对齐 8 字节访问(arm64 单拷贝原子);布尔返回值一律声明
-// nint 并掩低字节——小整型 ABI 只保证 w0。
+// 第六批追加约束(第十一批重写):add 走 OSAtomicAdd64Barrier(恰为
+// add_fetch 全屏障);exchange/compare_exchange/load/store 走
+// [AtomicCas]/[AtomicLoad]/[AtomicStore] 内建(casal/ldar/stlr,与
+// clang 对 C11 __atomic SEQ_CST 的 arm64 降码同款,LSE 全系支持)——
+// compare_exchange 无论成败都返回比较时刻看到的旧值,第六批的
+// load-after-fail 文档化偏差就此退役。osatomic_cas(旧)仍供各处自旋
+// 锁使用:布尔经 x0,必须掩 &255 再判——小整型 ABI 只保证 w0。
 //
 // 第七批追加约束:lit_buf[32..36] 存 "stub"(lit_init 追加,不影响
-// 既有偏移)。monitor 是条纹计数器而非真锁——本车道单线程,递归
-// 即 entry++/--,重入合法、退出钳 0;条纹折叠用乘法散列(^ 未验证)。
-// dispatch 用 OSAtomic CAS 自旋锁(0 闲 1 忙)替代 pthread mutex:
-// 互斥等价,争用下自旋;环状态在 calloc 控制块(自旋/容量/头/尾/环
+// 既有偏移)。monitor 第十一批换真 64 条纹递归 pthread 锁(条纹折叠
+// 与 oracle 逐字同款,第七批的乘法散列退役);dispatch 保持 OSAtomic
+// CAS 自旋锁(0 闲 1 忙)替代 pthread mutex:互斥等价,争用下自旋;
+// 环状态在 calloc 控制块(自旋/容量/头/尾/环
 // 指针),静态只存块指针、用点取新局部(缺口 2 纪律),grow 的头尾
-// 迁移与 C 版逐字对齐(head=0、tail=存活数);控制块惰性建立是单
-// 线程假设(与 try_lock 同款)。eh_tls_state 的 __thread 槽位换成
-// pthread specific key(key_create 无析构 + get/setspecific;key_t
-// 是 unsigned long)。double 形参/返回可用:0.0 走 (double)0L 显式
-// 转换,不写字面量。
+// 迁移与 C 版逐字对齐(head=0、tail=存活数)。eh_tls_state 的
+// __thread 槽位换成 pthread specific key(key_create 无析构 +
+// get/setspecific;key_t 是 unsigned long)。double 形参/返回可用:
+// 0.0 走 (double)0L 显式转换,不写字面量。
 //
 // 第八批追加约束:shared_table 的块布局自定(不必对齐 C zt_table,
 // A/B 只对符号级行为负责)——表块 3152B 十槽([0]名串 [1]容量 [2]键长
@@ -124,20 +159,54 @@
 // 只断言 != 0。指针算术一律经 st_ptr(long) 两步:((nint)(表达式))
 // 括号强转被解析器当方法调用(见缺口 3 旁注),(nint)标识符才合法。
 //
+// 第十批追加约束:本批新增静态一律零值哨兵(见 dns_pipe_r 注释)——
+// 静态字段初始化器经启动垫片写运行期存量,只对持有 Main 的对象生效,
+// 库对象数据段恒零(缺口三 strpool init 的同族教训)。fcntl(3 参)
+// 必须声明 Variadic=true(2 定参 + 调用点补尾参):纯声明把第三参放
+// 寄存器、被调方 va_arg 读栈拿到垃圾——F_SETFL"成功"设错标志,自
+// 管道排干 blocking read 冻死(io_socket_ready 的同款旧声明一并修正;
+// C 车道一直是真 fcntl,此项修复使 A/B 首次逐位一致)。委托对
+// {fn@0, env@8} 传给 thread_trampoline 的 fn 是裸代码地址(方法组
+// cast 或委托 thunk),trampoline 显式 |1 强制裸形态——interned 委托
+// 的 thunk 字段是裸地址,按 even 读会把代码当指针。dns_pipe_ensure
+// 的 O_NONBLOCK=0x4 与 F_GETFL=3/F_SETFL=4 是 Darwin 常数,本对象只
+// 入 macOS 车道;ELF 车道的对应实现走 linux 车道对象。
+//
+// 第十一批追加约束:rt_init_lk 是全部惰性静态的唯一串行化点,双检锁
+// 形态 `if (X == 0) { rt_lock(); if (X == 0) { X = build(); }
+// rt_unlock(); }`——calloc 失败保持 0,下次调用自然重试,无需 built
+// 旗标。rt_lock 是 OSAtomic CAS 自旋(Barrier 变体,acquire),
+// rt_unlock 是 OSAtomicAdd64Barrier(-1)(release):平铺 store 解锁
+// 没有 happens-before 边,后到的持锁方可能看不到锁内写入——这同时
+// 修掉 st_unlock/st_unspin/d_unlock 三处既有自旋的同一缺口。持
+// rt_init_lk 只准做快系统调用(叶锁),不得进入任何可能再取
+// rt_init_lk 或阻塞的路径;依赖先 ensure(lit 之于 app_dir)、永不
+// 嵌套。[StaticAddr("fld")] 方法由 ngen 发 adrp+add 取静态数据全局
+// 地址——普通表达式取不到静态地址,自旋锁落在静态单元全靠它。原子
+// 内建的占位体即文档,发射即实现。Darwin 实测常数:PTHREAD_MUTEX_
+// RECURSIVE=2、pthread_mutexattr_t=16B、pthread_mutex_t=64B。rt_tls
+// 每线程刮擦块([0..128) sockaddr 文本、[128..67808) 网卡快照),契约
+// "活到本线程下次调用"。io reactor watch 表(io_ws/io_n/io_cap)仍
+// 只被主线程触碰——那是 reactor 的属主模型(与 oracle 相同),不是
+// 本批未清的假设。
+//
 // 第九批追加约束:watch 表为私有布局 80B/项(fd/kind/active/buf/len/
 // deadline/frame/step/outn/垫),静态只存 io_ws/io_n/io_cap 三个
 // 指针计数(缺口 2 纪律),grow 用 calloc+memcpy+free(不用 realloc)。
 // co 助手在系统调用前一律先零超时 poll 探测(zt_fd_ready 语义):
 // accept 出的套接字常被调用方留在阻塞态,直接阻塞会冻死单线程引擎。
-// DNS 作业块是与 C worker 的共享契约(72B:next@0 name@8 port@16
-// buf@24 cap@32 outn@40 frame@48 step@56 result@64 v4@68),worker
-// 线程体留在 C(ngen 无函数指针调用,线程体地址经 zt_dns_worker_fn
-// thunk 取),完工链经互斥(zt_dns_drain)+ 自管道(读端 fd 经
-// zt_dns_pipe_rd,非阻塞——排干到 would-block 而不是冻死)交棒,
-// ready 队列仍只被主线程触碰。恢复一律经 zt_io_resume thunk(hook
-// 指针的间接调用,缺口 5);hook==0 的非 async 程序里它是空操作,
-// 语义只经 outn 槽与 poll 返回值观察。byte 事件位拼装按 int 收拾,
-// revents 在 +6 处用两 byte 拼回(短整型 ABI 只保证低字节可靠)。
+// DNS 作业块布局(80B:next@0 name@8 port@16 buf@24 cap@32 outn@40
+// frame@48 step@56 result@64 v4@68)是第九批与 C worker 的共享契约,
+// 第十批 worker 移入本文件后成为纯内部布局。worker 线程体、完工链
+// 互斥、自管道读端原经 zt_dns_worker_fn/zt_dns_drain/zt_dns_pipe_rd
+// 三个 C thunk(缺口 5),第十批改 dns_worker_job + dns_mu/dns_done +
+// dns_pipe_ensure(读端 F_SETFL 非阻塞——排干到 would-block 而不是
+// 冻死;O_NONBLOCK=0x4 是 Darwin 常数,本对象只入 macOS 车道),
+// ready 队列仍只被主线程触碰。恢复原经 zt_io_resume thunk(hook
+// 指针的间接调用,缺口 5),第十批改 io_resume:(委托)nint 裸调;
+// hook==0 的非 async 程序里它是空操作,语义只经 outn 槽与 poll 返回
+// 值观察。byte 事件位拼装按 int 收拾,revents 在 +6 处用两 byte 拼回
+// (短整型 ABI 只保证低字节可靠)。
 //
 // 已发现编译器缺口(ngen;本文件全部绕行;缺口 1/2/3/4 已分别在缺口一/
 // 二/三/四批次修复,其余仍开放):
@@ -218,12 +287,34 @@
 //      本文件的 (double)0L 写法保留(无害)。第八批 fixture 的
 //      float 段已升级为逐位值往返(1.5/0.1/-0.75/π,双配置字节
 //      一致);第七批 audio 断言经垫片后成为真 ABI 返回验证。
-//   5) 无间接调用/函数指针:LoadSymRef 可取全局地址,但不能经寄存器
-//      blr。受害形态:协程恢复 hook(zan_co_ready_hook)、线程体
-//      (pthread_create 的 fn)。绕行:C 侧包装 thunk(与已退役的
-//      zan_open_creat 同形态,属缺口五)——zt_io_resume(frame,step)
-//      内部判空调 hook;线程体地址经 zt_dns_worker_fn() 取;互斥下摘
-//      链经 zt_dns_drain()。
+//   5) 无间接调用/函数指针【缺口五,已修】——原状:LoadSymRef 可取
+//      全局地址,但不能经寄存器 blr,委托机器(_zan_dlg_intern intern
+//      对)之外无法调用运行期解析的地址。受害形态:协程恢复 hook
+//      (zan_co_ready_hook)、pthread_create 的线程体、DNS 完工链互斥
+//      摘链与自管道读端——全部绕行 C thunk(zt_io_resume/
+//      zt_dns_worker_fn/zt_dns_drain/zt_dns_pipe_rd + naked asm
+//      zan_thread_trampoline,与已退役的 zan_open_creat 同形态)。
+//      修复(oracle 双形态考古定案:委托值 bit0 为形态标记):
+//      (a) 编译器 (委托类型)nint 转换把值打上 |1 裸标记(orr x0,x0,#1;
+//      方法组 (nint)Static 本就发裸代码地址,even);(b) 调用点
+//      emit_delegate_invoke 分岔:tbnz x0,#0 走裸——and x9,x0,#~1 取
+//      址进 x9(必须先于移参:移参 mov x0,x1… 会先毁掉 x0 里的值,
+//      首版即栽在这),args x1..x7 下移 x0..x6,blr x9 无 env;even
+//      走 interned——[x9]=[x0+0] thunk、x0=[x0+8] env,blr。两形态
+//      共用同一调用点。(c) [ThreadEntry] 方法属性(parser/ast MOD
+//      524288):序言扩展帧 +96 并成对保存 x19-x28(POSIX 线程入口
+//      是 C→Zan 边界,libpthread 在被调者保存寄存器里放线程自指针;
+//      局部全部 x29 相对,帧扩展对方法体透明),收尾 mov sp,x29 后
+//      逐对恢复;与 Async 同用报错。(d) 泛型 cast 解析:parser 新增
+//      IsGenericCast((Ident<…>)仅当配平 > 后是 ")"+操作数头才认作
+//      cast,(Func<long,long,long>)(nint)Add 可链式)。永久金标
+//      native_fnptr(裸往返 + interned lambda 同点交错 + 越方法边界
+//      + Action<nint> 形状)入电池。runtime 收编:set_ready_hook/
+//      io_resume(裸调 hook,签名字面等价 _zan_co_ready)、
+//      thread_trampoline(+ThreadEntry)/thread_start/
+//      thread_current_id、dns_worker_job/dns_pipe_ensure/dns_mu_ensure
+//      全部 Zan 实现;四个 zt_* C thunk 与 naked trampoline 退役,
+//      C 基线车道原样保留供 A/B。
 //
 // 命名纪律:libc 导入一律别名(cfree/malloc/…),公开 ABI 方法名
 // (free/alloc/crc32/…必须与 libc 导入名错开——同类两个方法名会
@@ -238,6 +329,12 @@ class zan {
     public static extern void cfree(nint p);
     [DllImport("crt", EntryPoint = "memset")]
     public static extern nint memset(nint p, int v, long n);
+    [DllImport("crt", EntryPoint = "memmove")]
+    public static extern nint zmemmove(nint dst, nint src, long n);
+    [DllImport("crt", EntryPoint = "memcmp")]
+    public static extern int zmemcmp(nint a, nint b, long n);
+    [DllImport("crt", EntryPoint = "memchr")]
+    public static extern nint zmemchr(nint p, int v, long n);
     [DllImport("crt", EntryPoint = "memcpy")]
     public static extern nint memcpy(nint dst, nint src, long n);
     [DllImport("crt", EntryPoint = "clock_gettime")]
@@ -315,7 +412,8 @@ class zan {
     }
 
     // 从暂存块视图展开前 16 个字(写进 w);与 rounds256 分离是因为
-    // Span 视图只能作局部变量,不能作形参。
+    // 早期 Span 视图不能作形参——第十二批起视图形参按帧箱值语义健全
+    // (进序把调用方箱的 {base,len} 对拷入形参槽),函数形状保留。
     static void sched256(long[] w, Span<byte> b) {
         int j = 0;
         while (j < 16) {
@@ -607,7 +705,6 @@ class zan {
     // 只读缓存的可执行文件目录(对照 zanh_app_dir:ZAN_APP_DIR 优先,
     // 否则 _NSGetExecutablePath 去尾)。内部专用,不交给调用方释放。
     static nint app_dir_buf;
-    static long app_dir_done;
 
     // 环境变量名/拼装常量字节不能写字面量:ngen 的字符串字面量经数据
     // 槽间接寻址,槽由本对象的静态初始化填充,而 runtime_core.o 作为
@@ -618,50 +715,67 @@ class zan {
 
     static void lit_init() {
         if (lit_buf != 0) { return; }
-        lit_buf = calloc(1, 128);
-        Span<byte> lb = new Span<byte>(lit_buf, 128);
-        lb[0] = 90; lb[1] = 65; lb[2] = 78; lb[3] = 95;
-        lb[4] = 65; lb[5] = 80; lb[6] = 80; lb[7] = 95;
-        lb[8] = 68; lb[9] = 73; lb[10] = 82;
-        lb[12] = 90; lb[13] = 65; lb[14] = 78; lb[15] = 95;
-        lb[16] = 80; lb[17] = 75; lb[18] = 71; lb[19] = 95;
-        lb[20] = 68; lb[21] = 73; lb[22] = 82;
-        lb[48] = 48; lb[49] = 49; lb[50] = 44; lb[51] = 9; lb[52] = 10;
-        lb[32] = 115; lb[33] = 116; lb[34] = 117; lb[35] = 98; lb[36] = 0;
-        // 第八批:rate/lock 的常量列名。
-        lb[38] = 99; lb[39] = 111; lb[40] = 117; lb[41] = 110;
-        lb[42] = 116; lb[43] = 0;
-        lb[64] = 119; lb[65] = 105; lb[66] = 110; lb[67] = 100;
-        lb[68] = 111; lb[69] = 119; lb[70] = 95; lb[71] = 115;
-        lb[72] = 116; lb[73] = 97; lb[74] = 114; lb[75] = 116;
-        lb[76] = 0;
-        lb[80] = 111; lb[81] = 119; lb[82] = 110; lb[83] = 101;
-        lb[84] = 114; lb[85] = 0;
+        // 双检锁(十一批):两线程并发首用时旧代码各建一块、后存者胜,
+        // 先者的调用方拿到已失联的缓冲。lit_buf 一旦发布即不可变,内容
+        // 字节先于指针写入,快路径平铺读安全(arm64 多拷贝原子)。
+        rt_lock();
+        if (lit_buf == 0) {
+            nint lb0 = calloc(1, 128);
+            if (lb0 != 0) {
+                Span<byte> lb = new Span<byte>(lb0, 128);
+                lb[0] = 90; lb[1] = 65; lb[2] = 78; lb[3] = 95;
+                lb[4] = 65; lb[5] = 80; lb[6] = 80; lb[7] = 95;
+                lb[8] = 68; lb[9] = 73; lb[10] = 82;
+                lb[12] = 90; lb[13] = 65; lb[14] = 78; lb[15] = 95;
+                lb[16] = 80; lb[17] = 75; lb[18] = 71; lb[19] = 95;
+                lb[20] = 68; lb[21] = 73; lb[22] = 82;
+                lb[48] = 48; lb[49] = 49; lb[50] = 44; lb[51] = 9; lb[52] = 10;
+                lb[32] = 115; lb[33] = 116; lb[34] = 117; lb[35] = 98; lb[36] = 0;
+                // 第八批:rate/lock 的常量列名。
+                lb[38] = 99; lb[39] = 111; lb[40] = 117; lb[41] = 110;
+                lb[42] = 116; lb[43] = 0;
+                lb[64] = 119; lb[65] = 105; lb[66] = 110; lb[67] = 100;
+                lb[68] = 111; lb[69] = 119; lb[70] = 95; lb[71] = 115;
+                lb[72] = 116; lb[73] = 97; lb[74] = 114; lb[75] = 116;
+                lb[76] = 0;
+                lb[80] = 111; lb[81] = 119; lb[82] = 110; lb[83] = 101;
+                lb[84] = 114; lb[85] = 0;
+                lit_buf = lb0;
+            }
+        }
+        rt_unlock();
     }
 
     static nint app_dir() {
         lit_init();
         nint env = cgetenv(lit_buf);
         if (env != 0 && cstrlen(env) != 0 && cstrlen(env) < 4096) { return env; }
-        if (app_dir_done == 0) {
-            app_dir_done = 1;
-            app_dir_buf = calloc(1, 4096);          // C 静态缓冲零初始化
-            nint exe = malloc(4096);
-            nint cap = malloc(8);
-            Span<long> cv = new Span<long>(cap, 1);
-            cv[0] = 4096;
-            if (cnsgetpath(exe, cap) == 0) {
-                nint sep = cstrrchr(exe, 47);
-                if (sep != 0 && sep != exe) {
-                    Span<byte> zv = new Span<byte>(sep, 1);
-                    zv[0] = 0;
-                    long el = cstrlen(exe);
-                    if (el < 4096) { memcpy(app_dir_buf, exe, el + 1); }
+        if (app_dir_buf != 0) { return app_dir_buf; }
+        // 双检锁(十一批):两线程并发首用时旧代码双重 calloc、先者
+        // 失联;缓冲内容建好先于指针发布,快路径平铺读安全
+        rt_lock();
+        if (app_dir_buf == 0) {
+            nint ab = calloc(1, 4096);              // C 静态缓冲零初始化
+            if (ab != 0) {
+                nint exe = malloc(4096);
+                nint cap = malloc(8);
+                Span<long> cv = new Span<long>(cap, 1);
+                cv[0] = 4096;
+                if (cnsgetpath(exe, cap) == 0) {
+                    nint sep = cstrrchr(exe, 47);
+                    if (sep != 0 && sep != exe) {
+                        Span<byte> zv = new Span<byte>(sep, 1);
+                        zv[0] = 0;
+                        long el = cstrlen(exe);
+                        if (el < 4096) { memcpy(ab, exe, el + 1); }
+                    }
                 }
+                cfree(cap);
+                cfree(exe);
+                app_dir_buf = ab;
             }
-            cfree(cap);
-            cfree(exe);
         }
+        rt_unlock();
         return app_dir_buf;
     }
 
@@ -826,9 +940,13 @@ class zan {
 
     static void lk_init() {
         if (lk_used_tbl != 0) { return; }
-        lk_fd_tbl = calloc(32, 8);
-        lk_used_tbl = calloc(32, 8);
-        lk_gen_tbl = calloc(32, 8);
+        rt_lock();
+        if (lk_used_tbl == 0) {
+            lk_fd_tbl = calloc(32, 8);
+            lk_used_tbl = calloc(32, 8);
+            lk_gen_tbl = calloc(32, 8);
+        }
+        rt_unlock();
     }
 
     // O_RDWR|O_CREAT|O_CLOEXEC(macOS)= 0x01000202;0644 = 420;
@@ -966,8 +1084,12 @@ class zan {
     public static extern long crecv(int fd, nint buf, long len, int flags);
     [DllImport("crt", EntryPoint = "signal")]
     public static extern nint csignal(int sig, nint handler);
-    [DllImport("crt", EntryPoint = "fcntl")]
-    public static extern int cfcntl(int fd, int cmd, int arg);
+    // fcntl 是变参函数:F_SETFL 的第三参经 va_arg 从变参区读——纯声明
+    // 会把它放寄存器、被调方读栈拿到垃圾(缺口一的"三参 open"同款;
+    // 症状:O_NONBLOCK 没设上,自管道排干 blocking read 冻死)。声明
+    // Variadic 让第三参进尾参区(Apple 落栈、ELF 续 w2)。
+    [DllImport("crt", EntryPoint = "fcntl", Variadic = true)]
+    public static extern int cfcntl(int fd, int cmd);
     [DllImport("crt", EntryPoint = "connect")]
     public static extern int cconnect(int fd, nint sa, int len);
     [DllImport("crt", EntryPoint = "select")]
@@ -994,19 +1116,158 @@ class zan {
     public static extern int cpthread_create(nint tidp, nint attr, nint fn, nint arg);
     [DllImport("crt", EntryPoint = "pthread_detach")]
     public static extern int cpthread_detach(long tid);
-    // zanstubs.c 的内部 thunk(缺口五绕行,与已退役的 zan_open_creat 同
-    // 形态):resume
-    // 是间接调用(hook 指针,缺口五:无函数指针调用),worker_fn 给出线程
-    // 体地址,drain 在互斥下摘走完工 DNS 作业链,pipe_rd 建好自管道并给出
-    // 读端 fd(ensure 本身只报成败)
-    [DllImport("crt", EntryPoint = "zt_io_resume")]
-    public static extern void zt_io_resume(long frame, long step);
-    [DllImport("crt", EntryPoint = "zt_dns_worker_fn")]
-    public static extern nint zt_dns_worker_fn();
-    [DllImport("crt", EntryPoint = "zt_dns_drain")]
-    public static extern nint zt_dns_drain();
-    [DllImport("crt", EntryPoint = "zt_dns_pipe_rd")]
-    public static extern int zt_dns_pipe_rd();
+    // 缺口五批次:zt_io_resume / zt_dns_worker_fn / zt_dns_drain /
+    // zt_dns_pipe_rd 四个 C thunk 已退役——裸代码指针委托值
+    // ((委托类型)nint,bit0 标记)让 hook 调用、线程体派发、互斥摘链、
+    // 自管道全部回到本文件(见 thread_trampoline / io_resume /
+    // dns_pipe_ensure / io_poll 的排干臂)。
+    [DllImport("crt", EntryPoint = "pipe")]
+    public static extern int cpipe(nint fds);
+    [DllImport("crt", EntryPoint = "write")]
+    public static extern long cwrite(int fd, nint buf, long n);
+    [DllImport("crt", EntryPoint = "pthread_mutex_init")]
+    public static extern int cpthread_mutex_init(nint mu, nint attr);
+    [DllImport("crt", EntryPoint = "pthread_mutex_lock")]
+    public static extern int cpthread_mutex_lock(nint mu);
+    [DllImport("crt", EntryPoint = "pthread_mutex_unlock")]
+    public static extern int cpthread_mutex_unlock(nint mu);
+    [DllImport("crt", EntryPoint = "pthread_threadid_np")]
+    public static extern int cpthread_threadid_np(nint tidp, nint outp);
+
+    // ---- 缺口五:裸代码指针委托值(hook / 线程体) ----
+    // (Action<...>)nint 转换把运行期解析的地址变成"裸代码指针委托值"
+    // (bit0 标记;见编译器 ngen_delegate.zan 的调用分岔),调用按声明
+    // 签名直接 blr、不带 env——这是 zt_io_resume / zt_dns_worker_fn /
+    // zan_thread_trampoline 三组 C thunk 的语言级替代。
+    static long co_ready_hook;   // _zan_co_ready 地址(注册时写入)
+    static long dns_done;        // 完工 DNS 作业链头(互斥保护)
+    static nint dns_mu;          // pthread_mutex_t(calloc 64B + init 一次)
+    // fd 哨兵是 0 而非 -1:静态初始化器只在持有 Main 的对象里经启动
+    // 垫片写运行期存量(同缺口三的 strpool init 教训),库对象的数据段
+    // 恒零;POSIX fd 从 3 起,0 恒可用作"未建"。
+    static int dns_pipe_r;       // 自管道读端(F_SETFL 非阻塞)
+    static int dns_pipe_w;       // 自管道写端
+    static nint dns_wake;        // 1 字节堆 scratch,低字节 'x':管道唤醒
+
+    // 编译器发射的 _zan_co_ready 首次运行时注册(原 C 全局
+    // zan_co_ready_hook 的合同,缺口五起改经本函数)
+    public static void set_ready_hook(nint fn) {
+        co_ready_hook = (long)fn;
+    }
+
+    // 协程恢复:hook 未注册(非 async 程序)时是空操作。裸调用约定
+    // x0=frame, x1=step,与编译器发射的 _zan_co_ready 签名逐位一致。
+    static void io_resume(long frame, long step) {
+        if (co_ready_hook != 0) {
+            Action<long, long> h = (Action<long, long>)(nint)co_ready_hook;
+            h(frame, step);
+        }
+    }
+
+    // POSIX 线程入口(原 zanstubs.c 的 naked asm trampoline):libpthread
+    // 的 start routine 把自身状态放在被调者保存寄存器里,而 Zan 方法体
+    // 把 x19-x25 当工作寄存器——[ThreadEntry] 序言/收尾成对存取
+    // x19-x28。box 是 {fn@0, env@8}:fn 是裸代码地址(委托 thunk 或
+    // 普通 Zan 方法),按 fn(env) 裸调用——委托 thunk 的约定本就是
+    // x0=env,普通方法配 Action<nint> 形状,两种 fn 同一管子。
+    [ThreadEntry]
+    public static long thread_trampoline(nint box) {
+        if (box == 0) { return 0; }
+        Span<long> bv = new Span<long>(box, 2);
+        long fn = bv[0];
+        if (fn != 0) {
+            Action<nint> f = (Action<nint>)(fn | 1);
+            f((nint)bv[1]);
+        }
+        return 0;
+    }
+
+    // 原 C zan_thread_start:body 是 stdlib 传来的 {fn, env} 委托对
+    public static int thread_start(nint body) {
+        if (body == 0) { return 0; }
+        nint tid = calloc(1, 8);
+        int rc = cpthread_create(tid, 0, (nint)thread_trampoline, body);
+        if (rc != 0) { cfree(tid); return 0; }
+        Span<long> tv = new Span<long>(tid, 1);
+        cpthread_detach(tv[0]);
+        cfree(tid);
+        return 1;
+    }
+
+    // 原 C zan_thread_current_id:pthread_self 指针逐次漂移,
+    // pthread_threadid_np 给稳定数值 id(Darwin;本对象只在 macOS 车道)
+    public static long thread_current_id() {
+        nint op = calloc(1, 8);
+        int rc = cpthread_threadid_np(0, op);
+        long v = 0;
+        if (rc == 0) {
+            Span<long> ov = new Span<long>(op, 1);
+            v = ov[0];
+        }
+        cfree(op);
+        return v;
+    }
+
+    static void dns_mu_ensure() {
+        if (dns_mu != 0) { return; }
+        rt_lock();
+        if (dns_mu == 0) {
+            dns_mu = calloc(1, 64);
+            if (dns_mu != 0) { cpthread_mutex_init(dns_mu, 0); }
+        }
+        rt_unlock();
+    }
+
+    static int dns_pipe_ensure() {
+        if (dns_pipe_r != 0) { return dns_pipe_r; }
+        rt_lock();
+        if (dns_pipe_r == 0) {
+            nint rr = calloc(2, 4);
+            if (rr != 0 && cpipe(rr) == 0) {
+                Span<int> rv = new Span<int>(rr, 2);
+                dns_pipe_r = rv[0];
+                dns_pipe_w = rv[1];
+                cfree(rr);
+                dns_wake = calloc(1, 1);
+                Span<byte> sb = new Span<byte>(dns_wake, 1);
+                sb[0] = 120;                              // 'x'
+                int fl = cfcntl(dns_pipe_r, 3, 0);        // F_GETFL
+                if (fl >= 0) { cfcntl(dns_pipe_r, 4, fl | 4); }   // F_SETFL | O_NONBLOCK
+            } else if (rr != 0) {
+                cfree(rr);
+            }
+            // 管道建立失败不重试也不置位:catastrophic 路径,与 C 版
+            // pthread_once 语义一致(一次性,失败后保持读端 0)
+        }
+        rt_unlock();
+        return dns_pipe_r;
+    }
+
+    // DNS worker 体:经 thread_trampoline 的 fn(env) 裸调用进入
+    // (env = 作业)。ZtDnsJob 布局契约(80 字节,calloc 清零):
+    // next@0 name@8 port@16 buf@24 cap@32 outn@40 frame@48 step@56
+    // result@64 v4@68——与 C 版逐字段一致。
+    static void dns_worker_job(nint job) {
+        Span<long> jv = new Span<long>(job, 10);
+        Span<int> v4v = new Span<int>(st_ptr((long)job + 68), 1);
+        long r = 0;
+        if (v4v[0] == 1) {
+            r = io_resolve_ipv4((nint)jv[1]);
+        } else {
+            Span<int> pv2 = new Span<int>(st_ptr((long)job + 16), 1);
+            Span<int> cv2 = new Span<int>(st_ptr((long)job + 32), 1);
+            r = io_resolve_sa((nint)jv[1], pv2[0], (nint)jv[3], cv2[0]);
+        }
+        Span<int> rsv = new Span<int>(st_ptr((long)job + 64), 1);
+        rsv[0] = (int)r;
+        dns_mu_ensure();
+        cpthread_mutex_lock(dns_mu);
+        jv[0] = dns_done;
+        dns_done = (long)job;
+        cpthread_mutex_unlock(dns_mu);
+        cwrite(dns_pipe_w, dns_wake, 1);
+    }
+
 
     // errno 是每线程全局:__error() 返回 int*
     static int err_now() {
@@ -1056,7 +1317,9 @@ class zan {
 
     // 静态暂存区布局(懒分配一次,与 C 的 static zan_net_text 等价):
     // net_text@0 (65536) | addrs@65536 (2048) | mac@67584 (32) | ntop@67616 (64)
-    static nint net_buf;
+    // ——第十一批起这块缓冲每线程一份(net_tls_buf,rt_tls 的
+    // [128..67808) 切片):快照每次调用都重建,静态单块会被并发重建
+    // 交错写撕裂。
 
     // 十进制写入 dst(至少 11 字节),返回字节数。只用"临时 malloc +
     // Span(新局部)"的已证模式。
@@ -1086,7 +1349,8 @@ class zan {
     // 变参调用(snprintf)与静态字段指针上的 Span 写均已证实不可用,
     // 见 README"已发现编译器缺口"。
     public static nint plat_net_interfaces() {
-        if (net_buf == 0) { net_buf = calloc(1, 67680); }
+        nint net_buf = net_tls_buf();
+        if (net_buf == 0) { cabort(); }      // C 版缓冲永不失败;分配死即 abort
         lit_init();
         memset(net_buf, 0, 1);
         nint listp = malloc(8);
@@ -1341,15 +1605,66 @@ class zan {
     // sin6=28(sin6_addr@8)。
     // ------------------------------------------------------------------
 
-    // sockaddr_ip_str 的文本缓冲(C 为 __thread 128B;本车道单线程假设
-    // 一致,契约同为"返回值活到下次调用")。
-    static nint io_addr_buf;
+    // 每线程运行时刮擦块(十一批):一块 67808B 挂在专用 pthread
+    // specific key 上——[0..128) 是 sockaddr_ip_str 的文本缓冲(C 为
+    // __thread 128B),[128..67808) 是 plat_net_interfaces 的适配器快照
+    // (该函数每次调用都重建快照,静态单块在线程下会被并发重建交错写
+    // 撕裂)。契约同为"返回值活到本线程下次调用"。
+    static long rt_tls_key;
+    static long rt_tls_ready;
+
+    static nint rt_tls() {
+        if (rt_tls_ready == 0) {
+            rt_lock();
+            if (rt_tls_ready == 0) {
+                nint kp = malloc(8);
+                cpthread_key_create(kp, 0);
+                Span<long> kv = new Span<long>(kp, 1);
+                rt_tls_key = kv[0];
+                cfree(kp);
+                rt_tls_ready = 1;
+            }
+            rt_unlock();
+        }
+        nint p = cpthread_getspecific(rt_tls_key);
+        if (p == 0) {
+            p = calloc(1, 67808);
+            if (p != 0) { cpthread_setspecific(rt_tls_key, p); }
+        }
+        return p;
+    }
+
+    static nint io_tls_buf() {
+        return rt_tls();
+    }
+
+    static nint net_tls_buf() {
+        nint p = rt_tls();
+        if (p == 0) { return 0; }
+        return st_ptr((long)p + 128);
+    }
 
     // SIGPIPE 惰性忽略:rt_io.c 语义是"当前 handler 非 DFL 则不动"。
-    // signal() 版先装 IGN,再按返回值恢复旧 handler——单线程下逐次等价。
+    // signal() 版先装 IGN,再按返回值恢复旧 handler——第十一批把探测+
+    // 条件装回放进专用自旋锁(sigpipe_lk)串行:两线程并发首用 socket
+    // 时不会一方装 IGN 另一方把自定义 handler 判成"刚装的 IGN"恢复回去。
+    static long sigpipe_lk;
+
+    [StaticAddr("sigpipe_lk")]
+    public static nint sigpipe_lk_addr() {
+        return 0;      // 占位体:发射即实现(adrp+add 取数据全局地址)
+    }
+
     static void io_ignore_sigpipe() {
+        nint lk = sigpipe_lk_addr();
+        long state = 0;
+        while (state == 0) {
+            nint ok = osatomic_cas(0, 1, lk);
+            if ((ok & 255L) != 0) { state = 1; }
+        }
         nint old = csignal(13, 1);
         if (old != 0) { csignal(13, old); }
+        osatomic_add(-1, lk);
     }
 
     // rt_io.c:552 拷出:长度不含 NUL;buf 空或 cap<=0 或放不下 → -1。
@@ -1363,8 +1678,8 @@ class zan {
 
     // rt_io.c:509:v4/v6 文本;其他族或转换失败 → 空串。
     public static nint io_sockaddr_ip_str(nint sa) {
-        if (io_addr_buf == 0) { io_addr_buf = calloc(1, 128); }
-        nint ab = io_addr_buf;
+        nint ab = io_tls_buf();
+        if (ab == 0) { cabort(); }      // C 版缓冲永不失败;分配死即 abort
         if (sa != 0) {
             Span<byte> sv = new Span<byte>(sa, 2);
             int fam = sv[1];                       // sa_family u8
@@ -1832,13 +2147,63 @@ class zan {
     public static void io_socket_cleanup() {
     }
 
+    // ---- 第十一批:运行时初始化/同步 nexus ------------------------------
+    // rt_init_lk 是全运行时惰性静态的唯一串行化点:九处"calloc 静态 +
+    // 惰性建立"原是单线程假设(第七/八/十批追加约束),缺口五起真线程
+    // 在跑,两线程同时首用会各建一块、后存者胜,先者的状态分裂(split
+    // brain)。双检锁形态:外侧平铺读快路径;rt_lock 用 OSAtomic CAS
+    // 自旋(Barrier 变体,acquire),rt_unlock 用 OSAtomicAdd64Barrier(-1)
+    // (release)——平铺 store 解锁没有 happens-before 边,后到的线程
+    // 拿到锁也可能看到锁内写入的旧值,这是第十一批修掉的第二个 bug。
+    // 规则:持 rt_init_lk 期间只做 calloc/pthread 等快系统调用,不得
+    // 进入任何可能再取 rt_init_lk 或阻塞的路径(叶锁)。
+    static long rt_init_lk;
+
+    [StaticAddr("rt_init_lk")]
+    public static nint rt_init_lk_addr() {
+        return 0;      // 占位体:发射即实现(adrp+add 取数据全局地址)
+    }
+
+    static void rt_lock() {
+        nint lk = rt_init_lk_addr();
+        long state = 0;
+        while (state == 0) {
+            nint ok = osatomic_cas(0, 1, lk);
+            if ((ok & 255L) != 0) { state = 1; }
+        }
+    }
+
+    static void rt_unlock() {
+        osatomic_add(-1, rt_init_lk_addr());
+    }
+
+    // 双检锁 ensure 的统一形态(十一批):`if (X == 0) { rt_lock();
+    // if (X == 0) { X = build(); } rt_unlock(); }`——calloc 失败保持 0,
+    // 下次调用自然重试,不需要 built 旗标。
+
+    // ---- 原子内建([AtomicCas]/[AtomicLoad]/[AtomicStore],十一批)----
+    // 占位体即文档:发射被 ngen 换成单条指令。casal/ldar/stlr 与
+    // clang 对 C11 __atomic SEQ_CST 的 arm64 降码同款(LSE 原子);
+    // casal 返回比较时刻看到的旧值,oracle 的 seen 语义逐位对齐,
+    // 第六批的 load-after-fail 文档化偏差就此退役。
+    [AtomicCas]
+    public static long atomic_cas_raw(nint p, long expected, long desired) {
+        return 0;
+    }
+
+    [AtomicLoad]
+    public static long atomic_ldar_raw(nint p) {
+        return 0;
+    }
+
+    [AtomicStore]
+    public static void atomic_stlr_raw(nint p, long v) {
+    }
+
     // ---- 第六批:zan_atomic_int_*(spec: oracle rt_sync.c,C11 __atomic)----
-    // RMW 走 libSystem 的 OSAtomicAdd64Barrier / OSAtomicCompareAndSwap64
-    // Barrier(仍在导出表;add 直接等于 add_fetch)。exchange 用 CAS 循环,
-    // compare_exchange 失败路径取 load-after-fail 作"看到的旧值"——本车道
-    // 单线程,循环一过、两次读等值,与 oracle 的 seen 语义一致;多线程
-    // 竞争下这是文档化偏差(oracle 用真 __atomic)。load/store 是对齐 8 字
-    // 节访问(arm64 单拷贝原子);线程族仍在 C,跨线程排序语义未承载。
+    // add 走 OSAtomicAdd64Barrier(= fetch-add 全屏障;clang 的 ldaddal
+    // 等价);exchange 改 casal 环(每次迭代拿见证值,精确);load/store
+    // 走 ldar/stlr(SEQ_CST),不再是对齐平铺访问。
     [DllImport("crt", EntryPoint = "OSAtomicAdd64Barrier")]
     public static extern long osatomic_add(long delta, nint p);
     [DllImport("crt", EntryPoint = "OSAtomicCompareAndSwap64Barrier")]
@@ -1860,15 +2225,13 @@ class zan {
     public static long atomic_int_load(long handle) {
         nint p = (nint)handle;
         if (p == 0) { return 0; }
-        Span<long> v = new Span<long>(p, 1);
-        return v[0];
+        return atomic_ldar_raw(p);
     }
 
     public static void atomic_int_store(long handle, long new_value) {
         nint p = (nint)handle;
         if (p == 0) { return; }
-        Span<long> v = new Span<long>(p, 1);
-        v[0] = new_value;
+        atomic_stlr_raw(p, new_value);
     }
 
     // 返回新值(add_fetch 语义);空句柄 0。
@@ -1878,16 +2241,17 @@ class zan {
         return osatomic_add(delta, p);
     }
 
-    // 返回旧值(exchange 语义);CAS 循环,单线程一过。
+    // 返回旧值(exchange 语义);casal 环,每次失败的见证值直接当下一轮
+    // expected——比旧 CAS+load 循环少一次非原子读。
     public static long atomic_int_exchange(long handle, long new_value) {
         nint p = (nint)handle;
         if (p == 0) { return 0; }
         long seen = atomic_int_load(handle);
-        long state = 0;
-        while (state == 0) {
-            nint ok = osatomic_cas(seen, new_value, p);
-            if ((ok & 255L) != 0) { state = 1; }
-            else { seen = atomic_int_load(handle); }
+        long done = 0;
+        while (done == 0) {
+            long w = atomic_cas_raw(p, seen, new_value);
+            if (w == seen) { done = 1; }
+            else { seen = w; }
         }
         return seen;
     }
@@ -1897,9 +2261,7 @@ class zan {
             long handle, long expected, long desired) {
         nint p = (nint)handle;
         if (p == 0) { return 0; }
-        nint ok = osatomic_cas(expected, desired, p);
-        if ((ok & 255L) != 0) { return expected; }
-        return atomic_int_load(handle);
+        return atomic_cas_raw(p, expected, desired);
     }
 
     // ---- 第七批:zan_audio_*(诚实桩)/ zan_monitor_* / zan_dispatch_* /
@@ -2004,33 +2366,64 @@ class zan {
     public static void audio_voice_set_gain(long v, double g) {
     }
 
-    // lock (obj) 监视器:C 版是 64 条纹递归 pthread 锁;本车道单线程,
-    // 递归即计数——条纹表 entry++/--,重入自然合法,退出钳到 0。
-    // 条纹折叠换成乘法散列(^ 未验证);不同条纹函数只会过度串行,
-    // 不丢互斥。
+    // lock (obj) 监视器(十一批换真锁):C oracle 是 64 条纹递归
+    // pthread 锁,本车道曾是条纹计数器(单线程假设)——缺口五起 DNS
+    // worker 真在跑,计数器不提供互斥,lock 语句的契约被打破。现按
+    // oracle 同构:64×64B pthread_mutex_t 块,递归型(attr type 2,
+    // 重入合法),条纹折叠与 C 版逐字同款(^ 已验证,第七批的乘法散列
+    // 退役);建立走 rt_lock 双检锁。条纹共享只会过度串行,不丢互斥。
+    static nint mon_tbl;
+
+    [DllImport("crt", EntryPoint = "pthread_mutexattr_init")]
+    public static extern int cpthread_mutexattr_init(nint a);
+    [DllImport("crt", EntryPoint = "pthread_mutexattr_settype")]
+    public static extern int cpthread_mutexattr_settype(nint a, int t);
+    [DllImport("crt", EntryPoint = "pthread_mutexattr_destroy")]
+    public static extern int cpthread_mutexattr_destroy(nint a);
+
     static int mon_stripe(nint obj) {
         long bits = (long)obj;
-        bits = bits * 6364136223846793005L;
+        bits = bits ^ (bits >>> 20);
+        bits = bits ^ (bits >>> 8);
         return (int)((bits >>> 4) & 63L);
     }
 
-    public static void monitor_enter(nint obj) {
+    static void mon_ensure() {
         nint t = mon_tbl;
+        if (t != 0) { return; }
+        rt_lock();
+        t = mon_tbl;
         if (t == 0) {
-            t = calloc(64, 8);
-            mon_tbl = t;
+            t = calloc(64, 64);
+            nint ap = calloc(1, 16);
+            if (t != 0 && ap != 0) {
+                cpthread_mutexattr_init(ap);
+                cpthread_mutexattr_settype(ap, 2);
+                int i = 0;
+                while (i < 64) {
+                    cpthread_mutex_init(st_ptr((long)t + i * 64), ap);
+                    i = i + 1;
+                }
+                cpthread_mutexattr_destroy(ap);
+                mon_tbl = t;
+            }
+            if (ap != 0) { cfree(ap); }
+            // t 分配失败保持 0:下次调用自然重试(与其它 ensure 同款)
         }
-        Span<long> v = new Span<long>(t, 64);
+        rt_unlock();
+    }
+
+    public static void monitor_enter(nint obj) {
+        mon_ensure();
         int s = mon_stripe(obj);
-        v[s] = v[s] + 1;
+        cpthread_mutex_lock(st_ptr((long)mon_tbl + s * 64));
     }
 
     public static void monitor_exit(nint obj) {
         nint t = mon_tbl;
         if (t == 0) { return; }
-        Span<long> v = new Span<long>(t, 64);
         int s = mon_stripe(obj);
-        if (v[s] > 0) { v[s] = v[s] - 1; }
+        cpthread_mutex_unlock(st_ptr((long)t + s * 64));
     }
 
     // UI 线程派发环:C 版 pthread mutex → OSAtomic CAS 自旋锁(0 闲 1
@@ -2042,17 +2435,23 @@ class zan {
     // intern 块(_zan_dlg_intern),条目按裸指针搬移,C 版注释原样。
     static nint d_ctl() {
         nint t = d_ctl_s;
+        if (t != 0) { return t; }
+        rt_lock();
+        t = d_ctl_s;
         if (t == 0) {
             t = calloc(1, 40);
-            Span<long> v = new Span<long>(t, 5);
-            v[0] = 0;
-            v[1] = 64;
-            v[2] = 0;
-            v[3] = 0;
-            nint r = calloc(64, 8);
-            v[4] = (long)r;
-            d_ctl_s = t;
+            if (t != 0) {
+                Span<long> v = new Span<long>(t, 5);
+                v[0] = 0;
+                v[1] = 64;
+                v[2] = 0;
+                v[3] = 0;
+                nint r = calloc(64, 8);
+                v[4] = (long)r;
+                d_ctl_s = t;
+            }
         }
+        rt_unlock();
         return d_ctl_s;
     }
 
@@ -2065,8 +2464,9 @@ class zan {
     }
 
     static void d_unlock(nint t) {
-        Span<long> v = new Span<long>(t, 1);
-        v[0] = 0;
+        // release 屏障解锁(十一批):平铺 store 0 没有 happens-before
+        // 边,持锁方的环写入可能对后到的持锁方不可见
+        osatomic_add(-1, t);
     }
 
     // 环满翻倍并把存活条目搬到新环(head=0、tail=存活数,与 C 版一致);
@@ -2168,12 +2568,18 @@ class zan {
     // pthread specific key 承载(无析构,进程期存活)。
     public static nint eh_tls_state() {
         if (eh_ready == 0) {
-            nint kp = malloc(8);
-            cpthread_key_create(kp, 0);
-            Span<long> kv = new Span<long>(kp, 1);
-            eh_key = kv[0];
-            cfree(kp);
-            eh_ready = 1;
+            // key 只建一次:两线程并发首入 EH 会各建一把 key,后建者
+            // 覆写 eh_key,先建者槽位里的块从此失联(十一批串行化)
+            rt_lock();
+            if (eh_ready == 0) {
+                nint kp = malloc(8);
+                cpthread_key_create(kp, 0);
+                Span<long> kv = new Span<long>(kp, 1);
+                eh_key = kv[0];
+                cfree(kp);
+                eh_ready = 1;
+            }
+            rt_unlock();
         }
         nint p = cpthread_getspecific(eh_key);
         if (p == 0) {
@@ -2224,7 +2630,8 @@ class zan {
         tv[idx] = v;
     }
 
-    // 表自旋锁在表块字节 64(槽 [8])。
+    // 表自旋锁在表块字节 64(槽 [8]);解锁用 barrier 变体取反(十一批
+    // release 修复:平铺 store 0 没有 happens-before 边)。
     static void st_lock(nint t) {
         nint sp = st_ptr((long)t + 64);
         long state = 0;
@@ -2235,8 +2642,7 @@ class zan {
     }
 
     static void st_unlock(nint t) {
-        Span<long> v = new Span<long>(st_ptr((long)t + 64), 1);
-        v[0] = 0;
+        osatomic_add(-1, st_ptr((long)t + 64));
     }
 
     static void st_spin(nint lk) {
@@ -2248,8 +2654,7 @@ class zan {
     }
 
     static void st_unspin(nint lk) {
-        Span<long> v = new Span<long>(lk, 1);
-        v[0] = 0;
+        osatomic_add(-1, lk);
     }
 
     // (nint)(表达式) 括号强转不被解析器接受(nint 被当方法名,
@@ -2260,20 +2665,24 @@ class zan {
 
     static nint st_reg_lock() {
         nint lk = st_reg_lk;
-        if (lk == 0) {
-            lk = calloc(1, 8);
-            st_reg_lk = lk;
+        if (lk != 0) { return lk; }
+        rt_lock();
+        if (st_reg_lk == 0) {
+            st_reg_lk = calloc(1, 8);
         }
+        rt_unlock();
         return st_reg_lk;
     }
 
     static nint st_anon_lock() {
         nint lk = st_anon_lk;
-        if (lk == 0) {
-            lk = calloc(1, 8);
-            st_anon_lk = lk;
+        if (lk != 0) { return lk; }
+        rt_lock();
+        if (st_anon_lk == 0) {
+            st_anon_lk = calloc(1, 8);
         }
-        return lk;
+        rt_unlock();
+        return st_anon_lk;
     }
 
     static long st_coff(long c) {
@@ -2317,14 +2726,16 @@ class zan {
         return ms;
     }
 
-    // FNV-1a 64,强制非零;null 键按空串。
+    // FNV-1a 64,强制非零;null 键按空串(空串单例双检锁,十一批)。
     static long st_hash(nint v) {
         nint p = v;
         if (p == 0) {
             nint e = st_empty;
             if (e == 0) {
-                e = calloc(1, 1);
-                st_empty = e;
+                rt_lock();
+                if (st_empty == 0) { st_empty = calloc(1, 1); }
+                rt_unlock();
+                e = st_empty;
             }
             p = e;
         }
@@ -3370,7 +3781,7 @@ class zan {
             Span<long> ov = new Span<long>(op, 1);
             ov[0] = result;
         }
-        zt_io_resume(wv[6], wv[7]);
+        io_resume(wv[6], wv[7]);
     }
 
     // 一次非阻塞 recv:>=0 数据/EOF,-2 would-block(再停),-1 其余
@@ -3415,7 +3826,7 @@ class zan {
         // 关了的 fd 永不就绪,停进去就是永远搁浅;就绪探测路径交付 0
         // 立即恢复。
         if (io_socket_alive(fd) == 0) {
-            zt_io_resume(frame, step);
+            io_resume(frame, step);
             return;
         }
         io_ws_push((int)fd, interest == 2 ? 2 : 1, 0, 0, 0, frame, step, 0);
@@ -3436,7 +3847,7 @@ class zan {
         }
         Span<long> ov = new Span<long>(outn, 1);
         ov[0] = n;
-        zt_io_resume(frame, step);
+        io_resume(frame, step);
     }
 
     public static void io_recv_to_co(long fd, nint buf, long len, long tmo,
@@ -3455,7 +3866,7 @@ class zan {
         }
         Span<long> ov = new Span<long>(outn, 1);
         ov[0] = n;
-        zt_io_resume(frame, step);
+        io_resume(frame, step);
     }
 
     public static void io_accept_co(long fd, long frame, long step,
@@ -3478,7 +3889,7 @@ class zan {
         }
         Span<long> ov = new Span<long>(outfd, 1);
         ov[0] = c;
-        zt_io_resume(frame, step);
+        io_resume(frame, step);
     }
 
     // 主机名解析:resolve 本身同步(getaddrinfo),挂在脱离 worker 上
@@ -3490,13 +3901,13 @@ class zan {
         Span<long> ov = new Span<long>(outn, 1);
         if (name == 0) {
             ov[0] = 0;                            // 空 name:不劳 worker
-            zt_io_resume(frame, step);
+            io_resume(frame, step);
             return;
         }
         Span<byte> n0 = new Span<byte>(name, 1);
         if (n0[0] == 0) {
             ov[0] = 0;
-            zt_io_resume(frame, step);
+            io_resume(frame, step);
             return;
         }
         // 字面量(AF_INET/AF_INET6):无 DNS、无 worker
@@ -3509,13 +3920,13 @@ class zan {
         cfree(a6);
         if (lit == 1) {
             ov[0] = io_resolve_sa(name, (int)port, buf, (int)cap);
-            zt_io_resume(frame, step);
+            io_resume(frame, step);
             return;
         }
-        int rdfd = zt_dns_pipe_rd();
-        if (rdfd < 0) {
+        int rdfd = dns_pipe_ensure();
+        if (rdfd == 0) {
             ov[0] = 0;
-            zt_io_resume(frame, step);
+            io_resume(frame, step);
             return;
         }
         nint j = calloc(1, 80);
@@ -3527,7 +3938,7 @@ class zan {
         }
         if (j == 0) {
             ov[0] = 0;
-            zt_io_resume(frame, step);
+            io_resume(frame, step);
             return;
         }
         Span<long> jv = new Span<long>(j, 10);
@@ -3549,15 +3960,28 @@ class zan {
         if (havepipe == 0) {
             io_ws_push(rdfd, 6, 0, 0, 0, 0, 0, 0);
         }
+        nint box = calloc(1, 16);
+        if (box == 0) {
+            // 无内存:降级为内联(阻塞)查询
+            ov[0] = io_resolve_sa((nint)jv[1], (int)port, buf, (int)cap);
+            cfree((nint)jv[1]);
+            cfree(j);
+            io_resume(frame, step);
+            return;
+        }
+        Span<long> bv = new Span<long>(box, 2);
+        bv[0] = (long)(nint)dns_worker_job;
+        bv[1] = (long)j;
         nint tid = calloc(1, 8);
-        int rc = cpthread_create(tid, 0, zt_dns_worker_fn(), j);
+        int rc = cpthread_create(tid, 0, (nint)thread_trampoline, box);
         if (rc != 0) {
             // 无线程:降级为内联(阻塞)查询
             ov[0] = io_resolve_sa((nint)jv[1], (int)port, buf, (int)cap);
             cfree((nint)jv[1]);
             cfree(j);
+            cfree(box);
             cfree(tid);
-            zt_io_resume(frame, step);
+            io_resume(frame, step);
             return;
         }
         Span<long> tv = new Span<long>(tid, 1);
@@ -3573,19 +3997,19 @@ class zan {
         Span<long> ov = new Span<long>(outn, 1);
         if (name == 0) {
             ov[0] = 0;
-            zt_io_resume(frame, step);
+            io_resume(frame, step);
             return;
         }
         Span<byte> n0 = new Span<byte>(name, 1);
         if (n0[0] == 0) {
             ov[0] = 0;
-            zt_io_resume(frame, step);
+            io_resume(frame, step);
             return;
         }
-        int rdfd = zt_dns_pipe_rd();
-        if (rdfd < 0) {
+        int rdfd = dns_pipe_ensure();
+        if (rdfd == 0) {
             ov[0] = 0;
-            zt_io_resume(frame, step);
+            io_resume(frame, step);
             return;
         }
         nint j = calloc(1, 80);
@@ -3597,7 +4021,7 @@ class zan {
         }
         if (j == 0) {
             ov[0] = 0;
-            zt_io_resume(frame, step);
+            io_resume(frame, step);
             return;
         }
         Span<long> jv = new Span<long>(j, 10);
@@ -3616,14 +4040,26 @@ class zan {
         if (havepipe == 0) {
             io_ws_push(rdfd, 6, 0, 0, 0, 0, 0, 0);
         }
+        nint box = calloc(1, 16);
+        if (box == 0) {
+            ov[0] = io_resolve_ipv4((nint)jv[1]);
+            cfree((nint)jv[1]);
+            cfree(j);
+            io_resume(frame, step);
+            return;
+        }
+        Span<long> bv = new Span<long>(box, 2);
+        bv[0] = (long)(nint)dns_worker_job;
+        bv[1] = (long)j;
         nint tid = calloc(1, 8);
-        int rc = cpthread_create(tid, 0, zt_dns_worker_fn(), j);
+        int rc = cpthread_create(tid, 0, (nint)thread_trampoline, box);
         if (rc != 0) {
             ov[0] = io_resolve_ipv4((nint)jv[1]);
             cfree((nint)jv[1]);
             cfree(j);
+            cfree(box);
             cfree(tid);
-            zt_io_resume(frame, step);
+            io_resume(frame, step);
             return;
         }
         Span<long> tv = new Span<long>(tid, 1);
@@ -3728,7 +4164,11 @@ class zan {
                             if (cread((int)wvd[0], drain, 64) <= 0) { dr = 0; }
                         }
                         cfree(drain);
-                        nint list = zt_dns_drain();
+                        dns_mu_ensure();
+                        cpthread_mutex_lock(dns_mu);
+                        nint list = (nint)dns_done;
+                        dns_done = 0;
+                        cpthread_mutex_unlock(dns_mu);
                         while (list != 0) {
                             Span<long> lv = new Span<long>(list, 9);
                             nint nx = (nint)lv[0];
@@ -3736,7 +4176,7 @@ class zan {
                             Span<int> rvv = new Span<int>(st_ptr((long)list + 64), 1);
                             Span<long> ov = new Span<long>(op, 1);
                             ov[0] = (long)rvv[0];
-                            zt_io_resume(lv[6], lv[7]);
+                            io_resume(lv[6], lv[7]);
                             cfree((nint)lv[1]);
                             cfree(list);
                             list = nx;
@@ -3767,6 +4207,212 @@ class zan {
             i = i + 1;
         }
     }
+
+// —— 第十三批:NativeMemory mem 族 + Win32 宽文本对(最后一族 C)——
+// stdlib 的 EntryPoint 改名指向这里(zan_copy/…);C 基线同语义别名在
+// zanstubs.c 的 -D 编出段。语义与 C 基线逐符号一致。
+
+// void zan_copy(void *dst, const void *src, int n):memmove 语义(允许重叠)
+public static void copy(nint dst, nint src, int n) {
+    if (n <= 0 || dst == src) { return; }
+    zmemmove(dst, src, n);
+}
+
+// void zan_fill(void *p, int v, int n):memset(v 取低 8 位)
+public static void fill(nint p, int v, int n) {
+    if (n <= 0) { return; }
+    memset(p, v, n);
+}
+
+// int zan_compare(const void *a, const void *b, int n):memcmp 序 <0/0/>0
+public static int compare(nint a, nint b, int n) {
+    if (n <= 0) { return 0; }
+    return zmemcmp(a, b, n);
+}
+
+// int zan_find(const void *p, int off, int b, int n):memchr;命中返回相对
+// p 的偏移,未命中 -1(b 取低 8 位)
+public static int find(nint p, int off, int b, int n) {
+    if (n <= 0 || p == 0) { return -1; }
+    nint hit = zmemchr(p + off, b, n);
+    if (hit == 0) { return -1; }
+    return (int)(hit - p);
+}
+
+// string zan_get_string(const void *p, int off, int len):ARC 串手塑——
+// raw = [rc:8][header:8][data][NUL],header = 0x5A414E53_00000000|len,
+// 用户指针 = raw+16;rc=1 与 C 基线逐字一致(本车道无 rc 递减路径)。
+// 声明返 nint:ABI 上串就是数据指针,import 侧的 string 形态才是类型。
+public static nint get_string(nint p, int off, int len) {
+    if (len < 0 || p == 0) { len = 0; }
+    nint raw = malloc(len + 17);
+    if (raw == 0) { return 0; }
+    Span<long> h = new Span<long>(raw, 2);
+    h[0] = 1;
+    h[1] = 0x5A414E5300000000L | ((long)len & 0xFFFFFFFFL);
+    if (len > 0) { memcpy(raw + 16, p + off, len); }
+    new Span<byte>(raw + 16 + len, 1)[0] = 0;
+    return raw + 16;
+}
+
+// void zan_put_string(void *p, int off, string s, int len):串按数据指针
+// 传入,前 len 字节拷到 p+off(不写 NUL)
+public static void put_string(nint p, int off, nint s, int len) {
+    if (s != 0 && len > 0) { memcpy(p + off, s, len); }
+}
+
+// —— Win32 宽文本对(CP_UTF8=65001 真实实现,替换 zanstubs.c 的
+// return-0 阉割 stub;两车道同语义)——
+// flags=0:非法序列按 U+FFFD 替换(Win32 现行 CP_UTF8 行为);
+// sl/wl<0 表 NUL 终止(计数含 NUL);缓冲 0(或容量 0)表量尺;
+// 缓冲不足返 0(ERROR_INSUFFICIENT_BUFFER);他代码页返 0(不支持)。
+
+// 解一个 UTF-8 码点:s 基址、n 字节、i 为字节游标;非法(截断/续字节
+// 错/过长/超界)返 -1(调用方替换 U+FFFD 且只消耗 1 字节);合法的
+// U+FFFD 序列原样返回 0xFFFD
+static int zutf8_dec(nint s, int n, int i) {
+    int b0 = new Span<byte>(s + i, 1)[0];
+    int cpw; int adv;
+    if (b0 < 0x80) { return b0; }
+    if ((b0 & 0xE0) == 0xC0) { cpw = b0 & 0x1F; adv = 2; }
+    else if ((b0 & 0xF0) == 0xE0) { cpw = b0 & 0x0F; adv = 3; }
+    else if ((b0 & 0xF8) == 0xF0) { cpw = b0 & 0x07; adv = 4; }
+    else { return -1; }
+    if (i + adv > n) { return -1; }
+    int k = 1;
+    while (k < adv) {
+        int bx = new Span<byte>(s + i + k, 1)[0];
+        if ((bx & 0xC0) != 0x80) { return -1; }
+        cpw = (cpw << 6) | (bx & 0x3F);
+        k = k + 1;
+    }
+    if ((adv == 2 && cpw < 0x80) || (adv == 3 && cpw < 0x800)
+            || (adv == 4 && cpw < 0x10000) || cpw > 0x10FFFF) { return -1; }
+    return cpw;
+}
+
+// int zan_multi_byte_to_wide_char(cp, fl, s, sl, w, wl)
+public static int multi_byte_to_wide_char(int cp, int fl, nint s, int sl, nint w, int wl) {
+    if (cp != 65001 || s == 0) { return 0; }
+    int n = sl;
+    if (n < 0) {
+        n = 0;
+        while (new Span<byte>(s + n, 1)[0] != 0) { n = n + 1; }
+    }
+    if (n == 0) { return 0; }
+    bool q = w == 0 || wl == 0;
+    int units = 0;
+    int i = 0;
+    while (i < n) {
+        int d = zutf8_dec(s, n, i);
+        int cpw;
+        int adv;
+        if (d < 0) { cpw = 0xFFFD; adv = 1; }
+        else { cpw = d; adv = zutf8_adv(s, i); }
+        int cu = cpw > 0xFFFF ? 2 : 1;
+        if (q) {
+            units = units + cu;
+        } else {
+            if (units + cu > wl) { return 0; }
+            if (cu == 2) {
+                int v = cpw - 0x10000;
+                Span<ushort> wo = new Span<ushort>(w + units * 2, 2);
+                wo[0] = (ushort)(0xD800 + (v >>> 10));
+                wo[1] = (ushort)(0xDC00 + (v & 0x3FF));
+            } else {
+                new Span<ushort>(w + units * 2, 1)[0] = (ushort)cpw;
+            }
+            units = units + cu;
+        }
+        i = i + adv;
+    }
+    if (sl < 0) {
+        units = units + 1;
+        if (!q) {
+            if (units > wl) { return 0; }
+            new Span<ushort>(w + (units - 1) * 2, 1)[0] = 0;
+        }
+    }
+    return units;
+}
+
+// zutf8_dec 消耗的字节数(与 dec 配对;FFFD 恒 1)
+static int zutf8_adv(nint s, int i) {
+    int b0 = new Span<byte>(s + i, 1)[0];
+    if (b0 < 0x80) { return 1; }
+    if ((b0 & 0xE0) == 0xC0) { return 2; }
+    if ((b0 & 0xF0) == 0xE0) { return 3; }
+    if ((b0 & 0xF8) == 0xF0) { return 4; }
+    return 1;
+}
+
+// int zan_wide_char_to_multi_byte(cp, fl, w, wl, mb, mbl, dc, du)
+public static int wide_char_to_multi_byte(int cp, int fl, nint w, int wl, nint mb, int mbl, nint dc, nint du) {
+    if (cp != 65001 || w == 0) { return 0; }
+    int n = wl;
+    if (n < 0) {
+        n = 0;
+        while (new Span<ushort>(w + n * 2, 1)[0] != 0) { n = n + 1; }
+    }
+    if (n == 0) { return 0; }
+    bool q = mb == 0;
+    int bytes = 0;
+    int i = 0;
+    while (i < n) {
+        int u = new Span<ushort>(w + i * 2, 1)[0];
+        int cpw;
+        int adv;
+        if (u >= 0xD800 && u <= 0xDBFF && i + 1 < n) {
+            int u2 = new Span<ushort>(w + (i + 1) * 2, 1)[0];
+            if (u2 >= 0xDC00 && u2 <= 0xDFFF) {
+                cpw = 0x10000 + ((u - 0xD800) << 10) + (u2 - 0xDC00);
+                adv = 2;
+            } else { cpw = 0xFFFD; adv = 1; }
+        } else if (u >= 0xD800 && u <= 0xDFFF) { cpw = 0xFFFD; adv = 1; }
+        else { cpw = u; adv = 1; }
+        int len;
+        if (cpw < 0x80) { len = 1; }
+        else if (cpw < 0x800) { len = 2; }
+        else if (cpw < 0x10000) { len = 3; }
+        else { len = 4; }
+        if (q) {
+            bytes = bytes + len;
+        } else {
+            if (bytes + len > mbl) { return 0; }
+            if (len == 1) {
+                new Span<byte>(mb + bytes, 1)[0] = (byte)cpw;
+            } else if (len == 2) {
+                Span<byte> o = new Span<byte>(mb + bytes, 2);
+                o[0] = (byte)(0xC0 | (cpw >>> 6));
+                o[1] = (byte)(0x80 | (cpw & 0x3F));
+            } else if (len == 3) {
+                Span<byte> o = new Span<byte>(mb + bytes, 3);
+                o[0] = (byte)(0xE0 | (cpw >>> 12));
+                o[1] = (byte)(0x80 | ((cpw >>> 6) & 0x3F));
+                o[2] = (byte)(0x80 | (cpw & 0x3F));
+            } else {
+                Span<byte> o = new Span<byte>(mb + bytes, 4);
+                o[0] = (byte)(0xF0 | (cpw >>> 18));
+                o[1] = (byte)(0x80 | ((cpw >>> 12) & 0x3F));
+                o[2] = (byte)(0x80 | ((cpw >>> 6) & 0x3F));
+                o[3] = (byte)(0x80 | (cpw & 0x3F));
+            }
+            bytes = bytes + len;
+        }
+        i = i + adv;
+    }
+    if (wl < 0) {
+        if (q) {
+            bytes = bytes + 1;
+        } else {
+            if (bytes + 1 > mbl) { return 0; }
+            new Span<byte>(mb + bytes, 1)[0] = 0;
+            bytes = bytes + 1;
+        }
+    }
+    if (du != 0) { new Span<int>(du, 1)[0] = 0; }
+    return bytes;
+}
 }
 
 // ngen 要求入口:占位 Main,链接前由 localize_syms.py 本地化,

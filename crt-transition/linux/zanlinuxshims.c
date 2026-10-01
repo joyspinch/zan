@@ -469,3 +469,90 @@ void CCHmac(int alg, const void *key, unsigned long keyLen,
     (void)ip;
     (void)op;
 }
+
+/* ---- GCD semaphore surface (v18o-22 车道衔接) ----
+ * stdlib System/Threading 的 #elif MACOS 臂经 DllImport 直呼
+ * dispatch_semaphore_*(libSystem);ELF 车道在 macOS 主机上编译,同一臂
+ * 被编进(条件定义目前 per-HOST,ZAN_TARGET 条件化是 known_open 工程),
+ * 而 musl 没有 libdispatch。GCD 信号量语义用 musl 未命名 POSIX 信号量
+ * 逐位给全(macOS 的 sem_init 是 ENOSYS 桩,Linux 是真实现)。时间约定
+ * 与 stdlib 调用面一致:dispatch_time(0,delta) 返回单调 ns 绝对期限,
+ * -1 是 DISPATCH_TIME_FOREVER;wait 0=成功,超时 49(macOS
+ * KERN_OPERATION_TIMED_OUT),其余 errno 原样。 */
+#include <stdlib.h>
+#include <time.h>
+#include <errno.h>
+#include <semaphore.h>
+
+static long long zl_mono_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+void *dispatch_semaphore_create(long value) {
+    sem_t *s = (sem_t *)calloc(1, 64);
+    if (!s) return NULL;
+    if (sem_init(s, 0, value < 0 ? 0u : (unsigned)value) != 0) {
+        free(s);
+        return NULL;
+    }
+    return s;
+}
+
+long dispatch_time(long base, long deltaNs) {
+    if (base == -1LL) return -1LL;         /* FOREVER 吸收一切增量 */
+    return zl_mono_ns() + deltaNs;
+}
+
+int dispatch_semaphore_wait(void *sem, long timeout) {
+    sem_t *s = (sem_t *)sem;
+    if (timeout == -1LL) {
+        while (sem_wait(s) != 0) {
+            if (errno != EINTR) return errno;
+        }
+        return 0;
+    }
+    long long delta = (long long)timeout - zl_mono_ns();
+    if (delta <= 0) {
+        return sem_trywait(s) == 0 ? 0 : 49;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += (time_t)(delta / 1000000000LL);
+    ts.tv_nsec += (long)(delta % 1000000000LL);
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_nsec -= 1000000000L;
+        ts.tv_sec += 1;
+    }
+    int r;
+    while ((r = sem_timedwait(s, &ts)) != 0 && errno == EINTR) {}
+    return r == 0 ? 0 : (errno == ETIMEDOUT ? 49 : errno);
+}
+
+int dispatch_semaphore_signal(void *sem) {
+    return sem_post((sem_t *)sem) == 0 ? 0 : errno;
+}
+
+void dispatch_release(void *sem) {
+    sem_destroy((sem_t *)sem);
+    free(sem);
+}
+
+/* monitor 的递归锁类型常数:v11 运行时按 Darwin 实测硬编码
+ * PTHREAD_MUTEX_RECURSIVE=2,musl 的 2 是 ERRORCHECK(重入直接
+ * EDEADLK,lock 语句的重入契约在 guest 车道被打破)。本文件属主车道
+ * 垫片:静态链接时本定义胜 musl 档案副本,2→1 翻译;其它类型值原样
+ * 透传。真正的 per-TARGET 常数条件化仍是 known_open 工程。 */
+int pthread_mutexattr_settype(pthread_mutexattr_t *attr, int type) {
+    /* 静态链接下同名定义遮挡 musl 档案副本,不能回调真身;musl 1.2.x
+     * 的实现就是把类型存 pthread_mutexattr_t 首字的低 4 位
+     * (*a = (*a & ~15) | type,>2 返回 EINVAL),attr 在我们的调用面里
+     * 恒为 calloc 全零(mon_ensure 只走 init+settype+destroy),低位写
+     * 与真身逐位等价;native_sync 的重入/跨条纹断言在 guest 逐位仲裁。 */
+    if ((unsigned)type > 2u) return 22;    /* EINVAL */
+    if (type == 2) type = 1;               /* Darwin RECURSIVE -> musl RECURSIVE */
+    unsigned *a = (unsigned *)attr;
+    *a = (*a & ~15u) | (unsigned)type;
+    return 0;
+}

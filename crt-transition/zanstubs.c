@@ -11,12 +11,14 @@
  * zan_sha256, zan_sha512. Batch 2: zan_alloc, zan_free, zan_crc32 (the
  * stdlib NativeMemory decls now carry matching EntryPoints).
  *
- * Legacy aliases: artifacts produced from a pre-rename stdlib snapshot
- * (e.g. a stage1 compiled by an older seed beside its frozen stdlib) still
- * reference the bare Alloc/Free/Crc32 names. These forwarders are
- * deliberately NOT guarded — in the Zan configuration they resolve the
- * zan_* names from runtime_core.o at link time. They die once the pinned
- * seed postdates the rename. */
+ * Legacy aliases (RETIRED 第十三批): artifacts produced from a pre-rename
+ * stdlib snapshot (a stage1 compiled by an older seed beside its frozen
+ * stdlib) still referenced the bare names. The bridge was to leave the bare
+ * faces unguarded; the pinned seed now postdates the rename
+ * (run.MrSWND snapshots the renamed stdlib), so the bare faces compile only
+ * in the full C baseline (-UZAN_RT_CORE_ZAN) and zanstubs_rest.o no longer
+ * defines them. Bootstrap from a pre-rename seed: stage a fresh stdlib
+ * beside the seed binary instead of relying on this bridge. */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -29,9 +31,11 @@ void *zan_alloc(int size);
 void zan_free(void *p);
 long long zan_crc32(void *p, long long len);
 
+#ifndef ZAN_RT_CORE_ZAN /* 第十三批起裸名仅存于 C 基线车道 */
 void *Alloc(int size) { return zan_alloc(size); }
 void Free(void *p) { zan_free(p); }
 long long Crc32(void *p, long long len) { return zan_crc32(p, len); }
+#endif /* ZAN_RT_CORE_ZAN */
 
 #ifndef ZAN_RT_CORE_ZAN
 void *zan_alloc(int size) { return calloc(1, (size_t)(size > 0 ? size : 1)); }
@@ -42,6 +46,7 @@ void zan_free(void *p) { free(p); }
  * 变参调用降级后,runtime_core.zan 直接以 [DllImport(Variadic=true)]
  * open(path, flags, 0644) 三参调用,双 ABI 车道金标验证
  * (native_varargs / native_varargs_elf)。 */
+#ifndef ZAN_RT_CORE_ZAN /* 第十三批起裸名仅存于 C 基线车道 */
 void Copy(void *dst, void *src, int n) { memmove(dst, src, (size_t)n); }
 void Fill(void *p, int v, int n) { memset(p, v, (size_t)n); }
 int Compare(void *a, void *b, int n) { return memcmp(a, b, (size_t)n); }
@@ -253,8 +258,121 @@ long long zan_monotonic_ns(void) {
     return (long long)ts.tv_sec * 1000000000ll + (long long)ts.tv_nsec;
 }
 #endif /* ZAN_RT_CORE_ZAN */
-int MultiByteToWideChar(unsigned int cp, unsigned long fl, const char *s, int sl, unsigned short *w, int wl) { (void)cp;(void)fl;(void)s;(void)sl;(void)w;(void)wl; return 0; }
-int WideCharToMultiByte(unsigned int cp, unsigned long fl, const unsigned short *w, int wl, char *s, int sl, char *dc, int *du) { (void)cp;(void)fl;(void)w;(void)wl;(void)s;(void)sl;(void)dc;(void)du; return 0; }
+/* ---- Win32 宽文本对,CP_UTF8(65001)真实实现(第十三批:原 return-0
+ * stub 是阉割件,Wide.Of/Read 在其上产出空串)。flags=0 语义:非法字节
+ * 按 U+FFFD 替换(Win32 现行 CP_UTF8 行为);sl/wl<0 表 NUL 终止(计数
+ * 含 NUL);缓冲 0 表量尺;缓冲不足返 0;他代码页返 0(不支持)。 ---- */
+int MultiByteToWideChar(unsigned int cp, unsigned long fl, const char *s, int sl, unsigned short *w, int wl) {
+    if (cp != 65001u || s == 0) { return 0; }
+    int n = sl;
+    if (n < 0) { n = (int)strlen(s); }
+    if (n == 0) { return 0; }
+    int units = 0, i = 0;
+    while (i < n) {
+        unsigned char b0 = (unsigned char)s[i];
+        long cpw; int adv;
+        if (b0 < 0x80) { cpw = b0; adv = 1; }
+        else if ((b0 & 0xE0) == 0xC0) { cpw = b0 & 0x1F; adv = 2; }
+        else if ((b0 & 0xF0) == 0xE0) { cpw = b0 & 0x0F; adv = 3; }
+        else if ((b0 & 0xF8) == 0xF0) { cpw = b0 & 0x07; adv = 4; }
+        else { cpw = -1; adv = 1; }
+        if (cpw >= 0) {
+            if (i + adv > n) { cpw = -1; }
+            else {
+                for (int k = 1; k < adv; k++) {
+                    unsigned char bx = (unsigned char)s[i + k];
+                    if ((bx & 0xC0) != 0x80) { cpw = -1; break; }
+                    cpw = (cpw << 6) | (bx & 0x3F);
+                }
+            }
+        }
+        if (cpw >= 0 && ((adv == 2 && cpw < 0x80) || (adv == 3 && cpw < 0x800)
+                || (adv == 4 && cpw < 0x10000) || cpw > 0x10FFFF)) { cpw = -1; }
+        if (cpw < 0) { cpw = 0xFFFD; adv = 1; }
+        int cu = cpw > 0xFFFF ? 2 : 1;
+        if (w == 0 || wl == 0) { units += cu; }
+        else {
+            if (units + cu > wl) { return 0; }
+            if (cu == 2) {
+                cpw -= 0x10000;
+                w[units] = (unsigned short)(0xD800 + (cpw >> 10));
+                w[units + 1] = (unsigned short)(0xDC00 + (cpw & 0x3FF));
+            } else {
+                w[units] = (unsigned short)cpw;
+            }
+            units += cu;
+        }
+        i += adv;
+    }
+    if (sl < 0) {
+        units += 1;
+        if (w != 0 && wl != 0) {
+            if (units > wl) { return 0; }
+            w[units - 1] = 0;
+        }
+    }
+    return units;
+}
+int WideCharToMultiByte(unsigned int cp, unsigned long fl, const unsigned short *w, int wl, char *s, int sl, char *dc, int *du) {
+    if (cp != 65001u || w == 0) { return 0; }
+    int n = wl;
+    if (n < 0) { n = 0; while (w[n] != 0) { n++; } }
+    if (n == 0) { return 0; }
+    int bytes = 0, i = 0;
+    while (i < n) {
+        unsigned u = w[i];
+        long cpw;
+        if (u >= 0xD800 && u <= 0xDBFF && i + 1 < n
+                && (unsigned)w[i + 1] >= 0xDC00 && (unsigned)w[i + 1] <= 0xDFFF) {
+            cpw = 0x10000 + ((long)(u - 0xD800) << 10) + (w[i + 1] - 0xDC00);
+            i += 2;
+        } else {
+            cpw = (u >= 0xD800 && u <= 0xDFFF) ? 0xFFFD : (long)u;
+            i += 1;
+        }
+        int len = cpw < 0x80 ? 1 : cpw < 0x800 ? 2 : cpw < 0x10000 ? 3 : 4;
+        if (s == 0) { bytes += len; continue; }
+        if (bytes + len > sl) { return 0; }
+        if (len == 1) { s[bytes] = (char)cpw; }
+        else if (len == 2) {
+            s[bytes] = (char)(0xC0 | (cpw >> 6));
+            s[bytes + 1] = (char)(0x80 | (cpw & 0x3F));
+        } else if (len == 3) {
+            s[bytes] = (char)(0xE0 | (cpw >> 12));
+            s[bytes + 1] = (char)(0x80 | ((cpw >> 6) & 0x3F));
+            s[bytes + 2] = (char)(0x80 | (cpw & 0x3F));
+        } else {
+            s[bytes] = (char)(0xF0 | (cpw >> 18));
+            s[bytes + 1] = (char)(0x80 | ((cpw >> 12) & 0x3F));
+            s[bytes + 2] = (char)(0x80 | ((cpw >> 6) & 0x3F));
+            s[bytes + 3] = (char)(0x80 | (cpw & 0x3F));
+        }
+        bytes += len;
+    }
+    if (wl < 0) {
+        if (s == 0) { bytes += 1; }
+        else {
+            if (bytes + 1 > sl) { return 0; }
+            s[bytes] = 0;
+            bytes += 1;
+        }
+    }
+    if (du != 0) { *du = 0; }
+    return bytes;
+}
+#endif /* ZAN_RT_CORE_ZAN */
+/* 第十三批 zan_ 别名:stdlib 的 EntryPoint 改名指向这里;Zan 车道由
+ * runtime_core.zan 提供同名符号,本文件 -DZAN_RT_CORE_ZAN 编出。 */
+#ifndef ZAN_RT_CORE_ZAN
+void zan_copy(void *dst, void *src, int n) { Copy(dst, src, n); }
+void zan_fill(void *p, int v, int n) { Fill(p, v, n); }
+int zan_compare(void *a, void *b, int n) { return Compare(a, b, n); }
+int zan_find(void *p, int off, int b, int n) { return Find(p, off, b, n); }
+void *zan_get_string(void *p, int off, int len) { return GetString(p, off, len); }
+void zan_put_string(void *p, int off, unsigned char *s, int len) { PutString(p, off, s, len); }
+int zan_multi_byte_to_wide_char(unsigned int cp, unsigned long fl, const char *s, int sl, unsigned short *w, int wl) { return MultiByteToWideChar(cp, fl, s, sl, w, wl); }
+int zan_wide_char_to_multi_byte(unsigned int cp, unsigned long fl, const unsigned short *w, int wl, char *s, int sl, char *dc, int *du) { return WideCharToMultiByte(cp, fl, w, wl, s, sl, dc, du); }
+#endif
 
 /* ---- audio honest stubs — 第七批起由 runtime_core.zan 提供,这里 -D 编出 ---- */
 #ifndef ZAN_RT_CORE_ZAN
@@ -341,8 +459,10 @@ void *zan_eh_tls_state(void) {
     }
     return zan_eh_tls;
 }
-#endif /* ZAN_RT_CORE_ZAN */
 
+/* 缺口五起 Zan 车道的 trampoline 是 runtime_core.zan 的
+ * [ThreadEntry] thread_trampoline（x19-x28 序言/收尾替代这里的裸函数
+ * 屏障），本段只在 C 基线车道编出。 */
 /* Zan 方法体把 x19-x25 当作跨调用存活的工作寄存器（方法序言只保存
  * x29/x30，Zan 世界内部自洽），但 POSIX 线程入口是 C→Zan 边界：
  * libpthread 的 _pthread_start 在被调用者保存寄存器里放着线程自指针，
@@ -392,6 +512,7 @@ int64_t zan_thread_current_id(void) {
     if (pthread_threadid_np(NULL, &tid) != 0) return 0;
     return (int64_t)tid;
 }
+#endif /* ZAN_RT_CORE_ZAN */
 
 /* ---- UI-thread dispatch queue (spec: oracle rt_sync.c zan_dispatch_*) ----
  * The oracle ring retains a posted closure and releases on take/clear via the
@@ -1730,10 +1851,12 @@ int32_t zan_io_socket_alive(intptr_t fd) {
  * unresolved (weak), where these functions are unreachable anyway.
  * Batch 9: the reactor API (watch helpers, the five co entry points,
  * io_poll, close_notify, both resolve_co forms) is ported to Zan
- * (runtime_core.zan); what stays here under -DZAN_RT_CORE_ZAN is the
- * registration hook plus the three no-indirect-call / thread-body thunks
- * (zt_io_resume, zt_dns_worker_fn, zt_dns_drain) and the shared self-pipe
- * state (zt_dns_pipe_rd). */
+ * (runtime_core.zan). Batch 10 (缺口五): language-level indirect calls
+ * retire the remaining thunks -- the Zan reactor resumes through its own
+ * hook static (zan.set_ready_hook/io_resume), spawns DNS workers through
+ * the [ThreadEntry] trampoline, and drains under its own mutex; what
+ * stays here (C baseline lane only) is the hook global + setter shim for
+ * the C reactor and the C DNS worker/pipe. */
 /* -DZAN_RT_CORE_ZAN 时下面三个定义已编出(runtime_core.zan 提供),
  * reactor 段/DNS worker 仍引用它们——前向声明。 */
 extern int32_t zan_io_socket_alive(intptr_t fd);
@@ -1743,19 +1866,19 @@ extern int32_t zan_io_resolve_sa(const char *name, int32_t port, void *buf,
 
 #include <poll.h>
 
-/* The emitted async runtime registers its _zan_co_ready through this hook
- * (the first co_ready call stores its own address, idempotently). A plain
- * pointer keeps zanstubs.o linkable into non-async programs (the compiler
- * itself) where no weak-undefined trick is portable across linkers. */
+/* The emitted async runtime registers its _zan_co_ready through this shim
+ * (the first co_ready call passes its own address). C-baseline lane only:
+ * the Zan lane's runtime_core.zan owns the hook static and exports
+ * _zan_set_ready_hook itself. The plain data global stays exported for
+ * compilers emitted before the setter contract (they store the address
+ * directly); current emission only calls the shim. */
+#ifndef ZAN_RT_CORE_ZAN
 void (*zan_co_ready_hook)(long long frame, long long step);
 
-/* resume a parked coroutine from C: ngen has no indirect calls, so the Zan
- * reactor calls this thunk instead of loading the hook pointer itself (same
- * gap-workaround shape as zan_open_creat). No-op until the emitted async
- * runtime registers (non-async programs leave it NULL). */
-void zt_io_resume(long long frame, long long step) {
-    if (zan_co_ready_hook) zan_co_ready_hook(frame, step);
+void zan_set_ready_hook(void *fn) {
+    zan_co_ready_hook = (void (*)(long long, long long))fn;
 }
+#endif /* ZAN_RT_CORE_ZAN */
 
 #ifndef ZAN_RT_CORE_ZAN
 /* watcher kinds: 1/2 are ReadReady/WriteReady's interest codes, 3-5 the
@@ -1897,7 +2020,10 @@ void zan_io_accept_co(intptr_t fd, long long frame, long long step,
 /* hostname resolution: zan_io_resolve_sa is synchronous (getaddrinfo), so
  * it runs on a detached worker that hands the finished job over under a
  * mutex and signals the self-pipe; the pipe watch drains on the main
- * thread, so the ready queue is only ever touched by the main thread */
+ * thread, so the ready queue is only ever touched by the main thread.
+ * C-baseline lane only: the Zan lane's runtime_core.zan owns its own
+ * pipe/mutex/worker (dns_pipe_ensure/dns_worker_job/thread_trampoline). */
+#ifndef ZAN_RT_CORE_ZAN
 typedef struct ZtDnsJob {
     struct ZtDnsJob *next;
     char *name;
@@ -1938,28 +2064,7 @@ static void *zt_dns_worker(void *arg) {
     if (write(zt_dns_pipe[1], "x", 1) < 0) { /* main thread gone: nothing to wake */ }
     return NULL;
 }
-
-/* C-side thunks the Zan reactor needs (see zt_io_resume): the thread body's
- * address for pthread_create, the finished-job list under the mutex, and the
- * self-pipe read fd after ensuring the pipe (the ensure helper only reports
- * success). Shared ZtDnsJob layout is a private contract: next@0 name@8
- * port@16 buf@24 cap@32 outn@40 frame@48 step@56 result@64 v4@68. */
-void *zt_dns_worker_fn(void) {
-    return (void *)(intptr_t)zt_dns_worker;
-}
-
-void *zt_dns_drain(void) {
-    pthread_mutex_lock(&zt_dns_mu);
-    ZtDnsJob *list = zt_dns_done;
-    zt_dns_done = NULL;
-    pthread_mutex_unlock(&zt_dns_mu);
-    return list;
-}
-
-int zt_dns_pipe_rd(void) {
-    if (!zt_dns_pipe_ensure()) return -1;
-    return zt_dns_pipe[0];
-}
+#endif /* ZAN_RT_CORE_ZAN */
 
 #ifndef ZAN_RT_CORE_ZAN
 void zan_resolve_sa_co(const char *name, long long port, char *buf,

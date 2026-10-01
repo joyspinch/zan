@@ -8,9 +8,9 @@
     cc -c -o zanhost.o  zanhost.c
     cc -o zanc zanc.o zanstubs.o zanhost.o -lSystem
 
-## Zan 运行时第一批~第九批(runtime_core.zan)
+## Zan 运行时第一批~第十批(runtime_core.zan)
 
-`runtime_core.zan` 用 Zan 重新实现了过渡 C 运行时的九批符号:
+`runtime_core.zan` 用 Zan 重新实现了过渡 C 运行时的十批符号:
 `zan_monotonic_ns` / `zan_monotonic_us` / `zan_sha256` / `zan_sha512`(第一批)、
 `zan_alloc` / `zan_free` / `zan_crc32`(第二批)、
 `zan_pkg_fopen` / `zan_file_fopen` / `remove` / `rename` / `read_path`、
@@ -34,35 +34,45 @@ increment/extreme、expire 三件、rate_allow 窗口、lock 租约两件、
 clear/destroy)——第八批;
 native io reactor 8 符号(io_wait_co/io_recv_co/io_recv_to_co/
 io_accept_co/io_poll/io_close_notify/resolve_sa_co/resolve_ipv4_co:
-watch 表、零超时探测、DNS 自管道 + 脱离 worker 互斥交棒)——第九批。
-至此 `#ifndef ZAN_RT_CORE_ZAN` 编出的 reactor 段在 C 侧只剩 4 个内部
-thunk(zan_co_ready_hook 全局 + zt_io_resume 间接调用 + 
-zt_dns_worker_fn 线程体地址 + zt_dns_drain 互斥摘链,另 zt_dns_pipe_rd
-给出自管道读端)+ gen0 别名/Win 代码页/zan_thread_*;
-`zan_thread_*`(naked asm 屏障 + 函数指针调用)仍在 C。缺口一的
+watch 表、零超时探测、DNS 自管道 + 脱离 worker 互斥交棒)——第九批;
+缺口五批次(第十批)收回线程与恢复链:`zan_set_ready_hook`(
+编译器发射的 _zan_co_ready 自注册经 setter,不再直存 C 数据符号)、
+`zan_thread_start` / `zan_thread_current_id`(原 C zan_thread_*)、
+`[ThreadEntry] zan_thread_trampoline`(x19-x28 序言/收尾,替代
+zanstubs.c 的 naked asm 屏障)、DNS worker 体/自管道(F_SETFL 非阻塞)/
+互斥摘链——详见下文"缺口五批次"一节。
+至此 C 侧(Zan 车道)`#ifndef ZAN_RT_CORE_ZAN` 编出面上这一族清零:
+4 个内部 thunk(zt_io_resume / zt_dns_worker_fn / zt_dns_drain /
+zt_dns_pipe_rd)与 naked trampoline 一并退役;C 基线车道
+(zanstubs_full)原样保留全部 C 实现供 A/B。缺口一的
 zan_open_creat 包装已在缺口一批次随变参降级修复退役(锁定 C 符号账面
 21→20,缺口一批次详见下文)。
 它由原生自举编译器(ngen)编译成对象,再用 `localize_syms.py` 把 API 面
 之外的符号本地化——ngen 会把整套运行时帮助函数以全局符号发射进每个
-对象,不本地化则与程序对象撞符号。产出恰好导出 133 个强符号 + 4 个弱
+对象,不本地化则与程序对象撞符号。缺口五批次起导出面 136 个强符号
+(133 + set_ready_hook/thread_start/thread_current_id)+ 4 个弱
 符号(embed 族经 `--weaken` 置 N_WEAK_DEF,带内嵌资源的程序对象自带的
 强定义在链接时获胜):
 
     SEED=/path/to/stage2 bash crt-transition/build_zan_core.sh
 
-该脚本同时产出五个对象:Zan 配置用 `runtime_core.o + zanstubs_rest.o +
-zanhost_rest.o`(后两者是 `-DZAN_RT_CORE_ZAN` 编出的 C 余量),C 基线用
+该脚本同时产出五个对象:Zan 配置用 `runtime_core.o`(第十三批起即全部——
+`zanstubs_rest.o + zanhost_rest.o` 是 `-DZAN_RT_CORE_ZAN` 编出的 C 余量,
+全局符号已清零,仅为账面保留),C 基线用
 `zanstubs_full.o + zanhost_full.o`(无定义符,供 A/B 对照)。
 Zan 配置链接面:
 
     python3 scripts/native_regression.py --seed "$SEED" \
-      --runtime "crt-transition/runtime_core.o crt-transition/zanstubs_rest.o crt-transition/zanhost_rest.o" \
+      --runtime "crt-transition/runtime_core.o" \
       tests/selfhost/native_rt_core.zan          # 九批端到端(366 行金标)
 
-42 项默认电池(kernel 27 + 指定 15,含缺口四批次加入的 native_float_shapes
-与缺口一批次加入的 native_varargs / native_varargs_elf)同样接受上述
+46 项默认电池(kernel 27 + 指定 19,含缺口四批次加入的 native_float_shapes、
+缺口一批次加入的 native_varargs / native_varargs_elf、缺口五批次加入的
+native_fnptr、第十一批加入的 native_sync、第十二批加入的 native_spans 与
+第十三批加入的 native_memwide)
+同样接受上述
 `--runtime`。两个配置(A/B)都已全量验证:fixture(366 行金标,双配置字节一致)、
-默认电池 42/42、自举固定点
+默认电池 43/43、自举固定点
 (含 stage1.o 引用的全部 24 个文件族符号由 Zan 对象供给;第四批后另含
 net/ping 两符号,第五批后另含 17 个 io 符号,第六批后另含 7 个原子符号,
 第七批后另含 audio/monitor/dispatch/eh 28 个符号,第八批后另含
@@ -337,7 +347,7 @@ u32:127.0.0.1 → 0x0100007F = 16777343),"localhost" 可能 ::1 在前,
   runtime_core.zan,network 半边第四批移入);无定义符的
   `zanhost_full.o` 仍是 A/B 对照的 C oracle。注意:本文件
   是 2026-09-17 /tmp 清空后按符号需求重建的,与更早的失传版本不保证
-  逐行一致;功能以 42/42 回归 + bootstrap 定点 + parity sweep 为准。
+  逐行一致;功能以 43/43 回归 + bootstrap 定点 + parity sweep 为准。
 
 由本编译器产出的程序另引用 `_zan_ext_*`/`_zan_dt_*`/`_zan_dir_*` 帮助
 函数族（见 src/selfhost/ngen_host.zan）——那些由 ngen_host 直接生成
@@ -371,9 +381,103 @@ crt-transition/linux/ 新增(macOS 车道零引用):
   pthread_threadid_np 隐式声明在 musl 下是错误)。
 - compat/net/if_dl.h:shadow <net/if_dl.h>(-I 优先)——musl 无
   AF_LINK,以字节精确的 sockaddr_ll 视图给 LLADDR/sdl_alen。
-- zanstubs.c 引用的 `_zan_thread_trampoline_body`(下划线约定)在
-  ELF 目标由 ngen 发无前缀名,链接期 `--defsym` 别名补齐。
+- zanstubs.c 的线程族(`_zan_thread_trampoline` naked asm + 
+  `_zan_thread_trampoline_body`)自缺口五批次起只在 C 基线车道编出;
+  Zan 车道由 runtime_core.zan 的 `[ThreadEntry] thread_trampoline`
+  接管(ELF 符号无前缀,early 的 `--defsym` 别名随之删除)。
+- v18o-22 车道衔接垫片(zanlinuxshims.c 追加,两笔):
+  (1) GCD 信号量面——stdlib Threading 的 `#elif MACOS` 臂直呼
+  dispatch_semaphore_*(条件定义 per-HOST,ELF 对象在 macOS 主机上
+  编译时同一臂被编进;musl 无 libdispatch),musl 未命名 POSIX 信号量
+  逐位给全 create/wait/signal/release/dispatch_time(-1=FOREVER,
+  dispatch_time(0,delta)=单调 ns 绝对期限,超时返 49)。
+  (2) `pthread_mutexattr_settype` 翻译——第十一批 monitor 按 Darwin
+  实测硬编码 RECURSIVE=2,musl 的 2 是 ERRORCHECK(头文件实测
+  NORMAL/DEFAULT=0、RECURSIVE=1、ERRORCHECK=2),静态链接同名定义
+  遮挡档案副本,2→1 直接写低 4 位(attr 在调用面恒 calloc 全零);
+  native_sync 的重入/跨条纹断言 guest 逐位仲裁通过(除 try_lock 臂)。
+  try_lock 臂在 guest 全数返回 0:先在 Darwin open 常数家族
+  (copen2 的 0x200=O_CREAT 在 aarch64 Linux 不是 O_CREAT,无
+  O_CREAT 的 open 对新路径 ENOENT;cc91da8 同值证实,与 rt_core 的
+  struct stat 布局同族)——per-TARGET 常数条件化仍是 known_open。
 - 每夹具 guest 引导 ~7s;下载缓存于 build/linux-vehicle/dl(需网络,
   首次 ~60MB)。known_open 第一项(Linux 用户态宿主层)自此解锁,
   余下是覆盖面扩展(全电池 guest 化、plat_net_interfaces 的 MAC
   字段保真)。
+
+## 缺口五批次(v18o-21):语言级函数指针 + [ThreadEntry] + C thunk 清算
+
+编译器半边:委托值 bit0 定形态(oracle 双形态考古定案)——
+`(委托类型)nint` 转换打 `|1` 裸标记,调用点 tbnz 分岔:裸形态剥标记后
+按声明签名直接 blr(无 env),even 走 interned 成对读取;泛型 cast
+解析 `(Ident<…>)operand`(配平 `>` 后必须是 `)`+操作数头);
+`[ThreadEntry]` 方法属性:序言帧 +96 成对保存 x19-x28(libpthread 把
+线程自指针放在被调者保存寄存器里,线程入口是 C→Zan 边界),收尾
+`mov sp, x29` 后逐对恢复;async 注册改 BL `_zan_set_ready_hook`。
+运行时半边(runtime_core.zan 第十批):set_ready_hook / io_resume(裸调
+hook)/ thread_trampoline / thread_start / thread_current_id /
+dns_worker_job / dns_pipe_ensure / dns_mu_ensure 全部 Zan 实现;
+fcntl 声明修正为 Variadic=true(第三参 va_arg,纯声明会设错标志——
+此项修复后 A/B 首次逐位一致);新增静态一律零值哨兵(库对象数据段恒
+零,静态初始化器只对持有 Main 的对象生效)。永久金标 native_fnptr
+入电池(42→43)。
+
+独立验收(本仓库门禁,zanc_v21 = 闭包定点编译器):自举两路定点
+(旧 seed×C 基线造 stage1 → Zan 道定点 run.xrUewG;终树 runtime 自举
+闭包 run.cCLFzx,均 stage2.o == stage3.o 字节同一)、gate probes 绿、
+默认电池 43/43 × 双配置(Zan 道 + C 基线道)、native_rt_core 双车道显
+式绿、负例诊断逐字同旧编译器、crossboot 80/80(Mach-O + qemu ELF,
+SEED 钉死)、linux_vehicle 默认 5/5 guest 逐字节、parity sweep
+见 docs/native-parity-baseline.json v18o-21 记录。扩展 guest 集
+(55 夹具,超出电池面)暴露的两处差异均经 cc91da8 worktree A/B 证为
+先在状态:file 族的 struct stat 布局(musl 偏移不同,rt_core 第 25 行
+起)与 guest 无 PATH 环境(cstring_read 第 2 行)——非本批回归;
+plat_net_interfaces 的 MAC 保真与 Linux 常数条件化仍是 known_open。
+
+## 第十一批(v18o-22):多线程正确性清算(真锁 + 真 RMW + 惰性初始化串行化)
+
+编译器半边(占位体即文档的内建):`[AtomicCas]` → 单条 casal x1,x2,[x0]
+(armv8.1 LSE,返回比较时刻旧值,oracle seen 语义逐位对齐,第六批
+load-after-fail 文档化偏差退役)、`[AtomicLoad]` → ldar、`[AtomicStore]`
+→ stlr(真 SEQ_CST)、`[StaticAddr("fld")]` → adrp+add 取本类静态数据
+地址。运行时半边(runtime_core.zan 第十一批):monitor 从条纹计数器换
+真 64 条纹递归 pthread 锁(缺口五起 DNS worker 真在跑,计数器不提供
+互斥);rt_init_lk 唯一串行化点双检锁盖住九处惰性静态;三处自旋解锁
+平铺 store 0 → barrier 减一;atomic load/store/CX 走内建;SIGPIPE 探测
+入自旋锁;sockaddr 文本与网卡快照合并 rt_tls 每线程刮擦块。keep 账面
+不变(136)。永久金标 native_sync(同锁两写方 5000 精确、递归重入、
+跨条纹独立、CAS 环 2500 精确、worker EH 500、try_lock 代际表、线程 id
+互异)入电池 43→44。
+
+独立验收(本仓库门禁,zanc_v22 = 闭包定点编译器):自举两路定点
+(v21×终树 stage1 → Zan 道定点 run.jHDotS;终树 runtime 自举闭包
+run.4H0uBY,均 stage2.o == stage3.o 字节同一)、gate probes 绿、
+默认电池 44/44 × 双配置、native_rt_core 双车道显式绿(旧金标逐字
+不动)、负例诊断逐字同 v21、crossboot 80/80(SEED 钉死)、
+linux_vehicle 默认 5/5 guest 逐字节;guest 扩展:16 夹具集 15 绿 +
+native_sync 10/12 行绿(try_lock 臂 = 先在 O_CREAT 常数家族,cc91da8
+同值证实)、27 kernels 全绿;parity sweep 见
+docs/native-parity-baseline.json v18o-22 记录。
+
+## 第十二批(v18o-23):内存管理清算(Span 视图零堆分配)
+
+编译器半边:三个装箱点(`new Span<T>(b,n)`、`arr.AsSpan(...)`、
+`span.Slice(...)`)的 malloc(16) {base,len} 堆箱全部退役——每构造点
+在 ReserveSpanBoxes 预序预留私有 16B 帧槽,发射点按节点身份查表取
+`x29±off`;同夹具 _malloc 重定位 33→18,视图箱无界泄漏账面清零。
+值语义:Span 局部赋值/形参传递按 {base,len} 对拷贝(by-value,重绑不
+出 callee);逃逸禁令六处响亮诊断(返回/字段/Lambda 捕获/容器元素/
+ref out——C# ref-struct 规则;缺口二的静态 Span 读写能力随之退役,
+全库零用量)。runtime_core 零源码行为改动即受益(183 处 new Span 站点
+重编译后落帧槽)。永久金标 native_spans(拷贝 4040、形参下传+重绑
+3408、热循环双站点 5,000,000、三元两臂 20/50、越界软钳 111 等)入
+电池 44→45。
+
+独立验收(本仓库门禁,zanc_v23 = 闭包定点编译器):自举两路定点
+(v22×终树 stage1 → Zan 道定点 run.dWxIzk;终树 runtime 自举闭包
+run.NwCSpH,均 stage2.o == stage3.o 字节同一)、gate probes 绿、
+默认电池 45/45 × 双配置、native_rt_core 双车道显式绿、负例诊断逐字
+同 v22、crossboot 80/80(SEED 钉死)、linux_vehicle 默认 5/5 + 27
+kernels + fnptr/spans guest 逐字节(native_sync 仍 10/12,try_lock 臂
+= 先在 O_CREAT 常数家族);parity sweep 见
+docs/native-parity-baseline.json v18o-23 记录。

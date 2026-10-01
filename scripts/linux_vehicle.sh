@@ -153,7 +153,6 @@ run_one() {
     "$WORK/$name.elf.o" "$O/runtime_core.elf.o" "$O/zanstubs_rest.elf.o" \
     "$O/zanhost_rest.elf.o" "$O/zanlinuxshims.elf.o" \
     -L"$SYSROOT/usr/lib" -L"$GCCDIR" -lc -lgcc \
-    --defsym=_zan_thread_trampoline_body=zan_thread_trampoline_body \
     -o "$WORK/$name.elf" || { echo 'FAIL (link)'; return 1; }
 
   rm -rf "$WORK/guest"
