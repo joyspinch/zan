@@ -8,7 +8,20 @@
     cc -c -o zanhost.o  zanhost.c
     cc -o zanc zanc.o zanstubs.o zanhost.o -lSystem
 
-## Zan 运行时第一批~第十批(runtime_core.zan)
+## Zan 运行时第一批~第十三批(runtime_core.zan)
+
+ZAN_TARGET 条件编译(v18o-25):lexer 的平台 define 表跟目标走——
+`ZAN_TARGET=aarch64-linux` 时定义 LINUX+ARM64(不再 MACOS/APPLE),
+stdlib 的 `#if LINUX`/`#else` POSIX 臂(Platform/Runtime 平台报告、
+AppPath /proc 路径、Threading POSIX 信号量、Directory 的 Linux dirent
+偏移 18/19)随之编入,兑现 stdlib"交叉编译的程序报告目标系统而非构建
+主机"的契约;无环境(或其它值)时与 oracle 宿主表逐位一致。guest 探针
+实证:Directory 枚举命中(此前 guest 用 Darwin 偏移 20/21 读 musl 的
+glibc 布局 dirent,枚举名必错)、GetPlatform 报 "linux";宿主无环境
+逐位不变(电池 47/47 × 双配置、crossboot 80/80)。永久金标
+native_retarget(平台谓词恰好一真 + dirent 枚举命中,两车道同金标)
+入电池 46→47。runtime_core 的 Darwin 常数(O_CREAT/O_NONBLOCK、
+struct stat 布局)条件化以此为基础,仍属后续批次。
 
 `runtime_core.zan` 用 Zan 重新实现了过渡 C 运行时的十批符号:
 `zan_monotonic_ns` / `zan_monotonic_us` / `zan_sha256` / `zan_sha512`(第一批)、
@@ -66,10 +79,10 @@ Zan 配置链接面:
       --runtime "crt-transition/runtime_core.o" \
       tests/selfhost/native_rt_core.zan          # 九批端到端(366 行金标)
 
-46 项默认电池(kernel 27 + 指定 19,含缺口四批次加入的 native_float_shapes、
+47 项默认电池(kernel 27 + 指定 20,含缺口四批次加入的 native_float_shapes、
 缺口一批次加入的 native_varargs / native_varargs_elf、缺口五批次加入的
 native_fnptr、第十一批加入的 native_sync、第十二批加入的 native_spans 与
-第十三批加入的 native_memwide)
+第十三批加入的 native_memwide、v18o-25 加入的 native_retarget)
 同样接受上述
 `--runtime`。两个配置(A/B)都已全量验证:fixture(366 行金标,双配置字节一致)、
 默认电池 43/43、自举固定点
