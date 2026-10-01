@@ -1,0 +1,60 @@
+// Batch 13 permanent fixture: the last C family moves into runtime_core.zan --
+// mem ops (Copy/Fill/Compare/Find), ARC string ops (GetString/PutString), and
+// REAL CP_UTF8 <-> UTF-16 conversion (Wide.Of/Read/Length via the renamed
+// zan_multi_byte_to_wide_char / zan_wide_char_to_multi_byte; the old C stubs
+// returned 0 and Wide.Of produced empty strings).
+// Golden covers: overlapping memmove, memcmp order, memchr hit/miss/offset,
+// ARC byte-faithful strings, full round-trip (a é 中 emoji = 4-byte UTF-8),
+// invalid-byte U+FFFD replacement, truncated-sequence replacement, and the
+// null-pointer guards. Both runtimes (runtime_core.o and the C baseline in
+// zanstubs.c) must print it byte-identically.
+using System;
+
+class M {
+    static int Main() {
+        nint p = NativeMemory.Alloc(32);
+        Span<byte> s = new Span<byte>(p, 32);
+        for (int i = 0; i < 32; i++) { s[i] = (byte)i; }
+        // 0x55 fill straddles the upcoming copy window
+        NativeMemory.Fill(p + 8, 0x55, 8);
+        // overlapping memmove, forward: p[4..11] takes p[0..7]
+        NativeMemory.Copy(p + 4, p, 8);
+        Console.WriteLine(s[11]);                  // 7
+        Console.WriteLine(NativeMemory.Compare(p + 4, p, 4));  // 0 (copied back)
+        Console.WriteLine(NativeMemory.Compare(p + 8, p, 4));  // 4 (copy overwrote the 0x55 fill: 4 > 0)
+        Console.WriteLine(NativeMemory.Find(p, 0, 0x55, 32));  // 12 (only p[12..15] kept the fill)
+        Console.WriteLine(NativeMemory.Find(p, 0, 0xaa, 32));  // -1
+        Console.WriteLine(NativeMemory.Find(p, 13, 0x55, 4));  // 13 (offset measured from p)
+        string st = NativeMemory.GetString(p, 4, 4);
+        Console.WriteLine(st.Length);              // 4 (bytes 00 01 02 03 are legal content)
+        NativeMemory.PutString(p + 16, 0, st, 4);
+        Span<byte> t = s.Slice(16, 4);
+        Console.WriteLine(t[2]);                   // 2
+        Console.WriteLine(NativeMemory.GetString(p, 0, 0).Length);  // 0 (empty view)
+        NativeMemory.Free(p);
+        // "a" U+00E9 U+4E2D U+1F600 = 1+2+3+4 = 10 UTF-8 bytes, 5 UTF-16 units
+        byte[] bs = new byte[10];
+        bs[0] = 0x61; bs[1] = 0xc3; bs[2] = 0xa9;
+        bs[3] = 0xe4; bs[4] = 0xb8; bs[5] = 0xad;
+        bs[6] = 0xf0; bs[7] = 0x9f; bs[8] = 0x98; bs[9] = 0x80;
+        nint nb = NativeMemory.Alloc(10);
+        Span<byte> w = new Span<byte>(nb, 10);
+        for (int i = 0; i < 10; i++) { w[i] = bs[i]; }
+        nint wb = Wide.Of(NativeMemory.GetString(nb, 0, 10));
+        Console.WriteLine(Wide.Length(wb));        // 5
+        Console.WriteLine(Wide.Read(wb).Length);   // 10 (byte-faithful round trip)
+        nint nb2 = NativeMemory.Alloc(10);
+        NativeMemory.PutString(nb2, 0, Wide.Read(wb), 10);
+        Console.WriteLine(NativeMemory.Compare(nb, nb2, 10));  // 0
+        NativeMemory.Free(nb2);
+        NativeMemory.Free(wb);
+        w[0] = 0xff;  // impossible UTF-8 lead: one U+FFFD unit, rest decodes
+        Console.WriteLine(Wide.Read(Wide.Of(NativeMemory.GetString(nb, 0, 3))).Length);  // 2
+        w[0] = 0x61;
+        Console.WriteLine(Wide.Read(Wide.Of(NativeMemory.GetString(nb, 1, 1))).Length);  // 1 (c3 alone -> U+FFFD)
+        Console.WriteLine(Wide.Length(0));         // 0 (null guard)
+        Console.WriteLine(Wide.Read(0).Length);    // 0 (null guard)
+        NativeMemory.Free(nb);
+        return 0;
+    }
+}

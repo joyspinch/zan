@@ -481,3 +481,34 @@ run.NwCSpH,均 stage2.o == stage3.o 字节同一)、gate probes 绿、
 kernels + fnptr/spans guest 逐字节(native_sync 仍 10/12,try_lock 臂
 = 先在 O_CREAT 常数家族);parity sweep 见
 docs/native-parity-baseline.json v18o-23 记录。
+
+## 第十三批(v18o-24):最后一个 C 族清算(darwin 车道零项目 C)
+
+runtime_core 第十三批(11→0):mem 六件(Copy/Fill/Compare/Find/
+GetString/PutString)落 class zan(libc 走 zmemmove/zmemcmp/zmemchr
+别名避开 ABI 撞名;copy 免重叠自转,fill/compare/find 带 n<=0 与空指针
+卫);GetString/PutString 真实现([rc:8][0x5A414E53|len:8][data][NUL]
+布局与编译器内联展开逐位一致);Win32 文本两件按 CP_UTF8 语义(非法
+序列替 U+FFFD,合法 FFFD 不误替;sl/wl<0 计 NUL;零缓冲查尺寸;缓冲
+不足返 0;宽侧代理对拆合)。EntryPoint 改名面收账:NativeMemory 六件 +
+Interop.Wide/Process/Directory/Pinyin 全库自此不再声明任何裸名 C 导入。
+zanstubs_rest.o 全局符号清零(纯 C 余量为空,物保留作账面);C 基线
+双面(裸名 + zan_*)原样。自举机制入账:自举 SEED 优先用二进制旁的
+stdlib 快照——旧定点旁是改名前快照,其 stage1 引用裸名、零 C 链接必
+炸;解法是老种子 + 现行 stdlib 拷贝件作 SEED 一次自举,新定点的快照即
+含全部改名。永久金标 native_memwide(重叠 memmove/回拷比较/memchr/
+ARC 串长/Slice 视图/宽往返)入电池 45→46。
+
+独立验收(本仓库门禁,zanc_v24 = 闭包定点编译器):自举两路定点
+(v23×终树 → Zan 道定点 run.9iH4T1,RT_OBJS=runtime_core.o 单对象;
+终树 runtime 自举闭包 run.AXTX2c,均 stage2.o == stage3.o 字节同一;
+zanstubs_rest.o 全局符号 nm 实测 0)、gate probes 绿、默认电池 46/46
+× 双配置(zero-C 单对象 + C 基线双对象;C 基线 native_sync 一次
+w0lk=9 为 C 道遗留代际表竞态的统计命中——batch 11 串行化只在 Zan 道,
+重跑 5/5 绿)、native_rt_core 双车道显式绿、负例诊断逐字同 v23、
+crossboot 80/80(SEED 钉死)、linux_vehicle 默认 5/5 + 27 kernels +
+fnptr/spans/memwide guest 逐字节(native_sync 仍 10/12,try_lock 臂 =
+先在 O_CREAT 常数家族);parity sweep 573/624 平历史最高(om 3 =
+fileinfoex_mmap + http_forwarder_stream + tdengine_pool,后两者定向
+重跑即 pass,均 oracle 侧计时 flapper),见
+docs/native-parity-baseline.json v18o-24 记录。
