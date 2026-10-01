@@ -1614,3 +1614,30 @@ mne 18 = 两侧同非零 stdout 逐字节一致。剩余非 pass 全部 oracle �
 - 过程教训:一次 crossboot 启动静默回退到批中迭代编译器(zanc_fin),ELF
   变参引导空输出——该迭代缺的正是最后的 ELF 尾参读回段。定点迭代编译器
   在车道间不可互换,门禁必须显式钉死种子。
+
+## v18o-20 (2026-10-01) — Linux 用户态车道打开:qemu guest 载体 + shim 层 + ELF localize
+
+- 停泊的 known_open 第一项(Linux 用户态宿主层,卡"无执行载体")本批
+  解锁并端到端可用:qemu-system-aarch64 -M virt 引导 Alpine v3.20
+  aarch64 内核 + 自组 initramfs(minirootfs + stty -onlcr + stderr 剥离
+  的 init),单次 guest 引导 ~7 秒,无 VM 框架依赖。
+- 全流程:zanc(ZAN_TARGET=aarch64-linux)→ ELF 对象 →
+  scripts/elf_localize.py(ELF 版 localize:非 API 全局局部化 + symtab
+  重排使局部先于全局(ld.lld 严查 sh_info)+ .rela 符号索引重映射)→
+  与 ELF 版 runtime、-D ZAN_RT_CORE_ZAN C 余量(musl sysroot 交叉编译,
+  -include prelude + -I compat 影子头,不改编者文件)、shims、musl
+  libc.a + Alpine libgcc.a 静态链接 → guest 引导 → 串口输出对 .out
+  金标逐字节 diff。
+- shim 面(crt-transition/linux/zanlinuxshims.c,macOS 车道零引用):
+  CommonCrypto 四件(CC_MD5/CC_SHA1/CC_SHA256/CCHmac,标准算法,RFC
+  1321/2202/4231 + FIPS 向量全过)、OSAtomic 双件(C11 原子)、
+  os_unfair_lock(4 字节自旋锁保内嵌布局)、mach_task_self_/mach_vm_
+  read_overwrite(自进程 memcpy)、__error、arc4random_buf(getrandom)、
+  pthread_threadid_np(gettid)、_NSGetExecutablePath(/proc/self/exe);
+  compat/net/if_dl.h 把 macOS 链路层地址结构映射为 sockaddr_ll 字节
+  精确视图;zanstubs.c 的下划线约定引用经 --defsym 别名补齐。
+- 验收(默认五夹具,guest 内逐字节同金标):kernel1、native_extern、
+  native_string_ops、native_float_shapes、native_varargs_elf——变参
+  ELF 车道金标在真 Linux 用户态复现。macOS 车道零改动,sweep 记录与
+  v18o-19 同(570/624)。余下:全电池 guest 化、plat_net_interfaces
+  MAC 字段保真。
