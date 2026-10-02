@@ -36,7 +36,14 @@ def main():
         ROOT / 'tests/selfhost/native_fnptr.zan', ROOT / 'tests/selfhost/native_sync.zan',
         ROOT / 'tests/selfhost/native_spans.zan', ROOT / 'tests/selfhost/native_memwide.zan',
         ROOT / 'tests/selfhost/native_digests.zan',
-        ROOT / 'tests/selfhost/native_retarget.zan']
+        ROOT / 'tests/selfhost/native_retarget.zan',
+        # 第十八批:ELF 车道普查(55/71 绿)后收编的九席——async 族首次进
+        # 电池(redis_client 崩溃所在引擎的常备门),外加 int/dict 面。
+        ROOT / 'tests/selfhost/json_ignore_ok.zan',
+        ROOT / 'tests/selfhost/native_async_basic.zan', ROOT / 'tests/selfhost/native_async_detach.zan',
+        ROOT / 'tests/selfhost/native_async_locals.zan', ROOT / 'tests/selfhost/native_async_throw.zan',
+        ROOT / 'tests/selfhost/native_dict_packed_out.zan', ROOT / 'tests/selfhost/native_int_fieldinit.zan',
+        ROOT / 'tests/selfhost/native_int_narrow.zan', ROOT / 'tests/selfhost/native_int_narrow2.zan']
     failed = 0
     for i, fixture in enumerate(fixtures):
         fixture = fixture.resolve()

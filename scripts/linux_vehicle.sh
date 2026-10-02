@@ -33,9 +33,20 @@ MUSL_VER="1.2.5-r3"
 GCC_VER="13.2.1_git20240309-r1"
 FIXTURES=("$@")
 if (( ${#FIXTURES[@]} == 0 )); then
-  FIXTURES=(kernel1 native_extern native_string_ops native_float_shapes
+  FIXTURES=(kernel1 kernel2 kernel3 kernel4 kernel5 kernel6 kernel7 kernel8
+            kernel9 kernel10 kernel11 kernel12 kernel13 kernel14 kernel15
+            kernel16 kernel17 kernel18 kernel19 kernel20 kernel21 kernel22
+            kernel23 kernel24 kernel25 kernel26 kernel27
+            native_extern native_string_ops native_float_shapes
             native_varargs_elf native_digests native_memwide
-            native_rt_core native_sync native_varargs fileinfoex_mmap)
+            native_rt_core native_sync native_varargs fileinfoex_mmap
+            dict_growth dict_minimal host_args_bounds json_ignore_ok
+            list_string_search native_async_basic native_async_detach
+            native_async_locals native_async_throw native_dict_out_address
+            native_dict_packed_out native_lexical native_local_frame
+            native_spans native_int_fieldinit native_int_narrow
+            native_int_narrow2 native_numeric_runtime native_fnptr
+            native_generic_overload_fit native_float_return_arg)
 fi
 
 # 第十五批起 SKIP 清单为空:native_varargs 的 st_mode 偏移与 open 标志
