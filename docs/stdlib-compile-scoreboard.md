@@ -1916,3 +1916,95 @@ mne 18 = 两侧同非零 stdout 逐字节一致。剩余非 pass 全部 oracle �
   负测诊断逐字;runtime 对象级确定性逐字节。并行会话协作注:归一
   四处的落地与 probe 根因独立互证(assert 拒写即信号,勿重复施加),
   车道绿以重建后对象为准——源码比对象新时先重建再断言。
+
+## v18o-28 (2026-10-02) — 第十六批:x86_64 后端开工(kernel1 静态收敛)
+
+ZAN_TARGET=x86_64-macos 从零到出可链接的 x86_64 Mach-O 对象。本批
+是 mega-project 的第一批,覆盖面如实记录在案。
+
+**落地内容**
+- ngen_x86.zan(新,~370 行):x86_64 编码层 — ModRM/SIB/REX、SysV
+  对齐寄存器映射(v0-v5→rdi..r9 零移动、v6/v7→调用垫片专用栈槽、
+  v8-v15+v19-v28→rbp 溢出槽、v9→rax、v16/v17→r10/r11)、XPushV0/
+  XPushV1/XPushR/XPopV(目标感知:arm64 模式下发射原 E4 词,使全部
+  ~220 个历史 push/pop 站点机械 sweep 而无需逐点判断)、Sxtw0(20 处
+  sxtw 站点双臂)、X86IntBinop(完整四则/比较/移位/位运算 + 除零守
+  卫 + i64min/-1 折叠)、XFailClosed 诊断。
+- 真实修复:非交换操作数方向 — 压栈序列给出 b 在 rdi/a 在 rsi
+  (arm64 `sub x0,x1,x0` 契约被累加器反转),Minus 初版算成 b-a,
+  Fib(10) 死循环即此;printf twin 初版先 lea fmt 覆盖 rdi 再 mov,
+  值丢失。均由反汇编逐条审计抓出。
+- 调用序列:静态调用压栈→按偏移回读到 SysV 寄存器(v6/v7→专用槽,
+  垫片无条件上栈)、实例调用(receiver 最后压、按偏移读、≥6 参封
+  死)、blr→call rax、导出包装器(EmitExportShimNg x86=恒等置换 +
+  框架 + call body)、Main shim、int 静态初始化收窄。
+- Mach-O 写入器:cputype 0x01000007/cpusubtype 3;kind4 reloc→
+  X86_64_RELOC_BRANCH(type 4, r_address=pos+1);strRef→单个
+  X86_64_RELOC_SIGNED pcrel(type 1, r_address=adrpPos+3);nl 槽
+  UNSIGNED 原样。
+- 运行时核门控:x86 只发 strpool(尾声一次)+ print_int + println
+  + host_argc/argv dglb;delegate/binding/packed-slice/cls-name/
+  refl 尾部跳过;DblLibm1、ConvI2D、NarrowF32、TBZ、>8 参、params
+  变参、extern(DllImport)调用、float/double 导出全部 fail-closed
+  诊断,绝不静默发 arm64 字节。
+
+**验证状态(如实)**
+- 静态:kernel1 全表面反汇编逐条审过(_main/打印核/Fib/Add/Main
+  循环/K_ctor),全部合法 x86_64,语义对齐 arm64 契约。cc -arch
+  x86_64 链接干净。
+- arm64 零回归:battery Zan 车道 48/48 金标逐字节(sweep 后编译器
+  出品;python 收尾被环境卡死,结果由产物手工比对确认,48 个
+  run.stdout 全部与 tests/selfhost/*..out 一致)。
+- 动态 Rosetta 运行被环境死锁阻塞:本机 macOS 的 Rosetta 翻译管线
+  (oahd)自 ~12:07 起僵死——新构建的 x86_64 二进制(包括纯 C 的
+  clang hello-world)启动即挂,SIGKILL/ SIGALRM 无法收割(UE 状态,
+  0 CPU),/usr/bin/true 走缓存翻译不受影响;僵死蔓延到 arm64 进程
+  退出(并行会话的 kernel1 fixture、mp 系列同样 UE,共 10-12 个)。
+  非本批代码问题(同一 CPU 时间的 arm64 battery 全绿)。恢复手段需
+  要用户权限:`sudo killall -9 oahd`(守护自动重生)或重启;之后
+  `arch -x86_64 /tmp/b16/k1x` 应对金标 55/13/10。C 车道 battery、
+  crossboot、vehicle 复跑同样待环境恢复(与本批改动无关的随机挂)。
+
+**后续批次**(按 kernel1→kernelN 递进):extern 变参/DllImport、
+SSE 浮点车道、结构体拷贝、list/dict 运行时核、ThreadEntry、ELF
+x86_64 容器、linux vehicle。编译器源码本批已改,下一边界需要新
+bootstrap 定点(vanc_v28)。
+
+## v18o-28 批（2026-10-02，runtime 诚实批：mmap 八族真实现 + AT_FDCWD 平台分裂 + try_lock 临界区；sweep 572/619（带内 570→572；5 例未跑=closure_mutable_capture 预排 +
+dictionary_wide_values/int_format_boundaries/redis_client/struct_arc_lifetime
+现场楔死排除，批 15 分类沿用。om 2=http wall-clock 双案、em 3、rto 7、mne 18、
+rcf 17；fileinfoex_mmap 本轮记 mne——净沙箱下双侧同打 FileNotFoundException，
+定向对拍的 om 是泄漏次序效应，两侧 stdlib 异常映射本就同构），检查点仍 v18o-26/zanc_v27——本批零编译器源改动）
+
+四个独立根因，全部对照 oracle C 源逐行落地后双车道收敛。1. **file_set_time 硬编码
+AT_FDCWD=-100（Linux 常量）**，darwin 上 AT_FDCWD=-2：绝对路径无视 dirfd 侥幸过、
+相对路径必 EBADF；`#if MACOS -2 #else -100` 双臂，native_rt_core 的 set-time 断言
+严格化为"设置必成功且回读必等所设值"。2. **mmap 八族全 `return 0` 桩**（与注释
+"自举不练习 mmap"一起退役）：按 oracle rt_sync.c 实现=create/open/from_file/map/
+unmap/flush/close/unlink；16 字节句柄块 {int fd; int owner; nint namep}（namep 单独
+malloc 避免指针运算）；owner=1 仅创建者、其 close 或显式 unlink 才 shm_unlink；
+O_EXCL 二创必败；open 仅 size>0 才做精确尺寸校验（oracle 语义，也正是躲开 darwin
+ftruncate 16K 量子的活口）；O_CREAT/O_EXCL/MS_SYNC 常量按目标双臂；shm 名走
+"/name" 64 字节截断（对齐 oracle snprintf）。3. **fileinfoex_mmap 归因改正**——
+从来不是"oracle 漂移 flapper"：POSIX shm 区域活过进程，首跑者中途崩溃泄漏
+/ZanConfMmap_A，二跑者撞 EEXIST 使异常**类型**随跑序翻转（对拍实证：ref 先跑打
+FileNotFoundException、native 后跑打 IOException，序固定则结果固定）；叠加两个
+darwin 独有 oracle 缺陷（ftruncate 16K 量子使 oracle 自己的精确尺寸 OpenExisting
+在 darwin 永不可过；跨进程重开他人创建的区域 EACCES 类不可靠）——Linux/guest 车道
+无这些缺陷，fileinfoex_mmap 以 vehicle 默认第 11 席**首次端到端通过**。mmap_owner
+= matching_nonzero_exit 稳定（双侧同打 IOException）。4. **try_lock 代际表竞窗**
+（电池 47/48 那一次的根因，w0lk 3/10）：槽位无锁申领时两线程可同选一空槽，后注册
+者覆写先者 fd 并顶掉其代际；修成 oracle rt_file.c 同款——rt_lock 临界区罩住申领
+（used=1 圈内预留）+ 注册（gen/fd 落表），open/flock/close 留在圈外；unlock 的表
+变动同样入圈；修复后 native_sync 在 sweep 负载下 15/15 绿。车辆注：guest
+minirootfs 无 /dev/shm，musl shm_open 对整个 mmap 族 ENOENT（探针 errno=2 实证），
+init 模板补 mkdir+tmpfs 挂载（rootfs 模板缓存须作废重生成才生效）。门禁（对象为
+最终落地源 trio16c）：battery 48/48 ×2；native_sync 15/15 压力；linux_vehicle
+11/11（guest 全 mmap 流含 msync flush、跨句柄重开 4211 持久化、文件映射回写）；
+定向对拍 fileinfoex_mmap om + mmap_owner mne；sweep 572/619（带内 570→572；5 例未跑=closure_mutable_capture 预排 +
+dictionary_wide_values/int_format_boundaries/redis_client/struct_arc_lifetime
+现场楔死排除，批 15 分类沿用。om 2=http wall-clock 双案、em 3、rto 7、mne 18、
+rcf 17；fileinfoex_mmap 本轮记 mne——净沙箱下双侧同打 FileNotFoundException，
+定向对拍的 om 是泄漏次序效应，两侧 stdlib 异常映射本就同构）。纪律实证：纯注释
+源码编辑也改变 runtime_core.o 字节（trio16b/c 在 26857 偏移处分叉——对象内嵌源生
+数据），"重建后再断言"是字节级强制。

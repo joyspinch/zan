@@ -106,8 +106,9 @@
 // 程序对象(tryget_pinyin/file_embed_*),弱符号让程序自己的强定义
 // 赢;不带资源、只经 DllImport 调 API 的程序(如 native_rt_core 的
 // 诚实空集用例)仍解析到这里。
-// try_lock 代际表为进程内三块 calloc 静态,单线程假设与 C 版一致,锁
-// 本体是 BSD flock。read_path/embed_list 返回 malloc 的 C 串(每次
+// try_lock 代际表为进程内三块 calloc 静态,表变动(rt_lock 临界区)与
+// C 版 zan_fh_lock 同款;锁本体是 BSD flock(flock 本身留在临界区外)。
+// read_path/embed_list 返回 malloc 的 C 串(每次
 // 全新,调用方拥有),与 C 版 strdup 契约一致;该 string 返回 ABI 在
 // 托管侧目前是休眠路径(编译器本体只走 pkg_fopen+fread)。
 //
@@ -997,15 +998,24 @@ class zan {
         if (which == 0) { tv[2] = unixSec; tv[3] = 0; }
         else { tv[0] = unixSec; tv[1] = 0; }
 #endif
-        long r = cutimensat(-100, path, ts, 0) == 0 ? 1L : 0L;  // AT_FDCWD
+#if MACOS
+        // AT_FDCWD 两平台不同(darwin -2 / linux -100):传错值时绝对路径
+        // 侥幸通过、相对路径必 EBADF(fileinfoex_mmap 第十六批根因)
+        long r = cutimensat(-2, path, ts, 0) == 0 ? 1L : 0L;
+#else
+        long r = cutimensat(-100, path, ts, 0) == 0 ? 1L : 0L;
+#endif
         cfree(ts);
         cfree(sb);
         return r;
     }
 
     // ---- File.zan TryLock/Unlock:句柄编码 (gen << 32) | slot 的 32 槽
-    // 表,代际使同一句柄值的第二次 unlock 失败;锁本体是 BSD flock;
-    // 单线程假设与 C 版一致。
+    // 表,代际使同一句柄值的第二次 unlock 失败;锁本体是 BSD flock。
+    // 表变动全程 rt_lock 临界区(oracle rt_file.c zan_fh_lock 同款):
+    // 槽位无锁申领时两线程可同选一空槽,后注册者覆写先者的 fd 并顶掉
+    // 其代际——native_sync w0lk 在 CPU 抢占下闪 3/10(第十六批实证);
+    // open/flock/close 留在临界区外,与 C 版一致。
     static nint lk_fd_tbl;
     static nint lk_used_tbl;
     static nint lk_gen_tbl;
@@ -1030,11 +1040,13 @@ class zan {
         Span<long> uv = new Span<long>(lk_used_tbl, 32);
         Span<long> gv = new Span<long>(lk_gen_tbl, 32);
         long slot = -1;
+        rt_lock();
         int i = 0;
         while (slot < 0 && i < 32) {
             if (uv[i] == 0) { slot = i; uv[i] = 1; }
             i = i + 1;
         }
+        rt_unlock();
         if (slot < 0) { return 0; }
         // open 在 C 里是变参函数:缺口一之前 ngen 的第三参落寄存器残留
         // 值,文件以 040/100/200/740 等垃圾模式创建,确定性随链接布局
@@ -1054,16 +1066,23 @@ class zan {
 #else
         int fd = copen2(path, 524354, 420);
 #endif
-        if (fd < 0) { uv[(int)slot] = 0; return 0; }
-        if (cflock(fd, 6) != 0) { cclose(fd); uv[(int)slot] = 0; return 0; }
+        if (fd < 0) { rt_lock(); uv[(int)slot] = 0; rt_unlock(); return 0; }
+        if (cflock(fd, 6) != 0) {
+            cclose(fd);
+            rt_lock(); uv[(int)slot] = 0; rt_unlock();
+            return 0;
+        }
+        rt_lock();
         long next = gv[(int)slot] + 1;
         if (next == 4294967296L) {              // u32 代际回卷:退役该槽
             cclose(fd);
             uv[(int)slot] = 2;
+            rt_unlock();
             return 0;
         }
         gv[(int)slot] = next;
         fv[(int)slot] = fd;
+        rt_unlock();
         return next * 4294967296L + slot;
     }
 
@@ -1077,26 +1096,154 @@ class zan {
         Span<long> fv = new Span<long>(lk_fd_tbl, 32);
         Span<long> uv = new Span<long>(lk_used_tbl, 32);
         Span<long> gv = new Span<long>(lk_gen_tbl, 32);
-        if (uv[s] == 0 || gv[s] != gen) { return 0; }
+        rt_lock();
+        if (uv[s] == 0 || gv[s] != gen) { rt_unlock(); return 0; }
         int fd = (int)fv[s];
         fv[s] = -1;
         uv[s] = 0;
         long ng = gv[s] + 1;
         if (ng == 4294967296L) { ng = 1; }      // 同一句柄值二次 unlock 失败
         gv[s] = ng;
+        rt_unlock();
         cclose(fd);
         return 1;
     }
 
-    // ---- MemoryMappedFile.zan:自举不练习 mmap,诚实桩(与 C 一致) ----
-    public static long mmap_create(nint name, long size) { return 0; }
-    public static long mmap_open(nint name, long size) { return 0; }
-    public static long mmap_from_file(nint path, long size) { return 0; }
-    public static long mmap_map(long h, long size) { return 0; }
-    public static long mmap_unmap(long p, long size) { return 0; }
-    public static long mmap_flush(long p, long size) { return 0; }
-    public static long mmap_close(long h) { return 0; }
-    public static long mmap_unlink(nint name) { return 0; }
+    // ---- MemoryMappedFile.zan:POSIX shm 语义对照 oracle rt_sync.c。
+    // 句柄=16 字节块{int fd;int owner;nint namep}(owner=1 仅创建者,
+    // 其 close 或显式 unlink 才 shm_unlink;namep 单独分配避免指针运算)。
+    // darwin shm_open 是 variadic,但 Apple arm64 上变参同样走寄存器
+    // (w0/w1/w2),定参声明即正确投递;电池内跨句柄重开(x2 内进程)双批
+    // 验证为绿。跨进程重开他人创建的区域不可靠(mode 投递 EACCES 类,
+    // mp11 探针 errno=13),夹具一律走同进程 create/open 流;
+    // ELF/guest 车道不受影响(第十六批)。
+    [DllImport("crt", EntryPoint = "shm_open")]
+    public static extern int cshm_open(nint name, int oflag, int mode);
+    [DllImport("crt", EntryPoint = "shm_unlink")]
+    public static extern int cshm_unlink(nint name);
+    [DllImport("crt", EntryPoint = "ftruncate")]
+    public static extern int cftruncate(int fd, long len);
+    [DllImport("crt", EntryPoint = "fstat")]
+    public static extern int cfstat(int fd, nint buf);
+    [DllImport("crt", EntryPoint = "mmap")]
+    public static extern nint cmmap(nint addr, long len, int prot, int flags, int fd, long off);
+    [DllImport("crt", EntryPoint = "munmap")]
+    public static extern int cmunmap(nint addr, long len);
+    [DllImport("crt", EntryPoint = "msync")]
+    public static extern int cmsync(nint addr, long len, int flags);
+
+    // 把 C 字符串 name 复制成 "/name"(shm_open 要求前导斜杠;64 字节截断
+    // 与 oracle 的 snprintf(shm_name,64,"/%s") 一致)
+    public static nint shm_name_of(nint name) {
+        nint p = malloc(64);
+        Span<byte> b = new Span<byte>(p, 64);
+        b[0] = 47;
+        long n = cstrlen(name);
+        if (n > 62) { n = 62; }
+        if (n > 0) { memcpy(p + 1, name, n); }
+        new Span<byte>(p + 1 + n, 1)[0] = 0;
+        return p;
+    }
+
+    public static long mmap_create(nint name, long size) {
+        if (name == 0) { return 0; }
+        Span<byte> s0 = new Span<byte>(name, 1);
+        if (s0[0] == 0 || size <= 0) { return 0; }
+#if MACOS
+        int fl = 2 | 512 | 2048;             // O_RDWR|O_CREAT|O_EXCL
+#else
+        int fl = 2 | 64 | 128;
+#endif
+        nint np = shm_name_of(name);
+        int fd = cshm_open(np, fl, 384);     // 0600
+        if (fd < 0) { cfree(np); return 0; }
+        if (cftruncate(fd, size) != 0) {
+            cshm_unlink(np); cclose(fd); cfree(np); return 0;
+        }
+        nint h = malloc(16);
+        Span<int> hv = new Span<int>(h, 2);
+        hv[0] = fd; hv[1] = 1;
+        Span<long> hl = new Span<long>(h, 2);
+        hl[1] = (long)np;
+        return (long)h;
+    }
+
+    public static long mmap_open(nint name, long size) {
+        if (name == 0) { return 0; }
+        nint np = shm_name_of(name);
+        int fd = cshm_open(np, 2, 384);      // O_RDWR
+        if (fd < 0) { cfree(np); return 0; }
+        if (size > 0) {
+#if MACOS
+            nint sb = malloc(144);
+            long bad = cfstat(fd, sb) != 0 || new Span<long>(sb, 18)[12] != size;
+#else
+            nint sb = malloc(128);
+            long bad = cfstat(fd, sb) != 0 || new Span<long>(sb, 16)[6] != size;
+#endif
+            cfree(sb);
+            if (bad == 1) { cclose(fd); cfree(np); return 0; }
+        }
+        nint h = malloc(16);
+        Span<int> hv = new Span<int>(h, 2);
+        hv[0] = fd; hv[1] = 0;
+        Span<long> hl = new Span<long>(h, 2);
+        hl[1] = (long)np;
+        return (long)h;
+    }
+
+    public static long mmap_from_file(nint path, long size) {
+        if (path == 0) { return 0; }
+        int fd = copen2(path, 2);            // O_RDWR,无 O_CREAT
+        if (fd < 0) { return 0; }
+        if (size > 0 && cftruncate(fd, size) != 0) { cclose(fd); return 0; }
+        nint h = malloc(16);
+        Span<int> hv = new Span<int>(h, 2);
+        hv[0] = fd; hv[1] = 0;
+        Span<long> hl = new Span<long>(h, 2);
+        hl[1] = 0;                           // 无名:close 不 unlink
+        return (long)h;
+    }
+
+    public static long mmap_map(long h, long size) {
+        if (h == 0 || size <= 0) { return 0; }
+        Span<int> hv = new Span<int>((nint)h, 2);
+        nint p = cmmap(0, size, 3, 1, hv[0], 0);   // PROT_READ|WRITE, MAP_SHARED
+        if ((long)p == -1) { return 0; }
+        return (long)p;
+    }
+
+    public static long mmap_unmap(long p, long size) {
+        if (p == 0) { return 0; }
+        return cmunmap((nint)p, size) == 0 ? 1L : 0L;
+    }
+
+    public static long mmap_flush(long p, long size) {
+        if (p == 0) { return 1; }
+#if MACOS
+        return cmsync((nint)p, size, 16) == 0 ? 1L : 0L;   // MS_SYNC
+#else
+        return cmsync((nint)p, size, 4) == 0 ? 1L : 0L;
+#endif
+    }
+
+    public static long mmap_close(long h) {
+        if (h == 0) { return 0; }
+        Span<int> hv = new Span<int>((nint)h, 2);
+        Span<long> hl = new Span<long>((nint)h, 2);
+        cclose(hv[0]);
+        if (hv[1] == 1 && hl[1] != 0) { cshm_unlink((nint)hl[1]); cfree((nint)hl[1]); }
+        cfree((nint)h);
+        return 1;
+    }
+
+    public static long mmap_unlink(nint name) {
+        if (name == 0) { return 0; }
+        nint np = shm_name_of(name);
+        long r = cshm_unlink(np) == 0 ? 1L : 0L;
+        cfree(np);
+        return r;
+    }
 
     // ---- embed 族:native 车道无烘焙器,诚实空集。链接期弱符号
     // (localize_syms.py --weaken)——带内嵌资源的程序对象自带强定义,

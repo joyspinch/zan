@@ -35,7 +35,7 @@ FIXTURES=("$@")
 if (( ${#FIXTURES[@]} == 0 )); then
   FIXTURES=(kernel1 native_extern native_string_ops native_float_shapes
             native_varargs_elf native_digests native_memwide
-            native_rt_core native_sync native_varargs)
+            native_rt_core native_sync native_varargs fileinfoex_mmap)
 fi
 
 # 第十五批起 SKIP 清单为空:native_varargs 的 st_mode 偏移与 open 标志
@@ -97,6 +97,10 @@ GCCDIR="$SYSROOT/usr/lib/gcc/aarch64-alpine-linux-musl/13.2.1"
 #!/bin/sh
 /bin/busybox mount -t proc proc /proc 2>/dev/null
 /bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
+# POSIX shm_open 落在 /dev/shm/<name>:minirootfs 无此目录,mmap 族全部
+# ENOENT(第十六批探针 errno=2 实证),须自挂 tmpfs。
+/bin/busybox mkdir -p /dev/shm 2>/dev/null
+/bin/busybox mount -t tmpfs -o mode=777 shm /dev/shm 2>/dev/null
 /bin/busybox ip link set lo up 2>/dev/null || /bin/busybox ifconfig lo up 2>/dev/null
 /bin/busybox stty -onlcr 2>/dev/null
 /prog </dev/null 2>/dev/null

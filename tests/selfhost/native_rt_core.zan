@@ -70,6 +70,20 @@ class zanrt {
     public static extern nint EmbedList(string prefix);
     [DllImport("crt", EntryPoint = "zan_mmap_create")]
     public static extern long MmapCreate(string name, long size);
+    [DllImport("crt", EntryPoint = "zan_mmap_open")]
+    public static extern long MmapOpen(string name, long size);
+    [DllImport("crt", EntryPoint = "zan_mmap_from_file")]
+    public static extern long MmapFromFile(string path, long size);
+    [DllImport("crt", EntryPoint = "zan_mmap_map")]
+    public static extern long MmapMap(long h, long size);
+    [DllImport("crt", EntryPoint = "zan_mmap_unmap")]
+    public static extern long MmapUnmap(long v, long size);
+    [DllImport("crt", EntryPoint = "zan_mmap_flush")]
+    public static extern long MmapFlush(long v, long size);
+    [DllImport("crt", EntryPoint = "zan_mmap_close")]
+    public static extern long MmapClose(long h);
+    [DllImport("crt", EntryPoint = "zan_mmap_unlink")]
+    public static extern long MmapUnlink(string name);
     [DllImport("crt", EntryPoint = "zan_file_remove")]
     public static extern int FileRemove(string path);
     [DllImport("crt", EntryPoint = "zan_plat_net_interfaces")]
@@ -452,13 +466,11 @@ class zanrt {
         Console.WriteLine(FileLength(tf));
         Console.WriteLine(FileAttributes(tf));
         Console.WriteLine(FileTime(tf, 0) > 0);
-        // set_time 的 syscall 在部分受限环境拒绝(相对路径 utimensat)，
-        // 钉"返回值与回读一致"而非具体值:成功则 mtime 必为所设值，
-        // 失败则 mtime 必保持当前时间——任何环境下的正确实现都为 true。
-        // (不用 bool 三元:WriteLine 对三元结果按 int 传递,打印 0/1。)
-        long st = FileSetTime(tf, 0, 1000000000);
-        Console.WriteLine((st == 1 && FileTime(tf, 0) == 1000000000)
-            || (st == 0 && FileTime(tf, 0) != 1000000000));
+        // set_time:相对路径依赖 AT_FDCWD,两平台常量不同(darwin -2 /
+        // linux -100);第十六批前 darwin 臂硬编码 -100,相对路径必 EBADF。
+        // 严格契约:设置必成功且回读必等所设值。
+        Console.WriteLine(FileSetTime(tf, 0, 1000000000) == 1);
+        Console.WriteLine(FileTime(tf, 0) == 1000000000);
         // read_path:工作目录里存在 → "";缺失的相对路径($ZAN_PKG_DIR
         // 与可执行文件旁都没有)→ ""。
         nint rp1 = ReadPath(tf);
@@ -475,13 +487,50 @@ class zanrt {
         Console.WriteLine(TryLock(tf) == 0);
         Console.WriteLine(Unlock(lk) == 1);
         Console.WriteLine(Unlock(lk) == 0);
-        // embed 族诚实空集;mmap 诚实桩;remove 后属性 -1。
+        // embed 族诚实空集;remove 后属性 -1。
         Console.WriteLine(EmbedHas("no-such-embed") == 0);
         nint el = EmbedList("");
         Console.WriteLine(new Span<byte>(el, 1)[0] == 0);
-        Console.WriteLine(MmapCreate("no-such-mm", 16) == 0);
         Console.WriteLine(FileRemove(tf) == 0);
         Console.WriteLine(FileAttributes(tf) == -1);
+        // mmap 族(第十六批真实现,对照 oracle rt_sync.c)。走"创建句柄直
+        // 用"序列:创建/O_EXCL 二创必败/映射写读/flush/unmap/owner-close
+        // 即 unlink。不跨句柄 MmapOpen——darwin 上 ngen 对 variadic libc
+        // 尾参(mode)的投递缺口使 PSHM 区域 mode 为垃圾、重开必 EACCES
+        // (v18o13 zan_open_creat 同族,ELF/guest 车道不受影响)。
+        MmapUnlink("zan_rt_mm");
+        long mh = MmapCreate("zan_rt_mm", 4096);
+        Console.WriteLine(mh != 0);
+        Console.WriteLine(MmapCreate("zan_rt_mm", 4096) == 0);
+        nint mv = MmapMap(mh, 4096);
+        Console.WriteLine(mv != 0);
+        new Span<int>(mv, 1)[0] = 4211;
+        Console.WriteLine(MmapFlush(mv, 4096) == 1);
+        Console.WriteLine(MmapUnmap(mv, 4096) == 1);
+        Console.WriteLine(MmapClose(mh) == 1);
+        Console.WriteLine(MmapUnlink("zan_rt_mm") == 0);
+        Console.WriteLine(MmapCreate("", 16) == 0);
+        Console.WriteLine(MmapCreate("zan_rt_mm2", 0) == 0);
+        // 文件映射:写 16 字节→from_file 截到 16→map 改首字节→flush 持
+        // 久化→close→读回验证(MAP_SHARED 文件路径)。
+        string mf = "zan_rt_mm_file.bin";
+        long fw = FileOpen(mf, "w");
+        FileWrite(fw, "0123456789abcdef", 16);
+        FileClose(fw);
+        long fh2 = MmapFromFile(mf, 16);
+        Console.WriteLine(fh2 != 0);
+        nint fvv = MmapMap(fh2, 16);
+        Console.WriteLine(fvv != 0);
+        new Span<byte>(fvv, 16)[0] = 88;
+        Console.WriteLine(MmapFlush(fvv, 16) == 1);
+        Console.WriteLine(MmapUnmap(fvv, 16) == 1);
+        Console.WriteLine(MmapClose(fh2) == 1);
+        long fr3 = FileOpen(mf, "r");
+        nint rb = Malloc(16);
+        Console.WriteLine(FileRead(fr3, rb, 16) == 16 && new Span<byte>(rb, 16)[0] == 88);
+        FileClose(fr3);
+        free(rb);
+        Console.WriteLine(FileRemove(mf) == 0);
         // ---- 第四批:network 半边 ----
         // net_interfaces 结构不变量:非空、每行恰 4 个 '\t' 且以 '\n'
         // 结尾、含 lo0(macOS 回环接口恒在)。
