@@ -46,7 +46,8 @@ if (( ${#FIXTURES[@]} == 0 )); then
             native_dict_packed_out native_lexical native_local_frame
             native_spans native_int_fieldinit native_int_narrow
             native_int_narrow2 native_numeric_runtime native_fnptr
-            native_generic_overload_fit native_float_return_arg)
+            native_generic_overload_fit native_float_return_arg
+            native_cstring_read)
 fi
 
 # 第十五批起 SKIP 清单为空:native_varargs 的 st_mode 偏移与 open 标志
@@ -114,6 +115,9 @@ GCCDIR="$SYSROOT/usr/lib/gcc/aarch64-alpine-linux-musl/13.2.1"
 /bin/busybox mount -t tmpfs -o mode=777 shm /dev/shm 2>/dev/null
 /bin/busybox ip link set lo up 2>/dev/null || /bin/busybox ifconfig lo up 2>/dev/null
 /bin/busybox stty -onlcr 2>/dev/null
+# getenv("PATH") 等环境面与 darwin 车道对齐:内核给 init 的环境近乎空,
+# 不导出则 native_cstring_read 的 p.Length>0 在 guest 里翻 false。
+export PATH=/bin:/usr/bin
 /prog </dev/null 2>/dev/null
 echo "prog exit=$?"
 /bin/busybox poweroff -f

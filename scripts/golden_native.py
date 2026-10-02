@@ -106,8 +106,9 @@ def main():
     work = args.work or Path(tempfile.mkdtemp(prefix='zan-golden-native-'))
     counts = Counter()
     for case in args.cases:
-        src = args.suite / (case + '.zan')
-        golden = args.suite / (case + '.out')
+        # resolve:子进程 cwd 换到 cdir,相对 suite 路径会在那里失效
+        src = (args.suite / (case + '.zan')).resolve()
+        golden = (args.suite / (case + '.out')).resolve()
         if not src.is_file() or not golden.is_file():
             print(f'FAIL {case}: missing source or golden', flush=True)
             counts['missing'] += 1
