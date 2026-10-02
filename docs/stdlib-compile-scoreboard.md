@@ -2008,3 +2008,33 @@ rcf 17；fileinfoex_mmap 本轮记 mne——净沙箱下双侧同打 FileNotFoun
 定向对拍的 om 是泄漏次序效应，两侧 stdlib 异常映射本就同构）。纪律实证：纯注释
 源码编辑也改变 runtime_core.o 字节（trio16b/c 在 26857 偏移处分叉——对象内嵌源生
 数据），"重建后再断言"是字节级强制。
+## v18o-29 批（2026-10-02，golden 越界验证批；sweep 维持 572/619，golden 总覆盖 572→588/624；检查点仍 v18o-26——零编译器/运行时源改动）
+
+对拍只比 native vs reference，oracle 跑不完的 52 例（rcf 17 + rto 7 + em 3 +
+mne 18 + 楔死排除 5 + om 2）的原生输出从未对过 conformance golden。新工具
+scripts/golden_native.py 补这个洞：完整原生流水线（stdlib + OpenSSL + 从对拍
+工件里 scavange 的 reference 自带 DllImport 驱动 dylib），不跑 oracle，直接对
+golden 差分。结果：**16/52 原生过 golden**——rto 7/7 全过（oracle 纯属自己慢：
+http_client_redirect/http_forwarder_keepalive/http_forwarder_tunnel/sqlserver_tds
+四例此前从未原生执行过）、楔死排除 4/5 过（cmc/dwv/ifb/sal）、
+namespace_qualified_call + process_control_smoke 过（rcf=oracle 解析器陈旧）、
+process_list_smoke 过（em）、http_server_stress + http_forwarder_stream 过
+（om——原生与 golden 逐字节一致，oracle 才是偏离方）。两个真发现：
+1. **system_contract_v1 = 夹具环境缺陷**：写 _scratch/ 前不建目录，干净 cwd
+   下双侧同抛 IOException（实证 mkdir _scratch 后原生 ok:1）；同族缺陷
+   fileinfoex_mmap 当初加了 Directory.CreateDirectory，此夹具漏加。
+2. **redis_client = 我方真崩溃**（本工具首发）：异步续体
+   RedisClient_sendArgs__body$resume+820 解引用 NULL（ldr x0,[x0,#0x58] =
+   this.tls 而 this==NULL；帧盒 this 槽 frame[0x48] 在挂起与恢复之间被清零）
+   ——空闲端口复现、PING-only 裁剪夹具仍崩、io_deliver/io_resume 插桩证明崩溃
+   续体不经运行时反应器（零 trace），由编译器引擎就绪队列
+   （_zan_co_sched_run_until 直呼 resume）驱动。根因在异步降级（ngen_async）
+   ——该文件归并发写者，修复路由给异步引擎批，证据链如上。oracle 今天在同一
+   夹具上楔死（v18o-27 sweep 时双侧通过），本轮 oracle 退出楔死现象仍属环境
+   类、未解。其余 36 例分类：Windows-only golden 在 mac 上双侧同抛 PNSE 族
+   （win_device/serviceprocess/tray_screen、registry、shortcut、clipboard、
+   management、app_update、ws_cluster_bus）；darwin oracle 缺陷族
+   （fileinfoex_mmap/mmap_owner 16K 量子；chart_* cwd 资产 FNF 双侧同炸）；
+   embed 族 mac 上双侧诚实空（file_embed_bytes/subdir oracle 也打 0/FNF）；
+   gui/cef/designer 簇 17 例 = 原生运行时尚无 gui 子系统（已知空域，
+   zan_gui_* 链接失败）；http_client_keepalive 第 21 行网络闪失（em）。
