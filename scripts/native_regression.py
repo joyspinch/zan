@@ -39,6 +39,12 @@ def main():
         ROOT / 'tests/selfhost/native_retarget.zan',
         # 第十九批:cstring 读面(getenv/strchr 头部扫描约定)进电池
         ROOT / 'tests/selfhost/native_cstring_read.zan',
+        # 第二十批:原"排除席"三人转正——golden_native 驱动库解析 +
+        # harness 复刻(_scratch/数据链)后三例原生稳过金档,与 darwin
+        # 电池链路(runtime_core.o 单对象)3/3 实测兼容。
+        ROOT.parent / 'zan-lang/tests/conformance/struct_arc_lifetime.zan',
+        ROOT.parent / 'zan-lang/tests/conformance/dictionary_wide_values.zan',
+        ROOT.parent / 'zan-lang/tests/conformance/int_format_boundaries.zan',
         # 第十八批:ELF 车道普查(55/71 绿)后收编的九席——async 族首次进
         # 电池(redis_client 崩溃所在引擎的常备门),外加 int/dict 面。
         ROOT / 'tests/selfhost/json_ignore_ok.zan',

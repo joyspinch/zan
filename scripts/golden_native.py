@@ -19,6 +19,28 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CONF = ROOT.parent / 'zan-lang/tests/conformance'
+DRIVERS = ROOT.parent / 'zan-lang/stdlib'
+_driver_index = None
+
+
+def driver_dylibs(undef):
+    """DllImport 驱动库解析:stdlib **/drivers/macos-arm64 里按导出符号
+    覆盖未定义集的 dylib。GUI 家族的金档检查此前没有这一步,弱未定
+    符号落成空指针调用,进程在 Window_ctor 里不可杀地停驻(U 状态,
+    SIGKILL 与调试器暂停都无效,chart_axis_dataminmax 实证),把整条
+    检查队列冻死。"""
+    global _driver_index
+    if _driver_index is None:
+        _driver_index = []
+        for dylib in sorted(DRIVERS.glob('**/drivers/macos-arm64/*.dylib')):
+            try:
+                exp = subprocess.check_output(
+                    ['nm', '-gU', '--defined-only', str(dylib)], text=True)
+            except (subprocess.CalledProcessError, OSError):
+                continue
+            syms = {ln.split()[-1] for ln in exp.splitlines() if ln.strip()}
+            _driver_index.append((dylib, syms))
+    return [dylib for dylib, syms in _driver_index if undef & syms]
 
 
 def reference_dylibs(refexe):
@@ -115,13 +137,34 @@ def main():
             continue
         cdir = work / f'golden-{case}'
         cdir.mkdir(parents=True, exist_ok=True)
-        (cdir / 'stdlib').symlink_to(ROOT / 'stdlib', target_is_directory=True)
+        sl = cdir / 'stdlib'
+        if not sl.exists():
+            sl.symlink_to(ROOT / 'stdlib', target_is_directory=True)
+        # 编译前摘掉残留数据链/scratch:上一例失败现场会把含 .zan 的树
+        # 留在 cdir,编译器会把它当源码收编(examples/gui_charts 的 Gui
+        # 命名空间撞车实证)。
+        for junk in ('tests', 'examples'):
+            tj = cdir / junk
+            if tj.is_symlink() or tj.exists():
+                tj.unlink()
 
         def run(phase, cmd, timeout=120):
-            proc = subprocess.run(cmd, cwd=cdir, capture_output=True, timeout=timeout)
-            (cdir / (phase + '.stderr')).write_bytes(proc.stderr)
-            (cdir / (phase + '.stdout')).write_bytes(proc.stdout)
-            return proc.returncode, proc.stdout
+            # 不可杀子进程版 subprocess.run:UE 停驻(S 状态查不出,kill
+            # 后仍不退)时 communicate 二段 15s 死线,超了就弃例继续,
+            # 返回 rc=None 由调用方记 wedge。
+            p = subprocess.Popen(cmd, cwd=cdir, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+            try:
+                out, err = p.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                try:
+                    out, err = p.communicate(timeout=15)
+                except subprocess.TimeoutExpired:
+                    return None, b''
+            (cdir / (phase + '.stderr')).write_bytes(err)
+            (cdir / (phase + '.stdout')).write_bytes(out)
+            return p.returncode, out
 
         rc, err = run('compile', [str(args.seed), str(cdir / 'native.o'), str(src)])
         if rc != 0:
@@ -130,16 +173,27 @@ def main():
             counts['compile_failed'] += 1
             continue
 
+        undef = set()
+        try:
+            ul = subprocess.check_output(['nm', '-u', str(cdir / 'native.o')],
+                                         text=True)
+            undef = {ln.strip() for ln in ul.splitlines() if ln.strip()}
+        except (subprocess.CalledProcessError, OSError):
+            pass
+        drivers = driver_dylibs(undef)
+        drpaths = sorted({str(d.parent) for d in drivers})
+
         reflibs, rpaths = [], []
         refexe = find_reference(case, artifacts)
         if refexe:
             reflibs, rpaths = reference_dylibs(refexe)
-        rpath_args = [x for r in rpaths for x in ('-rpath', r)]
+        rpath_args = [x for r in rpaths + drpaths for x in ('-rpath', r)]
         rc, err = run('link', ['/usr/bin/ld', '-arch', 'arm64', '-e', '_main',
                                '-platform_version', 'macos', '11.0', version,
                                '-syslibroot', sdk, '-L' + sdk + '/usr/lib',
                                '-undefined', 'dynamic_lookup',
-                               *extra_libs, *reflibs, *rpath_args,
+                               *extra_libs, *reflibs, *map(str, drivers),
+                               *rpath_args,
                                '-o', str(cdir / 'native'), str(cdir / 'native.o'),
                                *map(str, args.runtime), '-lSystem'])
         if rc != 0:
@@ -148,11 +202,26 @@ def main():
             counts['link_failed'] += 1
             continue
 
-        try:
-            rc, out = run('run', [str(cdir / 'native')])
-        except subprocess.TimeoutExpired:
-            print(f'FAIL {case}: run timeout', flush=True)
-            counts['run_timeout'] += 1
+        # 数据链与 scratch 只在 RUN 前落位:编译期 cdir 里多出含 .zan 的
+        # 树会被编译器当源码收编(examples/gui_charts 的 Gui 命名空间
+        # 撞车实证),编译期只许 stdlib 一条链。
+        for lnk, src in (('tests', CONF.parent.parent / 'tests'),
+                         ('examples', CONF.parent.parent / 'examples')):
+            tl = cdir / lnk
+            if tl.is_symlink() and tl.readlink() == src:
+                pass
+            else:
+                if tl.is_symlink() or tl.exists():
+                    tl.unlink()
+                tl.symlink_to(src, target_is_directory=True)
+        sc = cdir / '_scratch'
+        if not sc.exists():
+            sc.mkdir()
+
+        rc, out = run('run', [str(cdir / 'native')], timeout=60)
+        if rc is None:
+            print(f'FAIL {case}: run wedge (unkillable child)', flush=True)
+            counts['run_wedge'] += 1
             continue
         if out == golden.read_bytes():
             print(f'PASS {case}', flush=True)
