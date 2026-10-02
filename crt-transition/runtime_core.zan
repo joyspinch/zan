@@ -1045,7 +1045,15 @@ class zan {
         // 变参调用,mode 0644 经 ELF 寄存器/Apple 栈两条 ABI 车道金标
         // (native_varargs*,vamode=33188=S_IFREG|0644)验证,与 C 版
         // 创建语义逐位一致。
+        // flags=O_CLOEXEC|O_CREAT|O_RDWR 按目标编码:darwin 0x1000202
+        // (O_CREAT=0x200);Linux asm-generic 0x80000|0x40|0x2=524354
+        // (O_CREAT=0x40,O_CLOEXEC=0x80000)——darwin 常量在 Linux 上
+        // 恰无创建位,不存在即 ENOENT,首锁必败(native_sync w0lk)。
+#if MACOS
         int fd = copen2(path, 16777730, 420);
+#else
+        int fd = copen2(path, 524354, 420);
+#endif
         if (fd < 0) { uv[(int)slot] = 0; return 0; }
         if (cflock(fd, 6) != 0) { cclose(fd); uv[(int)slot] = 0; return 0; }
         long next = gv[(int)slot] + 1;
@@ -1323,7 +1331,12 @@ class zan {
                 Span<byte> sb = new Span<byte>(dns_wake, 1);
                 sb[0] = 120;                              // 'x'
                 int fl = cfcntl(dns_pipe_r, 3, 0);        // F_GETFL
+                // O_NONBLOCK 按目标:darwin 0x4,Linux 0x800。
+#if MACOS
                 if (fl >= 0) { cfcntl(dns_pipe_r, 4, fl | 4); }   // F_SETFL | O_NONBLOCK
+#else
+                if (fl >= 0) { cfcntl(dns_pipe_r, 4, fl | 2048); }   // F_SETFL | O_NONBLOCK
+#endif
             } else if (rr != 0) {
                 cfree(rr);
             }
@@ -1381,20 +1394,30 @@ class zan {
         return (int)(~sum & 0xFFFFL);
     }
 
-    // AF_LINK sockaddr → "AA:BB:..." 大写十六进制(对照 zan_mac_from_
-    // sockaddr:sdl_nlen@5 sdl_alen@6 LLADDR=data+nlen,alen 限 1..8)
+    // 链路层 sockaddr → "AA:BB:..." 大写十六进制。darwin AF_LINK(18):
+    // sdl_nlen@5 sdl_alen@6 LLADDR=data@8+nlen;Linux AF_PACKET(17):
+    // sll_halen@11 sll_addr@12(无名字前缀,nlen=0)。alen 都限 1..8。
     static void mac_from_sa(nint sa, nint outp) {
         Span<byte> sv = new Span<byte>(sa, 32);
+#if MACOS
         int fam = sv[1];   // sa_family_t 是 u8;sv[2] 起是 sdl_index,不能并入
         if (fam != 18) { return; }                  // AF_LINK
         int nlen = sv[5];
         int alen = sv[6];
+        int dataAt = 8 + nlen;
+#else
+        int fam = sv[0];   // sa_family_t u16 低字节
+        if (fam != 17) { return; }                  // AF_PACKET
+        int nlen = 0;
+        int alen = sv[11];                          // sll_halen
+        int dataAt = 12;                            // sll_addr
+#endif
         if (alen <= 0 || alen > 8) { return; }
         Span<byte> ov = new Span<byte>(outp, 32);
         int used = 0;
         int i = 0;
         while (i < alen && used + 3 < 32) {
-            int b = sv[8 + nlen + i];
+            int b = sv[dataAt + i];
             int hi = b >>> 4;
             int lo = b & 15;
             if (i != 0) { ov[used] = 58; used = used + 1; }
@@ -1479,11 +1502,19 @@ class zan {
                                     mac_from_sa(sa, net_buf + 67584L);
                                 }
                                 Span<byte> sv = new Span<byte>(sa, 3);
+#if MACOS
                                 int fam = sv[1];  // sa_family_t 是 u8
+#else
+                                int fam = sv[0] == 10 ? 30 : sv[0];  // AF6 归一
+#endif
                                 if (fam == 2 || fam == 30) {
                                     nint src = fam == 2 ? sa + 4L : sa + 8L;
                                     nint ntopp = net_buf + 67616L;
+#if MACOS
                                     cinet_ntop(fam, src, ntopp, 64);
+#else
+                                    cinet_ntop(fam == 30 ? 10 : fam, src, ntopp, 64);
+#endif
                                     long tl = cstrlen(ntopp);
                                     if (tl != 0 && addrUsed + tl + 2 < 2048) {
                                         nint addrp = net_buf + 65536L;
@@ -1769,12 +1800,20 @@ class zan {
         if (ab == 0) { cabort(); }      // C 版缓冲永不失败;分配死即 abort
         if (sa != 0) {
             Span<byte> sv = new Span<byte>(sa, 2);
+#if MACOS
             int fam = sv[1];                       // sa_family u8
+#else
+            int fam = sv[0] == 10 ? 30 : sv[0];    // AF6 归一(见 family)
+#endif
             if (fam == 2) {
                 if (cinet_ntop(2, sa + 4L, ab, 128) != 0) { return ab; }
             }
             else if (fam == 30) {
+#if MACOS
                 if (cinet_ntop(30, sa + 8L, ab, 128) != 0) { return ab; }
+#else
+                if (cinet_ntop(10, sa + 8L, ab, 128) != 0) { return ab; }
+#endif
             }
         }
         memset(ab, 0, 1);
@@ -1821,10 +1860,18 @@ class zan {
     }
 
     // rt_io.c:615:AF_INET 需 len>=16,AF_INET6 需 len>=28,否则 0。
+    // sa_family 位置按目标:darwin 是 u8@1(前有 sa_len);Linux
+    // (sockaddr_generic/POSIX)是 u16@0。AF_INET6 的值也按目标:
+    // darwin 30,Linux 10——读侧一律归一成 30(darwin 正典,调用方
+    // 与金样都用 30 比较),只有进 libc 的 domain 参数用原生值。
     public static int io_sockaddr_family(nint sa, int len) {
         if (sa == 0 || len < 2) { return 0; }
         Span<byte> sv = new Span<byte>(sa, 2);
+#if MACOS
         int fam = sv[1];                           // sa_family u8
+#else
+        int fam = sv[0] == 10 ? 30 : sv[0];        // u16 低字节,AF6 归一
+#endif
         if (fam == 2 && len >= 16) { return 2; }
         if (fam == 30 && len >= 28) { return 30; }
         return 0;
@@ -1946,11 +1993,21 @@ class zan {
         nint p = rv[0];
         Span<long> pv = new Span<long>(p, 6);
         int fam = (int)(pv[0] >>> 32);
+#if !MACOS
+        if (fam == 10) { fam = 30; }               // AF_INET6 linux=10 归一
+#endif
         long len = fam == 30 ? 28L : fam == 2 ? 16L : 0L;
         long addrlen = pv[2] & 0xFFFFFFFFL;
         int r = 0;
         if (len != 0 && len <= cap && addrlen == len) {
+            // struct addrinfo 布局差:darwin ai_canonname@24 先于
+            // ai_addr@32;POSIX/Linux 反过来(ai_addr@24)。ai_addrlen@16
+            // 与 ai_family@4 两平台相同。
+#if MACOS
             nint addr = (nint)pv[4];
+#else
+            nint addr = (nint)pv[3];
+#endif
             memcpy(buf, addr, len);
             r = (int)len;
         }
@@ -1980,9 +2037,18 @@ class zan {
         Span<long> pv = new Span<long>(p, 6);
         int addr = 0;
         if ((int)(pv[0] >>> 32) == 2) {
-            nint sa = (nint)pv[4];
+#if MACOS
+            nint sa = (nint)pv[4];                 // darwin ai_addr@32
+#else
+            nint sa = (nint)pv[3];                 // linux ai_addr@24
+#endif
             Span<byte> sv = new Span<byte>(sa, 8);
-            if (sv[1] == 2) {
+#if MACOS
+            int sfam = sv[1];                      // sa_family u8
+#else
+            int sfam = sv[0];                      // sa_family_t u16 低字节
+#endif
+            if (sfam == 2) {
                 addr = (int)((sv[4] & 255L) | ((sv[5] & 255L) << 8) | ((sv[6] & 255L) << 16) | ((sv[7] & 255L) << 24));
             }
         }
@@ -2024,7 +2090,11 @@ class zan {
         nint p = head;
         while (p != 0) {
             Span<long> pv = new Span<long>(p, 6);
-            nint addr = (nint)pv[4];
+#if MACOS
+            nint addr = (nint)pv[4];              // darwin ai_addr@32
+#else
+            nint addr = (nint)pv[3];              // linux ai_addr@24
+#endif
             long addrlen = pv[2] & 0xFFFFFFFFL;
             int fam = io_sockaddr_family(addr, (int)addrlen);
             long len = fam == 30 ? 28L : fam == 2 ? 16L : 0L;
@@ -2063,7 +2133,11 @@ class zan {
     static int io_set_nonblocking(long fd) {
         int flags = cfcntl((int)fd, 3, 0);         // F_GETFL
         if (flags < 0) { return -1; }
+#if MACOS
         return cfcntl((int)fd, 4, flags | 4);      // F_SETFL|O_NONBLOCK
+#else
+        return cfcntl((int)fd, 4, flags | 2048);   // F_SETFL|O_NONBLOCK
+#endif
     }
 
     // rt_io.c:881:非阻塞 connect;0 已建立,-2 进行中,其余正 errno 或 -1。
@@ -3999,12 +4073,17 @@ class zan {
             io_resume(frame, step);
             return;
         }
-        // 字面量(AF_INET/AF_INET6):无 DNS、无 worker
+        // 字面量(AF_INET/AF_INET6):无 DNS、无 worker。pton 的
+        // domain 按目标原生值(darwin 30,Linux 10)。
         nint a4 = calloc(1, 16);
-        nint a6 = calloc(1, 16);
+        nint a6 = calloc(1, 28);
         int lit = 0;
         if (cinet_pton(2, name, a4) == 1) { lit = 1; }
+#if MACOS
         else if (cinet_pton(30, name, a6) == 1) { lit = 1; }
+#else
+        else if (cinet_pton(10, name, a6) == 1) { lit = 1; }
+#endif
         cfree(a4);
         cfree(a6);
         if (lit == 1) {

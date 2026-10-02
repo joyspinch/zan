@@ -6,6 +6,7 @@
 # Default fixtures: kernel1 native_extern native_string_ops
 #                   native_float_shapes native_varargs_elf
 #                   native_digests native_memwide
+#                   native_rt_core native_sync
 #
 # Pipeline per fixture: zanc (ZAN_TARGET=aarch64-linux) -> ELF object ->
 # ld.lld static link with the localized Zan runtime (ELF) and musl
@@ -33,14 +34,12 @@ GCC_VER="13.2.1_git20240309-r1"
 FIXTURES=("$@")
 if (( ${#FIXTURES[@]} == 0 )); then
   FIXTURES=(kernel1 native_extern native_string_ops native_float_shapes
-            native_varargs_elf native_digests native_memwide)
+            native_varargs_elf native_digests native_memwide
+            native_rt_core native_sync native_varargs)
 fi
 
-# Fixtures pinned to macOS byte layouts, excluded from the guest lane:
-#   native_varargs -- reads raw struct stat bytes (st_mode at the macOS
-#   offset) and raw fcntl flag bits; musl's struct stat layout differs.
-#   The ABI-focused golden native_varargs_elf covers the guest lane.
-SKIP=(native_varargs)
+# 第十五批起 SKIP 清单为空:native_varargs 的 st_mode 偏移与 open 标志
+# 已改为按目标的 #if 双臂,单一 golden 同时覆盖 darwin 与 guest。
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] ||
@@ -98,6 +97,7 @@ GCCDIR="$SYSROOT/usr/lib/gcc/aarch64-alpine-linux-musl/13.2.1"
 #!/bin/sh
 /bin/busybox mount -t proc proc /proc 2>/dev/null
 /bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
+/bin/busybox ip link set lo up 2>/dev/null || /bin/busybox ifconfig lo up 2>/dev/null
 /bin/busybox stty -onlcr 2>/dev/null
 /prog </dev/null 2>/dev/null
 echo "prog exit=$?"
@@ -177,12 +177,6 @@ run_one() {
 
 echo 'Linux userspace lane (compile -> localize/link -> guest boot -> diff):'
 for name in "${FIXTURES[@]}"; do
-  skip=0
-  for s in "${SKIP[@]}"; do [[ "$name" == "$s" ]] && skip=1; done
-  if (( skip )); then
-    echo "$name: SKIP (macOS-layout fixture, see SKIP list)"
-    continue
-  fi
   run_one "$name" || failures=$((failures + 1))
 done
 if (( failures > 0 )); then

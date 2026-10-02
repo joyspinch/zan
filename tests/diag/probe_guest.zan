@@ -1,0 +1,199 @@
+// Batch-15 diagnostic probe (NOT a battery fixture; lives in tests/diag/
+// so neither regression lane picks it up): raw values for the guest-lane
+// divergences in native_rt_core's resolver/socket region. The frozen .out
+// is the darwin reference; guest raws legitimately differ (heap pointers,
+// kernel AF_INET6=10 before runtime-face normalization). The probe
+// root-caused the 30-vs-10 family split, now normalized in runtime_core
+// (io_sockaddr_family / io_resolve_sa / resolve_sa_co pton).
+using System;
+
+class probe {
+    [DllImport("crt", EntryPoint = "malloc")]
+    public static extern nint Malloc(long n);
+    [DllImport("crt", EntryPoint = "memset")]
+    public static extern nint Memset(nint p, int v, long n);
+    [DllImport("crt", EntryPoint = "zan_io_resolve_sa")]
+    public static extern int ResolveSa(nint name, int port, nint buf, int cap);
+    [DllImport("crt", EntryPoint = "zan_io_resolve_ipv4")]
+    public static extern int ResolveV4(nint hostname);
+    [DllImport("crt", EntryPoint = "zan_io_sockaddr_family")]
+    public static extern int Family(nint sa, int len);
+    [DllImport("crt", EntryPoint = "zan_io_resolve_all")]
+    public static extern int ResolveAll(nint name, int port, nint buf, int cap);
+    [DllImport("crt", EntryPoint = "zan_io_poll")]
+    public static extern long Poll(long timerWaitNs);
+    [DllImport("crt", EntryPoint = "zan_resolve_sa_co")]
+    public static extern void ResolveSaCo(string name, long port, nint buf, long cap, long frame, long step, nint outn);
+    [DllImport("crt", EntryPoint = "zan_resolve_ipv4_co")]
+    public static extern void ResolveIpv4Co(string name, long frame, long step, nint outn);
+    [DllImport("crt", EntryPoint = "socketpair")]
+    public static extern int SocketPair(int domain, int type, int proto, nint sv);
+    [DllImport("crt", EntryPoint = "zan_io_recv_co")]
+    public static extern void RecvCo(long fd, nint buf, long len, long frame, long step, nint outn);
+    [DllImport("crt", EntryPoint = "zan_io_close_notify")]
+    public static extern void CloseNotify(long fd);
+    [DllImport("crt", EntryPoint = "write")]
+    public static extern long Write(long fd, nint buf, long n);
+    [DllImport("crt", EntryPoint = "close")]
+    public static extern int Close(int fd);
+    [DllImport("crt", EntryPoint = "zan_pkg_fopen")]
+    public static extern nint FOpen(string path, string mode);
+    [DllImport("crt", EntryPoint = "zan_file_read")]
+    public static extern long FileRead(long h, nint buf, long count);
+    [DllImport("crt", EntryPoint = "zan_file_close")]
+    public static extern int FileClose(long h);
+    [DllImport("crt", EntryPoint = "getaddrinfo")]
+    public static extern int Gai(nint name, nint service, nint hints, nint res);
+    [DllImport("crt", EntryPoint = "freeaddrinfo")]
+    public static extern void FreeGai(nint res);
+    [DllImport("crt", EntryPoint = "gai_strerror")]
+    public static extern nint GaiStrError(int rc);
+    [DllImport("crt", EntryPoint = "strlen")]
+    public static extern long StrLen(nint s);
+
+    static long RS(nint p) {
+        Span<long> s = new Span<long>(p, 1);
+        return s[0];
+    }
+
+    static void WS(nint p, long v) {
+        Span<long> s = new Span<long>(p, 1);
+        s[0] = v;
+    }
+
+    static int Main() {
+        // ---- raw getaddrinfo, fully non-overlapping buffers ----
+        nint nm = Malloc(32);
+        Memset(nm, 0, 32);
+        Span<byte> nv = new Span<byte>(nm, 32);
+        nv[0] = 108; nv[1] = 111; nv[2] = 99; nv[3] = 97; nv[4] = 108; nv[5] = 104; nv[6] = 111; nv[7] = 115; nv[8] = 116;
+        nint pstr = Malloc(8);
+        Span<byte> pv2 = new Span<byte>(pstr, 8);
+        pv2[0] = 56; pv2[1] = 48;   // "80"
+        nint hints = Malloc(48);
+        Memset(hints, 0, 48);
+        Span<long> hv2 = new Span<long>(hints, 6);
+        nint resp = Malloc(8);
+        Memset(resp, 0, 8);
+        // AF_INET
+        hv2[0] = 2L << 32;
+        hv2[1] = 1;
+        int rc4 = Gai(nm, pstr, hints, resp);
+        Console.WriteLine("gai4 rc " + rc4 + " err " + ErrStr(rc4));
+        DumpAi(resp);
+        // AF_UNSPEC
+        Memset(resp, 0, 8);
+        hv2[0] = 0;
+        int rcu = Gai(nm, pstr, hints, resp);
+        Console.WriteLine("gaiu rc " + rcu + " err " + ErrStr(rcu));
+        DumpAi(resp);
+        // ---- sync resolver raw shapes ----
+        nint sb = Malloc(96);
+        // ---- sync resolver raw shapes ----
+        Memset(sb, 0, 96);
+        Span<byte> bv = new Span<byte>(sb, 96);
+        bv[0] = 108; bv[1] = 111; bv[2] = 99; bv[3] = 97; bv[4] = 108; bv[5] = 104; bv[6] = 111; bv[7] = 115; bv[8] = 116;
+        int rs4 = ResolveSa(sb, 80, sb + 16, 96);
+        Console.WriteLine("rsa_ret " + rs4);
+        Console.WriteLine("fam " + Family(sb + 16, rs4));
+        Console.WriteLine("b " + bv[16] + "," + bv[17] + "," + bv[18] + "," + bv[19] + "," + bv[20] + "," + bv[21] + "," + bv[22] + "," + bv[23]);
+        Console.WriteLine("v4 " + ResolveV4(sb));
+        int ra = ResolveAll(sb, 80, sb + 32, 96);
+        Console.WriteLine("rall " + ra);
+        // ---- poll baseline ----
+        Console.WriteLine("poll0 " + Poll(0));
+        nint p8 = Malloc(8);
+        nint svb = Malloc(16);
+        Console.WriteLine("sp " + SocketPair(1, 1, 0, p8));
+        Span<int> svm = new Span<int>(p8, 2);
+        nint slot = Malloc(8);
+        WS(slot, -999);
+        RecvCo(svm[0], svb, 16, 0, 0, slot);
+        Console.WriteLine("parked " + RS(slot) + " poll " + Poll(0));
+        nint hi = Malloc(8);
+        Span<byte> hv = new Span<byte>(hi, 2);
+        hv[0] = 104; hv[1] = 105;
+        Console.WriteLine("wr " + Write(svm[1], hi, 2));
+        Console.WriteLine("poll1 " + Poll(0) + " slot " + RS(slot));
+        Console.WriteLine("poll2 " + Poll(0));
+        CloseNotify(svm[0]);
+        Console.WriteLine("closen " + RS(slot) + " poll " + Poll(0));
+        Console.WriteLine("cl " + Close(svm[1]) + Close(svm[0]));
+        Console.WriteLine("poll3 " + Poll(0));
+        // ---- /etc/hosts + resolv.conf as the guest resolver sees them ----
+        DumpFile("/etc/hosts");
+        DumpFile("/etc/resolv.conf");
+        // ---- resolve workers (leave the resident pipe watch last) ----
+        WS(slot, -999);
+        ResolveIpv4Co(sb, 0, 0, slot);
+        int g = 0;
+        while (RS(slot) == -999 && g < 50) {
+            Poll(20000000);
+            g = g + 1;
+        }
+        Console.WriteLine("w4 g " + g + " slot " + RS(slot));
+        WS(slot, -999);
+        ResolveSaCo(sb, 80, sb + 64, 96, 0, 0, slot);
+        g = 0;
+        while (RS(slot) == -999 && g < 50) {
+            Poll(20000000);
+            g = g + 1;
+        }
+        Span<byte> wv = new Span<byte>(sb + 64, 28);
+        Console.WriteLine("wsa g " + g + " slot " + RS(slot) + " fam " + wv[1] + " b " + wv[4] + "," + wv[5] + "," + wv[6] + "," + wv[7]);
+        Console.WriteLine("poll4 " + Poll(0));
+        return 0;
+    }
+
+    static string ErrStr(int rc) {
+        if (rc == 0) { return "ok"; }
+        nint s = GaiStrError(rc);
+        long n = StrLen(s);
+        Span<byte> bv = new Span<byte>(s, (int)n + 1);
+        string o = "";
+        int i = 0;
+        while (i < n) {
+            o = o + ((char)bv[i]).ToString();
+            i = i + 1;
+        }
+        return o;
+    }
+
+    static void DumpAi(nint resp) {
+        Span<long> rv = new Span<long>(resp, 1);
+        if (rv[0] == 0) {
+            Console.WriteLine("ai <null>");
+            return;
+        }
+        nint p = rv[0];
+        Span<long> pv = new Span<long>(p, 6);
+        Console.WriteLine("ai fam " + (pv[0] >>> 32) + " flags " + (pv[0] & 0xFFFFFFFFL)
+            + " addrlen " + (pv[2] & 0xFFFFFFFFL)
+            + " p3 " + (pv[3] & 0xFFFFFFL) + " p4 " + (pv[4] & 0xFFFFFFL));
+        FreeGai(p);
+    }
+
+    static void DumpFile(string path) {
+        long h = FOpen(path, "rb");
+        if (h == 0) {
+            Console.WriteLine("file " + path + " <none>");
+            return;
+        }
+        nint buf = Malloc(512);
+        Memset(buf, 0, 512);
+        long n = FileRead(h, buf, 500);
+        FileClose(h);
+        Span<byte> bv = new Span<byte>(buf, 512);
+        string s = "";
+        int i = 0;
+        while (i < n && i < 500) {
+            if (bv[i] == 10) {
+                s = s + "\\n";
+            } else {
+                s = s + ((char)bv[i]).ToString();
+            }
+            i = i + 1;
+        }
+        Console.WriteLine("file " + path + " " + s);
+    }
+}

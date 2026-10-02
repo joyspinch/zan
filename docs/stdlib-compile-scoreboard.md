@@ -1880,3 +1880,39 @@ mne 18 = 两侧同非零 stdout 逐字节一致。剩余非 pass 全部 oracle �
   linux_vehicle 7/7 guest(默认五 + native_digests + native_memwide
   新入默认集),**零 C 链接下全绿**;负测 native_unresolved_internal
   诊断逐字;runtime 与 fixture 对象级确定性逐字节。
+
+## v18o-27 (2026-10-02) — 第十五批:guest 车道收敛,SKIP 清单清空
+
+- 根因(AF_INET6 编号分裂):darwin 30 / Linux 10,而运行时面内部
+  口径与全部调用方、金样都用 darwin 正典 30。读侧归一四处——
+  io_sockaddr_ip_str、io_sockaddr_family、io_resolve_sa
+  (#if !MACOS fam==10→30 后再算 len 28/16)、resolve_sa_co 字面量
+  快路 pton 双臂(darwin 试 30,Linux 试 10;musl getaddrinfo 裸返
+  10,不经归一则 len=0 整段静默返 0,即 native_rt_core 尾部翻转的
+  单一根因)。zan_plat_net_interfaces 先例同款;进 libc 的 domain
+  参数一律传目标原生值。诊断路径:probe_guest 探针(现 tests/diag/)
+  裸打 getaddrinfo/addrinfo/sockaddr 原始值,把 13 处翻转压缩成
+  "fam 2/10 vs 金样 30" 一条。
+- 环境根因(guest 回环):init 模板补 `ip link set lo up`——lo down
+  使 bind/connect 127.0.0.1 全败,解析器、套接字回声、worker 交付
+  级联雪崩(表象是 120s 看门狗挂);rootfs 模板缓存作废重生成。
+  此修复同时闭合 native_sync guest 的 w0lk=0/0(TryLock 打开路径
+  本无错,纯环境级联),stdlib 零改动。
+- native_varargs 解钉(最后一个 macOS 布局钉):open 标志字面量
+  0x0601 按目标双臂(Linux O_WRONLY|O_CREAT|O_TRUNC=0x241)、
+  st_mode 偏移按目标双臂(darwin u16@4,Linux aarch64 u32@16),
+  mode=33188 单一 golden 两平台同值。SKIP 机制整体移除(空清单在
+  macOS bash 3.2 + set -u 下是 unbound variable 雷,不如删干净),
+  vehicle 默认集 7→10。
+- probe_guest 处置:tests/selfhost → tests/diag/(回归两车道本都
+  不收——battery 显式清单、vehicle 默认集,移位防未来误挂),头部
+  注释记录结论:guest 裸值合法地不同(堆指针、归一前内核族号),
+  该探针只做 darwin-vs-guest 人工对拍。
+- 门禁(基线 checkpoint 仍 v18o-26/zanc_v27,本批未触编译器源,
+  仅 runtime/fixture 与脚本):battery 48/48 ×2(runtime_core.o
+  按归一后源码重建再验);crossboot 40 夹具 80 PASS/0 FAIL;
+  linux_vehicle 10/10 guest 零 C 全绿(native_rt_core 366/366 含
+  hasLo0、resolver 断言、worker 尾;native_sync;native_varargs);
+  负测诊断逐字;runtime 对象级确定性逐字节。并行会话协作注:归一
+  四处的落地与 probe 根因独立互证(assert 拒写即信号,勿重复施加),
+  车道绿以重建后对象为准——源码比对象新时先重建再断言。

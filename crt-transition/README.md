@@ -378,10 +378,19 @@ ELF 对象 → `scripts/elf_localize.py`(ELF 版 localize:局部化非 API
 localize)+ musl libc.a + Alpine libgcc.a 静态链接 → guest 引导 → 串口
 输出对 .out 金标逐字节 diff。第十四批起链接里**零项目 C**
 (zanstubs/zanhost 余量与 zanlinuxshims.c 全部退役,见下)。验收(默认
-七夹具):kernel1、native_extern、native_string_ops、
-native_float_shapes、native_varargs_elf、native_digests、
-native_memwide 全绿——变参 ELF 车道金标与摘要/内存宽面金标都在真
-Linux 用户态复现。
+十夹具,第十五批起 SKIP 清单为空):kernel1、native_extern、
+native_string_ops、native_float_shapes、native_varargs_elf、
+native_digests、native_memwide、native_rt_core(366 行全 IO 面,
+第十五批收编)、native_sync(第十五批收编)、native_varargs(第十五
+批解钉收编:open 标志与 st_mode 偏移按目标 #if 双臂,单一 golden
+两平台;至此"macOS 布局钉"清零)全绿——变参 ELF 车道金标与摘要/
+内存宽面金标都在真 Linux 用户态复现。第十五批的两条根因:guest
+init 补 `ip link set lo up`(回环 down 的级联雪崩:bind/connect
+失败 → 解析器/套接字/worker 交付全挂);AF_INET6 编号 darwin 30 /
+Linux 10 读侧归一(io_sockaddr_family、io_resolve_sa、
+io_sockaddr_ip_str、resolve_sa_co pton 双臂;进 libc 的 domain 一律
+原生值)。诊断探针存 tests/diag/probe_guest.zan(裸值人工对拍,非
+电池夹具)。
 
 crt-transition/linux/(第十四批起整目录退役,macOS 车道素来零引用):
 - zanlinuxshims.c(558 行,已退役):曾垫 runtime 所引 macOS 面——
