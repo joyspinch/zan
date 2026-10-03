@@ -261,7 +261,14 @@ run_one() {
     cpio -0 -o -H newc 2>/dev/null | gzip -1 > "$WORK/$name.cpio.gz")
   rm -rf "$gdir"
 
-  ( "$QEMU" -M virt -cpu max -m 256M -nographic \
+  # 大 ELF 自动升内存:writer 侧 a64 数组膨胀可产出 25MB+ 静态二进制
+  # (sdk_wechat 78MB),256M guest 解 initramfs 直接 write error(内核
+  # panic "No working init");>30MB 的 fixture 用 1G。可用 QEMU_MEM 覆盖。
+  local qmem="${QEMU_MEM:-256M}"
+  local szf
+  szf="$(wc -c < "$WORK/$name.elf")"
+  (( szf > 30000000 )) && qmem=1G
+  ( "$QEMU" -M virt -cpu max -m "$qmem" -nographic \
       -kernel "$DL/vmlinuz-virt" -initrd "$WORK/$name.cpio.gz" \
       -append "console=ttyAMA0 panic=-1 rdinit=/init quiet" \
       </dev/null >"$WORK/$name.boot" 2>&1 & \
