@@ -22,6 +22,13 @@ CONF = ROOT.parent / 'zan-lang/tests/conformance'
 DRIVERS = ROOT.parent / 'zan-lang/stdlib'
 _driver_index = None
 
+# 金档是带 argv 跑出来的(与 linux_vehicle 的 /args 镜像同一约定):
+# main_args = alpha "beta gamma",environment_unicode_args = 中文 参数。
+CASE_ARGS = {
+    'main_args': ['alpha', 'beta gamma'],
+    'environment_unicode_args': ['中文', '参数'],
+}
+
 
 def driver_dylibs(undef):
     """DllImport 驱动库解析:stdlib **/drivers/macos-arm64 里按导出符号
@@ -129,6 +136,13 @@ def main():
             extra_libs += ['-L' + str(prefix / 'lib'),
                            '-rpath', str(prefix / 'lib'), '-lodbc']
             break
+    # libpq 同款(pg 族 fixture 直接引 PQ*;缺库时 lazy binding 会把进程
+    # 拖成不可杀停驻——pg_params_syntax 第三十批 wedge 实证)。
+    for prefix in (homebrew / 'opt/libpq', Path('/opt/homebrew/opt/libpq')):
+        if (prefix / 'lib/libpq.dylib').exists():
+            extra_libs += ['-L' + str(prefix / 'lib'),
+                           '-rpath', str(prefix / 'lib'), '-lpq']
+            break
 
     artifacts = []
     if args.work:
@@ -227,7 +241,8 @@ def main():
         if not sc.exists():
             sc.mkdir()
 
-        rc, out = run('run', [str(cdir / 'native')], timeout=60)
+        rc, out = run('run', [str(cdir / 'native'), *CASE_ARGS.get(case, [])],
+                      timeout=60)
         if rc is None:
             print(f'FAIL {case}: run wedge (unkillable child)', flush=True)
             counts['run_wedge'] += 1
