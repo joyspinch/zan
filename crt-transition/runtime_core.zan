@@ -3269,17 +3269,51 @@ class zan {
         return found;
     }
 
+    // 批量上限对应 oracle ZAN_PURGE_MAX_BATCH(64);maxb <= 0 不限量
+    // (purge_expired API 与 lock_acquire 走全量扫)。
     static void st_purge(nint t, long now) {
+        st_purge_b(t, now, 0);
+    }
+
+    static void st_purge_b(nint t, long now, long maxb) {
         Span<long> tv = new Span<long>(t, 7);
         long r = tv[5];
+        long batch = 0;
         while (r != 0) {
             Span<long> rv = new Span<long>((nint)r, 6);
+            long next = rv[0];
             if (rv[3] != 0 && rv[4] != 0 && rv[4] <= now) {
                 rv[3] = 0;
                 tv[6] = tv[6] - 1;
+                batch = batch + 1;
+                if (maxb > 0 && batch >= maxb) { return; }
             }
-            r = rv[0];
+            r = next;
         }
+    }
+
+    // oracle zan_purge_expired 的进程级 16ms 节流:表内无带 TTL 的活行
+    // 时不触钟、不刷新 last_attempt;一旦过门即刷新(哪怕随后无可清行,
+    // 与 C 版 top-peek 空跑同效)。
+    static long st_last_attempt;
+    static int st_has_expiry(nint t) {
+        long r = st_tget(t, 5);
+        while (r != 0) {
+            if (st_rget(r, 3) != 0 && st_rget(r, 4) != 0) { return 1; }
+            r = st_rget(r, 0);
+        }
+        return 0;
+    }
+
+    static void st_purge_thr(nint t) {
+        if (st_has_expiry(t) == 0) { return; }
+        long now = st_wall();
+        long last = st_last_attempt;
+        if (last > now - 16 && last <= now) { return; }
+        st_last_attempt = now;
+        st_lock(t);
+        st_purge_b(t, now, 64);
+        st_unlock(t);
     }
 
     static long st_find_row(nint t, nint key) {
@@ -3310,15 +3344,20 @@ class zan {
         return found;
     }
 
-    // oracle 载荷因子:7/8 满拒;tombstone 槽优先复用。
+    // oracle 载荷因子:count >= cap - cap/8 满拒(与 C 版同式,容量
+    // 非 8 倍数时 count*8>=cap*7 会差一);tombstone 槽优先复用。
+    // 复用必须重写键拷贝:C 版两个复用点都 memcpy 新键(b33 修复:
+    // 沿用死键会让键路径查找永久 miss 而哈希路径命中)。
     static long st_row_for(nint t, nint key) {
+        long klen = cstrlen(key);
+        if (klen == 0 || klen > st_tget(t, 2)) { return 0; }
         long r = st_find_row(t, key);
         if (r != 0) { return r; }
         long count = st_tget(t, 6);
         long cap = st_tget(t, 1);
         long stride = st_tget(t, 4);
         long head = st_tget(t, 5);
-        if (count * 8 >= cap * 7) { return 0; }
+        if (count >= cap - cap / 8) { return 0; }
         long cur = head;
         long reuse = 0;
         while (reuse == 0 && cur != 0) {
@@ -3328,8 +3367,13 @@ class zan {
         long hash = st_hash(key);
         long row = reuse;
         if (row != 0) {
+            nint kcopy = st_strdup(key);
+            if (kcopy == 0) { return 0; }
             nint data = (nint)st_rget(row, 5);
             memset(data, 0, stride > 0 ? stride : 1);
+            nint ok = (nint)st_rget(row, 2);
+            if (ok != 0) { cfree(ok); }
+            st_rset(row, 2, (long)kcopy);
             st_rset(row, 1, hash);
             st_rset(row, 4, 0);
             st_rset(row, 3, 1);
@@ -3532,8 +3576,8 @@ class zan {
             long handle, nint key, nint column, long value) {
         nint t = (nint)handle;
         if (t == 0 || key == 0) { return 0; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long c = st_find_col(t, column, 0);
         long r = c != 0 ? st_row_for(t, key) : 0;
         if (r != 0) {
@@ -3549,8 +3593,8 @@ class zan {
             long handle, nint key, nint column) {
         nint t = (nint)handle;
         if (t == 0 || key == 0) { return 0; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long c = st_find_col(t, column, 0);
         long r = c != 0 ? st_find_row(t, key) : 0;
         long v = 0;
@@ -3567,8 +3611,8 @@ class zan {
             long handle, nint key, nint column, double value) {
         nint t = (nint)handle;
         if (t == 0 || key == 0) { return 0; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long c = st_find_col(t, column, 1);
         long r = c != 0 ? st_row_for(t, key) : 0;
         if (r != 0) {
@@ -3584,8 +3628,8 @@ class zan {
             long handle, nint key, nint column) {
         nint t = (nint)handle;
         if (t == 0 || key == 0) { return (double)0L; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long c = st_find_col(t, column, 1);
         long r = c != 0 ? st_find_row(t, key) : 0;
         double v = (double)0L;
@@ -3602,8 +3646,8 @@ class zan {
             long handle, nint key, nint column, nint value) {
         nint t = (nint)handle;
         if (t == 0 || key == 0 || value == 0) { return 0; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long c = st_find_col(t, column, 2);
         long r = 0;
         if (c != 0 && cstrlen(value) < st_csize(c)) {
@@ -3628,8 +3672,8 @@ class zan {
         e0[0] = 0;
         nint t = (nint)handle;
         if (result == 0 || t == 0 || key == 0) { return result; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long c = st_find_col(t, column, 2);
         long r = c != 0 ? st_find_row(t, key) : 0;
         if (r != 0) {
@@ -3657,8 +3701,8 @@ class zan {
             long handle, nint key, nint column, long delta) {
         nint t = (nint)handle;
         if (t == 0 || key == 0) { return 0; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long c = st_find_col(t, column, 0);
         long r = c != 0 ? st_row_for(t, key) : 0;
         long v = 0;
@@ -3685,7 +3729,7 @@ class zan {
         nint t = (nint)handle;
         if (t == 0 || key == 0 || expires_at_ms < 0) { return 0; }
         st_lock(t);
-        st_purge(t, st_wall());
+        st_purge_b(t, st_wall(), 64);
         long r = st_find_row(t, key);
         if (r != 0) { st_rset(r, 4, expires_at_ms); }
         st_unlock(t);
@@ -3695,8 +3739,8 @@ class zan {
     public static long shared_table_expires_at(long handle, nint key) {
         nint t = (nint)handle;
         if (t == 0 || key == 0) { return -1; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long r = st_find_row(t, key);
         long at = r != 0 ? st_rget(r, 4) : -1;
         st_unlock(t);
@@ -3728,7 +3772,7 @@ class zan {
         long startc = st_find_col(t, lit_wstart_name(), 0);
         int allowed = 0;
         if (countc != 0 && startc != 0) {
-            st_purge(t, now_ms);
+            st_purge_b(t, now_ms, 64);
             long r = st_find_row(t, key);
             if (r == 0) { r = st_row_for(t, key); }
             if (r != 0) {
@@ -3789,7 +3833,7 @@ class zan {
         long ownec = st_find_col(t, lit_owner_name(), 0);
         int released = 0;
         if (ownec != 0) {
-            st_purge(t, st_wall());
+            st_purge_b(t, st_wall(), 64);
             long r = st_find_row(t, key);
             if (r != 0) {
                 nint slot = st_ptr(st_rget(r, 5) + st_coff(ownec));
@@ -3809,7 +3853,7 @@ class zan {
         nint t = (nint)handle;
         if (t == 0 || key == 0) { return 0; }
         st_lock(t);
-        st_purge(t, st_wall());
+        st_purge_b(t, st_wall(), 64);
         long r = st_find_row(t, key);
         if (r != 0) {
             st_rset(r, 3, 0);
@@ -3822,8 +3866,8 @@ class zan {
     public static int shared_table_exists(long handle, nint key) {
         nint t = (nint)handle;
         if (t == 0 || key == 0) { return 0; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long r = st_find_row(t, key);
         st_unlock(t);
         return r != 0 ? 1 : 0;
@@ -3832,8 +3876,8 @@ class zan {
     public static long shared_table_count(long handle) {
         nint t = (nint)handle;
         if (t == 0) { return 0; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long n = st_tget(t, 6);
         st_unlock(t);
         return n;
@@ -3876,8 +3920,8 @@ class zan {
             long handle, long key_hash, nint column, long value) {
         nint t = (nint)handle;
         if (t == 0) { return 0; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long c = st_find_col(t, column, 0);
         long r = 0;
         if (c != 0) {
@@ -3902,8 +3946,8 @@ class zan {
             long handle, long key_hash, nint column) {
         nint t = (nint)handle;
         if (t == 0) { return 0; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long c = st_find_col(t, column, 0);
         long r = c != 0 ? st_find_row_hash(t, key_hash) : 0;
         long v = 0;
@@ -3920,8 +3964,8 @@ class zan {
             long handle, long key_hash, nint column, long delta) {
         nint t = (nint)handle;
         if (t == 0) { return 0; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long c = st_find_col(t, column, 0);
         long r = 0;
         long v = 0;
@@ -3949,8 +3993,8 @@ class zan {
             long keep_larger) {
         nint t = (nint)handle;
         if (t == 0) { return 0; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long c = st_find_col(t, column, 0);
         long r = 0;
         long stored = 0;
@@ -3987,8 +4031,8 @@ class zan {
             long handle, long key_hash, nint column, nint value) {
         nint t = (nint)handle;
         if (t == 0 || value == 0) { return 0; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long c = st_find_col(t, column, 2);
         long r = 0;
         if (c != 0 && cstrlen(value) < st_csize(c)) {
@@ -4018,8 +4062,8 @@ class zan {
         e0[0] = 0;
         nint t = (nint)handle;
         if (result == 0 || t == 0) { return result; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long c = st_find_col(t, column, 2);
         long r = c != 0 ? st_find_row_hash(t, key_hash) : 0;
         if (r != 0) {
@@ -4046,7 +4090,6 @@ class zan {
         nint t = (nint)handle;
         if (t == 0 || text == 0) { return 0; }
         st_lock(t);
-        st_purge(t, st_wall());
         long c = st_find_col(t, column, 2);
         long r = c != 0 ? st_find_row_hash(t, key_hash) : 0;
         int equal = 0;
@@ -4062,8 +4105,8 @@ class zan {
     public static int shared_table_exists_at(long handle, long key_hash) {
         nint t = (nint)handle;
         if (t == 0) { return 0; }
+        st_purge_thr(t);
         st_lock(t);
-        st_purge(t, st_wall());
         long r = st_find_row_hash(t, key_hash);
         st_unlock(t);
         return r != 0 ? 1 : 0;
@@ -4073,7 +4116,7 @@ class zan {
         nint t = (nint)handle;
         if (t == 0) { return 0; }
         st_lock(t);
-        st_purge(t, st_wall());
+        st_purge_b(t, st_wall(), 64);
         long r = st_find_row_hash(t, key_hash);
         if (r != 0) {
             st_rset(r, 3, 0);
