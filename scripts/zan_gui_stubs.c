@@ -246,3 +246,17 @@ long zan_gui_window_visible(void) { return 0; }
 long zan_gui_window_width(void) { return 0; }
 
 long zan_gui_write_pixels(void) { return 0; }
+
+/* zan_tray_*: same driver class — the linux toolchain has no tray
+ * runtime either (batch-26 sweep: win_tray_screen_smoke was the one
+ * remaining link fail; these are pure link-time undefineds). */
+
+long zan_tray_next_event(void) { return 0; }
+
+long zan_tray_set_menu(void) { return 0; }
+
+long zan_tray_set_tooltip(void) { return 0; }
+
+long zan_tray_start(void) { return 0; }
+
+long zan_tray_stop(void) { return 0; }
