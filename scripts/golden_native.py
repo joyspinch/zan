@@ -120,6 +120,15 @@ def main():
         if (prefix / 'lib/libssl.dylib').exists():
             extra_libs += ['-L' + str(prefix / 'lib'), '-lssl', '-lcrypto']
             break
+    # unixODBC 同款:rpath 直接烙进测试可执行,运行期不依赖调用环境的
+    # DYLD 路径(odbc_buffers 实证:缺 -lodbc 时 dynamic_lookup 懒绑定
+    # 把进程拖成不可杀停驻,oracle 侧本就链 unixodbc 故无此象)。
+    # 注意链接走的是裸 ld,这里必须是 ld 语法(-rpath 路径 成对),非 -Wl,。
+    for prefix in (homebrew / 'opt/unixodbc', Path('/opt/homebrew/opt/unixodbc')):
+        if (prefix / 'lib/libodbc.dylib').exists():
+            extra_libs += ['-L' + str(prefix / 'lib'),
+                           '-rpath', str(prefix / 'lib'), '-lodbc']
+            break
 
     artifacts = []
     if args.work:
