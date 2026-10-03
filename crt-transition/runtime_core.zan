@@ -371,7 +371,11 @@ class zan {
     // (_time.h:159);struct timespec = {long tv_sec; long tv_nsec}。
     public static long monotonic_ns() {
         nint ts = malloc(16);
-        clock_gettime(6, ts);
+#if MACOS
+        clock_gettime(6, ts);      // darwin CLOCK_MONOTONIC
+#else
+        clock_gettime(1, ts);      // linux CLOCK_MONOTONIC(6 在 linux 是 BOOTTIME)
+#endif
         Span<long> v = new Span<long>(ts, 2);
         long ns = v[0] * 1000000000L + v[1];
         free(ts);
@@ -1790,7 +1794,7 @@ class zan {
             cclose(fd);
             cfree(ping_packet); ping_packet = 0;
             cfree(ping_dst); ping_dst = 0;
-            return err == 65 || err == 51 ? -2 : -3;   // EHOSTUNREACH/ENETUNREACH
+            return err == Ehostunreach() || err == Enetunreach() ? -2 : -3;   // EHOSTUNREACH/ENETUNREACH
         }
         if (ping_pfd != 0) { cfree(ping_pfd); }
         if (ping_reply != 0) { cfree(ping_reply); }
@@ -2299,6 +2303,29 @@ class zan {
 #endif
     }
 
+    // errno 值按平台取:darwin 与 linux 的非阻塞族 errno 不同
+    // (darwin EAGAIN=35/EINPROGRESS=36/EALREADY=37,Linux 11/115/114;
+    // EINTR=4 两边一致)。第二十四批 guest sweep 实证:connect 在 guest
+    // 返回 115 未被识别为"进行中"直通 rc,非阻塞 send/recv/accept 的
+    // EAGAIN 全被误判成致命错误(http_framing 家族 EOF、async_mt rc=115)。
+#if MACOS
+    static int Ewould() { return 35; }
+    static int Einprogress() { return 36; }
+    static int Ealready() { return 37; }
+    static int Ehostunreach() { return 65; }
+    static int Enetunreach() { return 51; }
+    static int SolSocket() { return 65535; }
+    static int SoError() { return 4103; }
+#else
+    static int Ewould() { return 11; }
+    static int Einprogress() { return 115; }
+    static int Ealready() { return 114; }
+    static int Ehostunreach() { return 113; }
+    static int Enetunreach() { return 101; }
+    static int SolSocket() { return 1; }
+    static int SoError() { return 4; }
+#endif
+
     // rt_io.c:881:非阻塞 connect;0 已建立,-2 进行中,其余正 errno 或 -1。
     static int io_connect_sa_start(long fd, nint sa, int salen) {
         if (sa == 0 || io_sockaddr_family(sa, salen) == 0) { return -1; }
@@ -2306,7 +2333,7 @@ class zan {
         int r = cconnect((int)fd, sa, salen);
         if (r == 0) { return 0; }
         int e = err_now();
-        if (e == 36 || e == 35 || e == 37) { return -2; }
+        if (e == Einprogress() || e == Ewould() || e == Ealready()) { return -2; }
         return e > 0 ? e : -1;
     }
 
@@ -2350,7 +2377,7 @@ class zan {
             nint elenp = malloc(8);
             Span<long> elv = new Span<long>(elenp, 1);
             elv[0] = 4;
-            if (cgetsockopt((int)fd, 65535, 4103, errp, elenp) != 0) {
+            if (cgetsockopt((int)fd, SolSocket(), SoError(), errp, elenp) != 0) {
                 result = -1L;
             }
             else {
@@ -2394,7 +2421,7 @@ class zan {
             nint elenp = malloc(8);
             Span<long> elv = new Span<long>(elenp, 1);
             elv[0] = 4;
-            if (cgetsockopt((int)fd, 65535, 4103, errp, elenp) != 0) {
+            if (cgetsockopt((int)fd, SolSocket(), SoError(), errp, elenp) != 0) {
                 r = -1;
             }
             else {
@@ -2450,7 +2477,7 @@ class zan {
             if (r >= 0) { result = r; state = 1; }
             else {
                 int e = err_now();
-                if (e == 35) { result = -1L; state = 1; }        // EAGAIN
+                if (e == Ewould()) { result = -1L; state = 1; }        // EAGAIN
                 else if (e != 4) { result = -2L; state = 1; }    // EINTR 重试
             }
         }
@@ -4120,7 +4147,7 @@ class zan {
                 if (e == 4) {
                     // EINTR:重试
                 }
-                else if (e == 35) { n = -2; done = 1; }   // EAGAIN/EWOULDBLOCK
+                else if (e == Ewould()) { n = -2; done = 1; }   // EAGAIN/EWOULDBLOCK
                 else { n = -1; done = 1; }
             }
         }
@@ -4203,7 +4230,7 @@ class zan {
                 c = caccept((int)fd, 0, 0);
                 if (c >= 0 || err_now() != 4) { go = 0; }
             }
-            if (c < 0 && err_now() == 35) { c = -2; }
+            if (c < 0 && err_now() == Ewould()) { c = -2; }
         }
         if (c == -2) {
             io_ws_push((int)fd, 5, 0, 0, 0, frame, step, outfd);

@@ -34,6 +34,10 @@ ALPINE="https://dl-cdn.alpinelinux.org/alpine/v3.20"
 REL="$ALPINE/releases/aarch64"
 MUSL_VER="1.2.5-r3"
 GCC_VER="13.2.1_git20240309-r1"
+OSSL_VER="3.3.7-r0"
+UODBC_VER="2.3.12-r0"
+SQLITE_VER="3.45.3-r3"
+LIBPQ_VER="16.14-r0"
 FIXTURES=("$@")
 if (( ${#FIXTURES[@]} == 0 )); then
   FIXTURES=(kernel1 kernel2 kernel3 kernel4 kernel5 kernel6 kernel7 kernel8
@@ -104,6 +108,41 @@ fetch "$ALPINE/main/aarch64/gcc-$GCC_VER.apk" "$DL/gcc.apk"
   tar -xzf "$DL/gcc.apk" -C "$SYSROOT" ./usr/lib/gcc 2>/dev/null || true
 GCCDIR="$SYSROOT/usr/lib/gcc/aarch64-alpine-linux-musl/13.2.1"
 [[ -f "$GCCDIR/libgcc.a" ]] || fail 'libgcc.a missing after extraction'
+# openssl 静态库：stdlib 的 TLS 族在 ELF 车道链接时缺 EVP_*/BIO_*（第二十三
+# 批 154 个 link-fail 的根因）。归档是惰性的——用不到的 fixture 不会因此
+# 膨胀。镜像若升版导致 404，车道照旧（只是那批继续 link-fail），不 fail。
+if [[ ! -s "$DL/openssl-libs-static.apk" ]]; then
+  curl -s --max-time 500 -o "$DL/openssl-libs-static.apk" \
+    "$ALPINE/main/aarch64/openssl-libs-static-$OSSL_VER.apk" || true
+fi
+if [[ -s "$DL/openssl-libs-static.apk" && ! -f "$SYSROOT/usr/lib/libcrypto.a" ]]; then
+  tar -xzf "$DL/openssl-libs-static.apk" -C "$SYSROOT" 2>/dev/null || true
+fi
+# unixODBC 同款(批二十二在 darwin 车道加 -lodbc;DB 族 fixture 的
+# SQLAllocHandle 类在 guest 静态车道同样缺):归档惰性,无用不膨胀。
+if [[ ! -s "$DL/unixodbc-static.apk" ]]; then
+  curl -s --max-time 500 -o "$DL/unixodbc-static.apk" \
+    "$ALPINE/main/aarch64/unixodbc-static-$UODBC_VER.apk" || true
+fi
+if [[ -s "$DL/unixodbc-static.apk" && ! -f "$SYSROOT/usr/lib/libodbc.a" ]]; then
+  tar -xzf "$DL/unixodbc-static.apk" -C "$SYSROOT" 2>/dev/null || true
+fi
+# SQLite 静态库同理(orm/sqlite 族直接引 sqlite3_* C API)。
+if [[ ! -s "$DL/sqlite-static.apk" ]]; then
+  curl -s --max-time 500 -o "$DL/sqlite-static.apk" \
+    "$ALPINE/main/aarch64/sqlite-static-$SQLITE_VER.apk" || true
+fi
+if [[ -s "$DL/sqlite-static.apk" && ! -f "$SYSROOT/usr/lib/libsqlite3.a" ]]; then
+  tar -xzf "$DL/sqlite-static.apk" -C "$SYSROOT" 2>/dev/null || true
+fi
+# libpq 静态库(pg 族直接引 PQ* C API;连带 pgcommon/pgport)。
+if [[ ! -s "$DL/libpq-dev.apk" ]]; then
+  curl -s --max-time 500 -o "$DL/libpq-dev.apk" \
+    "$ALPINE/main/aarch64/libpq-dev-$LIBPQ_VER.apk" || true
+fi
+if [[ -s "$DL/libpq-dev.apk" && ! -f "$SYSROOT/usr/lib/libpq.a" ]]; then
+  tar -xzf "$DL/libpq-dev.apk" -C "$SYSROOT" 2>/dev/null || true
+fi
 [[ -f "$DL/rootfs-template.tar.gz" ]] || {
   rm -rf "$WORK/rootfs-template"
   mkdir -p "$WORK/rootfs-template"
@@ -165,17 +204,26 @@ run_one() {
 
   ZAN_TARGET=aarch64-linux "$SEED" "$WORK/$name.elf.o" "$TESTS/$name.zan" ||
     { echo 'FAIL (compile)'; return 1; }
+  OSSL_LIBS=''
+  [[ -f "$SYSROOT/usr/lib/libssl.a" ]] && OSSL_LIBS='-lssl -lcrypto'
+  [[ -f "$SYSROOT/usr/lib/libodbc.a" ]] && OSSL_LIBS="$OSSL_LIBS -lodbc"
+  [[ -f "$SYSROOT/usr/lib/libsqlite3.a" ]] && OSSL_LIBS="$OSSL_LIBS -lsqlite3"
+  [[ -f "$SYSROOT/usr/lib/libpq.a" ]] &&
+    OSSL_LIBS="$OSSL_LIBS -lpq -lpgcommon -lpgport"
   "$LLD" -m aarch64linux -static "$SYSROOT/usr/lib/crt1.o" \
     "$WORK/$name.elf.o" "$O/runtime_core.elf.o" \
-    -L"$SYSROOT/usr/lib" -L"$GCCDIR" -lc -lgcc \
+    -L"$SYSROOT/usr/lib" -L"$GCCDIR" -lc -lgcc $OSSL_LIBS \
     -o "$WORK/$name.elf" || { echo 'FAIL (link)'; return 1; }
 
-  rm -rf "$WORK/guest"
-  mkdir -p "$WORK/guest"
-  tar -xzf "$DL/rootfs-template.tar.gz" -C "$WORK/guest"
-  cp "$WORK/$name.elf" "$WORK/guest/prog"
-  (cd "$WORK/guest" && find . -print0 |
+  # 每次调用独立 guest 目录：并行分片 sweep 时互不踩(第二十四批起)。
+  local gdir="$WORK/guest.$$"
+  rm -rf "$gdir"
+  mkdir -p "$gdir"
+  tar -xzf "$DL/rootfs-template.tar.gz" -C "$gdir"
+  cp "$WORK/$name.elf" "$gdir/prog"
+  (cd "$gdir" && find . -print0 |
     cpio -0 -o -H newc 2>/dev/null | gzip -1 > "$WORK/$name.cpio.gz")
+  rm -rf "$gdir"
 
   ( "$QEMU" -M virt -cpu max -m 256M -nographic \
       -kernel "$DL/vmlinuz-virt" -initrd "$WORK/$name.cpio.gz" \
