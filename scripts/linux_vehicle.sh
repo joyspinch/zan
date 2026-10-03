@@ -143,6 +143,13 @@ fi
 if [[ -s "$DL/libpq-dev.apk" && ! -f "$SYSROOT/usr/lib/libpq.a" ]]; then
   tar -xzf "$DL/libpq-dev.apk" -C "$SYSROOT" 2>/dev/null || true
 fi
+# zan_gui 桩:oracle 不发布 linux GUI 运行时(toolchain/linux-arm64 无
+# zanrt_gui.o),而 chart/几何族 fixture 只是链接期携带 zan_gui_* 外呼、
+# 纯几何路径从不执行。桩符号全零返回;真做渲染的 fixture 会因此分歧,
+# 留在 GUI-driver 类。符号清单=第二十四批 82 个 GUI 类 fixture 的未定义
+# 并集(121 个);stdlib 面扩大时用 nm -u 重新生成 scripts/zan_gui_stubs.c。
+"$CLANG" --target=aarch64-linux-musl --sysroot="$SYSROOT" -c \
+  "$ROOT/scripts/zan_gui_stubs.c" -o "$SYSROOT/usr/lib/zan_gui_stubs.o" 2>/dev/null || true
 [[ -f "$DL/rootfs-template.tar.gz" ]] || {
   rm -rf "$WORK/rootfs-template"
   mkdir -p "$WORK/rootfs-template"
@@ -160,7 +167,7 @@ fi
 # getenv("PATH") 等环境面与 darwin 车道对齐:内核给 init 的环境近乎空,
 # 不导出则 native_cstring_read 的 p.Length>0 在 guest 里翻 false。
 export PATH=/bin:/usr/bin
-/prog </dev/null 2>/dev/null
+/bin/prog </dev/null 2>/dev/null
 echo "prog exit=$?"
 /bin/busybox poweroff -f
 EOF
@@ -210,8 +217,10 @@ run_one() {
   [[ -f "$SYSROOT/usr/lib/libsqlite3.a" ]] && OSSL_LIBS="$OSSL_LIBS -lsqlite3"
   [[ -f "$SYSROOT/usr/lib/libpq.a" ]] &&
     OSSL_LIBS="$OSSL_LIBS -lpq -lpgcommon -lpgport"
+  GUI_O=''
+  [[ -f "$SYSROOT/usr/lib/zan_gui_stubs.o" ]] && GUI_O="$SYSROOT/usr/lib/zan_gui_stubs.o"
   "$LLD" -m aarch64linux -static "$SYSROOT/usr/lib/crt1.o" \
-    "$WORK/$name.elf.o" "$O/runtime_core.elf.o" \
+    "$WORK/$name.elf.o" "$O/runtime_core.elf.o" $GUI_O \
     -L"$SYSROOT/usr/lib" -L"$GCCDIR" -lc -lgcc $OSSL_LIBS \
     -o "$WORK/$name.elf" || { echo 'FAIL (link)'; return 1; }
 
@@ -220,7 +229,23 @@ run_one() {
   rm -rf "$gdir"
   mkdir -p "$gdir"
   tar -xzf "$DL/rootfs-template.tar.gz" -C "$gdir"
-  cp "$WORK/$name.elf" "$gdir/prog"
+  # 放 /bin/prog 而非 /prog:Skin.ExeDir() 按最后一个 '/' 切,exe 在
+  # 根目录时切出 ""(第二十五批 file_embed_subdir 首检查 0 实证);
+  # darwin 车道的 exe 一直在深目录,这里对齐。
+  mkdir -p "$gdir/bin"
+  cp "$WORK/$name.elf" "$gdir/bin/prog"
+  # 数据文件镜像:fixture 以 zan-lang 仓库根为 cwd 用相对路径读数据
+  # (examples/gui_charts/options/*.json、tests/conformance/data_*.json),
+  # golden 即在该 cwd 下产出。仓库整树太大(gui_charts 28M),按 fixture
+  # 源里的引用逐个拷进 guest 根(第二十五批起)。
+  local zroot="$(cd "$TESTS/../.." && pwd)"
+  grep -hoE '"[^"]+\.(json|txt|csv|bin)"' "$TESTS/$name.zan" 2>/dev/null |
+    tr -d '"' | sort -u |
+    while IFS= read -r rel; do
+      [[ -f "$zroot/$rel" ]] || continue
+      mkdir -p "$gdir/$(dirname "$rel")"
+      cp "$zroot/$rel" "$gdir/$rel"
+    done
   (cd "$gdir" && find . -print0 |
     cpio -0 -o -H newc 2>/dev/null | gzip -1 > "$WORK/$name.cpio.gz")
   rm -rf "$gdir"

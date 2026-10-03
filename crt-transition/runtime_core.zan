@@ -674,17 +674,23 @@ class zan {
     public static extern long creadlink(string path, nint buf, long cap);
     public static int exe_path(nint buf, nint cap) {
         if (cap == 0) { return -1; }
-        Span<long> cv = new Span<long>(cap, 1);
+        // 容量按 4 字节读:契约面是 _NSGetExecutablePath(uint32_t*),
+        // 唯一外部调用方 stdlib AppPath.Exe 用 Span<int>(4 字节)写入。
+        // 旧代码按 8 字节 long 读,高 4 字节是堆上相邻垃圾——第二十五批
+        // guest 实证 /prog 场景 cap 读成负值 → 一律 -1 → Skin.ExeDir()
+        // 返回 ""(file_embed_subdir 首检查 0)。截断回写同样收窄到
+        // 4 字节,避免越界写调用方的 4 字节分配。
+        Span<int> cv = new Span<int>(cap, 1);
         if (buf == 0) {
             long n = creadlink("/proc/self/exe", 0, 0);
             if (n < 0) { return -1; }
-            cv[0] = n + 1;
+            cv[0] = (int)(n + 1);
             return -1;
         }
         long capv = cv[0];
         long n2 = creadlink("/proc/self/exe", buf, capv);
         if (n2 < 0 || n2 >= capv) {
-            if (n2 >= capv) { cv[0] = n2 + 1; }
+            if (n2 >= capv) { cv[0] = (int)(n2 + 1); }
             return -1;
         }
         Span<byte> zv = new Span<byte>(buf + n2, 1);
@@ -776,7 +782,7 @@ class zan {
             if (ab != 0) {
                 nint exe = malloc(4096);
                 nint cap = malloc(8);
-                Span<long> cv = new Span<long>(cap, 1);
+                Span<int> cv = new Span<int>(cap, 1);   // 同 exe_path:容量面 4 字节
                 cv[0] = 4096;
                 if (exe_path(exe, cap) == 0) {
                     nint sep = cstrrchr(exe, 47);
