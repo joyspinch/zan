@@ -26,7 +26,10 @@ BUILD="$ROOT/build/linux-vehicle"
 DL="$BUILD/dl"
 SYSROOT="$BUILD/sysroot"
 WORK="$BUILD/work"
-TESTS="$ROOT/tests/selfhost"
+# ZAN_VEHICLE_TESTS 可把车道指向别的 .zan/.out 同名目录(批二十三的
+# conformance 全集 sweep 即用它指到 zan-lang/tests/conformance);
+# 缺省仍是 tests/selfhost,门禁行为不变。
+TESTS="${ZAN_VEHICLE_TESTS:-$ROOT/tests/selfhost}"
 ALPINE="https://dl-cdn.alpinelinux.org/alpine/v3.20"
 REL="$ALPINE/releases/aarch64"
 MUSL_VER="1.2.5-r3"
