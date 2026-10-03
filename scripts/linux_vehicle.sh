@@ -167,7 +167,12 @@ fi
 # getenv("PATH") 等环境面与 darwin 车道对齐:内核给 init 的环境近乎空,
 # 不导出则 native_cstring_read 的 p.Length>0 在 guest 里翻 false。
 export PATH=/bin:/usr/bin
-/bin/prog </dev/null 2>/dev/null
+# 金档是带 argv 跑出来的(如 main_args = alpha "beta gamma"):程序名
+# 不进 string[](D19 契约),args 文件一行一参,/bin/prog 逐行重建 "$@"。
+while IFS= read -r zanarg; do
+  set -- "$@" "$zanarg"
+done < /args
+/bin/prog "$@" </dev/null 2>/dev/null
 echo "prog exit=$?"
 /bin/busybox poweroff -f
 EOF
@@ -234,6 +239,12 @@ run_one() {
   # darwin 车道的 exe 一直在深目录,这里对齐。
   mkdir -p "$gdir/bin"
   cp "$WORK/$name.elf" "$gdir/bin/prog"
+  # 每 fixture 的 argv(golden 生成时的调用参数,逐一镜像):
+  case "$name" in
+    main_args) printf 'alpha\nbeta gamma\n' > "$gdir/args" ;;
+    environment_unicode_args) printf '\xe4\xb8\xad\xe6\x96\x87\n\xe5\x8f\x82\xe6\x95\xb0\n' > "$gdir/args" ;;
+    *) : > "$gdir/args" ;;
+  esac
   # 数据文件镜像:fixture 以 zan-lang 仓库根为 cwd 用相对路径读数据
   # (examples/gui_charts/options/*.json、tests/conformance/data_*.json),
   # golden 即在该 cwd 下产出。仓库整树太大(gui_charts 28M),按 fixture
