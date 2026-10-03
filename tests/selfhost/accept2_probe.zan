@@ -1,0 +1,58 @@
+// Probe: do TWO simultaneous client connections to one HttpServer both get
+// served? Isolates "parked accept loop misses the second connection" from
+// any HttpClient pooling logic.
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Threading;
+
+class Program {
+    static async HttpResponse Handle(HttpRequest req) {
+        return HttpResponse.Text("ok");
+    }
+
+    static List<string> slot1 = new List<string>();
+    static List<string> slot2 = new List<string>();
+
+    static async void Client(int id, List<string> outp) {
+        List<string> slot = id == 1 ? Program.slot1 : Program.slot2;
+        try {
+            HttpClient c = new HttpClient("127.0.0.1", 9535);
+            c.SetTimeout(5000);
+            string b = await c.GetAsync("/x");
+            slot.Add(Convert.ToString(id) + "=ok:" + b);
+        } catch (Exception e) {
+            slot.Add(Convert.ToString(id) + "=ERR: " + e.Message);
+        }
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = new HttpServer("127.0.0.1", 9535);
+        server.OnRequest(Handle);
+        Task.Spawn(server.Start());
+        for (int i = 0; i < 100; i = i + 1) { await Task.Delay(10); }
+
+        List<string> outp = new List<string>();
+        Task.Spawn(Program.Client(1, outp));
+        Task.Spawn(Program.Client(2, outp));
+        for (int i = 0; i < 400 && outp.Count < 2; i = i + 1) {
+            await Task.Delay(25);
+        }
+        int got = Program.slot1.Count + Program.slot2.Count;
+        Console.WriteLine("results: " + Convert.ToString(got));
+        for (int i = 0; i < Program.slot1.Count; i = i + 1) {
+            Console.WriteLine(Program.slot1[i]);
+        }
+        for (int i = 0; i < Program.slot2.Count; i = i + 1) {
+            Console.WriteLine(Program.slot2[i]);
+        }
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return 0;
+    }
+
+    static void Main() {
+        int _rc = await Run();
+    }
+}
