@@ -2371,3 +2371,20 @@ int64_t zan_monotonic_us(void) {
 }
 #endif /* ZAN_RT_CORE_ZAN */
 
+
+/* ---- b35 (v18o-63): oracle 音频面真身 ----
+ * oracle 的 zan_audio.c:WAV / OGG(stb_vorbis)解码全平台可用,
+ * 设备层 darwin/linux 为 stub(open 返 0,driver_name 返 "")。
+ * REST 车道(-DZAN_RT_CORE_ZAN)由这里供给 zan_audio_*;Zan 侧
+ * 同批删除了桩定义(旧桩连 ABI 都不对:load_wav 单参、play 三参、
+ * duration 返 int),避免链接期重定义。EXPORT 在 oracle 单 TU 约定
+ * 里由 gui_runtime.c 提供,这里按 darwin/linux 默认可见性补上。
+ * stb_vorbis.c 由 zan_audio.c 相对包含,无需额外配置。 */
+#ifdef ZAN_RT_CORE_ZAN
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#define EXPORT __attribute__((visibility("default")))
+#include "/Users/qq/Desktop/zanlang/zan-lang/src/runtime/zan_audio.c"
+#endif

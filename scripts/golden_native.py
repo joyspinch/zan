@@ -115,6 +115,18 @@ def main():
                              'parent temp dir)')
     parser.add_argument('cases', nargs='+')
     args = parser.parse_args()
+    # C remainder 自动补齐:audio 一类由 zanstubs_rest.o 供给的符号不在
+    # Zan 运行时对象里;调用方只传 runtime_core.o 时,同目录的 C 余量
+    # 对象自动追加到链接(已显式传入则不重复)。
+    _have = {p.resolve() for p in args.runtime}
+    _auto = []
+    for _extra in ('zanstubs_rest.o', 'zanhost_rest.o'):
+        for _r in args.runtime:
+            _cand = _r.parent / _extra
+            if _cand.exists() and _cand.resolve() not in _have:
+                _auto.append(_cand)
+    if _auto:
+        args.runtime = list(args.runtime) + _auto
 
     sdk = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'],
                                   text=True).strip()
