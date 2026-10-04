@@ -1,0 +1,92 @@
+// b34: file + mmap edge probe — seek origins, EOF via ReadByte, lock
+// semantics, executable bit, exact timestamp roundtrip, copy/move, and
+// a named mmap block written through one view and read through a
+// second mapping of the same name. Deterministic; cleans up its own
+// files at start and end.
+using System;
+using System.IO;
+
+class Program {
+    static void Main() {
+        string fn = "f34_edge.tmp";
+        File.Delete(fn);
+        File.WriteAllText(fn, "hello edge world");
+        Console.WriteLine("exists: " + (File.Exists(fn) ? 1 : 0));
+        Console.WriteLine("size: " + Convert.ToString(File.GetSize(fn)));
+        File.AppendAllText(fn, "!");
+        Console.WriteLine("size2: " + Convert.ToString(File.GetSize(fn)));
+        Console.WriteLine("txt: " + File.ReadAllText(fn));
+
+        FileInfo fi = new FileInfo(fn);
+        Console.WriteLine("sett: " + (fi.SetLastWriteTime(1000000000) ? 1 : 0));
+        Console.WriteLine("gett: " + Convert.ToString(fi.LastWriteTime()));
+
+        Console.WriteLine("chmod: " + (File.SetExecutable(fn, true) ? 1 : 0));
+        Console.WriteLine("exec: " + (File.IsExecutable(fn) ? 1 : 0));
+        Console.WriteLine("chmod2: " + (File.SetExecutable(fn, false) ? 1 : 0));
+        Console.WriteLine("exec2: " + (File.IsExecutable(fn) ? 1 : 0));
+
+        long h1 = File.TryLock(fn);
+        Console.WriteLine("lock1: " + (h1 != 0 ? 1 : 0));
+        long h2 = File.TryLock(fn);
+        Console.WriteLine("lock2: " + (h2 != 0 ? 1 : 0));
+        if (h2 != 0) { File.Unlock(h2); }
+        Console.WriteLine("unlock1: " + (File.Unlock(h1) ? 1 : 0));
+        long h3 = File.TryLock(fn);
+        Console.WriteLine("lock3: " + (h3 != 0 ? 1 : 0));
+        if (h3 != 0) { File.Unlock(h3); }
+
+        FileStream fs = FileStream.Open(fn, "r");
+        Console.WriteLine("canread: " + (fs.CanRead() ? 1 : 0));
+        Console.WriteLine("flen: " + Convert.ToString(fs.Length()));
+        Console.WriteLine("rb0: " + Convert.ToString(fs.ReadByte()));
+        Console.WriteLine("rb1: " + Convert.ToString(fs.ReadByte()));
+        Console.WriteLine("pos2: " + Convert.ToString(fs.Position()));
+        Console.WriteLine("skC: " + Convert.ToString(fs.Seek(3, (int)SeekOrigin.Current)));
+        Console.WriteLine("posC: " + Convert.ToString(fs.Position()));
+        Console.WriteLine("skE: " + Convert.ToString(fs.Seek(-2, (int)SeekOrigin.End)));
+        Console.WriteLine("posE: " + Convert.ToString(fs.Position()));
+        Console.WriteLine("rbEnd: " + Convert.ToString(fs.ReadByte()));
+        Console.WriteLine("rbEof: " + Convert.ToString(fs.ReadByte()));
+        Console.WriteLine("skB: " + Convert.ToString(fs.Seek(0, (int)SeekOrigin.Begin)));
+        Console.WriteLine("rbB: " + Convert.ToString(fs.ReadByte()));
+        fs.Close();
+        Console.WriteLine("closed: " + (fs.IsClosed() ? 1 : 0));
+
+        File.Copy(fn, "f34_copy.tmp");
+        Console.WriteLine("cpsize: " + Convert.ToString(File.GetSize("f34_copy.tmp")));
+        File.Move("f34_copy.tmp", "f34_moved.tmp");
+        Console.WriteLine("mvexists: " + (File.Exists("f34_moved.tmp") ? 1 : 0));
+        Console.WriteLine("cpmissing: " + (File.Exists("f34_copy.tmp") ? 1 : 0));
+
+        MemoryMappedFile.Unlink("f34_blk");
+        MemoryMappedFile mm = MemoryMappedFile.CreateNew("f34_blk", 64);
+        nint view = mm.Map(64);
+        Console.WriteLine("map: " + (view != 0 ? 1 : 0));
+        NativeMemory.PutString(view, 0, "mmap-edge", 9);
+        Console.WriteLine("flush: " + (mm.Flush(view, 64) ? 1 : 0));
+        // darwin shm: ftruncate does not update st_size, so an explicit
+        // size check in OpenExisting fails there (oracle parity, both
+        // sides) — size 0 skips the check.
+        try {
+            MemoryMappedFile bad = MemoryMappedFile.OpenExisting("f34_blk", 64);
+            Console.WriteLine("oe64: opened");
+            bad.Close();
+        } catch (Exception e) {
+            Console.WriteLine("oe64: EX");
+        }
+        MemoryMappedFile mm2 = MemoryMappedFile.OpenExisting("f34_blk", 0);
+        nint view2 = mm2.Map(64);
+        Console.WriteLine("map2: " + (view2 != 0 ? 1 : 0));
+        Console.WriteLine("mmval: " + NativeMemory.GetString(view2, 0, 9));
+        Console.WriteLine("unmap: " + (mm.Unmap(view, 64) ? 1 : 0));
+        Console.WriteLine("unmap2: " + (mm2.Unmap(view2, 64) ? 1 : 0));
+        mm.Close();
+        mm2.Close();
+        Console.WriteLine("unlink: " + (MemoryMappedFile.Unlink("f34_blk") ? 1 : 0));
+
+        File.Delete(fn);
+        File.Delete("f34_moved.tmp");
+        Console.WriteLine("cleanup: " + (File.Exists(fn) ? 1 : 0));
+    }
+}
