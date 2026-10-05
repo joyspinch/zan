@@ -1,0 +1,83 @@
+// b36: worker-thread handshake through AtomicInt (CAS witness loop,
+// tid isolation, happens-before release) plus the file metadata face:
+// attributes bits (1 readonly / 2 hidden / 4 dir), length, mtime/atime
+// exact round-trips, ctime positivity, and readonly interplay.
+using System;
+using System.Threading;
+
+class Program {
+    [DllImport("crt")]
+    static extern long zan_file_time(string path, int which);
+    [DllImport("crt")]
+    static extern long zan_file_length(string path);
+    [DllImport("crt")]
+    static extern long zan_file_attributes(string path);
+    [DllImport("crt")]
+    static extern long zan_file_set_readonly(string path, int on);
+    [DllImport("crt")]
+    static extern long zan_file_set_time(string path, int which, long unixSec);
+
+    static AtomicInt counter = new AtomicInt(0);
+    static AtomicInt done = new AtomicInt(0);
+    static AtomicInt ord = new AtomicInt(0);
+    static AtomicInt wtid = new AtomicInt(0);
+    static long mainTid;
+
+    static void WCounter() {
+        long i = 0;
+        while (i < 1000) {
+            long seen = counter.Load();
+            if (counter.CompareExchange(seen, seen + 1) == seen) { i = i + 1; }
+        }
+        ord.Exchange(7);          // happens-before done.Add below
+        wtid.Exchange(Thread.CurrentId());
+        done.Add(1);
+    }
+
+    static void WSleeper() {
+        Thread.Sleep(2);
+        done.Add(1);
+    }
+
+    static int Main() {
+        mainTid = Thread.CurrentId();
+        Console.WriteLine("tid-main-pos " + (mainTid > 0 ? 1 : 0));
+
+        Thread.Start(WCounter);
+        Thread.Start(WSleeper);
+        while (done.Load() < 2) { Thread.Sleep(1); }
+        Console.WriteLine("counter " + Convert.ToString(counter.Load()));
+        Console.WriteLine("ord " + Convert.ToString(ord.Load()));
+        long wt = wtid.Load();
+        Console.WriteLine("wtid-neq-main " + (wt != mainTid && wt > 0 ? 1 : 0));
+
+        string path = "thr_file.tmp";
+        string dot = ".thr_hidden.tmp";
+        File.WriteAllText(path, "hello");
+        File.WriteAllText(dot, "x");
+
+        Console.WriteLine("attr-reg " + Convert.ToString(zan_file_attributes(path)));
+        Console.WriteLine("attr-dot " + Convert.ToString(zan_file_attributes(dot)));
+        Console.WriteLine("attr-dir " + Convert.ToString(zan_file_attributes(".")));
+        Console.WriteLine("attr-missing " + Convert.ToString(zan_file_attributes("no_such_zan_b36")));
+        Console.WriteLine("len " + Convert.ToString(zan_file_length(path)));
+        Console.WriteLine("len-missing " + Convert.ToString(zan_file_length("no_such_zan_b36")));
+
+        Console.WriteLine("ro-on " + Convert.ToString(zan_file_set_readonly(path, 1)));
+        Console.WriteLine("attr-ro " + Convert.ToString(zan_file_attributes(path)));
+        Console.WriteLine("ro-off " + Convert.ToString(zan_file_set_readonly(path, 0)));
+        Console.WriteLine("attr-back " + Convert.ToString(zan_file_attributes(path)));
+
+        Console.WriteLine("setm " + Convert.ToString(zan_file_set_time(path, 0, 1000000000)));
+        Console.WriteLine("time0-eq " + (zan_file_time(path, 0) == 1000000000 ? 1 : 0));
+        Console.WriteLine("time1-pos " + (zan_file_time(path, 1) > 0 ? 1 : 0));
+        Console.WriteLine("seta " + Convert.ToString(zan_file_set_time(path, 2, 1500000000)));
+        Console.WriteLine("time2-eq " + (zan_file_time(path, 2) == 1500000000 ? 1 : 0));
+
+        Console.WriteLine("setm-ro " + Convert.ToString(zan_file_set_time(path, 0, 1234567890)));
+        Console.WriteLine("time0-ro " + (zan_file_time(path, 0) == 1234567890 ? 1 : 0));
+        Console.WriteLine("time-missing " + Convert.ToString(zan_file_time("no_such_zan_b36", 0)));
+        Console.WriteLine("set-missing " + Convert.ToString(zan_file_set_time("no_such_zan_b36", 0, 5)));
+        return 0;
+    }
+}

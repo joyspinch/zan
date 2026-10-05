@@ -1,0 +1,179 @@
+// b36: sockaddr address classification/formatting — the SSRF-guard CIDR
+// table (is_safe), family/length guards, ip_str canonical formatting,
+// copy-out variants, and literal-only resolutions. darwin BSD sockaddr
+// layout: byte 0 sa_len, byte 1 sa_family, port big-endian at 2.
+// NOTE: V6 addresses are built from 32-char hex strings — a 17-scalar-param
+// helper would hit the seed's 9th-stack-arg miscompile (writer bug, see
+// writer_route.md b36).
+using System;
+
+class Program {
+    [DllImport("crt", EntryPoint = "zan_io_sockaddr_family")]
+    static extern int SockFamily(nint sa, int len);
+    [DllImport("crt", EntryPoint = "zan_io_sockaddr_ip_str")]
+    static extern string SockIp(nint sa);
+    [DllImport("crt", EntryPoint = "zan_io_sockaddr_ip_str_into")]
+    static extern int SockIpInto(nint sa, nint buf, int cap);
+    [DllImport("crt", EntryPoint = "zan_io_sockaddr_is_safe")]
+    static extern int SockSafe(nint sa, int len, int allowLoopback);
+    [DllImport("crt", EntryPoint = "zan_io_resolve_sa")]
+    static extern int ResolveSa(string name, int port, nint buf, int cap);
+    [DllImport("crt", EntryPoint = "zan_io_resolve_ipv4")]
+    static extern int ResolveIpv4(string name);
+    [DllImport("crt", EntryPoint = "zan_io_resolve_all")]
+    static extern int ResolveAll(string name, int port, nint buf, int cap);
+
+    static nint buf;
+    static nint outb;
+    static int bidx;
+
+    static void Emit(int v) { NativeMemory.Fill(buf + bidx, v & 255, 1); bidx = bidx + 1; }
+    static void Zero(int n) { NativeMemory.Fill(buf + bidx, 0, n); bidx = bidx + n; }
+
+    static int V4(int port, int a, int b, int c, int d) {
+        bidx = 0;
+        Emit(16); Emit(2);
+        Emit((port >> 8) & 255); Emit(port & 255);
+        Emit(a); Emit(b); Emit(c); Emit(d);
+        Zero(8);
+        return 16;
+    }
+
+    static int HexVal(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (c >= 97 && c <= 102) { return c - 87; }
+        return c - 55;
+    }
+
+    // 16 address bytes from 32 hex chars, big-endian pair per byte
+    static int V6(int port, string hex) {
+        bidx = 0;
+        Emit(28); Emit(30);
+        Emit((port >> 8) & 255); Emit(port & 255);
+        Zero(4);
+        int i = 0;
+        while (i < 16) {
+            Emit(HexVal(hex[i + i]) * 16 + HexVal(hex[i + i + 1]));
+            i = i + 1;
+        }
+        Zero(4);
+        return 28;
+    }
+
+    static void V6Line(string name, int port, string hex) {
+        int n = V6(port, hex);
+        Console.WriteLine("v6 " + name + " fam " + Convert.ToString(SockFamily(buf, n))
+            + " safe0 " + Convert.ToString(SockSafe(buf, n, 0))
+            + " safe1 " + Convert.ToString(SockSafe(buf, n, 1))
+            + " ip '" + SockIp(buf) + "'");
+    }
+
+    static void V4Line(int a, int b, int c, int d) {
+        int n = V4(443, a, b, c, d);
+        Console.WriteLine("v4 " + Convert.ToString(a) + "." + Convert.ToString(b)
+            + "." + Convert.ToString(c) + "." + Convert.ToString(d)
+            + " fam " + Convert.ToString(SockFamily(buf, n))
+            + " safe0 " + Convert.ToString(SockSafe(buf, n, 0))
+            + " safe1 " + Convert.ToString(SockSafe(buf, n, 1))
+            + " ip '" + SockIp(buf) + "'");
+    }
+
+    static void Main() {
+        buf = NativeMemory.Alloc(256);
+        outb = NativeMemory.Alloc(128);
+
+        int[] q = new int[32];
+        q[0] = 127; q[1] = 0; q[2] = 0; q[3] = 1;
+        q[4] = 127; q[5] = 255; q[6] = 255; q[7] = 254;
+        q[8] = 0; q[9] = 0; q[10] = 0; q[11] = 0;
+        q[12] = 0; q[13] = 1; q[14] = 2; q[15] = 3;
+        q[16] = 9; q[17] = 9; q[18] = 9; q[19] = 9;
+        q[20] = 10; q[21] = 0; q[22] = 0; q[23] = 1;
+        q[24] = 10; q[25] = 255; q[26] = 255; q[27] = 255;
+        q[28] = 11; q[29] = 0; q[30] = 0; q[31] = 1;
+        int i = 0;
+        while (i < 32) { V4Line(q[i], q[i + 1], q[i + 2], q[i + 3]); i = i + 4; }
+        int[] q2 = new int[32];
+        q2[0] = 100; q2[1] = 63; q2[2] = 255; q2[3] = 255;
+        q2[4] = 100; q2[5] = 64; q2[6] = 0; q2[7] = 0;
+        q2[8] = 100; q2[9] = 127; q2[10] = 255; q2[11] = 255;
+        q2[12] = 100; q2[13] = 128; q2[14] = 0; q2[15] = 1;
+        q2[16] = 169; q2[17] = 254; q2[18] = 0; q2[19] = 1;
+        q2[20] = 172; q2[21] = 15; q2[22] = 255; q2[23] = 255;
+        q2[24] = 172; q2[25] = 16; q2[26] = 0; q2[27] = 1;
+        q2[28] = 172; q2[29] = 31; q2[30] = 255; q2[31] = 255;
+        i = 0;
+        while (i < 32) { V4Line(q2[i], q2[i + 1], q2[i + 2], q2[i + 3]); i = i + 4; }
+        int[] q3 = new int[32];
+        q3[0] = 172; q3[1] = 32; q3[2] = 0; q3[3] = 1;
+        q3[4] = 192; q3[5] = 0; q3[6] = 0; q3[7] = 1;
+        q3[8] = 192; q3[9] = 0; q3[10] = 0; q3[11] = 9;
+        q3[12] = 192; q3[13] = 0; q3[14] = 2; q3[15] = 1;
+        q3[16] = 192; q3[17] = 88; q3[18] = 99; q3[19] = 1;
+        q3[20] = 192; q3[21] = 168; q3[22] = 1; q3[23] = 1;
+        q3[24] = 198; q3[25] = 18; q3[26] = 0; q3[27] = 1;
+        q3[28] = 198; q3[29] = 19; q3[30] = 255; q3[31] = 255;
+        i = 0;
+        while (i < 32) { V4Line(q3[i], q3[i + 1], q3[i + 2], q3[i + 3]); i = i + 4; }
+        int[] q4 = new int[32];
+        q4[0] = 198; q4[1] = 51; q4[2] = 100; q4[3] = 1;
+        q4[4] = 203; q4[5] = 0; q4[6] = 113; q4[7] = 1;
+        q4[8] = 224; q4[9] = 0; q4[10] = 0; q4[11] = 1;
+        q4[12] = 239; q4[13] = 9; q4[14] = 9; q4[15] = 9;
+        q4[16] = 240; q4[17] = 0; q4[18] = 0; q4[19] = 1;
+        q4[20] = 255; q4[21] = 255; q4[22] = 255; q4[23] = 255;
+        q4[24] = 8; q4[25] = 8; q4[26] = 8; q4[27] = 8;
+        q4[28] = 1; q4[29] = 2; q4[30] = 3; q4[31] = 4;
+        i = 0;
+        while (i < 32) { V4Line(q4[i], q4[i + 1], q4[i + 2], q4[i + 3]); i = i + 4; }
+
+        V6Line("unspec", 443, "00000000000000000000000000000000");
+        V6Line("loop1", 443, "00000000000000000000000000000001");
+        V6Line("loop2", 443, "00000000000000000000000000000002");
+        V6Line("fc00", 443, "fc000000000000000000000000000001");
+        V6Line("fdff", 443, "fdff0000000000000000000000000001");
+        V6Line("fe80", 443, "fe800000000000000000000000000001");
+        V6Line("feb0", 443, "feb00000000000000000000000000001");
+        V6Line("ff02", 443, "ff020000000000000000000000000001");
+        V6Line("doc", 443, "20010db8000000000000000000000001");
+        V6Line("goog", 443, "20014860486000000000000000008888");
+        V6Line("map8", 443, "00000000000000000000ffff08080808");
+        V6Line("map10", 443, "00000000000000000000ffff0a000001");
+        V6Line("maploop", 443, "00000000000000000000ffff7f000001");
+        V6Line("6to4safe", 443, "20020808080800000000000000000001");
+        V6Line("6to4priv", 443, "20020a00000100000000000000000001");
+        V6Line("nat64safe", 443, "0064ff9b000000000000000080808080");
+        V6Line("nat64priv", 443, "0064ff9b00000000000000000a000001");
+        V6Line("teredo-safe", 443, "200100000808080800000000f7f7f7f7");
+        V6Line("teredo-priv", 443, "200100000a00000100000000f5ffffff");
+
+        Console.WriteLine("fam-short " + Convert.ToString(SockFamily(buf, 1))
+            + " " + Convert.ToString(SockFamily(buf, 0))
+            + " " + Convert.ToString(SockFamily(buf, 100)));
+        int n4 = V4(80, 1, 2, 3, 4);
+        Console.WriteLine("fam-trunc4 " + Convert.ToString(SockFamily(buf, 8)));
+        int n6 = V6(80, "00000000000000000000000000000001");
+        Console.WriteLine("fam-trunc6 " + Convert.ToString(SockFamily(buf, 16)));
+
+        int nv = V4(80, 8, 8, 8, 8);
+        int r1 = SockIpInto(buf, outb, 64);
+        Console.WriteLine("into " + Convert.ToString(r1)
+            + " '" + NativeMemory.GetString(outb, 0, r1) + "'"
+            + " " + Convert.ToString(SockIpInto(buf, outb, 7))
+            + " " + Convert.ToString(SockIpInto(buf, outb, 0)));
+
+        NativeMemory.Fill(buf, 0xAA, 128);
+        Console.WriteLine("rsa4 " + Convert.ToString(ResolveSa("127.0.0.1", 80, buf, 128)));
+        Console.WriteLine("rsa4ip '" + SockIp(buf) + "'");
+        NativeMemory.Fill(buf, 0xAA, 128);
+        Console.WriteLine("rsa6 " + Convert.ToString(ResolveSa("::1", 80, buf, 128)));
+        Console.WriteLine("rsa6ip '" + SockIp(buf) + "'");
+        Console.WriteLine("rsa-bogus " + Convert.ToString(ResolveSa("bogus.invalid.tld.zz", 80, buf, 128)));
+        Console.WriteLine("rsa-empty " + Convert.ToString(ResolveSa("", 80, buf, 128)));
+        Console.WriteLine("rip4 " + Convert.ToString(ResolveIpv4("127.0.0.1")));
+        Console.WriteLine("rip4-empty " + Convert.ToString(ResolveIpv4("")));
+        Console.WriteLine("rip4-bogus " + Convert.ToString(ResolveIpv4("bogus.invalid.tld.zz")));
+        Console.WriteLine("rall " + (ResolveAll("8.8.8.8", 80, buf, 128) > 0 ? 1 : 0));
+        Console.WriteLine("rall-smallcap " + Convert.ToString(ResolveAll("8.8.8.8", 80, buf, 8)));
+    }
+}
