@@ -2500,9 +2500,10 @@ __attribute__((weak)) void zan_gate_free(long long handle) {
 }
 
 /* ---- 单线程 CO 驱动(rt_io.c Non-Windows fallback 逐字语义;
- *      反应器泵在 Zan 车道尚不存在,以静态零桩收口) ---- */
-static long long zan_io_pump(void) { return 0; }
-static long long zan_io_pump_timeout(long long ms) { (void)ms; return 0; }
+ *      反应器泵在 Zan 车道尚不存在,以零桩收口;b39 去静态导出
+ *      oracle 面——oracle 的多工反应器版也导出这两个符号) ---- */
+long long zan_io_pump(void) { return 0; }
+long long zan_io_pump_timeout(long long ms) { (void)ms; return 0; }
 
 typedef struct zan_co_node {
     struct zan_co_node *next;
@@ -2617,5 +2618,91 @@ const char *zan_file_app_dir(void) {
     memcpy(dir, local, strlen(local) + 1);
     __atomic_store_n(&g_appdir_resolved, 1, __ATOMIC_RELEASE);
     return dir;
+}
+#endif
+
+/* ---- b39 (v18o-71): 目录列表 + 线程解绑 + 非阻塞套接字导出面 ---- */
+#ifdef ZAN_RT_CORE_ZAN
+/* rt_sync.c:2599 verbatim: glob(3) 匹配 pattern(如 dir 下取 .zan 后缀),
+ * 输出取 basename、'\n' 分隔、cap 截断;返回写入长度,无匹配返回 0。
+ * glob 默认排序(未传 GLOB_NOSORT),故输出顺序确定、可与 oracle 逐字节对拍。 */
+#include <glob.h>
+long long zan_dir_list_into(const char *pattern, char *out, long long cap) {
+    if (!out || cap <= 0) return 0;
+    out[0] = '\0';
+    if (!pattern) return 0;
+    long long len = 0;
+#ifdef _WIN32
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        long long nl = (long long)strlen(fd.cFileName);
+        if (len + nl + 2 > cap) break;
+        memcpy(out + len, fd.cFileName, (size_t)nl);
+        len += nl;
+        out[len++] = '\n';
+        out[len] = '\0';
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    glob_t g;
+    if (glob(pattern, 0, NULL, &g) != 0) return 0;
+    for (size_t i = 0; i < g.gl_pathc; i++) {
+        const char *base = strrchr(g.gl_pathv[i], '/');
+        base = base ? base + 1 : g.gl_pathv[i];
+        long long nl = (long long)strlen(base);
+        if (len + nl + 2 > cap) break;
+        memcpy(out + len, base, (size_t)nl);
+        len += nl;
+        out[len++] = '\n';
+        out[len] = '\0';
+    }
+    globfree(&g);
+#endif
+    return len;
+}
+
+/* rt_sync.c:914-931 verbatim:抛异常程序里 ngen 产物会定义强
+ * __zan_eh_release;弱定义让强定义赢,其余程序解析这份空操作。
+ * zan_thread_detach 供非运行时自启线程(X11/SDL/Cocoa 回调线程)归还
+ * 每线程槽位,POSIX 侧目前只是释放 EH 状态。 */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak)) void __zan_eh_release(void) { }
+#else
+void __zan_eh_release(void) { }
+#endif
+void zan_thread_detach(void) {
+    __zan_eh_release();
+}
+
+/* rt_io.c:973 verbatim:fcntl 置 O_NONBLOCK;0 成功,-1 失败。#ifndef
+ * 基线区已有同名 static(不导出),rest 侧此处导出 oracle 面。 */
+#include <sys/mman.h>
+#include <fcntl.h>
+/* b39:shm_open 经 clang 编译的薄壳转发——Zan 直接 DllImport 绑定 darwin
+ * libc 的 shm_open 变体时 mode 实参被吞(实测 create 请求 0600 落成只读
+ * 对象、open O_RDWR 得 EACCES);薄壳侧 mode 按标准 ABI 落寄存器。 */
+long long zanrt_shm_open(const char *name, int flags, int mode) {
+    return shm_open(name, flags, (mode_t)mode);
+}
+
+int32_t zan_io_sockaddr_family(const void *sa, int32_t salen);
+int32_t zan_io_set_nonblocking(intptr_t fd) {
+    int flags = fcntl((int)fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl((int)fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/* rt_io.c:881 verbatim:非阻塞 connect 启动;0 已建立,-2 进行中,
+ * 其余为正 errno 码或 -1。基线区同名 static 不受影响。 */
+int32_t zan_io_connect_sa_start(intptr_t fd, const void *sa, int32_t salen) {
+    if (!sa || zan_io_sockaddr_family(sa, salen) == 0) return -1;
+    if (zan_io_set_nonblocking(fd) != 0) return -1;
+    int r = connect((int)fd, (const struct sockaddr *)sa, (socklen_t)salen);
+    if (r == 0) return 0;
+    if (errno == EINPROGRESS || errno == EWOULDBLOCK || errno == EALREADY)
+        return -2;
+    return errno > 0 ? errno : -1;
 }
 #endif

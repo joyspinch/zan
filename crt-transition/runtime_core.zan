@@ -1139,8 +1139,12 @@ class zan {
     // oracle 本尊 darwin 运行同样 FileNotFoundException/失配(实测)。
     // 金档是 Linux 语义的产物,判环境类不判缺陷;mode 投递修好后以页
     // 尺寸 16384 走 create/open/map×2/跨进程可见/unmap/close 全链通。
-    [DllImport("crt", EntryPoint = "shm_open", Variadic = true)]
-    public static extern int cshm_open(nint name, int oflag);
+    // 原 EntryPoint "shm_open"+Variadic=true:变参调用约定吞掉 mode 实参
+    // (darwin 实测 create 请求 0600 落成只读对象,open O_RDWR 得 EACCES,
+    // fileinfoex_mmap 第三十九批根因)。经 zanstubs.c 的 zanrt_shm_open
+    // 薄壳(clang 标准 ABI)转发。
+    [DllImport("crt", EntryPoint = "zanrt_shm_open")]
+    public static extern int cshm_open(nint name, int oflag, int mode);
     [DllImport("crt", EntryPoint = "shm_unlink")]
     public static extern int cshm_unlink(nint name);
     [DllImport("crt", EntryPoint = "ftruncate")]
@@ -1197,6 +1201,10 @@ class zan {
         if (fd < 0) { cfree(np); return 0; }
         if (size > 0) {
 #if MACOS
+            // darwin arm64 struct stat:st_size @96(Span<long>[12],实证
+            // stat39 十六槽转储);linux @48([6])。darwin shm 对象按页取整
+            // (ftruncate 4096 实测 st_size=16384)——open 的严格 size 对拍
+            // 在两树 darwin 上同败,probe 侧改用页粒度尺寸(oracle 同象)
             nint sb = malloc(144);
             long bad = cfstat(fd, sb) != 0 || new Span<long>(sb, 18)[12] != size;
 #else

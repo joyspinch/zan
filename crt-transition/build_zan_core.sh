@@ -112,10 +112,15 @@ python3 crt-transition/localize_syms.py "$ROOT/crt-transition/zanstubs_rest.o" \
   _swoole_timer_stats _swoole_timer_tick \
   _zan_gate_new _zan_gate_park _zan_gate_signal _zan_gate_free \
   _zan_co_sched_init _zan_co_ready _zan_co_delay \
-  __zan_co_frame_free _zan_co_pending _zan_co_sched_run_until \
+  ___zan_co_frame_free _zan_co_pending _zan_co_sched_run_until \
   _zan_co_sched_run \
   _zan_file_app_dir _zan_exe_dir_into \
   _zan_rt_fatal _zan_rt_set_fatal_handler \
+  _zan_dir_list_into _zan_thread_detach ___zan_eh_release \
+  _zan_io_set_nonblocking _zan_io_pump _zan_io_pump_timeout \
+  _zan_io_connect_sa_start _zanrt_shm_open \
+  _zan_rt_guard_fail2 _zan_rt_soft_note _zan_rt_soft_note2 \
+  _zan_rt_soft_note3 _zan_rt_soft_scratch _zan_utf8_argv \
   --weaken \
   _zan_rt_dbl_parse _zan_rt_dbl_str _zan_rt_guard_fail3 \
   _zan_rt_set_strict _zan_rt_soft_is_hard
