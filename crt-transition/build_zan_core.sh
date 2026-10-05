@@ -88,13 +88,37 @@ python3 crt-transition/localize_syms.py "$OUT" \
   _zan_md5 _zan_sha1 _zan_hmac_sha256 _zan_urandom _zan_vm_read \
   _zan_lock_enter _zan_lock_exit _zan_exe_path \
   --weaken \
-  _zan_embed_has _zan_embed_read _zan_embed_bytes _zan_embed_list
+  _zan_embed_has _zan_embed_read _zan_embed_bytes _zan_embed_list \
+  _zan_rt_dbl_parse _zan_rt_dbl_str _zan_rt_guard_fail3 \
+  _zan_rt_set_strict _zan_rt_soft_is_hard
 cc -DZAN_RT_CORE_ZAN \
   -I/Users/qq/Desktop/zanlang/zan-lang/src/common \
   -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
   -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
   -c -o "$ROOT/crt-transition/zanstubs_rest.o" \
   "$ROOT/crt-transition/zanstubs.c"
+# rt_timer.c(gate/CO 块同)的五个符号 ngen 会烘焙进每个程序对象,
+# 弱化让烘焙强定义赢、非烘焙程序解析这里的副本
+python3 crt-transition/localize_syms.py "$ROOT/crt-transition/zanstubs_rest.o" \
+  _zan_embed_decode _zan_embed_rawlen \
+  _zan_timer_after _zan_timer_cancel_delay _zan_timer_clear \
+  _zan_timer_clear_all _zan_timer_delay _zan_timer_dispatch_due \
+  _zan_timer_info _zan_timer_list_at _zan_timer_list_count \
+  _zan_timer_next_timeout _zan_timer_now_ms _zan_timer_pending \
+  _zan_timer_runtime_reset _zan_timer_saturating_due \
+  _zan_timer_set_ready_hook _zan_timer_stats _zan_timer_tick \
+  _swoole_timer_after _swoole_timer_clear _swoole_timer_clear_all \
+  _swoole_timer_info _swoole_timer_list_at _swoole_timer_list_count \
+  _swoole_timer_stats _swoole_timer_tick \
+  _zan_gate_new _zan_gate_park _zan_gate_signal _zan_gate_free \
+  _zan_co_sched_init _zan_co_ready _zan_co_delay \
+  __zan_co_frame_free _zan_co_pending _zan_co_sched_run_until \
+  _zan_co_sched_run \
+  _zan_file_app_dir _zan_exe_dir_into \
+  _zan_rt_fatal _zan_rt_set_fatal_handler \
+  --weaken \
+  _zan_rt_dbl_parse _zan_rt_dbl_str _zan_rt_guard_fail3 \
+  _zan_rt_set_strict _zan_rt_soft_is_hard
 cc -DZAN_RT_CORE_ZAN -c -o "$ROOT/crt-transition/zanhost_rest.o" \
   "$ROOT/crt-transition/zanhost.c"
 cc -c -o "$ROOT/crt-transition/zanstubs_full.o" "$ROOT/crt-transition/zanstubs.c"

@@ -2403,3 +2403,219 @@ int64_t zan_monotonic_us(void) {
 #include "/Users/qq/Desktop/zanlang/zan-lang/src/common/miniz_tdef.c"
 #include "/Users/qq/Desktop/zanlang/zan-lang/src/runtime/zan_inflate.c"
 #endif
+
+/* ---- b38 (v18o-69): oracle 定时器面 + 协程门/单线程驱动真身 ----
+ * rt_timer.c 整文件:zan_timer 与 swoole_timer 两族、zan_rt_fatal 漏斗、
+ * 崩溃日志;oracle 每个 zanc 程序都无条件链它。gate 族与单线程 CO
+ * 驱动从 rt_io.c 逐字提取(darwin 上 oracle 走的正是 Non-Windows
+ * fallback 分支)。gate 与 CO 驱动一律弱符号:writer 的 ngen 会把
+ * 同名强定义烘焙进 async 模块(ngen_async.zan 2327 起),非 async
+ * 程序(如探针)解析这里的弱副本。zan_io_pump 与 pump_timeout 以同 TU 静态零桩代替
+ * ——Zan 车道还没有 C 反应器,writer 的 async 发射落地时若需要真
+ * 泵,删掉这两个桩再接真身(见 writer_route.md b38)。
+ * app_dir 与 exe_dir_into 同批补齐。 */
+#ifdef ZAN_RT_CORE_ZAN
+#include <stdint.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <mach-o/dyld.h>
+
+#include "/Users/qq/Desktop/zanlang/zan-lang/src/runtime/rt_timer.c"
+
+/* ---- gate 族(rt_io.c,ZAN_CO_DRIVER 形态:pthread 锁) ---- */
+typedef void (*zan_co_step_t)(void *frame);
+void zan_co_ready(void *frame, zan_co_step_t step);
+
+typedef struct zan_gate_waiter {
+    struct zan_gate_waiter *next;
+    void                   *frame;
+    zan_co_step_t           step;
+} zan_gate_waiter;
+
+typedef struct zan_gate {
+    zan_gate_waiter *head;
+    zan_gate_waiter *tail;
+    long long        surplus;
+    pthread_mutex_t  lock;
+} zan_gate;
+
+__attribute__((weak)) long long zan_gate_new(void) {
+    zan_gate *g = (zan_gate *)calloc(1, sizeof(*g));
+    if (!g) return 0;
+    pthread_mutex_init(&g->lock, NULL);
+    return (long long)(intptr_t)g;
+}
+
+__attribute__((weak)) void zan_gate_park(long long handle, void *frame, zan_co_step_t step) {
+    zan_gate *g = (zan_gate *)(intptr_t)handle;
+    if (!g) { if (step) zan_co_ready(frame, step); return; }
+    if (!step) return;
+    pthread_mutex_lock(&g->lock);
+    if (g->surplus > 0) {
+        g->surplus--;
+        pthread_mutex_unlock(&g->lock);
+        zan_co_ready(frame, step);
+        return;
+    }
+    zan_gate_waiter *w = (zan_gate_waiter *)malloc(sizeof(*w));
+    if (!w) { pthread_mutex_unlock(&g->lock); zan_co_ready(frame, step); return; }
+    w->next = NULL; w->frame = frame; w->step = step;
+    if (g->tail) g->tail->next = w; else g->head = w;
+    g->tail = w;
+    pthread_mutex_unlock(&g->lock);
+}
+
+__attribute__((weak)) void zan_gate_signal(long long handle) {
+    zan_gate *g = (zan_gate *)(intptr_t)handle;
+    if (!g) return;
+    pthread_mutex_lock(&g->lock);
+    zan_gate_waiter *w = g->head;
+    if (w) {
+        g->head = w->next;
+        if (!g->head) g->tail = NULL;
+        pthread_mutex_unlock(&g->lock);
+        zan_co_ready(w->frame, w->step);
+        free(w);
+        return;
+    }
+    g->surplus++;
+    pthread_mutex_unlock(&g->lock);
+}
+
+__attribute__((weak)) void zan_gate_free(long long handle) {
+    zan_gate *g = (zan_gate *)(intptr_t)handle;
+    if (!g) return;
+    pthread_mutex_lock(&g->lock);
+    zan_gate_waiter *w = g->head;
+    g->head = g->tail = NULL;
+    pthread_mutex_unlock(&g->lock);
+    while (w) {
+        zan_gate_waiter *n = w->next;
+        zan_co_ready(w->frame, w->step);
+        free(w);
+        w = n;
+    }
+    pthread_mutex_destroy(&g->lock);
+    free(g);
+}
+
+/* ---- 单线程 CO 驱动(rt_io.c Non-Windows fallback 逐字语义;
+ *      反应器泵在 Zan 车道尚不存在,以静态零桩收口) ---- */
+static long long zan_io_pump(void) { return 0; }
+static long long zan_io_pump_timeout(long long ms) { (void)ms; return 0; }
+
+typedef struct zan_co_node {
+    struct zan_co_node *next;
+    void               *frame;
+    zan_co_step_t       step;
+} zan_co_node;
+
+static zan_co_node *g_rq_head;
+static zan_co_node *g_rq_tail;
+
+__attribute__((weak)) void zan_co_sched_init(void) {
+    g_rq_head = g_rq_tail = NULL;
+    zan_timer_runtime_reset();
+    zan_timer_set_ready_hook(zan_co_ready);
+}
+
+__attribute__((weak)) void zan_co_ready(void *frame, zan_co_step_t step) {
+    if (!step) return;
+    zan_co_node *n = (zan_co_node *)malloc(sizeof(*n));
+    if (!n) {
+        step(frame);
+        return;
+    }
+    n->next = NULL; n->frame = frame; n->step = step;
+    if (g_rq_tail) g_rq_tail->next = n; else g_rq_head = n;
+    g_rq_tail = n;
+}
+
+__attribute__((weak)) void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
+    zan_timer_delay(ms, frame, step);
+}
+
+__attribute__((weak)) void __zan_co_frame_free(void *frame) { free(frame); }
+
+__attribute__((weak)) size_t zan_co_pending(void) {
+    size_t n = 0;
+    zan_co_node *p;
+    for (p = g_rq_head; p; p = p->next) n++;
+    return n;
+}
+
+__attribute__((weak)) void zan_co_sched_run_until(const volatile int *done) {
+    for (;;) {
+        while (g_rq_head) {
+            if (done && *done) return;
+            zan_co_node *n = g_rq_head;
+            g_rq_head = n->next; if (!g_rq_head) g_rq_tail = NULL;
+            void *frame = n->frame; zan_co_step_t step = n->step;
+            free(n);
+            step(frame);
+        }
+        if (done && *done) return;
+        long long timeout = zan_timer_next_timeout();
+        if (timeout >= 0) {
+            if (timeout > 0) {
+                zan_io_pump_timeout(timeout);
+                continue;
+            }
+            zan_timer_dispatch_due();
+            continue;
+        }
+        if (zan_io_pump() > 0) continue;
+        return;
+    }
+}
+
+__attribute__((weak)) void zan_co_sched_run(void) {
+    zan_co_sched_run_until(NULL);
+}
+
+/* ---- zan_exe_dir_into(rt_sync.c)与 zan_file_app_dir(rt_file.c)---- */
+long long zan_exe_dir_into(char *out, long long cap) {
+    if (!out || cap <= 0) return 0;
+    out[0] = '\0';
+    char buf[1024];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n < 0) n = 0;
+    while (n > 0 && buf[n - 1] != '/') n--;
+    if (n > 0) n--;
+    if ((long long)n >= cap) n = (ssize_t)(cap - 1);
+    memcpy(out, buf, (size_t)n);
+    out[n] = '\0';
+    return (long long)n;
+}
+
+static volatile int g_appdir_resolved;
+
+const char *zan_file_app_dir(void) {
+    static char dir[4096];
+    if (__atomic_load_n(&g_appdir_resolved, __ATOMIC_ACQUIRE)) return dir;
+    const char *env = getenv("ZAN_APP_DIR");
+    char local[4096];
+    local[0] = '\0';
+    if (env && env[0] && strlen(env) < sizeof(local)) {
+        memcpy(local, env, strlen(env) + 1);
+    } else {
+        char exe[4096];
+        exe[0] = 0;
+        uint32_t cap = (uint32_t)sizeof(exe);
+        if (_NSGetExecutablePath(exe, &cap) != 0) exe[0] = 0;
+        if (exe[0]) {
+            char *fwd = strrchr(exe, '/');
+            char *back = strrchr(exe, '\\');
+            char *sep = fwd > back ? fwd : back;
+            if (sep && sep != exe) {
+                *sep = 0;
+                if (strlen(exe) < sizeof(local))
+                    memcpy(local, exe, strlen(exe) + 1);
+            }
+        }
+    }
+    memcpy(dir, local, strlen(local) + 1);
+    __atomic_store_n(&g_appdir_resolved, 1, __ATOMIC_RELEASE);
+    return dir;
+}
+#endif
