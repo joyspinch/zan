@@ -89,7 +89,11 @@ python3 crt-transition/localize_syms.py "$OUT" \
   _zan_lock_enter _zan_lock_exit _zan_exe_path \
   --weaken \
   _zan_embed_has _zan_embed_read _zan_embed_bytes _zan_embed_list
-cc -DZAN_RT_CORE_ZAN -c -o "$ROOT/crt-transition/zanstubs_rest.o" \
+cc -DZAN_RT_CORE_ZAN \
+  -I/Users/qq/Desktop/zanlang/zan-lang/src/common \
+  -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
+  -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
+  -c -o "$ROOT/crt-transition/zanstubs_rest.o" \
   "$ROOT/crt-transition/zanstubs.c"
 cc -DZAN_RT_CORE_ZAN -c -o "$ROOT/crt-transition/zanhost_rest.o" \
   "$ROOT/crt-transition/zanhost.c"

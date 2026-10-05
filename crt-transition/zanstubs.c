@@ -2388,3 +2388,18 @@ int64_t zan_monotonic_us(void) {
 #define EXPORT __attribute__((visibility("default")))
 #include "/Users/qq/Desktop/zanlang/zan-lang/src/runtime/zan_audio.c"
 #endif
+
+/* ---- b37 (v18o-67): oracle 压缩资源解码面真身 ----
+ * zan_inflate.c 供 zan_embed_decode/rawlen(裸 deflate,载荷
+ * [u32 raw_len][u32 comp_len][stream],ARC tag 位在 len 里)。
+ * miniz 按 oracle CMakeLists zan_inflate 的裁剪旗编译(见
+ * build_zan_core.sh 的 -DMINIZ_NO_*);read API(read/has/bytes/
+ * list)不在此供给——oracle 策略是编译器把 read 面烘焙进引用它的
+ * 程序模块(embedres.c:315),Zan 侧同样归 ngen,runtime_core.zan
+ * 的弱桩继续当诚实空集回退。 */
+#ifdef ZAN_RT_CORE_ZAN
+#include "/Users/qq/Desktop/zanlang/zan-lang/src/common/miniz.c"
+#include "/Users/qq/Desktop/zanlang/zan-lang/src/common/miniz_tinfl.c"
+#include "/Users/qq/Desktop/zanlang/zan-lang/src/common/miniz_tdef.c"
+#include "/Users/qq/Desktop/zanlang/zan-lang/src/runtime/zan_inflate.c"
+#endif

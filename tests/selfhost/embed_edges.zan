@@ -1,0 +1,117 @@
+// b37: compressed-resource decoder (zan_embed_decode/rawlen) — the runtime
+// side of the inline embed API. Payload = [u32 raw_len][u32 comp_len][raw
+// deflate]; the length argument must carry the ARC managed-array tag bit
+// (1<<62) or the call is rejected. Read API (read/has/bytes/list) is not
+// probed: the oracle bakes it per-program (embedres.c), Zan-side that is
+// ngen territory.
+using System;
+
+class Program {
+    [DllImport("crt", EntryPoint = "zan_embed_rawlen")]
+    static extern int RawLen(nint payload, nint len);
+    [DllImport("crt", EntryPoint = "zan_embed_decode")]
+    static extern nint Decode(nint payload, nint len);
+
+    static nint TAG = ((nint)1) << 62;
+
+    static string Phello3 = "120000000a000000cb48cdc9c957c8402201";
+    static string Pempty = "00000000020000000300";
+    static string Pbytes256 = "00040000180100006360646266616563e7e0e4e2e6e1e5e3171014121611151397909492969195935750545256515553d7d0d4d2d6d1d5d33730343236313533b7b0b4b2b6b1b5b37770747276717573f7f0f4f2f6f1f5f30f080c0a0e090d0b8f888c8a8e898d8b4f484c4a4e494d4bcfc8cccacec9cdcb2f282c2a2e292d2bafa8acaaaea9adab6f686c6a6e696d6befe8eceaeee9edeb9f3071d2e42953a74d9f3173d6ec3973e7cd5fb070d1e2254b972d5fb172d5ea356bd7addfb071d3e62d5bb76ddfb173d7ee3d7bf7ed3f70f0d0e123478f1d3f71f2d4e93367cf9dbf70f1d2e52b57af5dbf71f3d6ed3b77efdd7ff0f0d1e3274f9f3d7ff1f2d5eb376fdfbdfff0f1d3e72f5fbf7dfff1f3d7ef3f7ffffd6718f5ffa8ff47b0ff01";
+    static string Pbigtext = "35070000820000002bc94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a7eb8179a38a47158f2aa6aae297b3b73d5db7f7e9dae9cfd72c7bb2a3efc98eb5cfa6b53fdbbefd59df248594d4b49cc4925485a77dddcff7ac7cb1b5e5d9ae09cfb676bf583f15a466ce9ac70d4da3da47b58f6aa7a77600";
+    static string Prand300 = "2c01000031010000012c01d3fe38b4e652e44da7f2370d9e260e27136550a4a3a6d07f5c0c332f8b1224083fd22b902f8911e81818f8c99d5d5d9831957504d90e945de2e8f54ee781cc75f636d85099095aa300165a67036f9b540d6b8f0be21124179c3dd9f73817ce6e118d264aad6cb6dd210faf94acd3cf92c190237cb11f5d108cf25930263938b370a1b5769fa0f1483f95a90d9df2f130d60fcf04bd93f50ae69514da8c659ce2b10cccdaebf990d19838b0d7ec0b3e97818ecb96c4dbadbe172296d5234a42b24c6ba4e6ed24ec636a8ac0a1271e5866279238aaf84e58056d8f2fa8edd094ba97ae8b15442ee2db611a91bfe39469733a9247d58fa3c55018300372555fd235f11829fb388c22e44cb637f01210c3707a90b405420fb169779edfb5b9342405157f54b12eae62d11e887eb0766d";
+    static string Ptrunc = "1200000005000000cb48cdc9c957c8402201";
+    static string Prawsmall = "110000000a000000cb48cdc9c957c8402201";
+    static string Pcompleng = "1200000013000000cb48cdc9c957c8402201";
+    static string Pemptystream = "1200000000000000";
+
+    static int HexVal(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (c >= 97 && c <= 102) { return c - 87; }
+        return c - 55;
+    }
+
+    static nint BufOf(string hex) {
+        int n = hex.Length / 2;
+        nint p = NativeMemory.Alloc(n + 1);
+        int i = 0;
+        while (i < n) {
+            NativeMemory.Fill(p + i, HexVal(hex[i + i]) * 16 + HexVal(hex[i + i + 1]), 1);
+            i = i + 1;
+        }
+        return p;
+    }
+
+    static string Hex16(ulong h) {
+        string digits = "0123456789abcdef";
+        string s = "";
+        int i = 0;
+        while (i < 16) {
+            s = s + digits.Substring((int)((h >>> (60 - i * 4)) & 15), 1);
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // FNV-1a 64 over the buffer, computed Zan-side (the oracle runtime does
+    // not export zan_sha256 — added in the Zan lane batch 14 — so digests
+    // must come from code both toolchains compile identically)
+    static string Digest(nint p, long n) {
+        Span<byte> sv = new Span<byte>(p, (int)n);
+        ulong h = 14695981039346656037;
+        int i = 0;
+        while (i < n) {
+            h = (h ^ sv[i]) * 1099511628211;
+            i = i + 1;
+        }
+        return Hex16(h);
+    }
+
+    // one valid vector: expect rawlen==r and a full decode; digest covers
+    // raw_len+1 bytes so the NUL terminator is pinned too
+    static void Good(string name, string hex, int r) {
+        nint p = BufOf(hex);
+        nint tagged = TAG | hex.Length / 2;
+        Console.WriteLine(name + " rawlen " + Convert.ToString(RawLen(p, tagged)));
+        nint outp = Decode(p, tagged);
+        if (outp == 0) {
+            Console.WriteLine(name + " decode null");
+        } else {
+            Console.WriteLine(name + " decode " + Digest(outp, r + 1));
+            NativeMemory.Free(outp);
+        }
+        NativeMemory.Free(p);
+    }
+
+    // one malformed vector: expect rawlen/decode to reject
+    static void Bad(string name, string hex, int passLen, bool tag) {
+        nint p = BufOf(hex);
+        nint len = passLen;
+        if (tag) { len = len | TAG; }
+        Console.WriteLine(name + " rawlen " + Convert.ToString(RawLen(p, len))
+            + " decode " + (Decode(p, len) == 0 ? "null" : "NONNULL"));
+        NativeMemory.Free(p);
+    }
+
+    static void Main() {
+        Good("hello3", Phello3, 18);
+        Good("empty", Pempty, 0);
+        Good("bytes256", Pbytes256, 1024);
+        Good("bigtext", Pbigtext, 1845);
+        Good("rand300", Prand300, 300);
+
+        // rawlen/decode on an untagged length: rejected outright
+        Bad("untagged", Phello3, Phello3.Length / 2, false);
+        // payload shorter than the 8-byte header
+        Bad("totalshort", Phello3, 4, true);
+        // comp_len field beyond the payload
+        Bad("compleng", Pcompleng, Pcompleng.Length / 2, true);
+        // stream truncated mid-block
+        Bad("trunc", Ptrunc, Ptrunc.Length / 2, true);
+        // raw_len one short: stream would overflow the buffer
+        Bad("rawsmall", Prawsmall, Prawsmall.Length / 2, true);
+        // comp_len 0 with a nonzero raw_len: no stream at all
+        Bad("emptystream", Pemptystream, Pemptystream.Length / 2, true);
+        // rawlen reads the first u32 regardless of the rest
+        Bad("rawlenonly", Pbigtext, 8, true);
+    }
+}
