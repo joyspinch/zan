@@ -1141,9 +1141,15 @@ class zan {
     // 尺寸 16384 走 create/open/map×2/跨进程可见/unmap/close 全链通。
     // 原 EntryPoint "shm_open"+Variadic=true:变参调用约定吞掉 mode 实参
     // (darwin 实测 create 请求 0600 落成只读对象,open O_RDWR 得 EACCES,
-    // fileinfoex_mmap 第三十九批根因)。经 zanstubs.c 的 zanrt_shm_open
-    // 薄壳(clang 标准 ABI)转发。
+    // fileinfoex_mmap 第三十九批根因)。darwin 上连不带 Variadic 的直连
+    // 三参声明也崩(b40 实测),故走 zanstubs.c 的 zanrt_shm_open 薄壳
+    // (clang 标准 ABI);ELF 车道无 C remainder,直连 musl 静态 shm_open
+    // (guest root 下 mode 吞参无观感,非变参直调 ABI 正常)。
+#if MACOS
     [DllImport("crt", EntryPoint = "zanrt_shm_open")]
+#else
+    [DllImport("crt", EntryPoint = "shm_open")]
+#endif
     public static extern int cshm_open(nint name, int oflag, int mode);
     [DllImport("crt", EntryPoint = "shm_unlink")]
     public static extern int cshm_unlink(nint name);
@@ -2307,16 +2313,6 @@ class zan {
         return io_resolve_all((nint)namePtr, port, (nint)bufPtr, cap);
     }
 
-    static int io_set_nonblocking(long fd) {
-        int flags = cfcntl((int)fd, 3, 0);         // F_GETFL
-        if (flags < 0) { return -1; }
-#if MACOS
-        return cfcntl((int)fd, 4, flags | 4);      // F_SETFL|O_NONBLOCK
-#else
-        return cfcntl((int)fd, 4, flags | 2048);   // F_SETFL|O_NONBLOCK
-#endif
-    }
-
     // errno 值按平台取:darwin 与 linux 的非阻塞族 errno 不同
     // (darwin EAGAIN=35/EINPROGRESS=36/EALREADY=37,Linux 11/115/114;
     // EINTR=4 两边一致)。第二十四批 guest sweep 实证:connect 在 guest
@@ -2341,7 +2337,8 @@ class zan {
 #endif
 
     // rt_io.c:881:非阻塞 connect;0 已建立,-2 进行中,其余正 errno 或 -1。
-    static int io_connect_sa_start(long fd, nint sa, int salen) {
+    // b40 去 static 导出 oracle 面(zan_io_connect_sa_start;语义不变)。
+    public static int io_connect_sa_start(long fd, nint sa, int salen) {
         if (sa == 0 || io_sockaddr_family(sa, salen) == 0) { return -1; }
         if (io_set_nonblocking(fd) != 0) { return -1; }
         int r = cconnect((int)fd, sa, salen);
@@ -2350,6 +2347,85 @@ class zan {
         if (e == Einprogress() || e == Ewould() || e == Ealready()) { return -2; }
         return e > 0 ? e : -1;
     }
+
+    // ---- b40 (v18o-72): b39 C 车道面下沉 Zan 车道,ELF(纯 Zan runtime)
+    //      车道由此获得同面导出;darwin 侧 C 副本改回局部,避免双导出 ----
+
+    // rt_io.c:973:b40 去 static 导出 oracle 面(zan_io_set_nonblocking)。
+    public static int io_set_nonblocking(long fd) {
+        int flags = cfcntl((int)fd, 3, 0);         // F_GETFL
+        if (flags < 0) { return -1; }
+#if MACOS
+        return cfcntl((int)fd, 4, flags | 4);      // F_SETFL|O_NONBLOCK
+#else
+        return cfcntl((int)fd, 4, flags | 2048);   // F_SETFL|O_NONBLOCK
+#endif
+    }
+
+    // rt_sync.c:2599 语义:glob(3) 匹配 pattern(如 dir 下取 .zan 后缀),
+    // 输出取 basename、'\n' 分隔、cap 截断(len+nl+2>cap 逐项 break),
+    // 返回写入长度,无匹配返回 0。glob 默认排序(未传 GLOB_NOSORT),
+    // 输出顺序确定。glob_t 布局 darwin/musl 前两槽一致(pathc@0、
+    // pathv@8;darwin pathc 是 size_t、musl 是 int,小端低 32 位同值),
+    // 按 int 读 pathc、按 long 读 pathv 两平台皆可。非变参导入——
+    // Variadic 吞参是 b39 实证的第三条 seed bug,勿加。
+    [DllImport("crt", EntryPoint = "glob")]
+    public static extern int cglob(nint pattern, int flags, nint errfn, nint pglob);
+    [DllImport("crt", EntryPoint = "globfree")]
+    public static extern void cglobfree(nint pglob);
+
+    public static long dir_list_into(nint pattern, nint outBuf, long cap) {
+        if (outBuf == 0 || cap <= 0) { return 0; }
+        new Span<byte>(outBuf, 1)[0] = 0;
+        if (pattern == 0) { return 0; }
+        nint g = malloc(128);
+        memset(g, 0, 128);
+        if (cglob(pattern, 0, 0, g) != 0) { cfree(g); return 0; }
+        long pathc = new Span<int>(g, 64)[0];
+        if (pathc < 0) { pathc = 0; }
+        // glob_t 布局分叉:darwin 是 {size_t pathc@0, int matchc@8,
+        // size_t offs@16, int flags@24, char** pathv@32};musl 是
+        // {int pathc@0, int flags@4, char** pathv@8}。pathc 低 32 位
+        // 两平台同值,pathv 槽位按平台取。
+#if MACOS
+        nint pathv = new Span<long>(g, 64)[4];
+#else
+        nint pathv = new Span<long>(g, 16)[1];
+#endif
+        long len = 0;
+        int i = 0;
+        while (i < pathc) {
+            nint s = new Span<long>(pathv, (int)(pathc * 8))[i];
+            long nl = cstrlen(s);
+            nint baseP = s;
+            long slash = -1;
+            for (long k = nl - 1; k >= 0; k = k - 1) {
+                if (new Span<byte>(s + k, 1)[0] == 47) { slash = k; break; }
+            }
+            if (slash >= 0) { baseP = s + slash + 1; nl = nl - slash - 1; }
+            if (len + nl + 2 > cap) { break; }
+            memcpy(outBuf + len, baseP, nl);
+            len = len + nl;
+            new Span<byte>(outBuf + len, 1)[0] = 10;
+            len = len + 1;
+            new Span<byte>(outBuf + len, 1)[0] = 0;
+            i = i + 1;
+        }
+        cglobfree(g);
+        cfree(g);
+        return len;
+    }
+
+    // rt_sync.c:929:oracle zan_thread_detach 面——POSIX 侧语义是释放调用
+    // 线程 EH 状态并归还每线程槽;本车道 EH 状态由 ngen 产物自持(抛异常
+    // 程序自带强 __zan_eh_release),非异步程序无可回收槽,空实现即
+    // oracle 可观测等价。
+    public static void thread_detach() { }
+
+    // oracle zan_io_pump 面:本车道无多工反应器,零返回桩与 darwin C
+    // 车道一致;反应器泵待异步引擎(writer 辖区)落地后对齐。
+    public static long io_pump() { return 0; }
+    public static long io_pump_timeout(long ms) { return 0; }
 
     // rt_io.c:903:本车道内联执行;0 已建立,正 SO_ERROR,-3 超时,-1 失败。
     public static long io_connect_sa(long fd, nint sa, int salen, int timeoutMs) {

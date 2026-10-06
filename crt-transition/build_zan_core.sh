@@ -82,6 +82,9 @@ python3 crt-transition/localize_syms.py "$OUT" \
   _zan_io_wait_co _zan_io_recv_co _zan_io_recv_to_co _zan_io_accept_co \
   _zan_io_poll _zan_io_close_notify _zan_resolve_sa_co _zan_resolve_ipv4_co \
   _zan_set_ready_hook _zan_thread_start _zan_thread_current_id \
+  _zan_io_set_nonblocking _zan_io_connect_sa_start \
+  _zan_dir_list_into _zan_thread_detach \
+  _zan_io_pump _zan_io_pump_timeout \
   _zan_copy _zan_fill _zan_compare _zan_find \
   _zan_get_string _zan_put_string \
   _zan_multi_byte_to_wide_char _zan_wide_char_to_multi_byte \
@@ -116,9 +119,7 @@ python3 crt-transition/localize_syms.py "$ROOT/crt-transition/zanstubs_rest.o" \
   _zan_co_sched_run \
   _zan_file_app_dir _zan_exe_dir_into \
   _zan_rt_fatal _zan_rt_set_fatal_handler \
-  _zan_dir_list_into _zan_thread_detach ___zan_eh_release \
-  _zan_io_set_nonblocking _zan_io_pump _zan_io_pump_timeout \
-  _zan_io_connect_sa_start _zanrt_shm_open \
+  ___zan_eh_release _zanrt_shm_open \
   _zan_rt_guard_fail2 _zan_rt_soft_note _zan_rt_soft_note2 \
   _zan_rt_soft_note3 _zan_rt_soft_scratch _zan_utf8_argv \
   --weaken \
