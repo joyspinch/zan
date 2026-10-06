@@ -9,11 +9,12 @@
 #                   native_rt_core native_sync
 #
 # Pipeline per fixture: zanc (ZAN_TARGET=aarch64-linux) -> ELF object ->
-# ld.lld static link with the localized Zan runtime (ELF) and musl
-# libgcc — ZERO project C since 第十四批 retired zanlinuxshims.c (the
-# -D ZAN_RT_CORE_ZAN remainder objects are empty and no longer linked) ->
-# a custom Alpine initramfs -> qemu-system-aarch64 -M virt boot -> serial
-# output compared byte-for-byte with tests/selfhost/<fixture>.out.
+# ld.lld static link with the localized Zan runtime (ELF), the localized
+# C remainder (zanstubs_elf.o, b41: timer/gate/CO/embed-decode/app_dir
+# faces from the oracle C sources — darwin-lane mirror) and musl
+# libgcc -> a custom Alpine initramfs -> qemu-system-aarch64 -M virt
+# boot -> serial output compared byte-for-byte with
+# tests/selfhost/<fixture>.out.
 #
 # Downloads (Alpine kernel, minirootfs, musl, gcc for libgcc.a) are
 # cached under build/linux-vehicle/dl on first use and need network.
@@ -200,6 +201,42 @@ PY
 )"
   python3 "$ROOT/scripts/elf_localize.py" "$O/runtime_core.elf.o" $KEEPS \
     --weaken zan_embed_has zan_embed_read zan_embed_bytes zan_embed_list
+  # b41:ELF C remainder(zanstubs.c 可移植子集:rt_timer.c + gate/CO 单
+  # 线程驱动 + miniz/inflate + app_dir/exe_dir_into + rt 诊断面;audio 面
+  # darwin-only 已在源内护栏)。keep 表 = Zan 车道已导出六面
+  # (dir_list_into/thread_detach/io_set_nonblocking/io_connect_sa_start/
+  # io_pump/io_pump_timeout)之外的全部 zan_/swoole_ 面,miniz 内部符号
+  # 不在 keep 即自动收局部;五件 ngen 每程序烘焙物按 b38 契约弱化。
+  ELFK="swoole_timer_after swoole_timer_clear swoole_timer_clear_all
+swoole_timer_info swoole_timer_list_at swoole_timer_list_count
+swoole_timer_stats swoole_timer_tick
+zan_timer_after zan_timer_cancel_delay zan_timer_clear zan_timer_clear_all
+zan_timer_delay zan_timer_dispatch_due zan_timer_info zan_timer_list_at
+zan_timer_list_count zan_timer_next_timeout zan_timer_now_ms
+zan_timer_pending zan_timer_runtime_reset zan_timer_saturating_due
+zan_timer_set_ready_hook zan_timer_stats zan_timer_tick
+zan_async_cfg_io_shards zan_async_cfg_sync_fast zan_async_cfg_workers
+zan_async_set_io_shards zan_async_set_sync_fast zan_async_set_workers
+zan_co_live_add zan_co_live_count zan_co_live_del zan_co_live_has
+zan_co_live_reset
+zan_gate_new zan_gate_park zan_gate_signal zan_gate_free
+zan_co_sched_init zan_co_ready zan_co_delay zan_co_pending
+zan_co_sched_run_until zan_co_sched_run __zan_co_frame_free
+__zan_eh_release
+zan_embed_decode zan_embed_rawlen
+zan_exe_dir_into zan_file_app_dir
+zan_rt_fatal zan_rt_set_fatal_handler
+zan_rt_guard_fail2 zan_rt_soft_note zan_rt_soft_note2 zan_rt_soft_note3
+zan_rt_soft_scratch zan_utf8_argv"
+  "$CLANG" --target=aarch64-linux-musl --sysroot="$SYSROOT" \
+    -DZAN_RT_CORE_ZAN \
+    -I/Users/qq/Desktop/zanlang/zan-lang/src/common \
+    -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
+    -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
+    -c -o "$O/zanstubs_elf.o" "$ROOT/crt-transition/zanstubs.c"
+  python3 "$ROOT/scripts/elf_localize.py" "$O/zanstubs_elf.o" $ELFK \
+    --weaken zan_rt_dbl_parse zan_rt_dbl_str zan_rt_guard_fail3 \
+    zan_rt_set_strict zan_rt_soft_is_hard
   touch "$WORK/$RTTAG.stamp"
 else
   O="$WORK/$RTTAG"
@@ -224,8 +261,12 @@ run_one() {
     OSSL_LIBS="$OSSL_LIBS -lpq -lpgcommon -lpgport"
   GUI_O=''
   [[ -f "$SYSROOT/usr/lib/zan_gui_stubs.o" ]] && GUI_O="$SYSROOT/usr/lib/zan_gui_stubs.o"
+  # b41:C remainder 回归 ELF 车道(timer/gate/CO/embed-decode/app_dir 面,
+  # 与 darwin 车道同构;此前第十四批"零项目 C"只对当时的面成立)。
+  CREST=''
+  [[ -f "$O/zanstubs_elf.o" ]] && CREST="$O/zanstubs_elf.o"
   "$LLD" -m aarch64linux -static "$SYSROOT/usr/lib/crt1.o" \
-    "$WORK/$name.elf.o" "$O/runtime_core.elf.o" $GUI_O \
+    "$WORK/$name.elf.o" "$O/runtime_core.elf.o" $CREST $GUI_O \
     -L"$SYSROOT/usr/lib" -L"$GCCDIR" -lc -lgcc $OSSL_LIBS \
     -o "$WORK/$name.elf" || { echo 'FAIL (link)'; return 1; }
 

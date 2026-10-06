@@ -1556,7 +1556,9 @@ int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <net/if.h>
+#if defined(__APPLE__)
 #include <net/if_dl.h>
+#endif
 #include <ifaddrs.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -2379,8 +2381,10 @@ int64_t zan_monotonic_us(void) {
  * 同批删除了桩定义(旧桩连 ABI 都不对:load_wav 单参、play 三参、
  * duration 返 int),避免链接期重定义。EXPORT 在 oracle 单 TU 约定
  * 里由 gui_runtime.c 提供,这里按 darwin/linux 默认可见性补上。
- * stb_vorbis.c 由 zan_audio.c 相对包含,无需额外配置。 */
-#ifdef ZAN_RT_CORE_ZAN
+ * stb_vorbis.c 由 zan_audio.c 相对包含,无需额外配置。
+ * b41:音频面仅 darwin C 车道编译——ELF C remainder 不含(audio 物件
+ * oracle ELF 也未随附,对拍不需要;且省 stb_vorbis 的大体量)。 */
+#if defined(ZAN_RT_CORE_ZAN) && defined(__APPLE__)
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2418,7 +2422,9 @@ int64_t zan_monotonic_us(void) {
 #include <stdint.h>
 #include <pthread.h>
 #include <unistd.h>
+#if defined(__APPLE__)
 #include <mach-o/dyld.h>
+#endif
 
 #include "/Users/qq/Desktop/zanlang/zan-lang/src/runtime/rt_timer.c"
 
@@ -2602,8 +2608,15 @@ const char *zan_file_app_dir(void) {
     } else {
         char exe[4096];
         exe[0] = 0;
+#if defined(__APPLE__)
         uint32_t cap = (uint32_t)sizeof(exe);
         if (_NSGetExecutablePath(exe, &cap) != 0) exe[0] = 0;
+#else
+        /* musl/glibc:readlink /proc/self/exe;失败留空(与 darwin 侧
+         * 取路径失败同象)。b41:ELF C remainder 的 app_dir 分支。 */
+        ssize_t rl = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        if (rl > 0) exe[rl] = 0; else exe[0] = 0;
+#endif
         if (exe[0]) {
             char *fwd = strrchr(exe, '/');
             char *back = strrchr(exe, '\\');
