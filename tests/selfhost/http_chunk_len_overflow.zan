@@ -1,0 +1,93 @@
+// Conformance: a chunk-size line whose value overflows 32 bits is rejected,
+// not wrapped to zero. With a 32-bit accumulator "100000000" (2^32) stepped
+// 0x10000000 * 16 back to 0, so the request looked like it ended at an empty
+// chunk and the bytes after it were parsed as the next pipelined request
+// (framing desync / request smuggling). The whole-request limit here is 1 GiB
+// so the 8-digit prefix still fits; only the 9th digit overflows.
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+
+class Program {
+    static int PORT = 9549;
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static async HttpResponse Echo(HttpRequest req) {
+        return HttpResponse.Text("/x " + Convert.ToString(req.bodyLength));
+    }
+
+    static int IndexOf(string hay, string needle) {
+        int hl = hay.Length;
+        int nl = needle.Length;
+        if (nl == 0 || hl < nl) { return -1; }
+        for (int i = 0; i + nl <= hl; i = i + 1) {
+            int j = 0;
+            while (j < nl && (hay[i + j] & 255) == (needle[j] & 255)) {
+                j = j + 1;
+            }
+            if (j == nl) { return i; }
+        }
+        return -1;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = new HttpServer("127.0.0.1", PORT);
+        server.SetMaxRequestBytes(1073741824);
+        server.SetTimeout(3000);
+        server.OnRequest(Echo);
+        Task.Spawn(server.Start());
+        await Task.Delay(150);
+
+        TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT, 3000);
+        int _h = await c.SendAsync(
+            "POST /x HTTP/1.1\r\nHost: t\r\n"
+            + "Transfer-Encoding: chunked\r\n\r\n");
+        await Task.Delay(20);
+        int _b = await c.SendAsync("100000000\r\n\r\n");
+        string resp = await c.RecvAsync(4096, 2000);
+        Check(IndexOf(resp, " 413 ") >= 0 || IndexOf(resp, " 413\r") >= 0,
+            "overflowing chunk length answered 413");
+        Check(IndexOf(resp, "/x 0") < 0,
+            "overflowing chunk length not treated as an empty terminator");
+        c.Close();
+
+        // Same value bounded by the whole-request limit on an ordinary
+        // server: still 413 (the digit-level bound fires first).
+        HttpServer small = new HttpServer("127.0.0.1", PORT + 1);
+        small.SetMaxRequestBytes(1024);
+        small.SetTimeout(3000);
+        small.OnRequest(Echo);
+        Task.Spawn(small.Start());
+        await Task.Delay(150);
+        TcpClient c2 = await TcpClient.ConnectAsync("127.0.0.1", PORT + 1, 3000);
+        int _h2 = await c2.SendAsync(
+            "POST /x HTTP/1.1\r\nHost: t\r\n"
+            + "Transfer-Encoding: chunked\r\n\r\n");
+        await Task.Delay(20);
+        int _b2 = await c2.SendAsync("100000000\r\n\r\n");
+        string resp2 = await c2.RecvAsync(4096, 2000);
+        Check(IndexOf(resp2, " 413 ") >= 0 || IndexOf(resp2, " 413\r") >= 0,
+            "oversized chunk length answered 413");
+        c2.Close();
+        small.Stop();
+
+        server.Stop();
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return failures;
+    }
+
+    static void Main() {
+        int _rc = await Run();
+    }
+}

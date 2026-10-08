@@ -55,7 +55,15 @@ if (( ${#FIXTURES[@]} == 0 )); then
             native_spans native_int_fieldinit native_int_narrow
             native_int_narrow2 native_numeric_runtime native_fnptr
             native_generic_overload_fit native_float_return_arg
-            native_cstring_read)
+            native_cstring_read
+            # b45:socket 族收编(tests/selfhost 内已固化双车道绿档):
+            # http/redis 客户端 + 代理链 + 并发压力服务器 + TLS。
+            http_client_redirect http_client_binary http_client_timeout
+            http_client_cookies redis_pool redis_tls
+            http_forwarder_keepalive http_forwarder_stream
+            http_forwarder_tunnel http_server_stress http_framing
+            http_parser_hardening http_smuggling http_upload_bytes
+            http_bytes_redirect http_chunk_len_overflow)
 fi
 
 # 第十五批起 SKIP 清单为空:native_varargs 的 st_mode 偏移与 open 标志

@@ -51,15 +51,47 @@ def main():
         ROOT / 'tests/selfhost/native_async_basic.zan', ROOT / 'tests/selfhost/native_async_detach.zan',
         ROOT / 'tests/selfhost/native_async_locals.zan', ROOT / 'tests/selfhost/native_async_throw.zan',
         ROOT / 'tests/selfhost/native_dict_packed_out.zan', ROOT / 'tests/selfhost/native_int_fieldinit.zan',
-        ROOT / 'tests/selfhost/native_int_narrow.zan', ROOT / 'tests/selfhost/native_int_narrow2.zan']
+        ROOT / 'tests/selfhost/native_int_narrow.zan', ROOT / 'tests/selfhost/native_int_narrow2.zan',
+        # b45:socket 族收编——16 件 conformance fixture 拷入 selfhost
+        # (zan-lang/tests/conformance 原件双车道 32/32 实证后固化;http/
+        # redis 客户端 + 代理链 + 并发压力服务器 + TLS,自含 mock server,
+        # 无外网依赖)。http_client_keepalive 与 redis_client 不收:seed
+        # ngen_async 并发/this 捕获双车道可复现(writer_route.md b44)。
+        ROOT / 'tests/selfhost/http_client_redirect.zan', ROOT / 'tests/selfhost/http_client_binary.zan',
+        ROOT / 'tests/selfhost/http_client_timeout.zan', ROOT / 'tests/selfhost/http_client_cookies.zan',
+        ROOT / 'tests/selfhost/redis_pool.zan', ROOT / 'tests/selfhost/redis_tls.zan',
+        ROOT / 'tests/selfhost/http_forwarder_keepalive.zan', ROOT / 'tests/selfhost/http_forwarder_stream.zan',
+        ROOT / 'tests/selfhost/http_forwarder_tunnel.zan', ROOT / 'tests/selfhost/http_server_stress.zan',
+        ROOT / 'tests/selfhost/http_framing.zan', ROOT / 'tests/selfhost/http_parser_hardening.zan',
+        ROOT / 'tests/selfhost/http_smuggling.zan', ROOT / 'tests/selfhost/http_upload_bytes.zan',
+        ROOT / 'tests/selfhost/http_bytes_redirect.zan', ROOT / 'tests/selfhost/http_chunk_len_overflow.zan']
     failed = 0
+    # b45:stdlib 的 TLS/DB 族经 DllImport 引 OpenSSL/unixODBC/libpq——
+    # golden_native 链接时按前缀探测补库(见其 extra_libs),这里同样补齐,
+    # 否则 socket 族 16 件在链接期未解析(EVP_*/SQLAllocHandle/PQ*)。
+    extra_libs = []
+    homebrew = Path('/Users/qq/.homebrew') if Path('/Users/qq/.homebrew/opt').exists() \
+        else Path('/opt/homebrew')
+    for prefix_dir in (homebrew / 'opt/openssl@3', homebrew / 'opt/openssl'):
+        if (prefix_dir / 'lib/libssl.dylib').exists():
+            extra_libs += ['-L' + str(prefix_dir / 'lib'), '-lssl', '-lcrypto']
+            break
+    for prefix_dir in (homebrew / 'opt/unixodbc', Path('/opt/homebrew/opt/unixodbc')):
+        if (prefix_dir / 'lib/libodbc.dylib').exists():
+            extra_libs += ['-L' + str(prefix_dir / 'lib'), '-lodbc']
+            break
+    for prefix_dir in (homebrew / 'opt/libpq', Path('/opt/homebrew/opt/libpq')):
+        if (prefix_dir / 'lib/libpq.dylib').exists():
+            extra_libs += ['-L' + str(prefix_dir / 'lib'), '-lpq']
+            break
     for i, fixture in enumerate(fixtures):
         fixture = fixture.resolve()
         prefix = work / f'{i}-{fixture.stem}'
         commands = [
             [str(seed), str(prefix) + '.o', str(fixture)],
             ['/usr/bin/ld', '-arch', 'arm64', '-e', '_main', '-platform_version', 'macos', '11.0', version,
-             '-syslibroot', sdk, '-L' + sdk + '/usr/lib', '-o', str(prefix), str(prefix) + '.o', *runtime, '-lSystem'],
+             '-syslibroot', sdk, '-L' + sdk + '/usr/lib', '-o', str(prefix), str(prefix) + '.o', *runtime,
+             *extra_libs, '-lSystem'],
             [str(prefix)],
         ]
         try:
