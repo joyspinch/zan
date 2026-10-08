@@ -64,7 +64,10 @@ def main():
         ROOT / 'tests/selfhost/http_forwarder_tunnel.zan', ROOT / 'tests/selfhost/http_server_stress.zan',
         ROOT / 'tests/selfhost/http_framing.zan', ROOT / 'tests/selfhost/http_parser_hardening.zan',
         ROOT / 'tests/selfhost/http_smuggling.zan', ROOT / 'tests/selfhost/http_upload_bytes.zan',
-        ROOT / 'tests/selfhost/http_bytes_redirect.zan', ROOT / 'tests/selfhost/http_chunk_len_overflow.zan']
+        ROOT / 'tests/selfhost/http_bytes_redirect.zan', ROOT / 'tests/selfhost/http_chunk_len_overflow.zan',
+        # b46:fail-soft 诊断面(共识子集:出货 oracle 二进制早于 rt_timer.c
+        # 的 ARC 头 scratch 重设计,探针只断言二进制与源码一致的面)。
+        ROOT / 'tests/selfhost/softdiag.zan']
     failed = 0
     # b45:stdlib 的 TLS/DB 族经 DllImport 引 OpenSSL/unixODBC/libpq——
     # golden_native 链接时按前缀探测补库(见其 extra_libs),这里同样补齐,
